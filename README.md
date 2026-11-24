@@ -29,6 +29,23 @@
 2. **模型上头显**：把 ZipDepth NPU 版导出成 256 int8 的 TFLite，在 PICO 4 上实测 CPU（XNNPACK）和 GPU delegate 的耗时，确认每秒 12 张深度图做不做得到。
 3. **PICO 4 原生播放器**：OpenXR（PICO 的 loader）+ MediaCodec 解码本地或网盘视频 + GLES 实现上面的 warp（双边上采样、偏移搜索、采样三个 pass）+ 两个视角各一个 layer。渲染部分打算直接借 MoonlightXR 的 `xr-renderer`，所以整个项目跟着用 **GPLv3**。
 
+## PICO 4 实测（2026-11-24）
+
+在空闲状态下用 TFLite `benchmark_model` 测，取 40 次的平均：
+
+| 模型 | 后端 | 每张耗时 |
+|---|---|---|
+| ZipDepth int8 动态量化，256×256 | CPU XNNPACK 1 线程 | 31.9 ms |
+| 同上 | CPU XNNPACK 2 线程 | 23.2 ms |
+| 同上 | **CPU XNNPACK 4 线程** | **16.7 ms** |
+| 同上 | GPU delegate | 18.1 ms |
+| ZipDepth fp16，512×288 | GPU delegate | 34.4 ms |
+| 同上 | CPU XNNPACK 4 线程 | 77.9 ms |
+
+结论：深度模型走 CPU int8 256、4 线程，把 GPU 留给解码后的 warp 和合成。每秒 12 张只占约 20% 的时间，还有余量提到 15–20 张。播放时有解码和渲染负载，数字会变差，要在播放器里再测一次。
+
+PICO 4 自带播放器的「3D 左右」按半宽格式解。原型默认输出 `--layout pico`：整帧 2W×2H，每只眼保留全部横向分辨率。
+
 ## 原型用法
 
 ```bash
