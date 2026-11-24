@@ -1262,7 +1262,8 @@ class CtxApiAndRecoveryTest {
             File(repoRoot, "docs/specs/plugin-schema/dom-vectors.json").readText(),
         ).jsonObject
         val matrixCases = vecRoot["matrixCases"]!!.jsonArray
-        assertTrue("Expected all 85 matrixCases in dom-vectors.json", matrixCases.size >= 85)
+        assertTrue("Expected all 85+ matrixCases including knownDifference vectors", matrixCases.size >= 96)
+        var knownDiffCount = 0
         for (mcEl in matrixCases) {
             val mc = mcEl.jsonObject
             val id = mc["id"]!!.jsonPrimitive.int
@@ -1271,7 +1272,9 @@ class CtxApiAndRecoveryTest {
             val target = mc["target"]!!.jsonPrimitive.content
             val op = mc["op"]!!.jsonPrimitive.content
             val expectThrows = mc["throws"]!!.jsonPrimitive.boolean
-            val expectedEl = mc["expected"]!!
+            val isKnownDiff = mc["knownDifference"]?.jsonPrimitive?.boolean == true
+            if (isKnownDiff) knownDiffCount += 1
+            val expectedEl = if (isKnownDiff) mc["expectedAndroid"]!! else mc["expected"]!!
 
             val parser = PluginDomParser()
             var threw = false
@@ -1306,6 +1309,7 @@ class CtxApiAndRecoveryTest {
                 assertEquals("matrixCase #$id ($mode / $target / $op) mismatch", expectedStr, actual)
             }
         }
+        assertTrue("Expected at least 6 knownDifference vectors (select, ws, template)", knownDiffCount >= 6)
 
         // 2. Round 5 Item #1 [Blocking]: Pathological selectors MUST complete in < 1s via O(N*S) memoized DP
         run {
@@ -1472,6 +1476,382 @@ class CtxApiAndRecoveryTest {
             server.shutdown()
             tmpDir.deleteRecursively()
         }
+    }
+
+    @Test
+    fun enforcesRound6HardCapsBoundedMemoryDocCloseAndBridgeErrorTrapsUnderXmx256m(): Unit = runBlocking {
+        // 1. Run ALL Round 6 worst-case probes inside a strict -Xmx256m child JVM process,
+        //    proving every single worst-case input returns or throws a clear error in < 1s
+        //    without OutOfMemoryError or StackOverflowError.
+        val javaBin = File(System.getProperty("java.home"), "bin/java").absolutePath
+        val classpath = System.getProperty("java.class.path")
+        val proc = ProcessBuilder(
+            javaBin,
+            "-Xmx256m",
+            "-cp",
+            classpath,
+            Round6WorstCaseSubprocessMain::class.java.name,
+        ).redirectErrorStream(true).start()
+        val procOut = proc.inputStream.bufferedReader().readText()
+        val exitCode = proc.waitFor()
+        assertEquals(
+            "Constrained -Xmx256m Round 6 worst-case probe suite MUST pass cleanly:\n$procOut",
+            0,
+            exitCode,
+        )
+        assertTrue("Probe must emit ROUND6_ALL_PASSED:\n$procOut", procOut.contains("ROUND6_ALL_PASSED"))
+
+        // 2. Verify doc.close(), live-doc reclamation, handle reuse, and host bridge
+        //    StackOverflowError / OutOfMemoryError traps inside real QuickJS PluginRuntime.
+        val tmpDir = Files.createTempDirectory("d3-r6-runtime").toFile()
+        val secretBox = SoftwareAesSecretBox()
+        val logger = PluginLogger("dev.depth3d.r6", "inst-r6", sink = { _, _ -> })
+        val storage = InstanceStorage(File(tmpDir, "storage.enc"), secretBox)
+        val cookieJar = PluginCookieJar(File(tmpDir, "cookies.enc"), secretBox)
+        val manifest = PluginManifest(api = 1, id = "dev.depth3d.r6", name = "R6", version = "1.0.0")
+        val mainJs = """
+            export default {
+              home() { return []; },
+              browse(ctx, arg) {
+                const m = arg.categoryId;
+                if (m === 'doc-close-loop') {
+                  // Parse & close 20 docs sequentially (> 8 live cap) -> MUST succeed!
+                  for (let i = 0; i < 20; i++) {
+                    const d = ctx.parse.html('<p>doc-' + i + '</p>');
+                    const p = d.querySelector('p');
+                    if (p.text !== 'doc-' + i) throw new Error('mismatch');
+                    d.close();
+                    // Accessing closed handles must degrade safely without crash
+                    if (d.tag !== '' || p.text !== '') throw new Error('closed handle not cleared');
+                  }
+                  return { ok: true };
+                }
+                if (m === 'doc-unclosed-9') {
+                  for (let i = 0; i < 9; i++) ctx.parse.html('<p>' + i + '</p>');
+                  return { ok: true };
+                }
+                if (m === 'trigger-bridge') {
+                  const d = ctx.parse.html('<p>hi</p>');
+                  return { tag: d.querySelector('p').tag };
+                }
+                return { ok: true };
+              },
+              detail() { return { id: '1', kind: 'video', title: '1' }; },
+              playback() { return { url: 'https://cdn.example.com/a.mp4' }; },
+            };
+        """.trimIndent()
+        val runtime = PluginRuntime(
+            manifest = manifest,
+            instanceId = "inst-r6",
+            mainJsSource = mainJs,
+            config = emptyMap(),
+            fetchGateway = PluginFetchGateway(NetworkPolicy(manifest.permissions), cookieJar),
+            storage = storage,
+            cookieJar = cookieJar,
+            logger = logger,
+        )
+        try {
+            val closeRes = runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("doc-close-loop"))))
+            assertTrue(closeRes.jsonObject["ok"]!!.jsonPrimitive.boolean)
+
+            try {
+                runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("doc-unclosed-9"))))
+                fail("9 unclosed live documents must fail with PluginInternalException")
+            } catch (_: PluginInternalException) {
+            }
+
+            // Bridge StackOverflowError trap: NEVER leaks StackOverflowError out of host function!
+            val creationsBeforeSo = runtime.creationCount
+            runtime.bridgeFaultInjectorForTesting = { op ->
+                if (op == "domSelectFirstId") throw StackOverflowError("simulated bridge stack overflow")
+            }
+            try {
+                runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("trigger-bridge"))))
+                fail("Bridge StackOverflowError must map cleanly to PluginInternalException")
+            } catch (_: PluginInternalException) {
+            } finally {
+                runtime.bridgeFaultInjectorForTesting = null
+            }
+            assertEquals(creationsBeforeSo, runtime.creationCount)
+            // Runtime remains completely healthy after trapped StackOverflowError
+            val afterSo = runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("trigger-bridge"))))
+            assertEquals("p", afterSo.jsonObject["tag"]!!.jsonPrimitive.content)
+
+            // Bridge OutOfMemoryError trap: NEVER leaks OutOfMemoryError & destroys/rebuilds VM!
+            val creationsBeforeOom = runtime.creationCount
+            runtime.bridgeFaultInjectorForTesting = { op ->
+                if (op == "domSelectFirstId") throw OutOfMemoryError("simulated bridge OOM")
+            }
+            try {
+                runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("trigger-bridge"))))
+                fail("Bridge OutOfMemoryError must map cleanly to PluginInternalException")
+            } catch (_: PluginInternalException) {
+            } finally {
+                runtime.bridgeFaultInjectorForTesting = null
+            }
+            val afterOom = runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("trigger-bridge"))))
+            assertEquals("p", afterOom.jsonObject["tag"]!!.jsonPrimitive.content)
+            assertEquals("VM must rebuild after bridge OutOfMemoryError", creationsBeforeOom + 1, runtime.creationCount)
+        } finally {
+            runtime.close()
+            tmpDir.deleteRecursively()
+        }
+    }
+}
+
+/**
+ * Isolated `-Xmx256m` child JVM proving EVERY Round 6 worst-case DOM/selector
+ * input completes or throws a clear plugin limit/syntax/timeout error in < 1s
+ * with bounded memory and zero StackOverflowError / OutOfMemoryError.
+ */
+object Round6WorstCaseSubprocessMain {
+    private inline fun assertFastUnder1s(name: String, block: () -> Unit) {
+        val t0 = System.nanoTime()
+        block()
+        val ms = (System.nanoTime() - t0) / 1_000_000L
+        if (ms >= 1000L) {
+            throw AssertionError("Case '$name' exceeded 1000ms budget: ${ms}ms")
+        }
+        println("OK [$name] ${ms}ms")
+    }
+
+    @JvmStatic
+    fun main(args: Array<String>) {
+        // Pre-build worst-case documents once to exercise query & registry behavior under -Xmx256m
+        val html190k = "<div>" + "<i></i>".repeat(190_000) + "</div>"
+
+        // Case 1 (Blocking #1): 190k <i> + `x` followed by 2999 x ` x` (~6 KB) -> rejected at parse in < 1s
+        run {
+            val p = PluginDomParser()
+            val root = p.parseHtml(html190k)
+            val hugeSel = "x" + " x".repeat(2999)
+            assertFastUnder1s("B1_long_selector_6kb") {
+                try {
+                    p.selectAllIds(root, hugeSel)
+                    throw AssertionError("6 KB / 3000-compound selector must throw DomLimitExceededException")
+                } catch (_: DomLimitExceededException) {
+                }
+            }
+            // Valid 32-compound non-matching selector on 190k <i> -> lazy memo allocates 0 bytes & finishes in < 1s
+            val valid32NonMatch = "x" + " x".repeat(31)
+            assertFastUnder1s("B1_valid32_nonmatch_zero_memo") {
+                val res = p.selectAllIds(root, valid32NonMatch)
+                if (res.size != 0) throw AssertionError("Expected 0 matches, got ${res.size}")
+            }
+            // Valid 32-compound matching-tail descendant selector on 190k <i> -> parent-keyed DP finishes in < 1s
+            val valid32MatchTail = "x" + " i".repeat(31)
+            assertFastUnder1s("B1_valid32_matchtail_parent_dp") {
+                val res = p.selectAllIds(root, valid32MatchTail)
+                if (res.size != 0) throw AssertionError("Expected 0 matches, got ${res.size}")
+            }
+            // Valid 32-compound sibling selector on 190k <i> -> trips 16 MB query memory budget -> DomLimitExceededException in < 1s!
+            val siblingBudgetTrip = "x" + " ~ i".repeat(31)
+            assertFastUnder1s("B1_16mb_memory_budget_trip") {
+                try {
+                    p.selectAllIds(root, siblingBudgetTrip)
+                    throw AssertionError("190k siblings x 32 compounds must trip 16 MB memo memory budget")
+                } catch (_: DomLimitExceededException) {
+                }
+            }
+            p.clear()
+        }
+
+        // Case 2 (Blocking #2): 2000 x `~ li` -> rejected at parse (> 32 compounds) + max allowed depth 4 x 32 no SOE
+        run {
+            val p = PluginDomParser()
+            val ul2k = "<ul>" + "<li></li>".repeat(2010) + "</ul>"
+            val root = p.parseHtml(ul2k)
+            val deepSib = "li" + " ~ li".repeat(1999) + ":last-child"
+            assertFastUnder1s("B2_2000_sibling_rejected") {
+                try {
+                    p.selectAllIds(root, deepSib)
+                    throw AssertionError("2000-compound selector must throw DomLimitExceededException")
+                } catch (_: DomLimitExceededException) {
+                }
+            }
+            // Nesting depth > 4 rejected
+            assertFastUnder1s("B2_nesting_5_rejected") {
+                try {
+                    p.selectAllIds(root, ":not(:not(:not(:not(:not(li)))))")
+                    throw AssertionError("Nesting depth 5 must throw DomLimitExceededException")
+                } catch (_: DomLimitExceededException) {
+                }
+            }
+            // Max legal complexity (depth 4 nesting + 32 compounds): :not(:is(:not(span))) == span (false on li),
+            // so `chain32` (32 sibling `li`s) matches indices 32..2010 = 1979 elements, no StackOverflowError, < 1s
+            val chain32 = "li" + " ~ li".repeat(31)
+            val maxLegal = "li:is(:not(:is(:not(span))), $chain32)"
+            assertFastUnder1s("B2_max_legal_depth4_32compounds") {
+                val res = p.selectAllIds(root, maxLegal)
+                if (res.size != 1979) throw AssertionError("Expected 1979, got ${res.size}")
+            }
+            p.clear()
+        }
+
+        // Case 3 (Required #3): 2 MB attribute + [x*="a...(20k)b"] / [x*="a...(250)b"] / 32x[x*=b i], 1M-token class + .z
+        run {
+            val p = PluginDomParser()
+            val attr2Mb = "<p x=\"" + "a".repeat(2_000_000) + "\"></p>"
+            val rAttr = p.parseHtml(attr2Mb)
+            // 20k value rejected at parse (> 256 chars)
+            assertFastUnder1s("R3_attr_value_20k_rejected") {
+                try {
+                    p.selectAllIds(rAttr, "[x*=\"" + "a".repeat(20_000) + "b\"]")
+                    throw AssertionError("20k attr value must throw DomLimitExceededException")
+                } catch (_: DomLimitExceededException) {
+                }
+            }
+            // Legal 251-char needle against 2 MB attr with 1s deadline -> budgeted KMP throws DomLimitExceededException in < 1s
+            val needle251 = "[x*=\"" + "a".repeat(250) + "b\"]"
+            p.setCallDeadlineNanos(System.nanoTime() + 1_000_000_000L)
+            assertFastUnder1s("R3_attr_2mb_kmp_budgeted") {
+                try {
+                    p.selectAllIds(rAttr, needle251)
+                    throw AssertionError("2 MB attr KMP scan must hit 2M step budget")
+                } catch (_: DomLimitExceededException) {
+                }
+            }
+            // 32 groups of case-insensitive [x*=b i] on 2 MB attr -> hits 2M step budget in < 1s (zero 2MB lowercase copies!)
+            val ci32 = (1..32).joinToString(",") { "p[x*=b i]" }
+            assertFastUnder1s("R3_attr_2mb_ci_32groups") {
+                try {
+                    p.selectAllIds(rAttr, ci32)
+                    throw AssertionError("2 MB attr x 32 [x*=b i] must hit 2M step budget")
+                } catch (_: DomLimitExceededException) {
+                }
+            }
+            p.clear()
+
+            // 1M-token class + 3000 groups `.z` (rejected > 32 groups) and 32 groups `.z` (cached once + step budgeted)
+            val cls1M = "<p class=\"" + "a ".repeat(1_000_000) + "\"></p>"
+            val rCls = p.parseHtml(cls1M)
+            assertFastUnder1s("R3_class_3000_groups_rejected") {
+                try {
+                    p.selectAllIds(rCls, (1..3000).joinToString(",") { ".z" })
+                    throw AssertionError("3000 comma groups must throw DomLimitExceededException")
+                } catch (_: DomLimitExceededException) {
+                }
+            }
+            assertFastUnder1s("R3_class_1m_tokens_32groups") {
+                try {
+                    val res = p.selectAllIds(rCls, (1..32).joinToString(",") { ".z" })
+                    if (res.size != 0) throw AssertionError("Expected 0 matches")
+                } catch (_: DomLimitExceededException) {
+                    // Acceptable when 2M char scan hits 2M step budget
+                }
+            }
+            // 500k-token class (1 MB) + 32 groups `.z`: tokenizes ONCE, caches Set, completes cleanly in < 1s!
+            p.clear()
+            val rCls500k = p.parseHtml("<p class=\"" + "a ".repeat(500_000) + "\"></p>")
+            assertFastUnder1s("R3_class_500k_tokens_cached_32groups") {
+                val res = p.selectAllIds(rCls500k, (1..32).joinToString(",") { ".z" })
+                if (res.size != 0) throw AssertionError("Expected 0 matches")
+            }
+            p.clear()
+        }
+
+        // Case 4 (Required #4): 190k <i> + select('*') looped 40x -> deduplicated handles, zero OOM under -Xmx256m;
+        // plus 8 live docs / 400k live elements / doc.close()
+        run {
+            val p = PluginDomParser()
+            val root = p.parseHtml(html190k)
+            val firstIds = p.selectAllIds(root, "*")
+            val expectedHandles = p.currentHandleCount()
+            if (expectedHandles != 190_005) {
+                throw AssertionError("Expected 190005 handles (html,head,body,div,190k*i + #document), got $expectedHandles")
+            }
+            // Repeat 40x (previously OOMed at 34x!) -> handles stay strictly deduplicated
+            for (iter in 0 until 40) {
+                val t0 = System.nanoTime()
+                val curIds = p.selectAllIds(root, "*")
+                val ms = (System.nanoTime() - t0) / 1_000_000L
+                if (ms >= 1000L) throw AssertionError("select('*') iter #$iter took ${ms}ms >= 1000ms")
+                if (curIds.size != firstIds.size) throw AssertionError("Match count drifted")
+                if (p.currentHandleCount() != expectedHandles) {
+                    throw AssertionError("Handle leak at iter #$iter: ${p.currentHandleCount()} != $expectedHandles")
+                }
+            }
+            println("OK [R4_dedup_190k_select_star_40x] handles=$expectedHandles")
+
+            // Live total element cap = 400k across live docs + doc.close() reclamation
+            val root2 = p.parseHtml(html190k) // 190,004 * 2 = 380,008 <= 400,000
+            if (p.currentLiveDocCount() != 2 || p.currentTotalNodes() != 380_008) {
+                throw AssertionError("Expected 2 live docs / 380008 nodes, got ${p.currentLiveDocCount()} / ${p.currentTotalNodes()}")
+            }
+            val html50k = "<div>" + "<i></i>".repeat(50_000) + "</div>"
+            assertFastUnder1s("R4_live_400k_cap_enforced") {
+                try {
+                    p.parseHtml(html50k)
+                    throw AssertionError("380k + 50k > 400k live cap must throw DomLimitExceededException")
+                } catch (_: DomLimitExceededException) {
+                }
+            }
+            // Closing doc #1 immediately reclaims its 190,004 elements and handles!
+            if (!p.closeDoc(root)) throw AssertionError("closeDoc(root) returned false")
+            if (p.currentLiveDocCount() != 1 || p.currentTotalNodes() != 190_004) {
+                throw AssertionError("After closeDoc: docs=${p.currentLiveDocCount()} nodes=${p.currentTotalNodes()}")
+            }
+            val root3 = p.parseHtml(html50k) // 190,004 + 50,004 = 240,008 <= 400,000 -> succeeds!
+            if (p.currentLiveDocCount() != 2 || p.currentTotalNodes() != 240_008) {
+                throw AssertionError("After reclaim+parse: docs=${p.currentLiveDocCount()} nodes=${p.currentTotalNodes()}")
+            }
+            p.closeDoc(root2)
+            p.closeDoc(root3)
+            if (p.currentLiveDocCount() != 0 || p.currentTotalNodes() != 0 || p.currentHandleCount() != 0) {
+                throw AssertionError("All closed docs must release to 0")
+            }
+            println("OK [R4_live_400k_and_doc_close]")
+        }
+
+        // Case 5 (Small #7 & #9): :nth-* overflow rejection + identical exception class for step & memory budgets
+        run {
+            val p = PluginDomParser()
+            val root = p.parseHtml("<ul><li>1</li><li>2</li></ul>")
+            val badNths = listOf(
+                "li:nth-child(n-2147483648)",
+                "li:nth-child(2n-2147483647)",
+                "li:nth-child(-2147483648n+3)",
+                "li:nth-child(2147483648)",
+                "li:nth-child(1000001)",
+                "li:nth-child(-1000001)",
+                "li:nth-child(99999999999999999999n+1)",
+            )
+            assertFastUnder1s("S7_nth_overflow_rejected") {
+                for (sel in badNths) {
+                    try {
+                        p.selectAllIds(root, sel)
+                        throw AssertionError("Expected rejection for $sel")
+                    } catch (_: IllegalArgumentException) {
+                    }
+                }
+            }
+            // Small #9: Step budget & memory budget throw the EXACT same exception class (DomLimitExceededException)
+            val stepParser = PluginDomParser(maxSelectorSteps = 10)
+            val rStep = stepParser.parseHtml("<ul>" + "<li></li>".repeat(50) + "</ul>")
+            val stepErr = try {
+                stepParser.selectAllIds(rStep, "li")
+                throw AssertionError("Expected step budget error")
+            } catch (e: Throwable) {
+                e
+            }
+            val memParser = PluginDomParser(maxSelectorMemoryBytes = 1024)
+            val rMem = memParser.parseHtml("<ul>" + "<li></li>".repeat(200) + "</ul>")
+            val memErr = try {
+                memParser.selectAllIds(rMem, "li ~ li")
+                throw AssertionError("Expected memory budget error")
+            } catch (e: Throwable) {
+                e
+            }
+            if (stepErr.javaClass != DomLimitExceededException::class.java ||
+                memErr.javaClass != DomLimitExceededException::class.java
+            ) {
+                throw AssertionError("Budget error types diverged: step=${stepErr.javaClass}, mem=${memErr.javaClass}")
+            }
+            println("OK [S9_same_budget_error_class]")
+        }
+
+        println("ROUND6_ALL_PASSED")
+        kotlin.system.exitProcess(0)
     }
 }
 

@@ -793,24 +793,45 @@ class Media3DashAndRoomTest {
                     }
                 }
 
-                // Round 5 Item #2: Artworks.load MUST directly reject plugin-stamped Artwork at runtime
-                // even if UI code accidentally routes a plugin Artwork into Artworks.load.
+                // Round 6 Item #5: Artworks.load MUST gracefully refuse plugin-stamped Artwork at runtime
+                // by returning null (so Components.kt displays a placeholder instead of crashing) AND making 0 HTTP calls.
                 val pluginStampedArt = Artwork(
                     url = "$lanBase/Items/item1/Images/Primary",
                     headers = mapOf("Authorization" to expectedAuth),
                     sourceKind = com.limelight.local.media.SourceKind.PLUGIN,
                 )
-                runBlocking {
-                    try {
-                        com.limelight.local.media.Artworks.load(
-                            context,
-                            pluginStampedArt,
-                            com.limelight.local.media.Artworks.Size.CARD,
-                        )
-                        fail("Artworks.load must throw UnsupportedOperationException for SourceKind.PLUGIN Artwork")
-                    } catch (_: UnsupportedOperationException) {
-                    }
+                val reqCountBefore = server.requestCount
+                val refusedBmp = runBlocking {
+                    com.limelight.local.media.Artworks.load(
+                        context,
+                        pluginStampedArt,
+                        com.limelight.local.media.Artworks.Size.CARD,
+                    )
                 }
+                assertNull("Artworks.load must return null (non-crashing fallback) for SourceKind.PLUGIN", refusedBmp)
+                assertEquals(
+                    "Artworks.load must make 0 HTTP requests for SourceKind.PLUGIN",
+                    reqCountBefore,
+                    server.requestCount,
+                )
+                val pluginFrameArt = Artwork(
+                    url = "$lanBase/Items/item1/Images/Primary",
+                    isVideoFrame = true,
+                    sourceKind = com.limelight.local.media.SourceKind.PLUGIN,
+                )
+                val refusedFrame = runBlocking {
+                    com.limelight.local.media.Artworks.load(
+                        context,
+                        pluginFrameArt,
+                        com.limelight.local.media.Artworks.Size.CARD,
+                    )
+                }
+                assertNull("Artworks.load must return null for plugin video-frame Artwork", refusedFrame)
+                assertEquals(
+                    "Artworks.load must make 0 HTTP requests for plugin video-frame Artwork",
+                    reqCountBefore,
+                    server.requestCount,
+                )
             } finally {
                 runBlocking { mgr.shutdownAll() }
             }

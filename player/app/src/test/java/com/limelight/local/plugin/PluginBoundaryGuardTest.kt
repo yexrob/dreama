@@ -15,14 +15,132 @@ import org.junit.Test
 import java.io.File
 
 /**
- * Architecture boundary guard enforcing `docs/specs/plugin-host-integration.md`.
+ * Architecture boundary guard supporting `docs/specs/plugin-host-integration.md`.
  *
- * Because the Android app currently lives in a single `:app` Gradle module,
- * Kotlin `internal` visibility is module-wide rather than package-private.
- * This test scans every `.kt` and `.java` source file outside `local/plugin/`
- * so any bypass of [PluginPlayback] or [PluginImages.loadBitmap] fails CI immediately.
+ * Real coverage scope (important — do NOT overstate):
+ * 1. **Static source scan** over `.kt`/`.java` files outside `local/plugin/`:
+ *    - Forbids referencing plugin-internal implementation classes/helpers anywhere
+ *      outside `local/plugin/`.
+ *    - Verifies `Artworks.kt` keeps its non-crashing runtime fallback (`LimeLog.warning`
+ *      + `return null`) for `SourceKind.PLUGIN`.
+ *    - Flags unguarded mixing of `PluginMediaSource` / `SourceKind.PLUGIN` with raw
+ *      HTTP / `DefaultHttpDataSource` / `MediaMetadataRetriever` / `Artworks.load` /
+ *      `PlaybackInfo.url|headers`, while **explicitly allowing** UI/player files that
+ *      branch via `PluginHostGuards.isPlugin*` or `PluginHostGuards.requireNonPlugin*`.
+ * 2. **Unit test of [PluginHostGuards]** helper methods in isolation.
+ *
+ * What this test does NOT verify:
+ * - Only `Artworks.load` / `Artworks.frame` currently have runtime refusal wired in
+ *   production code (tested in `Media3DashAndRoomTest`).
+ * - `WallActivity.launchPlayer`, `LocalPlayerXR.java` frame probing, and DLNA/cast
+ *   (`local/dlna/`, `CastScreen.kt`) are NOT wired yet; the UI/player integration
+ *   task MUST call [PluginHostGuards] in those entry points.
  */
 class PluginBoundaryGuardTest {
+
+    private val pluginPkgPrefix = "com/limelight/local/plugin/"
+    private val localPkgPrefix = "com/limelight/local/"
+
+    private val forbiddenInternalSymbols = listOf(
+        "PlaybackMediaSourceFactory",
+        "SafePluginHttpDataSource",
+        "SafePluginHttpExecutor",
+        "PluginImageFetcher",
+        "FailoverUrlDataSource",
+        "FailoverUrlSelector",
+        "JsonSubtitleVttDataSource",
+        "PluginImages.loadBytes",
+        "createPlaybackFactory",
+        "createImageFetcher",
+    )
+
+    private val legacyLocalRawClientFiles = setOf(
+        "com/limelight/local/LocalPlayerXR.java",
+        "com/limelight/local/WebDav.java",
+        "com/limelight/local/media/Artworks.kt",
+        "com/limelight/local/media/Model.kt",
+        "com/limelight/local/wall/WallActivity.kt",
+        "com/limelight/local/wall/Components.kt",
+    )
+
+    private val rawPlaybackOrHttpPatterns = listOf(
+        Regex("""\bDefaultHttpDataSource\b""") to "DefaultHttpDataSource (must use PluginPlayback for plugins)",
+        Regex("""\bOkHttpClient\b""") to "raw OkHttpClient (must use PluginImages.loadBitmap / PluginPlayback for plugins)",
+        Regex("""\bHttpURLConnection\b""") to "HttpURLConnection (must use PluginImages.loadBitmap / PluginPlayback for plugins)",
+        Regex("""\bMediaMetadataRetriever\b""") to "MediaMetadataRetriever (forbidden for plugin URLs; use PluginImages.loadBitmap / ExoPlayer Format)",
+        Regex("""\bArtworks\.load\b""") to "Artworks.load (forbidden for plugin artwork; use PluginImages.loadBitmap)",
+    )
+    private val rawPlaybackFieldAccess = Regex("""\b[a-zA-Z_][a-zA-Z0-9_]*\.(?:url|headers)\b""")
+    private val playbackTypeMention = Regex("""\bPlaybackInfo\b""")
+    private val pluginMarkerRegex = Regex("""\b(?:PluginMediaSource|SourceKind\.PLUGIN)\b""")
+    private val hostGuardBranchRegex = Regex(
+        """\bPluginHostGuards\.(?:isPlugin(?:Source|Artwork|Playback)|requireNonPlugin(?:Artwork|Playback|FrameProbe|Cast))\b""",
+    )
+
+    internal fun auditSourceText(rel: String, rawText: String): List<String> {
+        if (rel.startsWith(pluginPkgPrefix)) return emptyList()
+        val violations = ArrayList<String>()
+        val codeOnly = stripComments(rawText)
+
+        // Rule 1: ZERO references to plugin-internal classes/helpers anywhere outside local/plugin/
+        for (sym in forbiddenInternalSymbols) {
+            if (Regex("""\b${Regex.escape(sym)}\b""").containsMatchIn(codeOnly)) {
+                violations += "$rel references internal plugin symbol '$sym' (use PluginPlayback / PluginImages.loadBitmap instead)"
+            }
+        }
+
+        // Rule 2: Inside local/, audit raw HTTP/player clients and PlaybackInfo.url/headers access
+        if (rel.startsWith(localPkgPrefix)) {
+            if (rel == "com/limelight/local/media/Artworks.kt") {
+                // Artworks.kt must keep its non-crashing runtime fallback (log warning + return null)
+                if (!codeOnly.contains("art.sourceKind == SourceKind.PLUGIN") ||
+                    !codeOnly.contains("LimeLog.warning") ||
+                    !codeOnly.contains("return null")
+                ) {
+                    violations += "$rel must retain non-crashing runtime fallback (LimeLog.warning + return null) for SourceKind.PLUGIN"
+                }
+                if (codeOnly.contains("throw UnsupportedOperationException")) {
+                    violations += "$rel must return null instead of throwing UnsupportedOperationException so Wall UI does not crash"
+                }
+                if (codeOnly.contains("PluginMediaSource")) {
+                    violations += "$rel must not handle PluginMediaSource directly"
+                }
+                return violations
+            }
+
+            val mentionsPlugin = pluginMarkerRegex.containsMatchIn(codeOnly)
+            val usesHostGuards = hostGuardBranchRegex.containsMatchIn(codeOnly)
+            val isLegacyAllowlisted = rel in legacyLocalRawClientFiles
+
+            for ((pattern, desc) in rawPlaybackOrHttpPatterns) {
+                if (pattern.containsMatchIn(codeOnly)) {
+                    if (!isLegacyAllowlisted) {
+                        violations += "$rel uses $desc outside audited legacy allowlist (see docs/specs/plugin-host-integration.md)"
+                    } else if (mentionsPlugin && !usesHostGuards) {
+                        violations += "$rel mixes plugin source handling with $desc without branching via PluginHostGuards.isPlugin* / requireNonPlugin*"
+                    }
+                }
+            }
+
+            if (playbackTypeMention.containsMatchIn(codeOnly) && rawPlaybackFieldAccess.containsMatchIn(codeOnly)) {
+                if (!isLegacyAllowlisted) {
+                    violations += "$rel directly accesses PlaybackInfo.url/headers outside audited legacy allowlist (use PluginPlayback instead)"
+                } else if (mentionsPlugin && !usesHostGuards) {
+                    violations += "$rel references plugin source AND directly accesses PlaybackInfo.url/headers without PluginHostGuards branching"
+                }
+            }
+        } else {
+            // Rule 3: Outside local/, never mix plugin source with raw HTTP/player APIs unless explicitly guarded
+            if (pluginMarkerRegex.containsMatchIn(codeOnly) && !hostGuardBranchRegex.containsMatchIn(codeOnly)) {
+                for ((pattern, desc) in rawPlaybackOrHttpPatterns) {
+                    if (pattern.containsMatchIn(codeOnly)) {
+                        violations += "$rel outside local/ mixes plugin source with $desc without PluginHostGuards"
+                    }
+                }
+            }
+        }
+        return violations
+    }
 
     @Test
     fun enforcesPluginPlaybackAndImageBoundaryOutsidePluginPackage() {
@@ -30,109 +148,12 @@ class PluginBoundaryGuardTest {
         val mainJavaRoot = File(repoRoot, "player/app/src/main/java")
         assertTrue("Expected Android source root at $mainJavaRoot", mainJavaRoot.isDirectory)
 
-        val pluginPkgPrefix = "com/limelight/local/plugin/"
-        val localPkgPrefix = "com/limelight/local/"
-
-        // Internal plugin runtime classes that must NEVER be referenced outside local/plugin/
-        val forbiddenInternalSymbols = listOf(
-            "PlaybackMediaSourceFactory",
-            "SafePluginHttpDataSource",
-            "SafePluginHttpExecutor",
-            "PluginImageFetcher",
-            "FailoverUrlDataSource",
-            "FailoverUrlSelector",
-            "JsonSubtitleVttDataSource",
-            "PluginImages.loadBytes",
-            "createPlaybackFactory",
-            "createImageFetcher",
-        )
-
-        // Pre-existing non-plugin files in local/ audited as legacy Local/WebDAV-only paths.
-        // None of these may mix SourceKind.PLUGIN / PluginMediaSource with raw HTTP/player calls;
-        // any NEW file outside local/plugin/ using PlaybackInfo.url/headers or raw HTTP clients fails.
-        val legacyLocalRawClientFiles = setOf(
-            "com/limelight/local/LocalPlayerXR.java",
-            "com/limelight/local/WebDav.java",
-            "com/limelight/local/media/Artworks.kt",
-            "com/limelight/local/media/Model.kt",
-            "com/limelight/local/wall/WallActivity.kt",
-            "com/limelight/local/wall/Components.kt",
-        )
-
-        val rawPlaybackOrHttpPatterns = listOf(
-            Regex("""\bDefaultHttpDataSource\b""") to "DefaultHttpDataSource (must use PluginPlayback for plugins)",
-            Regex("""\bOkHttpClient\b""") to "raw OkHttpClient (must use PluginImages.loadBitmap / PluginPlayback for plugins)",
-            Regex("""\bHttpURLConnection\b""") to "HttpURLConnection (must use PluginImages.loadBitmap / PluginPlayback for plugins)",
-            Regex("""\bMediaMetadataRetriever\b""") to "MediaMetadataRetriever (forbidden for plugin URLs; use PluginImages.loadBitmap / ExoPlayer Format)",
-            Regex("""\bArtworks\.load\b""") to "Artworks.load (forbidden for plugin artwork; use PluginImages.loadBitmap)",
-        )
-        val rawPlaybackFieldAccess = Regex("""\b[a-zA-Z_][a-zA-Z0-9_]*\.(?:url|headers)\b""")
-        val playbackTypeMention = Regex("""\bPlaybackInfo\b""")
-        val pluginMarkerRegex = Regex("""\b(?:PluginMediaSource|SourceKind\.PLUGIN)\b""")
-
         val violations = ArrayList<String>()
-
         mainJavaRoot.walkTopDown()
             .filter { it.isFile && (it.extension == "kt" || it.extension == "java") }
             .forEach { file ->
                 val rel = file.relativeTo(mainJavaRoot).path.replace(File.separatorChar, '/')
-                if (rel.startsWith(pluginPkgPrefix)) return@forEach
-
-                val text = file.readText()
-                val codeOnly = stripComments(text)
-
-                // Rule 1: ZERO references to plugin-internal classes/helpers anywhere outside local/plugin/
-                for (sym in forbiddenInternalSymbols) {
-                    if (Regex("""\b${Regex.escape(sym)}\b""").containsMatchIn(codeOnly)) {
-                        violations += "$rel references internal plugin symbol '$sym' (use PluginPlayback / PluginImages.loadBitmap instead)"
-                    }
-                }
-
-                // Rule 2: Inside local/, audit raw HTTP/player clients and PlaybackInfo.url/headers access
-                if (rel.startsWith(localPkgPrefix)) {
-                    if (rel == "com/limelight/local/media/Artworks.kt") {
-                        // Artworks.kt is explicitly allowed to check `SourceKind.PLUGIN` ONLY to reject it at runtime
-                        if (!codeOnly.contains("art.sourceKind == SourceKind.PLUGIN") ||
-                            !codeOnly.contains("throw UnsupportedOperationException")
-                        ) {
-                            violations += "$rel must retain runtime rejection guard for SourceKind.PLUGIN"
-                        }
-                        if (codeOnly.contains("PluginMediaSource")) {
-                            violations += "$rel must not handle PluginMediaSource directly"
-                        }
-                        return@forEach
-                    }
-
-                    val mentionsPlugin = pluginMarkerRegex.containsMatchIn(codeOnly)
-                    val isLegacyAllowlisted = rel in legacyLocalRawClientFiles
-
-                    for ((pattern, desc) in rawPlaybackOrHttpPatterns) {
-                        if (pattern.containsMatchIn(codeOnly)) {
-                            if (!isLegacyAllowlisted) {
-                                violations += "$rel uses $desc outside audited legacy allowlist (see docs/specs/plugin-host-integration.md)"
-                            } else if (mentionsPlugin) {
-                                violations += "$rel mixes plugin source handling with $desc; isolate plugin playback/artwork strictly through PluginPlayback / PluginImages.loadBitmap"
-                            }
-                        }
-                    }
-
-                    if (playbackTypeMention.containsMatchIn(codeOnly) && rawPlaybackFieldAccess.containsMatchIn(codeOnly)) {
-                        if (!isLegacyAllowlisted) {
-                            violations += "$rel directly accesses PlaybackInfo.url/headers outside audited legacy allowlist (use PluginPlayback instead)"
-                        } else if (mentionsPlugin) {
-                            violations += "$rel references plugin source AND directly accesses PlaybackInfo.url/headers (must route plugins through PluginPlayback)"
-                        }
-                    }
-                } else {
-                    // Rule 3: Outside local/ (e.g. DLNA/streaming/activities), NEVER reference plugin sources alongside raw HTTP/PlaybackInfo.url
-                    if (pluginMarkerRegex.containsMatchIn(codeOnly)) {
-                        for ((pattern, desc) in rawPlaybackOrHttpPatterns) {
-                            if (pattern.containsMatchIn(codeOnly)) {
-                                violations += "$rel outside local/ mixes plugin source with $desc"
-                            }
-                        }
-                    }
-                }
+                violations += auditSourceText(rel, file.readText())
             }
 
         if (violations.isNotEmpty()) {
@@ -144,7 +165,68 @@ class PluginBoundaryGuardTest {
     }
 
     @Test
-    fun runtimeGuardsRejectPluginItemsAndPlaybackAtEveryLegacyHostEntryPoint() {
+    fun staticAuditAllowsPluginHostGuardsBranchingInUiFilesAndRejectsUnguardedMixing() {
+        // UI file branching cleanly on PluginHostGuards.isPluginArtwork -> MUST be allowed!
+        val guardedUiCode = """
+            package com.limelight.local.wall
+            import com.limelight.local.media.Artworks
+            import com.limelight.local.plugin.PluginHostGuards
+            import com.limelight.local.plugin.PluginImages
+            import com.limelight.local.plugin.PluginMediaSource
+            suspend fun loadArt(src: PluginMediaSource?, art: Artwork) =
+                if (PluginHostGuards.isPluginArtwork(art)) PluginImages.loadBitmap(src!!, art)
+                else Artworks.load(ctx, art, Artworks.Size.CARD)
+        """.trimIndent()
+        assertEquals(
+            "UI file branching via PluginHostGuards.isPluginArtwork must be allowed",
+            emptyList<String>(),
+            auditSourceText("com/limelight/local/wall/Components.kt", guardedUiCode),
+        )
+
+        // Legacy UI file branching on PluginHostGuards.isPluginPlayback -> MUST be allowed!
+        val guardedLaunchCode = """
+            package com.limelight.local.wall
+            import com.limelight.local.media.PlaybackInfo
+            import com.limelight.local.media.SourceKind
+            import com.limelight.local.plugin.PluginHostGuards
+            fun launch(info: PlaybackInfo) {
+                if (PluginHostGuards.isPluginPlayback(info) || info.sourceKind == SourceKind.PLUGIN) return
+                openLegacy(info.url, info.headers)
+            }
+        """.trimIndent()
+        assertEquals(
+            "WallActivity branching via PluginHostGuards.isPluginPlayback must be allowed",
+            emptyList<String>(),
+            auditSourceText("com/limelight/local/wall/WallActivity.kt", guardedLaunchCode),
+        )
+
+        // Legacy UI file mixing PluginMediaSource with Artworks.load WITHOUT PluginHostGuards -> MUST fail!
+        val unguardedUiCode = """
+            package com.limelight.local.wall
+            import com.limelight.local.media.Artworks
+            import com.limelight.local.plugin.PluginMediaSource
+            suspend fun bad(src: PluginMediaSource, art: Artwork) = Artworks.load(ctx, art, Artworks.Size.CARD)
+        """.trimIndent()
+        assertTrue(
+            "Unguarded mixing of PluginMediaSource and Artworks.load must be rejected",
+            auditSourceText("com/limelight/local/wall/Components.kt", unguardedUiCode).isNotEmpty(),
+        )
+
+        // Referencing internal plugin class outside local/plugin/ -> ALWAYS fails even with PluginHostGuards!
+        val internalLeakCode = """
+            package com.limelight.local.wall
+            import com.limelight.local.plugin.PluginHostGuards
+            import com.limelight.local.plugin.SafePluginHttpDataSource
+            fun leak() { PluginHostGuards.isPluginSource(null); SafePluginHttpDataSource::class }
+        """.trimIndent()
+        assertTrue(
+            "Internal plugin symbol outside local/plugin/ must always be rejected",
+            auditSourceText("com/limelight/local/wall/Components.kt", internalLeakCode).isNotEmpty(),
+        )
+    }
+
+    @Test
+    fun runtimeGuardHelpersRejectPluginItemsAndPlaybackInIsolation() {
         val policy = NetworkPolicy(
             permissions = PluginPermissions(hosts = listOf("cdn.example.com"), lan = false),
             dnsResolver = { listOf(java.net.InetAddress.getByName("93.184.216.34")) },
@@ -189,7 +271,7 @@ class PluginBoundaryGuardTest {
         assertEquals(SourceKind.PLUGIN, playback.sourceKind)
         assertTrue(PluginHostGuards.isPluginPlayback(playback))
 
-        // 1. Artworks.load / Components.kt guard rejects plugin artwork even without explicit sourceKind argument
+        // 1. requireNonPluginArtwork rejects plugin artwork
         for (art in listOf(poster, thumb, backdrop, personImg)) {
             try {
                 PluginHostGuards.requireNonPluginArtwork(art)
@@ -198,14 +280,14 @@ class PluginBoundaryGuardTest {
             }
         }
 
-        // 2. WallActivity.launchPlayer / LocalPlayerXR DefaultHttpDataSource guard rejects plugin PlaybackInfo
+        // 2. requireNonPluginPlayback rejects plugin PlaybackInfo
         try {
             PluginHostGuards.requireNonPluginPlayback(playback)
             fail("requireNonPluginPlayback must reject plugin PlaybackInfo")
         } catch (_: UnsupportedOperationException) {
         }
 
-        // 3. MediaMetadataRetriever / MediaExtractor frame probe guard rejects plugin source/artwork/playback
+        // 3. requireNonPluginFrameProbe rejects plugin source/artwork/playback
         try {
             PluginHostGuards.requireNonPluginFrameProbe(SourceKind.PLUGIN)
             fail("requireNonPluginFrameProbe must reject SourceKind.PLUGIN")
@@ -217,7 +299,7 @@ class PluginBoundaryGuardTest {
         } catch (_: UnsupportedOperationException) {
         }
 
-        // 4. DLNA (local/dlna/, local/wall/CastScreen.kt) & out-of-package cast guard rejects plugin Item/PlaybackInfo
+        // 4. requireNonPluginCast rejects plugin Item/PlaybackInfo
         try {
             PluginHostGuards.requireNonPluginCast(SourceKind.PLUGIN, info = playback, item = item)
             fail("requireNonPluginCast must reject SourceKind.PLUGIN")

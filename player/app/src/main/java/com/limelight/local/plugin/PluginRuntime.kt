@@ -169,6 +169,12 @@ class PluginRuntime(
     private var activeCallScope: CoroutineScope? = null
     @Volatile
     private var storageCorruptedInCall: Boolean = false
+    @Volatile
+    private var domTimedOutInCall: Boolean = false
+    @Volatile
+    private var hostOomInCall: Boolean = false
+    @Volatile
+    internal var bridgeFaultInjectorForTesting: ((String) -> Unit)? = null
     private val callGeneration = AtomicInteger(0)
 
     private class ActiveTimerHandle(
@@ -265,6 +271,8 @@ class PluginRuntime(
         val callScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         activeCallScope = callScope
         storageCorruptedInCall = false
+        domTimedOutInCall = false
+        hostOomInCall = false
         domParser.clear()
         releaseAllResponseBodies()
 
@@ -407,6 +415,8 @@ class PluginRuntime(
             val initScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
             activeCallScope = initScope
             storageCorruptedInCall = false
+            domTimedOutInCall = false
+            hostOomInCall = false
             try {
                 withContext(dispatcher) {
                     withTimeout(timeoutMs) {
@@ -524,9 +534,10 @@ class PluginRuntime(
         // Note: plain plugin `throw new Error("...timeout...")` or `throw new Error("interrupted")` MUST map to Internal,
         // NOT Unavailable; only genuine host timeout/QuickJS interruption triggers Unavailable & VM rebuild.
         if (t is TimeoutCancellationException || t is QuickJsInterruptedException ||
-            hasCause<DomTimeoutException>(t) ||
+            domTimedOutInCall || hasCause<DomTimeoutException>(t) ||
             (t is QuickJsException && t.message?.contains("InternalError: interrupted", ignoreCase = true) == true)
         ) {
+            domTimedOutInCall = false
             logger.warn("Method '$method' timed out; cancelling active requests and rebuilding runtime")
             fetchGateway.cancelAllActive()
             try {
@@ -566,8 +577,9 @@ class PluginRuntime(
         }
 
         // 4. Out of memory -> destroy immediately & rebuild on next call (§7, §11.1)
-        if (isOutOfMemoryError(t)) {
-            logger.error("QuickJS runtime hit memory limit during '$method'; destroying runtime for rebuild")
+        if (hostOomInCall || isOutOfMemoryError(t)) {
+            hostOomInCall = false
+            logger.error("QuickJS runtime or host bridge hit memory limit during '$method'; destroying runtime for rebuild")
             destroyRuntimeLocked(runDispose = false)
             throw PluginErrorMapper.toException(
                 PluginErrorPayload(PluginErrorCode.INTERNAL),
@@ -577,7 +589,18 @@ class PluginRuntime(
             )
         }
 
-        // 5. All other JS/host errors -> Internal (§6)
+        // 5. StackOverflowError (never allowed to escape host/bridge) -> Internal (§6)
+        if (hasCause<StackOverflowError>(t)) {
+            logger.error("StackOverflowError trapped during '$method'")
+            throw PluginErrorMapper.toException(
+                PluginErrorPayload(PluginErrorCode.INTERNAL),
+                itemId = itemId,
+                context = androidContext,
+                cause = t,
+            )
+        }
+
+        // 6. All other JS/host errors -> Internal (§6)
         logger.error("Unhandled error in '$method': ${t.message ?: t.javaClass.simpleName}")
         throw PluginErrorMapper.toException(
             PluginErrorPayload(PluginErrorCode.INTERNAL),
@@ -625,44 +648,80 @@ class PluginRuntime(
         }
     }
 
+    private class HostBridgeRuntimeException(message: String, cause: Throwable? = null) :
+        IllegalStateException(message, cause)
+
+    private inline fun <T> guardBridgeSync(opName: String, block: () -> T): T {
+        return try {
+            bridgeFaultInjectorForTesting?.invoke(opName)
+            block()
+        } catch (e: DomTimeoutException) {
+            domTimedOutInCall = true
+            throw e
+        } catch (e: StackOverflowError) {
+            logger.error("Host bridge '$opName' trapped StackOverflowError")
+            throw HostBridgeRuntimeException("宿主函数调用栈溢出（$opName）", e)
+        } catch (e: OutOfMemoryError) {
+            hostOomInCall = true
+            logger.error("Host bridge '$opName' trapped OutOfMemoryError")
+            throw HostBridgeRuntimeException("宿主函数内存不足（$opName）", e)
+        }
+    }
+
+    private suspend inline fun <T> guardBridgeAsync(opName: String, block: suspend () -> T): T {
+        return try {
+            bridgeFaultInjectorForTesting?.invoke(opName)
+            block()
+        } catch (e: DomTimeoutException) {
+            domTimedOutInCall = true
+            throw e
+        } catch (e: StackOverflowError) {
+            logger.error("Host bridge '$opName' trapped StackOverflowError")
+            throw HostBridgeRuntimeException("宿主函数调用栈溢出（$opName）", e)
+        } catch (e: OutOfMemoryError) {
+            hostOomInCall = true
+            logger.error("Host bridge '$opName' trapped OutOfMemoryError")
+            throw HostBridgeRuntimeException("宿主函数内存不足（$opName）", e)
+        }
+    }
+
     private fun bindHostBridge(qjs: QuickJs, expectedToken: String) {
         val configJson = JsonObject(config).toString()
         val deviceJson = deviceInfo.toJsonObject().toString()
 
         qjs.define("__d3_host") {
-            function("getConfigJson") { args ->
-                requireToken(expectedToken, args)
-                configJson
-            }
-            function("getInstanceId") { args ->
-                requireToken(expectedToken, args)
-                instanceId
-            }
-            function("getDeviceJson") { args ->
-                requireToken(expectedToken, args)
-                deviceJson
-            }
-            function("getErrorMarker") { args ->
-                requireToken(expectedToken, args)
-                PluginErrorMapper.WIRE_MARKER
-            }
-            function("isStrictAwaitTracking") { args ->
-                requireToken(expectedToken, args)
-                false
-            }
-            function("reportUnawaitedOps") { args ->
-                requireToken(expectedToken, args)
-                Unit
+            fun safeFunction(name: String, block: (Array<Any?>) -> Any?) {
+                function(name) { args ->
+                    guardBridgeSync(name) {
+                        requireToken(expectedToken, args)
+                        block(args)
+                    }
+                }
             }
 
+            fun safeAsyncFunction(name: String, block: suspend (Array<Any?>) -> Any?) {
+                asyncFunction(name) { args ->
+                    guardBridgeAsync(name) {
+                        requireToken(expectedToken, args)
+                        block(args)
+                    }
+                }
+            }
+
+            safeFunction("getConfigJson") { configJson }
+            safeFunction("getInstanceId") { instanceId }
+            safeFunction("getDeviceJson") { deviceJson }
+            safeFunction("getErrorMarker") { PluginErrorMapper.WIRE_MARKER }
+            safeFunction("isStrictAwaitTracking") { false }
+            safeFunction("reportUnawaitedOps") { Unit }
+
             // §11.1 / S3: true cancellable timers & immediate settle cleanup (atomic 256 active timer cap)
-            asyncFunction("sleep") { args ->
-                requireToken(expectedToken, args)
-                val timerId = (args.getOrNull(1) as? Number)?.toInt() ?: return@asyncFunction false
+            safeAsyncFunction("sleep") { args ->
+                val timerId = (args.getOrNull(1) as? Number)?.toInt() ?: return@safeAsyncFunction false
                 val ms = (args.getOrNull(2) as? Number)?.toLong()?.coerceIn(0L, 60_000L) ?: 0L
                 val gen = (args.getOrNull(3) as? Number)?.toInt() ?: -1
-                if (gen != callGeneration.get()) return@asyncFunction false
-                val scope = activeCallScope ?: return@asyncFunction false
+                if (gen != callGeneration.get()) return@safeAsyncFunction false
+                val scope = activeCallScope ?: return@safeAsyncFunction false
                 if (!tryReserveTimerSlot()) {
                     throw IllegalStateException("同时活跃的定时器数量超过上限（最多 $MAX_ACTIVE_TIMERS 个）")
                 }
@@ -695,20 +754,18 @@ class PluginRuntime(
                 if (gen != callGeneration.get()) {
                     activeTimers.remove(timerId, handle)
                     handle.cancelAndRelease()
-                    return@asyncFunction false
+                    return@safeAsyncFunction false
                 }
                 done.await()
             }
 
-            function("cancelTimer") { args ->
-                requireToken(expectedToken, args)
-                val timerId = (args.getOrNull(1) as? Number)?.toInt() ?: return@function Unit
+            safeFunction("cancelTimer") { args ->
+                val timerId = (args.getOrNull(1) as? Number)?.toInt() ?: return@safeFunction Unit
                 activeTimers.remove(timerId)?.cancelAndRelease()
                 Unit
             }
 
-            function("finishCall") { args ->
-                requireToken(expectedToken, args)
+            safeFunction("finishCall") { args ->
                 val gen = (args.getOrNull(1) as? Number)?.toInt() ?: -1
                 if (gen == callGeneration.get()) {
                     cancelAllTimers()
@@ -719,8 +776,7 @@ class PluginRuntime(
 
             // §11.1 / B2: binary fetch bridge with pre-parse envelope/body/header/URL caps
             // and atomic 16-request queue cap BEFORE decoding request body bytes.
-            asyncFunction("fetchMeta") { args ->
-                requireToken(expectedToken, args)
+            safeAsyncFunction("fetchMeta") { args ->
                 val reqJson = args.getOrNull(1)?.toString()
                     ?: throw IllegalArgumentException("Missing fetch request")
                 val gen = (args.getOrNull(2) as? Number)?.toInt() ?: -1
@@ -827,30 +883,26 @@ class PluginRuntime(
                 }.toString()
             }
 
-            function("fetchReadBytes") { args ->
-                requireToken(expectedToken, args)
-                val handleId = (args.getOrNull(1) as? Number)?.toInt() ?: return@function ByteArray(0)
-                val bytes = responseBodies.remove(handleId) ?: return@function ByteArray(0)
+            safeFunction("fetchReadBytes") { args ->
+                val handleId = (args.getOrNull(1) as? Number)?.toInt() ?: return@safeFunction ByteArray(0)
+                val bytes = responseBodies.remove(handleId) ?: return@safeFunction ByteArray(0)
                 fetchGateway.inFlightBudget.release(bytes.size.toLong())
                 bytes
             }
 
-            function("fetchReadText") { args ->
-                requireToken(expectedToken, args)
-                val handleId = (args.getOrNull(1) as? Number)?.toInt() ?: return@function ""
-                val bytes = responseBodies.remove(handleId) ?: return@function ""
+            safeFunction("fetchReadText") { args ->
+                val handleId = (args.getOrNull(1) as? Number)?.toInt() ?: return@safeFunction ""
+                val bytes = responseBodies.remove(handleId) ?: return@safeFunction ""
                 fetchGateway.inFlightBudget.release(bytes.size.toLong())
                 String(bytes, Charsets.UTF_8)
             }
 
             // §11.1: async ctx.storage.*
-            asyncFunction("storageGet") { args ->
-                requireToken(expectedToken, args)
-                val key = args.getOrNull(1)?.toString() ?: return@asyncFunction null
+            safeAsyncFunction("storageGet") { args ->
+                val key = args.getOrNull(1)?.toString() ?: return@safeAsyncFunction null
                 guardStorage { withContext(Dispatchers.IO) { storage.get(key)?.toString() } }
             }
-            asyncFunction("storageSet") { args ->
-                requireToken(expectedToken, args)
+            safeAsyncFunction("storageSet") { args ->
                 val key = args.getOrNull(1)?.toString()
                     ?: throw IllegalArgumentException("storage.set requires key")
                 val valJson = args.getOrNull(2)?.toString() ?: "null"
@@ -858,14 +910,12 @@ class PluginRuntime(
                 guardStorage { withContext(Dispatchers.IO) { storage.setRawJson(key, valJson) } }
                 Unit
             }
-            asyncFunction("storageRemove") { args ->
-                requireToken(expectedToken, args)
-                val key = args.getOrNull(1)?.toString() ?: return@asyncFunction Unit
+            safeAsyncFunction("storageRemove") { args ->
+                val key = args.getOrNull(1)?.toString() ?: return@safeAsyncFunction Unit
                 guardStorage { withContext(Dispatchers.IO) { storage.remove(key) } }
                 Unit
             }
-            asyncFunction("storageKeys") { args ->
-                requireToken(expectedToken, args)
+            safeAsyncFunction("storageKeys") {
                 guardStorage {
                     withContext(Dispatchers.IO) {
                         buildJsonArray {
@@ -876,14 +926,12 @@ class PluginRuntime(
             }
 
             // §11.1: async ctx.cookies.*
-            asyncFunction("cookiesGet") { args ->
-                requireToken(expectedToken, args)
+            safeAsyncFunction("cookiesGet") { args ->
                 val url = args.getOrNull(1)?.toString()
                     ?: throw IllegalArgumentException("cookies.get requires url")
                 guardStorage { withContext(Dispatchers.IO) { cookieJar.getHeaderForUrl(url) } }
             }
-            asyncFunction("cookiesSet") { args ->
-                requireToken(expectedToken, args)
+            safeAsyncFunction("cookiesSet") { args ->
                 val url = args.getOrNull(1)?.toString()
                     ?: throw IllegalArgumentException("cookies.set requires url")
                 val cookie = args.getOrNull(2)?.toString()
@@ -891,15 +939,13 @@ class PluginRuntime(
                 guardStorage { withContext(Dispatchers.IO) { cookieJar.setCookie(url, cookie) } }
                 Unit
             }
-            asyncFunction("cookiesClear") { args ->
-                requireToken(expectedToken, args)
+            safeAsyncFunction("cookiesClear") {
                 withContext(Dispatchers.IO) { cookieJar.clear() }
                 Unit
             }
 
             // ctx.crypto
-            function("cryptoHash") { args ->
-                requireToken(expectedToken, args)
+            safeFunction("cryptoHash") { args ->
                 val algo = args.getOrNull(1)?.toString() ?: ""
                 val data = PluginCrypto.base64Decode(args.getOrNull(2)?.toString() ?: "")
                 when (algo) {
@@ -909,15 +955,13 @@ class PluginRuntime(
                     else -> throw IllegalArgumentException("Unsupported hash: $algo")
                 }
             }
-            function("cryptoHmac") { args ->
-                requireToken(expectedToken, args)
+            safeFunction("cryptoHmac") { args ->
                 val algo = args.getOrNull(1)?.toString() ?: "sha256"
                 val key = PluginCrypto.base64Decode(args.getOrNull(2)?.toString() ?: "")
                 val data = PluginCrypto.base64Decode(args.getOrNull(3)?.toString() ?: "")
                 PluginCrypto.hmac(algo, key, data)
             }
-            function("cryptoAes") { args ->
-                requireToken(expectedToken, args)
+            safeFunction("cryptoAes") { args ->
                 val encrypt = args.getOrNull(1) as? Boolean ?: true
                 val mode = args.getOrNull(2)?.toString() ?: "GCM"
                 val key = PluginCrypto.base64Decode(args.getOrNull(3)?.toString() ?: "")
@@ -931,96 +975,82 @@ class PluginRuntime(
                 }
                 PluginCrypto.base64Encode(out)
             }
-            function("cryptoRsaEncrypt") { args ->
-                requireToken(expectedToken, args)
+            safeFunction("cryptoRsaEncrypt") { args ->
                 val pem = args.getOrNull(1)?.toString() ?: ""
                 val data = PluginCrypto.base64Decode(args.getOrNull(2)?.toString() ?: "")
                 val padding = args.getOrNull(3)?.toString()?.ifBlank { "PKCS1" } ?: "PKCS1"
                 PluginCrypto.base64Encode(PluginCrypto.rsaEncrypt(pem, data, padding))
             }
-            function("cryptoRandomBytes") { args ->
-                requireToken(expectedToken, args)
+            safeFunction("cryptoRandomBytes") { args ->
                 val n = (args.getOrNull(1) as? Number)?.toInt() ?: 0
                 PluginCrypto.base64Encode(PluginCrypto.randomBytes(n))
             }
-            function("cryptoBase64Encode") { args ->
-                requireToken(expectedToken, args)
+            safeFunction("cryptoBase64Encode") { args ->
                 val data = PluginCrypto.base64Decode(args.getOrNull(1)?.toString() ?: "")
                 val urlSafe = args.getOrNull(2) as? Boolean ?: false
                 PluginCrypto.base64Encode(data, urlSafe)
             }
-            function("cryptoBase64Decode") { args ->
-                requireToken(expectedToken, args)
+            safeFunction("cryptoBase64Decode") { args ->
                 val str = args.getOrNull(1)?.toString() ?: ""
                 PluginCrypto.base64Encode(PluginCrypto.base64Decode(str))
             }
-            function("cryptoHexEncode") { args ->
-                requireToken(expectedToken, args)
+            safeFunction("cryptoHexEncode") { args ->
                 val data = PluginCrypto.base64Decode(args.getOrNull(1)?.toString() ?: "")
                 PluginCrypto.hexEncode(data)
             }
-            function("cryptoHexDecode") { args ->
-                requireToken(expectedToken, args)
+            safeFunction("cryptoHexDecode") { args ->
                 val hex = args.getOrNull(1)?.toString() ?: ""
                 PluginCrypto.base64Encode(PluginCrypto.hexDecode(hex))
             }
 
-            // §11.1 / S4: lazy handle-based ctx.parse
-            function("parseHtml") { args ->
-                requireToken(expectedToken, args)
+            // §11.1 / S4: lazy handle-based ctx.parse (deduplicated handles + explicit doc.close())
+            safeFunction("parseHtml") { args ->
                 domParser.parseHtml(args.getOrNull(1)?.toString() ?: "")
             }
-            function("parseXml") { args ->
-                requireToken(expectedToken, args)
+            safeFunction("parseXml") { args ->
                 domParser.parseXml(args.getOrNull(1)?.toString() ?: "")
             }
-            function("domSelectFirstId") { args ->
-                requireToken(expectedToken, args)
-                val id = (args.getOrNull(1) as? Number)?.toInt() ?: return@function 0
-                val sel = args.getOrNull(2)?.toString() ?: return@function 0
+            safeFunction("domCloseDoc") { args ->
+                val docId = (args.getOrNull(1) as? Number)?.toInt() ?: return@safeFunction false
+                domParser.closeDoc(docId)
+            }
+            safeFunction("domSelectFirstId") { args ->
+                val id = (args.getOrNull(1) as? Number)?.toInt() ?: return@safeFunction 0
+                val sel = args.getOrNull(2)?.toString() ?: return@safeFunction 0
                 domParser.selectFirstId(id, sel)
             }
-            function("domSelectAllIds") { args ->
-                requireToken(expectedToken, args)
-                val id = (args.getOrNull(1) as? Number)?.toInt() ?: return@function "[]"
-                val sel = args.getOrNull(2)?.toString() ?: return@function "[]"
+            safeFunction("domSelectAllIds") { args ->
+                val id = (args.getOrNull(1) as? Number)?.toInt() ?: return@safeFunction "[]"
+                val sel = args.getOrNull(2)?.toString() ?: return@safeFunction "[]"
                 domParser.selectAllIds(id, sel).toString()
             }
-            function("domChildrenIds") { args ->
-                requireToken(expectedToken, args)
-                val id = (args.getOrNull(1) as? Number)?.toInt() ?: return@function "[]"
+            safeFunction("domChildrenIds") { args ->
+                val id = (args.getOrNull(1) as? Number)?.toInt() ?: return@safeFunction "[]"
                 domParser.childrenIds(id).toString()
             }
-            function("domTag") { args ->
-                requireToken(expectedToken, args)
+            safeFunction("domTag") { args ->
                 domParser.tag((args.getOrNull(1) as? Number)?.toInt() ?: 0)
             }
-            function("domText") { args ->
-                requireToken(expectedToken, args)
+            safeFunction("domText") { args ->
                 domParser.text((args.getOrNull(1) as? Number)?.toInt() ?: 0)
             }
-            function("domHtml") { args ->
-                requireToken(expectedToken, args)
+            safeFunction("domHtml") { args ->
                 domParser.html((args.getOrNull(1) as? Number)?.toInt() ?: 0)
             }
-            function("domOuterHtml") { args ->
-                requireToken(expectedToken, args)
+            safeFunction("domOuterHtml") { args ->
                 domParser.outerHtml((args.getOrNull(1) as? Number)?.toInt() ?: 0)
             }
-            function("domAttr") { args ->
-                requireToken(expectedToken, args)
-                val id = (args.getOrNull(1) as? Number)?.toInt() ?: return@function null
-                val name = args.getOrNull(2)?.toString() ?: return@function null
+            safeFunction("domAttr") { args ->
+                val id = (args.getOrNull(1) as? Number)?.toInt() ?: return@safeFunction null
+                val name = args.getOrNull(2)?.toString() ?: return@safeFunction null
                 domParser.attr(id, name)
             }
-            function("domAttrs") { args ->
-                requireToken(expectedToken, args)
+            safeFunction("domAttrs") { args ->
                 domParser.attrsJson((args.getOrNull(1) as? Number)?.toInt() ?: 0)
             }
 
             // ctx.log (truncate to 4 KB BEFORE regex redaction to protect host CPU & heap)
-            function("log") { args ->
-                requireToken(expectedToken, args)
+            safeFunction("log") { args ->
                 val levelName = args.getOrNull(1)?.toString()?.uppercase(Locale.ROOT) ?: "INFO"
                 val rawMsg = args.getOrNull(2)?.toString() ?: ""
                 val msg = PluginLogger.truncateUtf8(rawMsg, PluginLogger.MAX_MESSAGE_BYTES)
@@ -1030,8 +1060,7 @@ class PluginRuntime(
             }
 
             // ctx.t
-            function("translate") { args ->
-                requireToken(expectedToken, args)
+            safeFunction("translate") { args ->
                 val key = args.getOrNull(1)?.toString() ?: ""
                 val varsJson = args.getOrNull(2)?.toString()
                 val vars = if (!varsJson.isNullOrEmpty() && varsJson != "null") {

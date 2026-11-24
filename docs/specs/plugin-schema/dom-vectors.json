@@ -1,5 +1,5 @@
 {
-  "description": "Shared HTML/XML DOM parity test vectors run identically on Android PluginDomParser (Jsoup) and tools/plugin-kit (linkedom).",
+  "description": "Shared HTML/XML DOM parity test vectors run on Android PluginDomParser (Jsoup) and tools/plugin-kit (parse5 for HTML, linkedom for XML), including knownDifference malformed-HTML tree vectors.",
   "cases": [
     {
       "name": "xml_dash_mpd_self_closing_and_case",
@@ -1097,6 +1097,129 @@
       "op": "attr:a",
       "throws": false,
       "expected": "&eacute;"
+    },
+    {
+      "id": 86,
+      "mode": "html",
+      "input": "<ul><li k=1></li><li k=2></li><li k=3></li></ul>",
+      "target": "li:nth-child(n-2147483648)",
+      "op": "tag",
+      "throws": true,
+      "expected": null
+    },
+    {
+      "id": 87,
+      "mode": "html",
+      "input": "<ul><li k=1></li><li k=2></li><li k=3></li></ul>",
+      "target": "li:nth-child(2n-2147483647)",
+      "op": "tag",
+      "throws": true,
+      "expected": null
+    },
+    {
+      "id": 88,
+      "mode": "html",
+      "input": "<ul><li k=1></li><li k=2></li><li k=3></li></ul>",
+      "target": "li:nth-child(2147483648)",
+      "op": "tag",
+      "throws": true,
+      "expected": null
+    },
+    {
+      "id": 89,
+      "mode": "html",
+      "input": "<ul><li k=1></li><li k=2></li><li k=3></li></ul>",
+      "target": "li:nth-child(1000001)",
+      "op": "tag",
+      "throws": true,
+      "expected": null
+    },
+    {
+      "id": 90,
+      "mode": "html",
+      "input": "<ul><li k=1></li><li k=2></li><li k=3></li></ul>",
+      "target": "li:nth-child(-1000001n+1)",
+      "op": "tag",
+      "throws": true,
+      "expected": null
+    },
+    {
+      "id": 91,
+      "mode": "html",
+      "knownDifference": true,
+      "category": "select_non_option",
+      "reason": "Jsoup retains non-<option> elements inside <select>, whereas WHATWG HTML5 (parse5) drops disallowed start tags in 'in select' insertion mode.",
+      "input": "<select><div><p>a</p></div><option>b</option></select>",
+      "target": "#root",
+      "op": "outer",
+      "throws": false,
+      "expectedAndroid": "<html><head></head><body><select><div><p>a</p></div><option>b</option></select></body></html>",
+      "expectedKit": "<html><head></head><body><select>a<option>b</option></select></body></html>"
+    },
+    {
+      "id": 92,
+      "mode": "html",
+      "knownDifference": true,
+      "category": "select_non_option",
+      "reason": "WHATWG HTML5 (parse5) closes <select> upon seeing <textarea>, whereas Jsoup nests <textarea> inside <select>.",
+      "input": "<select><textarea>raw</textarea><option>b</option></select>",
+      "target": "#root",
+      "op": "outer",
+      "throws": false,
+      "expectedAndroid": "<html><head></head><body><select><textarea>raw</textarea><option>b</option></select></body></html>",
+      "expectedKit": "<html><head></head><body><select></select><textarea>raw</textarea><option>b</option></body></html>"
+    },
+    {
+      "id": 93,
+      "mode": "html",
+      "knownDifference": true,
+      "category": "whitespace_before_html",
+      "reason": "Jsoup retains leading whitespace text nodes before <html>, whereas WHATWG HTML5 (parse5) drops whitespace in initial/before-html mode.",
+      "input": "</em> </span><p>a</p>",
+      "target": "#root",
+      "op": "outer",
+      "throws": false,
+      "expectedAndroid": " <html><head></head><body><p>a</p></body></html>",
+      "expectedKit": "<html><head></head><body><p>a</p></body></html>"
+    },
+    {
+      "id": 94,
+      "mode": "html",
+      "knownDifference": true,
+      "category": "whitespace_after_body",
+      "reason": "Jsoup keeps trailing whitespace after </body> as a child of <html>, whereas WHATWG HTML5 (parse5) re-inserts after-body whitespace into <body>.",
+      "input": "<html><body><p>a</p></body>   ",
+      "target": "#root",
+      "op": "outer",
+      "throws": false,
+      "expectedAndroid": "<html><head></head><body><p>a</p></body>   </html>",
+      "expectedKit": "<html><head></head><body><p>a</p>   </body></html>"
+    },
+    {
+      "id": 95,
+      "mode": "html",
+      "knownDifference": true,
+      "category": "template_malformed_nesting",
+      "reason": "Inside <select> with malformed tags around <template>, parse5 drops <nobr> and keeps <template> directly under <select>, whereas Jsoup keeps <nobr> wrapping <template>.",
+      "input": "<select><nobr><template><p>t</p></template></nobr></select>",
+      "target": "#root",
+      "op": "outer",
+      "throws": false,
+      "expectedAndroid": "<html><head></head><body><select><nobr><template><p>t</p></template></nobr></select></body></html>",
+      "expectedKit": "<html><head></head><body><select><template><p>t</p></template></select></body></html>"
+    },
+    {
+      "id": 96,
+      "mode": "html",
+      "knownDifference": true,
+      "category": "template_malformed_nesting",
+      "reason": "Inside <template><table><form>, parse5 follows WHATWG in-table form pointer rules and drops the empty <form>, whereas Jsoup retains <form> under <table>.",
+      "input": "<template><table><form></form></table></template>",
+      "target": "#root",
+      "op": "outer",
+      "throws": false,
+      "expectedAndroid": "<html><head><template><table><form></form></table></template></head><body></body></html>",
+      "expectedKit": "<html><head><template><table></table></template></head><body></body></html>"
     }
   ]
 }

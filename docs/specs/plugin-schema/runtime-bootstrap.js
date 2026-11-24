@@ -272,8 +272,9 @@
     }, record);
   }
 
-  // Lazy DOM handle wrapper (§11.1, S4): never eagerly serializes html/outerHtml/text
-  function wrapLazyNode(nodeId) {
+  // Lazy DOM handle wrapper (§11.1, S4): never eagerly serializes html/outerHtml/text.
+  // Document handles also expose `close()` to release host-side DOM memory immediately.
+  function wrapLazyNode(nodeId, isDocument) {
     if (nodeId === null || nodeId === undefined || nodeId <= 0) return null;
     const el = {
       get tag() { return host.domTag(BRIDGE_TOKEN, nodeId); },
@@ -287,19 +288,24 @@
       },
       querySelector(sel) {
         const childId = host.domSelectFirstId(BRIDGE_TOKEN, nodeId, String(sel));
-        return childId > 0 ? wrapLazyNode(childId) : null;
+        return childId > 0 ? wrapLazyNode(childId, false) : null;
       },
       selectFirst(sel) { return el.querySelector(sel); },
       querySelectorAll(sel) {
         const ids = JSON.parse(host.domSelectAllIds(BRIDGE_TOKEN, nodeId, String(sel)));
-        return ids.map(wrapLazyNode);
+        return ids.map((id) => wrapLazyNode(id, false));
       },
       select(sel) { return el.querySelectorAll(sel); },
       get children() {
         const ids = JSON.parse(host.domChildrenIds(BRIDGE_TOKEN, nodeId));
-        return ids.map(wrapLazyNode);
+        return ids.map((id) => wrapLazyNode(id, false));
       },
     };
+    if (isDocument) {
+      el.close = function () {
+        host.domCloseDoc(BRIDGE_TOKEN, nodeId);
+      };
+    }
     return Object.freeze(el);
   }
 
@@ -569,8 +575,8 @@
       }),
 
       parse: Object.freeze({
-        html(text) { return wrapLazyNode(host.parseHtml(BRIDGE_TOKEN, String(text ?? ''))); },
-        xml(text) { return wrapLazyNode(host.parseXml(BRIDGE_TOKEN, String(text ?? ''))); },
+        html(text) { return wrapLazyNode(host.parseHtml(BRIDGE_TOKEN, String(text ?? '')), true); },
+        xml(text) { return wrapLazyNode(host.parseXml(BRIDGE_TOKEN, String(text ?? '')), true); },
       }),
 
       log: Object.freeze({

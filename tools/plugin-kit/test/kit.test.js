@@ -882,11 +882,13 @@ test('Round 3: shared zip-vectors.json (incl. dual.zip PoC) and shared dom-vecto
     await host.dispose();
   }
 
-  // Round 5 Items #1, #3, #4: ALL 85 matrixCases (parse5 HTML5 + canonical serialization),
-  // O(N*S) memoized selectors (< 1s), step budget & deadline timeout, exact recount on 95k adoption agency
-  const { PluginDomParser, DomTimeoutError } = await import('../src/dom.js');
-  assert.ok(domVectors.matrixCases.length >= 85);
+  // Round 5 & 6 Items #1, #3, #4, #6, #7, #9: ALL matrixCases (incl. knownDifference & :nth-* overflow),
+  // O(N*S) memoized selectors (< 1s), step & memory budget errors, deadline timeout, adoption agency recount
+  const { PluginDomParser, DomLimitExceededError, DomTimeoutError } = await import('../src/dom.js');
+  assert.ok(domVectors.matrixCases.length >= 96);
+  let knownDiffCount = 0;
   for (const mc of domVectors.matrixCases) {
+    if (mc.knownDifference) knownDiffCount += 1;
     const p = new PluginDomParser();
     let threw = false;
     let actual = null;
@@ -909,9 +911,11 @@ test('Round 3: shared zip-vectors.json (incl. dual.zip PoC) and shared dom-vecto
       assert.equal(threw, true, `matrixCase #${mc.id} must throw`);
     } else {
       assert.equal(threw, false, `matrixCase #${mc.id} must not throw`);
-      assert.equal(actual, mc.expected, `matrixCase #${mc.id} mismatch`);
+      const expected = mc.knownDifference ? mc.expectedKit : mc.expected;
+      assert.equal(actual, expected, `matrixCase #${mc.id} mismatch`);
     }
   }
+  assert.ok(knownDiffCount >= 6, 'Expected at least 6 knownDifference vectors (select, ws, template)');
 
   // Pathological selector complexity tests (< 1s each)
   {
@@ -944,7 +948,7 @@ test('Round 3: shared zip-vectors.json (incl. dual.zip PoC) and shared dom-vecto
   {
     const tight = new PluginDomParser(8, 4 * 1024 * 1024, 200_000, 500);
     const r = tight.parseHtml('<ul>' + '<li>x</li>'.repeat(2000) + '</ul>');
-    assert.throws(() => tight.selectAllIds(r, 'li'), /步数超过上限/);
+    assert.throws(() => tight.selectAllIds(r, 'li'), DomLimitExceededError);
 
     const exp = new PluginDomParser();
     const rx = exp.parseHtml('<ul>' + '<li>x</li>'.repeat(3000) + '</ul>');
@@ -952,7 +956,7 @@ test('Round 3: shared zip-vectors.json (incl. dual.zip PoC) and shared dom-vecto
     assert.throws(() => exp.selectAllIds(rx, 'li'), DomTimeoutError);
 
     const amp = new PluginDomParser();
-    assert.throws(() => amp.parseHtml('<b><p>x</b>y</p>'.repeat(95_000)), /节点总数超过上限/);
+    assert.throws(() => amp.parseHtml('<b><p>x</b>y</p>'.repeat(95_000)), DomLimitExceededError);
     assert.equal(amp.totalNodes, 0);
 
     const cnt = new PluginDomParser();
@@ -960,6 +964,207 @@ test('Round 3: shared zip-vectors.json (incl. dual.zip PoC) and shared dom-vecto
     assert.equal(cnt.totalNodes, 4);
     cnt.parseXml('<r><a/></r>');
     assert.equal(cnt.totalNodes, 6);
+  }
+});
+
+test('Round 6: selector hard caps, 16 MB memo budget, budgeted attr/class, dedup handles + doc.close(), :nth-* overflow, bridge RangeError trap', async () => {
+  const { PluginDomParser, DomLimitExceededError } = await import('../src/dom.js');
+  const html190k = '<div>' + '<i></i>'.repeat(190_000) + '</div>';
+
+  // 1. Blocking #1: 190k <i> + 6 KB / 3000-compound selector rejected in < 1s; lazy memo + 16 MB budget
+  {
+    const p = new PluginDomParser();
+    const root = p.parseHtml(html190k);
+
+    let t = Date.now();
+    assert.throws(() => p.selectAllIds(root, 'x' + ' x'.repeat(2999)), DomLimitExceededError);
+    assert.ok(Date.now() - t < 1000);
+
+    t = Date.now();
+    assert.equal(p.selectAllIds(root, 'x' + ' x'.repeat(31)).length, 0);
+    assert.ok(Date.now() - t < 1000, '32-compound non-matching selector must complete in < 1s');
+
+    t = Date.now();
+    assert.equal(p.selectAllIds(root, 'x' + ' i'.repeat(31)).length, 0);
+    assert.ok(Date.now() - t < 1000, '32-compound matching-tail descendant selector must complete in < 1s');
+
+    // 190k siblings x 32 compounds trips 16 MB query memory budget -> DomLimitExceededError in < 1s
+    t = Date.now();
+    assert.throws(() => p.selectAllIds(root, 'x' + ' ~ i'.repeat(31)), DomLimitExceededError);
+    assert.ok(Date.now() - t < 1000, '16 MB memo memory budget must trip in < 1s');
+    p.clear();
+  }
+
+  // 2. Blocking #2: 2000 x `~ li` rejected + nesting > 4 rejected + max legal complexity (depth 4 x 32) no RangeError
+  {
+    const p = new PluginDomParser();
+    const root = p.parseHtml('<ul>' + '<li></li>'.repeat(2010) + '</ul>');
+    let t = Date.now();
+    assert.throws(() => p.selectAllIds(root, 'li' + ' ~ li'.repeat(1999) + ':last-child'), DomLimitExceededError);
+    assert.ok(Date.now() - t < 1000);
+
+    assert.throws(() => p.selectAllIds(root, ':not(:not(:not(:not(:not(li)))))'), DomLimitExceededError);
+
+    t = Date.now();
+    const chain32 = 'li' + ' ~ li'.repeat(31);
+    assert.equal(p.selectAllIds(root, `li:is(:not(:is(:not(span))), ${chain32})`).length, 1979);
+    assert.ok(Date.now() - t < 1000);
+    p.clear();
+  }
+
+  // 3. Required #3: 2 MB attr + [x*="a...(20k)b"] / [x*="a...(250)b"] / 32x[x*=b i], 1M-token class + .z
+  {
+    const p = new PluginDomParser();
+    const rAttr = p.parseHtml('<p x="' + 'a'.repeat(2_000_000) + '"></p>');
+
+    let t = Date.now();
+    assert.throws(() => p.selectAllIds(rAttr, '[x*="' + 'a'.repeat(20_000) + 'b"]'), DomLimitExceededError);
+    assert.ok(Date.now() - t < 1000);
+
+    p.setCallDeadlineMs(Date.now() + 1000);
+    t = Date.now();
+    assert.throws(() => p.selectAllIds(rAttr, '[x*="' + 'a'.repeat(250) + 'b"]'), DomLimitExceededError);
+    assert.ok(Date.now() - t < 1000, '2 MB attr budgeted KMP scan must abort in < 1s');
+
+    t = Date.now();
+    assert.throws(() => p.selectAllIds(rAttr, Array(32).fill('p[x*=b i]').join(',')), DomLimitExceededError);
+    assert.ok(Date.now() - t < 1000, '2 MB attr x 32 [x*=b i] must abort in < 1s');
+    p.clear();
+
+    const rCls = p.parseHtml('<p class="' + 'a '.repeat(1_000_000) + '"></p>');
+    t = Date.now();
+    assert.throws(() => p.selectAllIds(rCls, Array(3000).fill('.z').join(',')), DomLimitExceededError);
+    assert.ok(Date.now() - t < 1000);
+
+    t = Date.now();
+    try {
+      assert.equal(p.selectAllIds(rCls, Array(32).fill('.z').join(',')).length, 0);
+    } catch (err) {
+      assert.ok(err instanceof DomLimitExceededError);
+    }
+    assert.ok(Date.now() - t < 1000, '1M-token class + 32 groups .z must complete/abort in < 1s');
+    p.clear();
+
+    const rCls500k = p.parseHtml('<p class="' + 'a '.repeat(500_000) + '"></p>');
+    t = Date.now();
+    assert.equal(p.selectAllIds(rCls500k, Array(32).fill('.z').join(',')).length, 0);
+    assert.ok(Date.now() - t < 1000, '500k-token cached class + 32 groups .z must complete in < 1s');
+    p.clear();
+  }
+
+  // 4. Required #4: 190k <i> + select('*') looped 40x -> deduplicated handles; 8 live docs / 400k live elements / doc.close()
+  {
+    const p = new PluginDomParser();
+    const root = p.parseHtml(html190k);
+    const first = p.selectAllIds(root, '*');
+    const expectedHandles = p.handleCount;
+    assert.equal(expectedHandles, 190_005);
+    for (let i = 0; i < 40; i++) {
+      const t = Date.now();
+      const ids = p.selectAllIds(root, '*');
+      assert.ok(Date.now() - t < 1000, `select('*') iter #${i} exceeded 1s`);
+      assert.equal(ids.length, first.length);
+      assert.equal(p.handleCount, expectedHandles, `handle count leaked on iter #${i}`);
+    }
+
+    const root2 = p.parseHtml(html190k); // 380,008 <= 400,000
+    assert.equal(p.docCount, 2);
+    assert.equal(p.totalNodes, 380_008);
+    const html50k = '<div>' + '<i></i>'.repeat(50_000) + '</div>';
+    assert.throws(() => p.parseHtml(html50k), DomLimitExceededError);
+
+    assert.equal(p.closeDoc(root), true);
+    assert.equal(p.docCount, 1);
+    assert.equal(p.totalNodes, 190_004);
+    const root3 = p.parseHtml(html50k);
+    assert.equal(p.docCount, 2);
+    assert.equal(p.totalNodes, 240_008);
+    p.closeDoc(root2);
+    p.closeDoc(root3);
+    assert.equal(p.docCount, 0);
+    assert.equal(p.totalNodes, 0);
+    assert.equal(p.handleCount, 0);
+  }
+
+  // 5. Small #7 & #9: :nth-* overflow rejection + identical DomLimitExceededError class for step & memory budgets
+  {
+    const p = new PluginDomParser();
+    const r = p.parseHtml('<ul><li>1</li><li>2</li></ul>');
+    for (const sel of [
+      'li:nth-child(n-2147483648)',
+      'li:nth-child(2n-2147483647)',
+      'li:nth-child(-2147483648n+3)',
+      'li:nth-child(2147483648)',
+      'li:nth-child(1000001)',
+      'li:nth-child(-1000001)',
+      'li:nth-child(99999999999999999999n+1)',
+    ]) {
+      assert.throws(() => p.selectAllIds(r, sel), Error, `Expected rejection for ${sel}`);
+    }
+
+    const stepP = new PluginDomParser(8, 4 * 1024 * 1024, 200_000, 10);
+    const rs = stepP.parseHtml('<ul>' + '<li></li>'.repeat(50) + '</ul>');
+    let stepErr = null;
+    try { stepP.selectAllIds(rs, 'li'); } catch (e) { stepErr = e; }
+    const memP = new PluginDomParser(8, 4 * 1024 * 1024, 200_000, 2_000_000, 400_000, 1024);
+    const rm = memP.parseHtml('<ul>' + '<li></li>'.repeat(200) + '</ul>');
+    let memErr = null;
+    try { memP.selectAllIds(rm, 'li ~ li'); } catch (e) { memErr = e; }
+    assert.ok(stepErr instanceof DomLimitExceededError);
+    assert.ok(memErr instanceof DomLimitExceededError);
+    assert.equal(stepErr.constructor, memErr.constructor);
+  }
+
+  // 6. Real QuickJS host: doc.close() loop (> 8 sequential docs), 9 unclosed docs fails, bridge RangeError trapped
+  const host = new QuickJsPluginHost({
+    manifest: { api: 1, id: 'dev.depth3d.r6js', name: 'R6JS', version: '1.0.0' },
+    mainJs: `export default {
+      home() { return []; },
+      browse(ctx, arg) {
+        if (arg.categoryId === 'close-loop') {
+          for (let i = 0; i < 20; i++) {
+            const d = ctx.parse.html('<p>v' + i + '</p>');
+            const p = d.querySelector('p');
+            if (p.text !== 'v' + i) throw new Error('mismatch');
+            d.close();
+            if (d.tag !== '' || p.text !== '') throw new Error('not cleared');
+          }
+          return { ok: true };
+        }
+        if (arg.categoryId === 'unclosed-9') {
+          for (let i = 0; i < 9; i++) ctx.parse.html('<p>' + i + '</p>');
+          return { ok: true };
+        }
+        if (arg.categoryId === 'bridge-fault') {
+          const d = ctx.parse.html('<p>ok</p>');
+          return { tag: d.querySelector('p').tag };
+        }
+        return { ok: true };
+      },
+      detail() { return { id: '1', kind: 'video', title: '1' }; },
+      playback() { return { url: 'https://cdn.example.com/a.mp4' }; },
+    };`,
+    logSink: () => {},
+  });
+  try {
+    const r = await host.invoke('browse', { categoryId: 'close-loop' });
+    assert.equal(r.ok, true);
+    await assert.rejects(
+      () => host.invoke('browse', { categoryId: 'unclosed-9' }),
+      (e) => e instanceof PluginCallError && e.code === 'Internal',
+    );
+    host._bridgeFaultInjectorForTesting = (op) => {
+      if (op === 'domSelectFirstId') throw new RangeError('Maximum call stack size exceeded');
+    };
+    await assert.rejects(
+      () => host.invoke('browse', { categoryId: 'bridge-fault' }),
+      (e) => e instanceof PluginCallError && e.code === 'Internal',
+    );
+    host._bridgeFaultInjectorForTesting = null;
+    const recovered = await host.invoke('browse', { categoryId: 'bridge-fault' });
+    assert.equal(recovered.tag, 'p');
+  } finally {
+    await host.dispose();
   }
 });
 

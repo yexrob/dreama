@@ -4,7 +4,7 @@ import path from 'node:path';
 import { getQuickJS } from 'quickjs-emscripten';
 import { pluginCrypto } from './crypto.js';
 import { PluginCookieJar } from './cookies.js';
-import { DomTimeoutError, PluginDomParser } from './dom.js';
+import { DomLimitExceededError, DomTimeoutError, PluginDomParser } from './dom.js';
 import { FetchGateway, FetchRequestTooLargeError, MAX_FETCH_META_JSON_BYTES, MAX_QUEUED_REQUEST_BODY_BYTES } from './fetch-gateway.js';
 import { PluginLocale } from './locale.js';
 import { MAX_LOG_MESSAGE_BYTES, PluginLogger, truncateUtf8 } from './logger.js';
@@ -145,6 +145,7 @@ export class QuickJsPluginHost {
     this.deadlineMs = Infinity;
     this._lastCallTimedOut = false;
     this._interruptTriggered = false;
+    this._bridgeFaultInjectorForTesting = null;
     this._unawaitedOps = [];
     /** Map<timerId, { timer: NodeJS.Timeout, resolve: (val: boolean) => void }> */
     this.activeTimers = new Map();
@@ -513,6 +514,9 @@ export class QuickJsPluginHost {
       this._lastCallTimedOut = true;
       return new PluginCallError('Unavailable', '插件调用超时，请重试。');
     }
+    if (err instanceof DomLimitExceededError) {
+      return new PluginCallError('Internal', err.message || 'DOM 资源超限');
+    }
     const msg = String(err?.message || err || '');
     const wire = parseWireError(msg);
     if (wire) return wire;
@@ -547,10 +551,24 @@ export class QuickJsPluginHost {
 
     const addSync = (name, fn) => {
       const h = vm.newFunction(name, (...argHandles) => {
-        const rawArgs = argHandles.map((a) => vm.dump(a));
-        const args = requireToken(rawArgs);
-        const out = fn(...args);
-        return toHandle(vm, out).handle;
+        try {
+          const rawArgs = argHandles.map((a) => vm.dump(a));
+          const args = requireToken(rawArgs);
+          if (typeof this._bridgeFaultInjectorForTesting === 'function') {
+            this._bridgeFaultInjectorForTesting(name);
+          }
+          const out = fn(...args);
+          return toHandle(vm, out).handle;
+        } catch (err) {
+          if (err instanceof DomTimeoutError) {
+            this._lastCallTimedOut = true;
+          }
+          if (err instanceof RangeError) {
+            this.logger.log('ERROR', `Host bridge '${name}' trapped RangeError: ${err.message}`);
+            throw new Error(`宿主函数调用栈或范围溢出（${name}）：${err.message}`);
+          }
+          throw err;
+        }
       });
       vm.setProp(hostObj, name, h);
       h.dispose();
@@ -565,7 +583,12 @@ export class QuickJsPluginHost {
         const myVm = vm;
         const myRt = this.rt;
         Promise.resolve()
-          .then(() => fn(...args))
+          .then(() => {
+            if (typeof this._bridgeFaultInjectorForTesting === 'function') {
+              this._bridgeFaultInjectorForTesting(name);
+            }
+            return fn(...args);
+          })
           .then(
             (res) => {
               this.pendingDeferreds.delete(deferred);
@@ -578,7 +601,13 @@ export class QuickJsPluginHost {
             (err) => {
               this.pendingDeferreds.delete(deferred);
               if (this.vm !== myVm || this.rt !== myRt) return;
-              const errHandle = myVm.newError(String(err?.message || err));
+              if (err instanceof DomTimeoutError) {
+                this._lastCallTimedOut = true;
+              }
+              const errMsg = err instanceof RangeError
+                ? `宿主函数调用栈或范围溢出（${name}）：${err.message}`
+                : String(err?.message || err);
+              const errHandle = myVm.newError(errMsg);
               deferred.reject(errHandle);
               errHandle.dispose();
               try { this._drainJobs(); } catch {}
@@ -781,9 +810,10 @@ export class QuickJsPluginHost {
     addSync('cryptoHexEncode', (dataB64) => pluginCrypto.hexEncode(Buffer.from(dataB64, 'base64')));
     addSync('cryptoHexDecode', (hex) => pluginCrypto.hexDecode(hex).toString('base64'));
 
-    // §11.1 (S4): lazy DOM handle bridge
+    // §11.1 (S4): lazy DOM handle bridge (deduplicated handles + explicit doc.close())
     addSync('parseHtml', (text) => this.domParser.parseHtml(text));
     addSync('parseXml', (text) => this.domParser.parseXml(text));
+    addSync('domCloseDoc', (docId) => this.domParser.closeDoc(Number(docId)));
     addSync('domTag', (id) => this.domParser.tag(Number(id)));
     addSync('domText', (id) => this.domParser.text(Number(id)));
     addSync('domHtml', (id) => this.domParser.html(Number(id)));
