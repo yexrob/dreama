@@ -1,0 +1,116 @@
+package com.limelight.local.wall
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.input.TextFieldDecorator
+import androidx.compose.foundation.text.input.TextFieldLineLimits
+import androidx.compose.foundation.text.input.TextFieldState
+import androidx.compose.foundation.text.input.rememberTextFieldState
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
+
+/**
+ * The WebDAV server: address, user, password. The design wants text typed
+ * on the phone, not on the headset keyboard; until that exists this is the
+ * system keyboard, as the old form was. The server is checked before it is
+ * saved so a wrong password shows here.
+ */
+@Composable
+fun WebDavSheet(model: WallModel, nav: WallNav, suggested: String) {
+    val saved = remember { model.savedWebDav() }
+    val base = rememberTextFieldState(suggested)
+    val user = rememberTextFieldState(saved?.user ?: "depth3d")
+    val pass = rememberTextFieldState(saved?.pass ?: "")
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    val found = saved == null && suggested != "http://"
+
+    Box(Modifier.fillMaxSize()
+        .background(Wall.Scrim)
+        // Pointing past the sheet and pulling the trigger closes it, like the mockups' scrim
+        .clickable(remember { MutableInteractionSource() }, indication = null) { if (!busy) nav.closeWebDav() },
+        contentAlignment = Alignment.Center) {
+        Column(Modifier.width(720.dp)
+            .shadow(40.dp, RoundedCornerShape(Wall.RadiusXl))
+            .clip(RoundedCornerShape(Wall.RadiusXl)).background(Wall.Sheet)
+            .clickable(remember { MutableInteractionSource() }, indication = null) {}
+            .padding(horizontal = 48.dp, vertical = 40.dp)) {
+            Text(if (found) "找到 Mac 了，填一下密码" else "WebDAV 服务器", style = WallType.Head)
+            Text("Mac 上运行 scripts/serve-gdrive.sh；密码在 ~/.config/depth3d/webdav-pass。",
+                style = WallType.Caption, color = Wall.Text2, modifier = Modifier.padding(top = 6.dp))
+            Field("地址", base, KeyboardType.Uri, Modifier.padding(top = 28.dp))
+            Row(Modifier.padding(top = 20.dp), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+                Field("用户名", user, KeyboardType.Ascii, Modifier.weight(1f))
+                // Shown in the clear: typed on the headset keyboard, a mistake is otherwise invisible
+                Field("密码", pass, KeyboardType.Ascii, Modifier.weight(1f))
+            }
+            error?.let {
+                Box(Modifier.padding(top = 20.dp)) { Notice(it) }
+            }
+            Row(Modifier.padding(top = 32.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                WallButton(if (busy) "正在连接…" else "连接", {
+                    if (busy) {
+                        return@WallButton
+                    }
+                    busy = true
+                    error = null
+                    scope.launch {
+                        try {
+                            model.connectWebDav(base.text.trim().toString(), user.text.trim().toString(),
+                                pass.text.trim().toString())
+                            nav.closeWebDav()
+                        } catch (e: Exception) {
+                            error = "连不上：" + (e.message ?: e.toString())
+                        } finally {
+                            busy = false
+                        }
+                    }
+                }, kind = ButtonKind.Primary)
+                WallButton("取消", { if (!busy) nav.closeWebDav() })
+            }
+        }
+    }
+}
+
+@Composable
+private fun Field(label: String, state: TextFieldState, type: KeyboardType, modifier: Modifier) {
+    Column(modifier) {
+        Text(label, style = WallType.Caption, color = Wall.Text2)
+        BasicTextField(state, Modifier.padding(top = 8.dp).fillMaxWidth(), textStyle = WallType.Body,
+            keyboardOptions = KeyboardOptions(keyboardType = type, autoCorrectEnabled = false, imeAction = ImeAction.Next),
+            lineLimits = TextFieldLineLimits.SingleLine,
+            cursorBrush = SolidColor(Wall.Accent),
+            decorator = TextFieldDecorator { inner ->
+                Box(Modifier.fillMaxWidth().height(72.dp).clip(RoundedCornerShape(Wall.Radius)).background(Wall.Surface)
+                    .padding(horizontal = 24.dp), contentAlignment = Alignment.CenterStart) { inner() }
+            })
+    }
+}

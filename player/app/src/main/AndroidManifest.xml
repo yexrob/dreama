@@ -4,7 +4,7 @@
     xmlns:horizonos="http://schemas.horizonos/sdk">
 
     <!-- The OpenXR loader declares minSdk 24 but is only ever loaded on
-         headsets, so the app wide minSdk 21 remains safe -->
+         headsets, so the app wide minSdk 23 remains safe -->
     <uses-sdk tools:overrideLibrary="org.khronos.openxr.openxr_loader_for_android" />
 
     <!-- Horizon OS refuses to route immersive frames for apps that do not
@@ -16,6 +16,8 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <!-- Android 13 and later ask for videos by type -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -264,21 +266,18 @@
              history: a boundary prompt stops it before the session starts,
              and a no history activity is finished by the system on any stop.
              Game.onStop still ends the stream once the session is through -->
-                <!-- depth3d: local video list (2d panel) and the immersive player -->
+        <!-- depth3d: the play wall (2d panel) and the immersive player. The
+             wall is Compose and redraws itself on a resize or a keyboard
+             coming up, so those do not recreate it -->
         <activity
-            android:name=".local.LocalVideosActivity"
+            android:name=".local.wall.WallActivity"
             android:label="depth3d"
-            android:exported="true">
+            android:exported="true"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|density|fontScale">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <meta-data android:name="pvr.app.type" android:value="2d" />
-        </activity>
-        <activity
-            android:name=".local.RemoteBrowserActivity"
-            android:label="Google Drive"
-            android:exported="true">
             <meta-data android:name="pvr.app.type" android:value="2d" />
         </activity>
         <activity

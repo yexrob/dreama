@@ -1,4 +1,7 @@
 apply plugin: 'com.android.application'
+// Kotlin itself is built into AGP 9; these add Compose and Room's processor
+apply plugin: 'org.jetbrains.kotlin.plugin.compose'
+apply plugin: 'com.google.devtools.ksp'
 
 // Signing details for the sideloaded release build, kept out of the repo.
 // Without the file the release build still works, it just comes out unsigned
@@ -133,6 +136,12 @@ abstract class GenerateXrShared extends DefaultTask {
     }
 }
 
+// Room writes each database version's schema here, so a later version can
+// be checked against it and given a migration rather than a wipe
+ksp {
+    arg('room.schemaLocation', "$projectDir/schemas".toString())
+}
+
 def generateXrShared = tasks.register('generateXrShared', GenerateXrShared) {
     header = layout.projectDirectory.file('src/main/jni/xr-renderer/xr_shared.h')
     outputDir = layout.buildDirectory.dir('generated/source/xrshared')
@@ -152,7 +161,8 @@ android {
     namespace 'com.limelight'
 
     defaultConfig {
-        minSdk 21
+        // Compose, Room and activity-compose need 23; every headset is far above it
+        minSdk 23
         targetSdk 36
 
         versionName "12.1-xr0.4.3"
@@ -173,6 +183,7 @@ android {
         buildConfig = true
         prefab = true
         resValues = true
+        compose = true
     }
 
     androidResources {
@@ -308,6 +319,21 @@ dependencies {
     implementation 'com.squareup.okhttp3:okhttp:5.5.0'
     implementation 'org.jmdns:jmdns:3.6.3'
     implementation 'com.github.cgutman:ShieldControllerExtensions:1.0.1'
+
+    // The 2D panel (the wall, library, details), Apache 2.0. Compose 1.12:
+    // 1.13 (BOM 2026.11) will only build against the 37.1 SDK platform
+    def composeBom = platform('androidx.compose:compose-bom:2026.09.00')
+    implementation composeBom
+    implementation 'androidx.compose.foundation:foundation'
+    implementation 'androidx.compose.material3:material3'
+    implementation 'androidx.activity:activity-compose:1.13.0'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.11.1'
+    implementation 'androidx.lifecycle:lifecycle-runtime-compose:2.11.1'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0'
+    // Watch progress, Apache 2.0
+    implementation 'androidx.room:room-runtime:2.8.5'
+    implementation 'androidx.room:room-ktx:2.8.5'
+    ksp 'androidx.room:room-compiler:2.8.5'
 
     coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'
 

@@ -66,11 +66,31 @@ export JAVA_HOME=$(brew --prefix openjdk@17)/libexec/openjdk.jdk/Contents/Home A
 adb install -r -g app/build/outputs/apk/nonRoot/debug/app-nonRoot-debug.apk
 ```
 
-头显应用库里叫 **depth3d (Debug)**，打开后列出所有视频，点一个就用 3D 播放。扳机键暂停或继续，摇杆每推一下跳 10 秒。基于 MoonlightXR 75d92f2，代码在 `player/app/src/main/java/com/limelight/local/`。
+头显应用库里叫 **depth3d (Debug)**。基于 MoonlightXR 75d92f2，代码在 `player/app/src/main/java/com/limelight/local/`。从这一版起需要 Android 6.0（API 23）以上，头显都满足。
+
+### 首页（播放墙）
+
+打开后是照 `design-opus` 做的播放墙（Compose，`local/wall/`）：
+
+- **首页**：最上面是最近看过的片子（没看过就是最新的一个），按「继续播放」从上次的位置接着看；下面一行「继续观看」，混排所有播放源，点卡片直接续播；再往下每个播放源一行海报，点行标题进入这一类。某个源连不上时只有它那一行显示「连不上」和「重试」。
+- **媒体库**：左边是播放源，右边是选中源里的文件夹；没有海报的文件夹用里面几段视频的画面拼成缩略图。点进去是 6 列海报网格。
+- **详情**：继续播放 / 从头播放，下面是进度和剩余时间。
+- **投屏**：iPad、手机投屏还没做，页面上标着「即将支持」；下面的「电脑串流」进入 Moonlight 原来的电脑列表。右上角齿轮是串流设置。
+
+本机视频的海报是从视频里截的一帧（十分之一处，最多 5 分钟），截一次就缓存在应用缓存目录，不重复解码；网盘里的视频不截帧，用色块和片名代替。观看进度存在 Room 里（`wall.db`），暂停、退出播放时写入；看过 30 秒以上、剩余超过 1 分钟（且超过 5%）的才进「继续观看」。
+
+### 播放源
+
+播放源都实现同一个接口 `local/media/MediaSource.kt`（首页 → 分类浏览 → 详情 → 播放信息，全部是 suspend），数据模型按产品方案 2.4：Source → Category → Item → PlaybackInfo。以后的 QuickJS 插件也实现这个接口。现在内置两个：
+
+- **本机**：MediaStore 里的所有视频，按所在文件夹分类，另有「全部视频」。第一次打开会请求存储权限，拒绝后首页那一行有「允许访问」。
+- **Google Drive（WebDAV）**：见下一节。没有配置过时，会在局域网里自动找 `_webdav._tcp`，找到后首页空状态和媒体库里会显示出来，点一下填密码即可；媒体库的「管理播放源」可以改地址和密码。保存前会先连一次，密码错了当场提示。
+
+播放时扳机键暂停或继续，摇杆每推一下跳 10 秒。
 
 ### Google Drive（经 Mac）
 
-Mac 上用 rclone 把 Drive 开成局域网 WebDAV，并通过 Bonjour（`_webdav._tcp`）广播，头显打开「Google Drive」会自己找到：
+Mac 上用 rclone 把 Drive 开成局域网 WebDAV，并通过 Bonjour（`_webdav._tcp`）广播，头显会自己找到：
 
 ```bash
 scripts/serve-gdrive.sh            # 默认 gdrive:，端口 8890，只读
@@ -79,11 +99,11 @@ scripts/serve-gdrive.sh            # 默认 gdrive:，端口 8890，只读
 登录名 `depth3d`，密码在 `~/.config/depth3d/webdav-pass`（第一次运行时生成），头显里填一次即可。也可以用 adb 直接写进去：
 
 ```bash
-adb shell am start -n dev.depth3d.player.debug/com.limelight.local.RemoteBrowserActivity \
+adb shell am start -n dev.depth3d.player.debug/com.limelight.local.wall.WallActivity \
   --es base http://<Mac IP>:8890 --es user depth3d --es pass <密码>
 ```
 
-首页另外保留了 Moonlight 原来的串流入口（「Mac 串流」）。
+Moonlight 原来的串流入口在「投屏」页的「电脑串流」里。
 
 ## 原型用法
 
@@ -107,7 +127,7 @@ M 系列 Mac 上用 MPS，256 输入大约 32–38 ms 一张。warp 目前是 nu
 Mac 端跑 Sunshine（`brew tap lizardbyte/homebrew && brew install lizardbyte/homebrew/sunshine`，
 `brew services start lizardbyte/homebrew/sunshine`，需在系统设置里给它「屏幕录制」权限）。
 编码走 VideoToolbox（H.264/HEVC）。管理页 https://localhost:47990，用户 depth3d，
-密码在 `~/.config/depth3d/sunshine-pass`。头显里点「Mac 串流」，选这台 Mac，把显示的 PIN
+密码在 `~/.config/depth3d/sunshine-pass`。头显里进「投屏 › 电脑列表」，选这台 Mac，把显示的 PIN
 填进管理页的 PIN 栏完成配对。macOS 上没有虚拟手柄；要声音需另装虚拟声卡（如 BlackHole）。
 
 ### 本地播放控制条
