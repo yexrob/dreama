@@ -82,6 +82,7 @@ public final class HostRuntime: ObservableObject {
     }
 
     private var pendingPairingTickets: [String: PendingPairingTicket] = [:]
+    private var inFlightPairingIPs: Set<String> = []
     private var ticketCleanupTask: Task<Void, Never>?
     internal var ticketTTLSeconds: TimeInterval = 120.0
     internal var pinFeederWindowSeconds: TimeInterval = 60.0
@@ -540,16 +541,44 @@ public final class HostRuntime: ObservableObject {
         rotateWebDAVCredentialsAndNotify()
 
         if let fp = device.certFingerprint, !fp.isEmpty, let api = engineAPIClient {
-            await api.unpairAllEntries(
+            _ = await api.unpairAllEntries(
                 forFingerprint: fp,
                 fallbackUUID: device.engineUUID,
                 stateFileURL: store.paths.engineStateFile
             )
             refreshPairedClientsFromEngine()
-        } else if let uuid = device.engineUUID, !uuid.isEmpty, let api = engineAPIClient {
-            // Legacy record with engineUUID but no certFingerprint: still remove that UUID from engine.
-            _ = try? await api.unpairClient(uuid: uuid)
-            refreshPairedClientsFromEngine()
+        } else if let api = engineAPIClient {
+            let legacyUUIDs = device.allLegacyEngineUUIDs
+            if !legacyUUIDs.isEmpty {
+                // Before unpairing any legacy nil-fingerprint UUID, verify NO remaining
+                // fingerprint-bound record uses that UUID (directly or via state.json cert fingerprint).
+                let boundRecords = pairedDevices.filter { $0.certFingerprint?.isEmpty == false }
+                let boundUUIDs = Set(boundRecords.compactMap { $0.engineUUID?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
+                let boundFPs = Set(boundRecords.compactMap { $0.certFingerprint?.uppercased() })
+                let stateEntriesByUUID = Dictionary(
+                    uniqueKeysWithValues: EngineConfigGenerator.loadAllPairedCerts(at: store.paths.engineStateFile).map { ($0.uuid, $0) }
+                )
+
+                var removedAny = false
+                for uuid in legacyUUIDs {
+                    if boundUUIDs.contains(uuid) {
+                        HostLogger.warning("Skipping legacy unpair of UUID \(uuid): still referenced by a fingerprint-bound record", category: "pair")
+                        continue
+                    }
+                    if let engineEntry = stateEntriesByUUID[uuid],
+                       let entryFP = engineEntry.fingerprintSHA256?.uppercased(),
+                       boundFPs.contains(entryFP)
+                    {
+                        HostLogger.warning("Skipping legacy unpair of UUID \(uuid): its certificate fingerprint belongs to an active bound record", category: "pair")
+                        continue
+                    }
+                    _ = try? await api.unpairClient(uuid: uuid)
+                    removedAny = true
+                }
+                if removedAny {
+                    refreshPairedClientsFromEngine()
+                }
+            }
         }
     }
 
@@ -835,21 +864,37 @@ public final class HostRuntime: ObservableObject {
         approvedViaAutoAllow: Bool,
         identityChanged: Bool
     ) async -> PairTicketIssueResult {
+        let targetIP = IPAddressNormalizer.normalize(clientAddress)
+        let normalizedFP = peerCertFingerprintSHA256.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+
+        // Enforce strictly ONE in-flight pairing issuance per IP (prevents concurrent auto-approved
+        // `/pair` requests from the same IP from launching overlapping feeders or racing unpair).
+        if inFlightPairingIPs.contains(targetIP) {
+            HostLogger.warning("Rejecting concurrent /pair issuance from \(targetIP) while another pairing is in progress", category: "pair")
+            return .busy(retryAfterSec: 2)
+        }
+        inFlightPairingIPs.insert(targetIP)
+        defer { inFlightPairingIPs.remove(targetIP) }
+
         await pruneExpiredPairingTickets()
         let fallbackReason = streamReadyInfo.reason ?? HostStrings.string("protocol.stream.unavailable")
         guard let store, let api = engineAPIClient, engineState.isReadyForClients else {
             return .streamNotReady(reason: fallbackReason)
         }
 
-        let targetIP = IPAddressNormalizer.normalize(clientAddress)
-        let normalizedFP = peerCertFingerprintSHA256.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-
-        // Cancel & await any earlier superseded ticket/feeder from the same IP before mutating engine state.
+        // Cancel & wait for any earlier superseded ticket/feeder from the same IP to fully finish
+        // (and cancel its engine session first so any blocking POST /api/pin unwinds promptly)
+        // BEFORE inspecting or deleting engine entries.
         let supersededEntries = pendingPairingTickets.values.filter { $0.clientIP == targetIP }
-        for oldEntry in supersededEntries {
-            pendingPairingTickets.removeValue(forKey: oldEntry.ticket)
-            oldEntry.feederTask?.cancel()
-            _ = await oldEntry.feederTask?.value
+        if !supersededEntries.isEmpty {
+            for oldEntry in supersededEntries {
+                pendingPairingTickets.removeValue(forKey: oldEntry.ticket)
+                oldEntry.feederTask?.cancel()
+            }
+            await api.cancelPendingPairings(forIP: targetIP)
+            for oldEntry in supersededEntries {
+                _ = await oldEntry.feederTask?.value
+            }
         }
 
         let nextStep: String
@@ -859,15 +904,21 @@ public final class HostRuntime: ObservableObject {
             nextStep = "done"
         } else {
             nextStep = "gamestream"
-            // Mandatory pre-gamestream cleanup (B-1):
+            // Mandatory pre-gamestream cleanup (B-1 & Round-6 #2):
             // 1. Cancel any stale pending GameStream pairing sessions from `targetIP`.
-            // 2. Remove ALL existing engine entries for `normalizedFP` so fresh 5-step pairing succeeds cleanly.
+            // 2. Remove ALL existing engine entries for `normalizedFP` and confirm state.json reaches 0.
+            // 3. Refresh UI device list so removed entries are not displayed as active.
             await api.cancelPendingPairings(forIP: targetIP)
-            await api.unpairAllEntries(
+            let cleared = await api.unpairAllEntries(
                 forFingerprint: normalizedFP,
                 fallbackUUID: nil,
                 stateFileURL: store.paths.engineStateFile
             )
+            refreshPairedClientsFromEngine()
+            guard cleared else {
+                HostLogger.error("Pre-gamestream cleanup failed to clear existing cert entries for \(targetIP)", category: "pair")
+                return .streamNotReady(reason: HostStrings.string("protocol.stream.cleanup_failed"))
+            }
         }
 
         let ticket = SecureRandom.hexString(byteCount: 24)
@@ -927,6 +978,10 @@ public final class HostRuntime: ObservableObject {
         guard entry.expiresAt > Date() else {
             pendingPairingTickets.removeValue(forKey: ticket)
             entry.feederTask?.cancel()
+            _ = await entry.feederTask?.value
+            if !hasActivePairing(forIP: entry.clientIP) {
+                await engineAPIClient?.cancelPendingPairings(forIP: entry.clientIP)
+            }
             return .ticketExpired
         }
         // Ticket binds BOTH source IP and the certificate fingerprint presented to `/pair` (B-1).
@@ -976,6 +1031,25 @@ public final class HostRuntime: ObservableObject {
         await engineAPIClient?.cancelPendingPairings(forIP: clientAddress)
     }
 
+    internal func revokeIssuedPairingTicket(_ ticket: String, forClientAddress clientAddress: String) async {
+        let targetIP = IPAddressNormalizer.normalize(clientAddress)
+        if let entry = pendingPairingTickets.removeValue(forKey: ticket) {
+            entry.feederTask?.cancel()
+            await engineAPIClient?.cancelPendingPairings(forIP: targetIP)
+            _ = await entry.feederTask?.value
+        } else if !hasActivePairing(forIP: targetIP) {
+            await engineAPIClient?.cancelPendingPairings(forIP: targetIP)
+        }
+    }
+
+    private func hasActivePairing(forIP normalizedIP: String) -> Bool {
+        if inFlightPairingIPs.contains(normalizedIP) {
+            return true
+        }
+        let now = Date()
+        return pendingPairingTickets.values.contains { $0.clientIP == normalizedIP && $0.expiresAt > now }
+    }
+
     internal func restartTicketCleanupTimerForTesting() {
         startTicketCleanupTimer()
     }
@@ -1003,7 +1077,9 @@ public final class HostRuntime: ObservableObject {
         for entry in expiredEntries {
             entry.feederTask?.cancel()
             _ = await entry.feederTask?.value
-            await engineAPIClient?.cancelPendingPairings(forIP: entry.clientIP)
+            if !hasActivePairing(forIP: entry.clientIP) {
+                await engineAPIClient?.cancelPendingPairings(forIP: entry.clientIP)
+            }
         }
     }
 
@@ -1323,5 +1399,10 @@ private final class RuntimeControlProtocolAdapter: ControlProtocolDelegate, @unc
     func cancelPendingEnginePairings(forClientAddress clientAddress: String) async {
         guard let runtime else { return }
         await runtime.cancelPendingEnginePairings(forClientAddress: clientAddress)
+    }
+
+    func revokeIssuedPairingTicket(_ ticket: String, forClientAddress clientAddress: String) async {
+        guard let runtime else { return }
+        await runtime.revokeIssuedPairingTicket(ticket, forClientAddress: clientAddress)
     }
 }

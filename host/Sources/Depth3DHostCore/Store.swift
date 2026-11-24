@@ -55,7 +55,7 @@ public final class HostStateStore: @unchecked Sendable {
 
     /// Merges duplicate records that share the same normalized `certFingerprint` (keeping the record
     /// with the latest `lastSeenAt`, tie-broken by `pairedAt`). Legacy nil-fingerprint records are
-    /// deduplicated by `deviceId`.
+    /// deduplicated by `deviceId`, preserving ALL distinct `engineUUID`s from merged records for cleanup.
     internal static func deduplicatePairedDevices(_ devices: [PairedDeviceRecord]) -> (records: [PairedDeviceRecord], didMerge: Bool) {
         var byKey: [String: (index: Int, record: PairedDeviceRecord)] = [:]
         var ordered: [PairedDeviceRecord] = []
@@ -67,6 +67,7 @@ public final class HostStateStore: @unchecked Sendable {
                 deviceId: item.deviceId,
                 name: item.name,
                 engineUUID: item.engineUUID,
+                legacyEngineUUIDs: item.legacyEngineUUIDs,
                 certFingerprint: item.certFingerprint,
                 autoAllow: item.autoAllow,
                 pairedAt: item.pairedAt,
@@ -77,10 +78,21 @@ public final class HostStateStore: @unchecked Sendable {
                 didMerge = true
                 let keepNew = normalized.lastSeenAt > existing.record.lastSeenAt
                     || (normalized.lastSeenAt == existing.record.lastSeenAt && normalized.pairedAt > existing.record.pairedAt)
-                if keepNew {
-                    ordered[existing.index] = normalized
-                    byKey[key] = (existing.index, normalized)
+                var winner = keepNew ? normalized : existing.record
+                let loser = keepNew ? existing.record : normalized
+                if winner.certFingerprint == nil {
+                    // Preserve engineUUIDs from BOTH merged nil-fingerprint legacy records for later unpair cleanup.
+                    var combinedUUIDs = winner.allLegacyEngineUUIDs
+                    for uuid in loser.allLegacyEngineUUIDs where !combinedUUIDs.contains(uuid) {
+                        combinedUUIDs.append(uuid)
+                    }
+                    let primary = combinedUUIDs.first
+                    let extras = Array(combinedUUIDs.dropFirst())
+                    winner.engineUUID = primary
+                    winner.legacyEngineUUIDs = extras.isEmpty ? nil : extras
                 }
+                ordered[existing.index] = winner
+                byKey[key] = (existing.index, winner)
             } else {
                 byKey[key] = (ordered.count, normalized)
                 ordered.append(normalized)

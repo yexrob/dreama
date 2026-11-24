@@ -335,7 +335,7 @@ public final class EngineAPIClient: @unchecked Sendable {
                     _ = try? await self.unpairClient(uuid: other.uuid)
                 }
 
-                // Wait briefly for Sunshine to flush state.json after unpair calls.
+                // Wait briefly for Sunshine to flush state.json after unpair calls (break on cancellation to avoid spin).
                 let flushDeadline = Date().addingTimeInterval(1.0)
                 while Date() < flushDeadline {
                     if EngineConfigGenerator.isCertificateUniquelyEnabled(
@@ -344,7 +344,11 @@ public final class EngineAPIClient: @unchecked Sendable {
                     ) {
                         break
                     }
-                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    do {
+                        try await Task.sleep(nanoseconds: 50_000_000)
+                    } catch {
+                        break
+                    }
                 }
             }
 
@@ -361,13 +365,14 @@ public final class EngineAPIClient: @unchecked Sendable {
 
     /// Removes EVERY entry in the streaming engine matching `fingerprintSHA256` (including any
     /// duplicates or entries without a stored `engineUUID`), plus `fallbackUUID` if provided,
-    /// and waits briefly for Sunshine to flush `state.json` so a subsequent fresh pairing
-    /// cannot collide with an un-flushed duplicate entry (B-1).
+    /// and waits for Sunshine to flush `state.json` to strictly 0 matching entries.
+    /// Returns `true` ONLY when confirmed 0 entries remain for `fingerprintSHA256` in `state.json`.
+    @discardableResult
     public func unpairAllEntries(
         forFingerprint fingerprintSHA256: String,
         fallbackUUID: String? = nil,
         stateFileURL: URL
-    ) async {
+    ) async -> Bool {
         await serializer.runSerialized { [self] in
             var uuidsToRemove: [String] = []
             let all = EngineConfigGenerator.loadAllPairedCerts(at: stateFileURL)
@@ -379,19 +384,41 @@ public final class EngineAPIClient: @unchecked Sendable {
             if let fallbackUUID, !fallbackUUID.isEmpty, !uuidsToRemove.contains(fallbackUUID) {
                 uuidsToRemove.append(fallbackUUID)
             }
-            guard !uuidsToRemove.isEmpty else { return }
+            if uuidsToRemove.isEmpty {
+                return true
+            }
             for uuid in uuidsToRemove {
-                _ = try? await self.unpairClient(uuid: uuid)
+                do {
+                    _ = try await self.unpairClient(uuid: uuid)
+                } catch {
+                    HostLogger.warning("Failed to unpair engine entry \(uuid): \(error.localizedDescription)", category: "pair")
+                }
             }
 
-            let flushDeadline = Date().addingTimeInterval(1.0)
+            let flushDeadline = Date().addingTimeInterval(1.5)
             while Date() < flushDeadline {
                 let remaining = EngineConfigGenerator.loadAllPairedCerts(at: stateFileURL).filter {
                     $0.fingerprintSHA256?.caseInsensitiveCompare(fingerprintSHA256) == .orderedSame
                 }
-                if remaining.isEmpty { break }
-                try? await Task.sleep(nanoseconds: 50_000_000)
+                if remaining.isEmpty { return true }
+                do {
+                    try await Task.sleep(nanoseconds: 50_000_000)
+                } catch {
+                    break
+                }
             }
+
+            let finalRemaining = EngineConfigGenerator.loadAllPairedCerts(at: stateFileURL).filter {
+                $0.fingerprintSHA256?.caseInsensitiveCompare(fingerprintSHA256) == .orderedSame
+            }
+            if !finalRemaining.isEmpty {
+                HostLogger.error(
+                    "Engine state still has \(finalRemaining.count) entry(ies) for cert after unpairAllEntries",
+                    category: "pair"
+                )
+                return false
+            }
+            return true
         }
     }
 

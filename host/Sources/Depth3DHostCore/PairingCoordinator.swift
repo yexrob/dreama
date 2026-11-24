@@ -62,6 +62,8 @@ public actor PairingCoordinator {
     private let cooldownDuration: TimeInterval
     private let fairnessYieldDuration: TimeInterval
     private let recentFailurePenaltyWindow: TimeInterval
+    private let cancelWindowSeconds: TimeInterval
+    private let cancelCooldownThreshold: Int
 
     /// Uppercase SHA-256 hex fingerprints of bound client certificates with "以后自动允许" enabled.
     /// Auto-allow NEVER depends on `deviceId`; it trusts ONLY the TLS handshake certificate fingerprint.
@@ -69,6 +71,11 @@ public actor PairingCoordinator {
 
     /// Cooldown expiration timestamps keyed STRICTLY by normalized source IP (`ip:<addr>`).
     private var cooldownUntilByIP: [String: Date] = [:]
+
+    /// Disconnect-cancel timestamps per normalized IP within `cancelWindowSeconds`; once an IP
+    /// triggers `cancelCooldownThreshold` (default 3) disconnect-cancellations within 60s, it
+    /// enters IP cooldown to prevent prompt-flashing floods.
+    private var cancelTimestampsByIP: [String: [Date]] = [:]
 
     /// Multi-IP fairness state (Round-5 #2):
     /// - `waitingIPs`: distinct source IPs that recently got `.busy` while a prompt was occupied,
@@ -93,12 +100,16 @@ public actor PairingCoordinator {
         cooldownDuration: TimeInterval = 30.0,
         fairnessYieldDuration: TimeInterval = 10.0,
         recentFailurePenaltyWindow: TimeInterval = 120.0,
+        cancelWindowSeconds: TimeInterval = 60.0,
+        cancelCooldownThreshold: Int = 3,
         autoAllowedFingerprints: Set<String> = []
     ) {
         self.timeout = timeout
         self.cooldownDuration = max(0, cooldownDuration)
         self.fairnessYieldDuration = max(0, fairnessYieldDuration)
         self.recentFailurePenaltyWindow = max(cooldownDuration, recentFailurePenaltyWindow)
+        self.cancelWindowSeconds = max(1.0, cancelWindowSeconds)
+        self.cancelCooldownThreshold = max(1, cancelCooldownThreshold)
         self.autoAllowedFingerprints = Set(
             autoAllowedFingerprints
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
@@ -315,7 +326,21 @@ public actor PairingCoordinator {
     public func cancelPrompt(id: UUID) {
         guard let waiter = activeWaiter, waiter.prompt.id == id else { return }
         let ip = waiter.prompt.clientAddress
-        HostLogger.info("Pairing request cancelled (client disconnected) for \(ip); closing confirmation prompt", category: "pair")
+        let now = Date()
+        let cutoff = now.addingTimeInterval(-cancelWindowSeconds)
+        var recent = (cancelTimestampsByIP[ip] ?? []).filter { $0 > cutoff }
+        recent.append(now)
+        cancelTimestampsByIP[ip] = recent
+        if recent.count >= cancelCooldownThreshold {
+            applyCooldown(for: waiter.prompt)
+            recentRejectOrTimeoutAt[ip] = now
+            HostLogger.warning(
+                "Pairing request cancelled \(recent.count)x within \(Int(cancelWindowSeconds))s for \(ip); applying IP cooldown",
+                category: "pair"
+            )
+        } else {
+            HostLogger.info("Pairing request cancelled (client disconnected) for \(ip); closing confirmation prompt", category: "pair")
+        }
         scheduleNextFairTurn(afterFinishingIP: ip)
         resolveInternal(decision: .cancelled)
     }
@@ -381,6 +406,15 @@ public actor PairingCoordinator {
         waitingIPs = waitingIPs.filter { $0.value > waiterCutoff }
         let penaltyCutoff = now.addingTimeInterval(-recentFailurePenaltyWindow)
         recentRejectOrTimeoutAt = recentRejectOrTimeoutAt.filter { $0.value > penaltyCutoff }
+        let cancelCutoff = now.addingTimeInterval(-cancelWindowSeconds)
+        for (ip, times) in cancelTimestampsByIP {
+            let kept = times.filter { $0 > cancelCutoff }
+            if kept.isEmpty {
+                cancelTimestampsByIP.removeValue(forKey: ip)
+            } else {
+                cancelTimestampsByIP[ip] = kept
+            }
+        }
     }
 
     private func resolveInternal(decision: PairingDecision) {

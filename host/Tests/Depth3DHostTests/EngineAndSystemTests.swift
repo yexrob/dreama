@@ -186,9 +186,10 @@ final class EngineAndSystemTests: XCTestCase {
         let orphan = Process()
         orphan.executableURL = URL(fileURLWithPath: "/bin/sleep")
         orphan.arguments = ["60"]
+        let orphanWaiter = ProcessExitWaiter(process: orphan)
         try orphan.run()
         let orphanPID = orphan.processIdentifier
-        defer { if orphan.isRunning { kill(orphanPID, SIGKILL) } }
+        defer { if orphan.isRunning { _ = orphanWaiter.terminateAndWaitSync(timeout: 2.0) } }
         ledger.register(pid: orphanPID, kind: .engine, executableHint: "sleep")
 
         // Verify startTimeSec was automatically captured from kernel BSD info
@@ -199,15 +200,16 @@ final class EngineAndSystemTests: XCTestCase {
         let reusedPIDProc = Process()
         reusedPIDProc.executableURL = URL(fileURLWithPath: "/bin/sleep")
         reusedPIDProc.arguments = ["60"]
+        let reusedWaiter = ProcessExitWaiter(process: reusedPIDProc)
         try reusedPIDProc.run()
         let reusedPID = reusedPIDProc.processIdentifier
-        defer { if reusedPIDProc.isRunning { kill(reusedPID, SIGKILL); reusedPIDProc.waitUntilExit() } }
+        defer { if reusedPIDProc.isRunning { _ = kill(reusedPID, SIGKILL); _ = reusedWaiter.wait(timeout: 2.0) } }
         ledger.register(pid: reusedPID, startTimeSec: 12345, kind: .engine, executableHint: "sleep")
 
         let killedCount = ledger.cleanupStaleChildren(kinds: [.engine])
         XCTAssertEqual(killedCount, 1)
 
-        orphan.waitUntilExit()
+        XCTAssertTrue(orphanWaiter.wait(timeout: 3.0))
         XCTAssertFalse(orphan.isRunning)
         XCTAssertTrue(reusedPIDProc.isRunning, "PID with mismatched startTimeSec must NEVER be killed")
     }
@@ -299,16 +301,17 @@ final class EngineAndSystemTests: XCTestCase {
 
         let parent = Process()
         parent.executableURL = parentScript
+        let parentWaiter = ProcessExitWaiter(process: parent)
         try parent.run()
         let parentPID = parent.processIdentifier
-        defer { if parent.isRunning { _ = kill(parentPID, SIGKILL) } }
+        defer { if parent.isRunning { _ = kill(parentPID, SIGKILL); _ = parentWaiter.wait(timeout: 2.0) } }
 
         let grandchildPID = waitForPID(at: pidFileB, timeout: 3.0)
         XCTAssertGreaterThan(grandchildPID, 1)
         defer { if grandchildPID > 1 && kill(grandchildPID, 0) == 0 { _ = kill(grandchildPID, SIGKILL) } }
 
         _ = kill(parentPID, SIGKILL)
-        parent.waitUntilExit()
+        XCTAssertTrue(parentWaiter.wait(timeout: 3.0))
 
         let exitDeadline = Date().addingTimeInterval(3.5)
         var grandchildDead = false
@@ -496,8 +499,41 @@ final class EngineAndSystemTests: XCTestCase {
             hostName: "RaceTest", basePort: testPort, quality: .balanced, displayID: nil, paths: paths
         )
 
-        // Rapidly issue start() + stop() with staggered 0..60ms delays to hit the launch window.
-        for delayMs in [0, 5, 15, 30, 60] {
+        // Round-6 minor: Deterministically pause `launchIfDesired()` RIGHT between `try proc.run()`
+        // and `activeLaunch` / `ledger` registration, inject `supervisor.stop()` from another thread
+        // in that exact window, and prove serialized `stop()` waits for registration and kills the child!
+        let enteredRaceWindow = DispatchSemaphore(value: 0)
+        let allowRegistration = DispatchSemaphore(value: 0)
+        let stopFinished = DispatchSemaphore(value: 0)
+        let stopReturnedPrematurely = UnsafeMutablePointer<Bool>.allocate(capacity: 1)
+        stopReturnedPrematurely.initialize(to: false)
+        defer { stopReturnedPrematurely.deinitialize(count: 1); stopReturnedPrematurely.deallocate() }
+
+        supervisor.onAfterProcessRunForTesting = {
+            enteredRaceWindow.signal()
+            _ = allowRegistration.wait(timeout: .now() + 5.0)
+        }
+
+        supervisor.start(config: cfg)
+        XCTAssertEqual(enteredRaceWindow.wait(timeout: .now() + 5.0), .success, "Hook must fire right after proc.run()")
+
+        // Launch stop() concurrently while launchIfDesired() is paused BEFORE `activeLaunch = launchRecord`!
+        DispatchQueue.global(qos: .userInitiated).async {
+            supervisor.stop()
+            stopFinished.signal()
+        }
+
+        // Wait 120ms: because `stop()` is serialized on `queue`, it MUST NOT return before registration finishes!
+        if stopFinished.wait(timeout: .now() + 0.12) == .success {
+            stopReturnedPrematurely.pointee = true
+        }
+        allowRegistration.signal()
+        XCTAssertEqual(stopFinished.wait(timeout: .now() + 5.0), .success, "stop() must finish once launchIfDesired completes")
+        XCTAssertFalse(stopReturnedPrematurely.pointee, "Serialized stop() must wait for launchIfDesired instead of racing past activeLaunch == nil")
+
+        // Also run rapid back-to-back start()/stop() cycles without the hook.
+        supervisor.onAfterProcessRunForTesting = nil
+        for delayMs in [0, 5, 15, 30] {
             supervisor.start(config: cfg)
             if delayMs > 0 {
                 Thread.sleep(forTimeInterval: TimeInterval(delayMs) / 1000.0)
@@ -677,6 +713,7 @@ final class EngineAndSystemTests: XCTestCase {
             "protocol.stream.no_screen_recording",
             "protocol.stream.port_conflict",
             "protocol.stream.paused",
+            "protocol.stream.cleanup_failed",
             "engine.error.crash_loop",
             "rclone.error.auth_expired",
             "rclone.error.remote_not_found",
@@ -740,6 +777,34 @@ final class EngineAndSystemTests: XCTestCase {
         XCTAssertEqual(migrated[0].name, "Newer Name")
         XCTAssertEqual(migrated[0].engineUUID, "NEW-UUID")
         XCTAssertGreaterThan(newerDate, olderDate)
+
+        // Round-6 minor: Merging two nil-fingerprint legacy records sharing `deviceId` preserves BOTH engineUUIDs!
+        let dupLegacyJSON = """
+        [
+          {
+            "autoAllow": false,
+            "deviceId": "legacy-dup-dev",
+            "engineUUID": "LEG-UUID-OLD",
+            "lastSeenAt": "2023-11-14T22:13:20Z",
+            "name": "Old Legacy",
+            "pairedAt": "2023-11-14T22:13:20Z"
+          },
+          {
+            "autoAllow": false,
+            "deviceId": "legacy-dup-dev",
+            "engineUUID": "LEG-UUID-NEW",
+            "lastSeenAt": "2025-06-15T12:26:40Z",
+            "name": "New Legacy",
+            "pairedAt": "2025-06-15T12:26:40Z"
+          }
+        ]
+        """
+        try Data(dupLegacyJSON.utf8).write(to: store.paths.pairedDevicesFile, options: .atomic)
+        let mergedLegacy = store.loadPairedDevices()
+        XCTAssertEqual(mergedLegacy.count, 1)
+        XCTAssertNil(mergedLegacy[0].certFingerprint)
+        XCTAssertEqual(mergedLegacy[0].name, "New Legacy")
+        XCTAssertEqual(Set(mergedLegacy[0].allLegacyEngineUUIDs), Set(["LEG-UUID-NEW", "LEG-UUID-OLD"]))
     }
 
     /// m-1 (upgraded m6): Verifies `fetch-engine.sh --verify-only` validates against the
@@ -770,14 +835,15 @@ final class EngineAndSystemTests: XCTestCase {
         try FileManager.default.copyItem(at: stageURL, to: copiedStage)
 
         func runVerifyOnly() throws -> Int32 {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/bin/bash")
-            p.arguments = [scriptURL.path, "--arch", "arm64", "--out", copiedStage.path, "--verify-only"]
-            p.standardOutput = FileHandle.nullDevice
-            p.standardError = FileHandle.nullDevice
-            try p.run()
-            p.waitUntilExit()
-            return p.terminationStatus
+            let res = try TestProcessRunner.run(
+                executable: "/bin/bash",
+                arguments: [scriptURL.path, "--arch", "arm64", "--out", copiedStage.path, "--verify-only"],
+                captureStdout: false,
+                captureStderr: false,
+                timeout: 15.0
+            )
+            XCTAssertFalse(res.timedOut)
+            return res.exitCode
         }
 
         // 1. Intact staged copy passes full file + symlink verification against repo-pinned manifest

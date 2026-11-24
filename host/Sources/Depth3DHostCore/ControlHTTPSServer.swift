@@ -89,12 +89,14 @@ private final class ConnectionLifecycleBox: @unchecked Sendable {
         conn: ActiveTLSConnection,
         connectionGuard: ConnectionGuard,
         peerIP: String,
-        wasPromotedToPaired: Bool
+        wasPromotedToPaired: Bool,
+        monitorDisconnect: Bool = true
     ) {
         self.conn = conn
         self.connectionGuard = connectionGuard
         self.peerIP = peerIP
         self.wasPromotedToPaired = wasPromotedToPaired
+        self.sourceCancelled = !monitorDisconnect
     }
 
     func attachRouteTask(_ task: Task<Void, Never>) {
@@ -502,10 +504,14 @@ public final class ControlHTTPSServer: @unchecked Sendable {
         }
 
         // If this connection landed in the reserved paired-cert zone and presented NO client certificate
-        // at all, reject immediately after handshake without waiting to read an HTTP request.
+        // at all, reject immediately after handshake with 429 busy (never 503, which is stream_not_ready).
         if inReservedZone && peerDER == nil {
             ioCtx.deadlineUptime = ProcessInfo.processInfo.systemUptime + 1.0
-            let busy = HTTPResponse.json(503, object: ["error": "busy"], extraHeaders: [("Retry-After", "2")])
+            let busy = HTTPResponse.json(
+                429,
+                object: ["error": "busy", "retryAfterSec": 2],
+                extraHeaders: [("Retry-After", "2")]
+            )
             writeAll(ctx: ctx, data: busy.serialize())
             conn.close()
             connectionGuard.release(forIP: peerIP, wasPromotedToPaired: false)
@@ -534,40 +540,49 @@ public final class ControlHTTPSServer: @unchecked Sendable {
             return
         }
 
-        // Hand off paired-cert slot promotion, rate-limit checks, and routing to an async Task,
-        // paired with a `DispatchSourceRead` monitor so client disconnect while a confirmation
-        // prompt is open immediately cancels `routeTask` and dismisses the prompt (B-1)!
+        // Hand off paired-cert slot promotion, rate-limit checks, and routing to an async Task.
+        // Client-disconnect monitoring (`DispatchSourceRead`) is attached ONLY for `POST /depth3d/v1/pair`
+        // (waiting on user confirmation / post-approval issuance), so clients that half-close their
+        // write side immediately after sending `/info`, `/media`, or `/pair/complete` still receive
+        // their full HTTP response normally.
         let router = self.router
         let ioQueue = self.ioQueue
         let guardRef = self.connectionGuard
         let rateLimiter = self.unauthRateLimiter
+        let monitorDisconnect = (request.method == "POST" && request.path == "/depth3d/v1/pair")
         let lifecycle = ConnectionLifecycleBox(
             conn: conn,
             connectionGuard: guardRef,
             peerIP: peerIP,
-            wasPromotedToPaired: false
+            wasPromotedToPaired: false,
+            monitorDisconnect: monitorDisconnect
         )
 
-        // Configure and resume `readSource` strictly BEFORE spawning `routeTask` so no other
-        // thread can ever call `readSource.cancel()` concurrently with `setEventHandler`/`resume()`.
-        let readSource = DispatchSource.makeReadSource(fileDescriptor: conn.fd, queue: disconnectQueue)
-        readSource.setCancelHandler {
-            lifecycle.markSourceCancelled()
-        }
-        readSource.setEventHandler {
-            var peekByte: UInt8 = 0
-            let n = Darwin.recv(conn.fd, &peekByte, 1, MSG_PEEK | MSG_DONTWAIT)
-            if n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) || (n > 0 && peekByte == 0x15) {
-                if lifecycle.markClientDisconnectedAndCancelRoute() {
-                    readSource.cancel()
-                }
-            } else if n > 0 {
-                // Unexpected non-alert bytes on a Connection: close stream; stop monitoring to avoid level-triggered spin.
-                readSource.cancel()
+        var readSource: DispatchSourceRead?
+        if monitorDisconnect {
+            // Configure and resume `readSource` strictly BEFORE spawning `routeTask` so no other
+            // thread can ever call `readSource.cancel()` concurrently with `setEventHandler`/`resume()`.
+            let src = DispatchSource.makeReadSource(fileDescriptor: conn.fd, queue: disconnectQueue)
+            src.setCancelHandler {
+                lifecycle.markSourceCancelled()
             }
+            src.setEventHandler {
+                var peekByte: UInt8 = 0
+                let n = Darwin.recv(conn.fd, &peekByte, 1, MSG_PEEK | MSG_DONTWAIT)
+                if n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) || (n > 0 && peekByte == 0x15) {
+                    if lifecycle.markClientDisconnectedAndCancelRoute() {
+                        src.cancel()
+                    }
+                } else if n > 0 {
+                    // Unexpected non-alert bytes on a Connection: close stream; stop monitoring to avoid level-triggered spin.
+                    src.cancel()
+                }
+            }
+            src.resume()
+            readSource = src
         }
-        readSource.resume()
 
+        let capturedReadSource = readSource
         let routeTask = Task {
             let isKnownPaired: Bool
             if let fp = request.peerCertificateFingerprintSHA256 {
@@ -583,16 +598,16 @@ public final class ControlHTTPSServer: @unchecked Sendable {
 
             let response: HTTPResponse
             if !isKnownPaired && !guardRef.allowUnauthenticatedAdmission() {
-                // Unauthenticated connection landed in reserved paired-cert slots -> reject promptly!
+                // Connection-layer reserved-slot rejection uniformly returns 429 busy (never 503).
                 response = HTTPResponse.json(
-                    503,
-                    object: ["error": "busy"],
+                    429,
+                    object: ["error": "busy", "retryAfterSec": 2],
                     extraHeaders: [("Retry-After", "2")]
                 )
             } else if !isKnownPaired && !rateLimiter.allow(key: peerIP) {
                 response = HTTPResponse.json(
                     429,
-                    object: ["error": "rate_limited"],
+                    object: ["error": "busy", "retryAfterSec": 10],
                     extraHeaders: [("Retry-After", "10")]
                 )
             } else {
@@ -600,7 +615,7 @@ public final class ControlHTTPSServer: @unchecked Sendable {
             }
 
             ioQueue.async {
-                readSource.cancel()
+                capturedReadSource?.cancel()
                 if !lifecycle.isClientDisconnected {
                     conn.ioCtx.timedOut = false
                     conn.ioCtx.deadlineUptime = ProcessInfo.processInfo.systemUptime + 10.0

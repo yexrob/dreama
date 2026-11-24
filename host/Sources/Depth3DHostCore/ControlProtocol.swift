@@ -336,6 +336,7 @@ public struct MediaCredentialsResponse: Codable, Equatable, Sendable {
 
 public enum PairTicketIssueResult: Equatable, Sendable {
     case issued(next: String, ticket: String)
+    case busy(retryAfterSec: Int)
     case streamNotReady(reason: String)
 }
 
@@ -402,12 +403,14 @@ public protocol ControlProtocolDelegate: Sendable {
         peerCertFingerprintSHA256: String
     ) async -> PairCompleteOutcome
     func cancelPendingEnginePairings(forClientAddress clientAddress: String) async
+    func revokeIssuedPairingTicket(_ ticket: String, forClientAddress clientAddress: String) async
 }
 
 public extension ControlProtocolDelegate {
     func isKnownPairedCertificate(fingerprintSHA256: String) async -> Bool { false }
     func knownBoundCertFingerprints(forDeviceId deviceId: String) async -> Set<String> { [] }
     func cancelPendingEnginePairings(forClientAddress clientAddress: String) async {}
+    func revokeIssuedPairingTicket(_ ticket: String, forClientAddress clientAddress: String) async {}
 }
 
 /// Pure, unit-testable HTTP router implementing `docs/specs/host-protocol.md` (v1).
@@ -596,22 +599,52 @@ public final class ControlProtocolRouter: Sendable {
         approvedViaAutoAllow: Bool,
         identityChanged: Bool
     ) async -> HTTPResponse {
-        let result = await delegate.issueApprovedPairingTicket(
-            deviceName: device,
-            deviceId: deviceId,
-            pin: pin,
-            streamPaired: streamPaired,
-            clientAddress: request.remoteAddress,
-            peerCertFingerprintSHA256: peerCertFP,
-            autoAllowFuture: autoAllowFuture,
-            approvedViaAutoAllow: approvedViaAutoAllow,
-            identityChanged: identityChanged
-        )
+        // Run post-approval ticket issuance (engine dedup/unpair + state.json flush) inside an
+        // uncancellable task so a mid-flight client disconnect NEVER cancels URLSession halfway
+        // through deleting old entries or causes flush-wait loops to spin.
+        let delegateRef = self.delegate
+        let remoteIP = request.remoteAddress
+        let result = await Task.detached {
+            await delegateRef.issueApprovedPairingTicket(
+                deviceName: device,
+                deviceId: deviceId,
+                pin: pin,
+                streamPaired: streamPaired,
+                clientAddress: remoteIP,
+                peerCertFingerprintSHA256: peerCertFP,
+                autoAllowFuture: autoAllowFuture,
+                approvedViaAutoAllow: approvedViaAutoAllow,
+                identityChanged: identityChanged
+            )
+        }.value
+
+        // If the headset disconnected during issuance, revoke the ticket & stop any feeder/session.
+        if Task.isCancelled {
+            if case .issued(_, let ticket) = result {
+                await Task.detached {
+                    await delegateRef.revokeIssuedPairingTicket(ticket, forClientAddress: remoteIP)
+                }.value
+            } else {
+                await Task.detached {
+                    await delegateRef.cancelPendingEnginePairings(forClientAddress: remoteIP)
+                }.value
+            }
+            return HTTPResponse.json(403, object: ["error": "rejected"])
+        }
+
         switch result {
         case .issued(let next, let ticket):
             return HTTPResponse.jsonEncodable(200, PairApprovedResponse(ok: true, next: next, ticket: ticket))
+        case .busy(let retryAfterSec):
+            return HTTPResponse.json(
+                429,
+                object: ["error": "busy", "retryAfterSec": retryAfterSec],
+                extraHeaders: [("Retry-After", String(retryAfterSec))]
+            )
         case .streamNotReady(let reason):
-            await delegate.cancelPendingEnginePairings(forClientAddress: request.remoteAddress)
+            await Task.detached {
+                await delegateRef.cancelPendingEnginePairings(forClientAddress: remoteIP)
+            }.value
             return HTTPResponse.json(503, object: ["error": "stream_not_ready", "reason": reason])
         }
     }
@@ -645,7 +678,9 @@ public final class ControlProtocolRouter: Sendable {
             return HTTPResponse.json(409, object: ["error": "not_paired"])
 
         case .ticketExpired:
-            await delegate.cancelPendingEnginePairings(forClientAddress: request.remoteAddress)
+            // Do NOT cancel engine pending pairings here: a concurrent losing `/pair/complete`
+            // (or stale retry) gets `410` after the winning request already consumed the ticket
+            // and must never disturb the winning or newer session on this IP.
             return HTTPResponse.json(410, object: ["error": "ticket_expired"])
 
         case .sourceMismatch:

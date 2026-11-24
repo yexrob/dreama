@@ -81,6 +81,9 @@ public struct PairedDeviceRecord: Codable, Equatable, Identifiable, Sendable {
     public var deviceId: String
     public var name: String
     public var engineUUID: String?
+    /// Additional engine UUIDs preserved when migrating/merging duplicate legacy nil-fingerprint records
+    /// so removing the merged record still cleans up all associated engine entries.
+    public var legacyEngineUUIDs: [String]?
     /// Uppercase SHA-256 hex digest of the exact X.509 client certificate bound during pairing.
     public var certFingerprint: String?
     public var autoAllow: Bool
@@ -94,10 +97,26 @@ public struct PairedDeviceRecord: Codable, Equatable, Identifiable, Sendable {
         return "legacy:\(deviceId)"
     }
 
+    /// Deduplicated list of all non-empty engine UUIDs stored on a legacy nil-fingerprint record.
+    public var allLegacyEngineUUIDs: [String] {
+        var result: [String] = []
+        if let primary = engineUUID?.trimmingCharacters(in: .whitespacesAndNewlines), !primary.isEmpty {
+            result.append(primary)
+        }
+        for extra in legacyEngineUUIDs ?? [] {
+            let trimmed = extra.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty, !result.contains(trimmed) {
+                result.append(trimmed)
+            }
+        }
+        return result
+    }
+
     public init(
         deviceId: String,
         name: String,
         engineUUID: String? = nil,
+        legacyEngineUUIDs: [String]? = nil,
         certFingerprint: String? = nil,
         autoAllow: Bool = false,
         pairedAt: Date = Date(),
@@ -106,6 +125,10 @@ public struct PairedDeviceRecord: Codable, Equatable, Identifiable, Sendable {
         self.deviceId = deviceId
         self.name = name
         self.engineUUID = engineUUID
+        let cleanedExtras = (legacyEngineUUIDs ?? [])
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && $0 != engineUUID }
+        self.legacyEngineUUIDs = cleanedExtras.isEmpty ? nil : cleanedExtras
         if let fp = certFingerprint?.trimmingCharacters(in: .whitespacesAndNewlines), !fp.isEmpty {
             self.certFingerprint = fp.uppercased()
         } else {

@@ -12,11 +12,18 @@ private actor MockControlDelegate: ControlProtocolDelegate {
     var engineUniquelyPairedFingerprints: Set<String> = []
     var issuedTickets: [String: (clientIP: String, certFP: String, deviceName: String, deviceId: String, autoAllow: Bool)] = [:]
     var cancelledIPs: [String] = []
+    var revokedTickets: [String] = []
     var handledRequestCount: Int = 0
     var issuedTicketCount: Int = 0
+    var issueDelayNs: UInt64 = 0
+    var sawTaskCancelledDuringIssue: Bool = false
 
     init(snapshot: ControlProtocolSnapshot) {
         self.snapshot = snapshot
+    }
+
+    func setIssueDelay(nanoseconds: UInt64) {
+        issueDelayNs = nanoseconds
     }
 
     func setAuthorized(deviceId: String, fingerprint: String) {
@@ -59,6 +66,12 @@ private actor MockControlDelegate: ControlProtocolDelegate {
         approvedViaAutoAllow: Bool,
         identityChanged: Bool
     ) async -> PairTicketIssueResult {
+        if issueDelayNs > 0 {
+            try? await Task.sleep(nanoseconds: issueDelayNs)
+        }
+        if Task.isCancelled {
+            sawTaskCancelledDuringIssue = true
+        }
         handledRequestCount += 1
         issuedTicketCount += 1
         guard snapshot.streamReady else {
@@ -94,8 +107,17 @@ private actor MockControlDelegate: ControlProtocolDelegate {
         cancelledIPs.append(IPAddressNormalizer.normalize(clientAddress))
     }
 
+    func revokeIssuedPairingTicket(_ ticket: String, forClientAddress clientAddress: String) async {
+        revokedTickets.append(ticket)
+        issuedTickets.removeValue(forKey: ticket)
+        cancelledIPs.append(IPAddressNormalizer.normalize(clientAddress))
+    }
+
     func getCancelledIPs() -> [String] { cancelledIPs }
+    func getRevokedTickets() -> [String] { revokedTickets }
     func getIssuedTicketCount() -> Int { issuedTicketCount }
+    func getSawTaskCancelledDuringIssue() -> Bool { sawTaskCancelledDuringIssue }
+    func clearCancelledIPs() { cancelledIPs.removeAll() }
 }
 
 final class ControlProtocolTests: XCTestCase {
@@ -456,6 +478,74 @@ final class ControlProtocolTests: XCTestCase {
         ))
         XCTAssertEqual(autoGS.statusCode, 200)
         XCTAssertEqual(try JSONDecoder().decode(PairApprovedResponse.self, from: autoGS.body).next, "gamestream")
+
+        // 6. Round-6 #4: Repeated disconnect-cancellations from same IP (3rd within 60s) trigger IP cooldown!
+        let cancelCoord = PairingCoordinator(
+            timeout: 10.0, cooldownDuration: 30.0, fairnessYieldDuration: 0.0,
+            cancelWindowSeconds: 60.0, cancelCooldownThreshold: 3
+        )
+        let cancelRouter = ControlProtocolRouter(pairingCoordinator: cancelCoord, delegate: delegate)
+        let floodIP = "192.168.1.210"
+        for attempt in 1...3 {
+            let t = Task {
+                await cancelRouter.handle(HTTPRequest(
+                    method: "POST", rawTarget: "/depth3d/v1/pair",
+                    body: Data("{\"device\":\"Flasher\",\"deviceId\":\"fl-\(attempt)\",\"pin\":\"1234\",\"streamPaired\":false}".utf8),
+                    peerCertificateDER: sampleCertC, remoteAddress: floodIP
+                ))
+            }
+            var opened = false
+            let dl = Date().addingTimeInterval(2.0)
+            while Date() < dl {
+                if !(await cancelCoord.pendingPrompts()).isEmpty { opened = true; break }
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            XCTAssertTrue(opened, "Attempt \(attempt) before cooldown threshold must open prompt")
+            t.cancel()
+            _ = await t.value
+        }
+        // 4th attempt after 3rd cancel within 60s MUST immediately hit 429 cooldown!
+        let after3Cancels = await cancelRouter.handle(HTTPRequest(
+            method: "POST", rawTarget: "/depth3d/v1/pair",
+            body: Data("{\"device\":\"Flasher\",\"deviceId\":\"fl-4\",\"pin\":\"1234\",\"streamPaired\":false}".utf8),
+            peerCertificateDER: sampleCertC, remoteAddress: floodIP
+        ))
+        XCTAssertEqual(after3Cancels.statusCode, 429, "Round-6 #4: 3rd disconnect-cancel in 60s must trigger IP cooldown")
+        let cancelCDJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: after3Cancels.body) as? [String: Any])
+        XCTAssertEqual(cancelCDJSON["error"] as? String, "cooldown")
+
+        // 7. Round-6 #1: Post-approval issuance runs uncancellable, then revokes ticket if client cancelled mid-issue!
+        let slowDelegate = MockControlDelegate(snapshot: snap)
+        await slowDelegate.setIssueDelay(nanoseconds: 150_000_000)
+        await slowDelegate.setAuthorized(deviceId: "slow-dev", fingerprint: certAFp)
+        let slowCoord = PairingCoordinator(timeout: 5.0, cooldownDuration: 0.0, autoAllowedFingerprints: [certAFp])
+        let slowRouter = ControlProtocolRouter(pairingCoordinator: slowCoord, delegate: slowDelegate)
+        let cancelDuringIssue = Task {
+            await slowRouter.handle(HTTPRequest(
+                method: "POST", rawTarget: "/depth3d/v1/pair",
+                body: Data("{\"device\":\"PICO\",\"deviceId\":\"slow-dev\",\"pin\":\"1234\",\"streamPaired\":false}".utf8),
+                peerCertificateDER: sampleCertA, remoteAddress: "192.168.1.211"
+            ))
+        }
+        try await Task.sleep(nanoseconds: 40_000_000)
+        cancelDuringIssue.cancel()
+        let cancelIssueResp = await cancelDuringIssue.value
+        XCTAssertEqual(cancelIssueResp.statusCode, 403)
+        let sawCancelInsideIssue = await slowDelegate.getSawTaskCancelledDuringIssue()
+        XCTAssertFalse(sawCancelInsideIssue, "Round-6 #1: issueApprovedPairingTicket must run inside uncancellable Task")
+        let revoked = await slowDelegate.getRevokedTickets()
+        XCTAssertEqual(revoked.count, 1, "Round-6 #1: Ticket issued for already-disconnected request must be revoked immediately")
+
+        // 8. Round-6 minor: 410 ticket_expired on `/pair/complete` MUST NOT cancel pending engine pairings on that IP!
+        await slowDelegate.clearCancelledIPs()
+        let expiredComplete = await slowRouter.handle(HTTPRequest(
+            method: "POST", rawTarget: "/depth3d/v1/pair/complete",
+            body: Data("{\"ticket\":\"already-consumed-ticket\"}".utf8),
+            peerCertificateDER: sampleCertA, remoteAddress: "192.168.1.212"
+        ))
+        XCTAssertEqual(expiredComplete.statusCode, 410)
+        let cancelledAfter410 = await slowDelegate.getCancelledIPs()
+        XCTAssertFalse(cancelledAfter410.contains("192.168.1.212"), "Round-6 minor: 410 on /pair/complete must not cancel active pairing session on that IP")
     }
 
     /// P3 + B-1: `/depth3d/v1/media` authenticates strictly by TLS client certificate fingerprint,
@@ -576,7 +666,14 @@ final class ControlProtocolTests: XCTestCase {
         }
         XCTAssertNotEqual(v6RC, 0, "S-3: ControlHTTPSServer must bind IPv4-only")
 
-        // 2. B-1: Client disconnects while confirmation prompt is open -> prompt MUST close immediately & issue NO ticket!
+        // 1b. Round-6 minor: Client half-closing its write side (`SHUT_WR`) right after sending `/info`
+        //     MUST still receive the full HTTP 200 response (disconnect monitor is ONLY for `/pair`)!
+        let halfCloseResponse = try sendHTTPSGetAndHalfCloseWrite(port: port, path: "/depth3d/v1/info")
+        XCTAssertTrue(halfCloseResponse.hasPrefix("HTTP/1.1 200 OK"), "Half-closed /info must still return 200, got: \(halfCloseResponse)")
+        XCTAssertTrue(halfCloseResponse.contains("\"v\":1"))
+
+        // 2. B-1 + Round-6 #3: Client disconnects while confirmation prompt is open -> prompt MUST close
+        //    immediately & issue NO ticket! Uses ProcessExitWaiter (terminationHandler + timeout, never waitUntilExit).
         let ticketsBeforeDisconnect = await delegate.getIssuedTicketCount()
         let disconnectProc = Process()
         disconnectProc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
@@ -589,6 +686,7 @@ final class ControlProtocolTests: XCTestCase {
         ]
         disconnectProc.standardOutput = FileHandle.nullDevice
         disconnectProc.standardError = FileHandle.nullDevice
+        let disconnectWaiter = ProcessExitWaiter(process: disconnectProc)
         try disconnectProc.run()
 
         // Wait until confirmation prompt opens
@@ -603,9 +701,9 @@ final class ControlProtocolTests: XCTestCase {
         }
         XCTAssertTrue(promptOpened, "Confirmation prompt should open for dropping client")
 
-        // Kill client (TCP FIN/RST) while prompt is still waiting!
-        disconnectProc.terminate()
-        disconnectProc.waitUntilExit()
+        // Kill client (TCP FIN/RST) while prompt is still waiting, waiting via terminationHandler + timeout!
+        let exitedCleanly = await disconnectWaiter.terminateAndWaitAsync(timeout: 3.0)
+        XCTAssertTrue(exitedCleanly, "disconnectProc should exit cleanly within timeout")
 
         // Prompt MUST dismiss promptly (well before 20s timeout!) and NO ticket may be issued!
         var promptDismissed = false
@@ -621,7 +719,7 @@ final class ControlProtocolTests: XCTestCase {
         let ticketsAfterDisconnect = await delegate.getIssuedTicketCount()
         XCTAssertEqual(ticketsAfterDisconnect, ticketsBeforeDisconnect, "B-1: Disconnected request must NEVER issue a ticket")
 
-        // 3. S-5: Unknown self-signed cert is still rate-limited; paired cert is exempt
+        // 3. S-5 + Round-6 #5: Unknown self-signed cert is rate-limited with 429 {"error":"busy","retryAfterSec":...}; paired cert is exempt
         let rlServer = ControlHTTPSServer(
             identity: serverId.secIdentity,
             router: router,
@@ -635,13 +733,17 @@ final class ControlProtocolTests: XCTestCase {
         defer { rlServer.stop() }
         XCTAssertEqual(runCurl(["-sk", "--max-time", "3", "--cert", unknownCert.path, "--key", unknownKey.path, "https://127.0.0.1:\(rlPort)/depth3d/v1/info"]).0, 200)
         XCTAssertEqual(runCurl(["-sk", "--max-time", "3", "--cert", unknownCert.path, "--key", unknownKey.path, "https://127.0.0.1:\(rlPort)/depth3d/v1/info"]).0, 200)
-        XCTAssertEqual(runCurl(["-sk", "--max-time", "3", "--cert", unknownCert.path, "--key", unknownKey.path, "https://127.0.0.1:\(rlPort)/depth3d/v1/info"]).0, 429)
+        let (rlCode, rlBody) = runCurl(["-sk", "--max-time", "3", "--cert", unknownCert.path, "--key", unknownKey.path, "https://127.0.0.1:\(rlPort)/depth3d/v1/info"])
+        XCTAssertEqual(rlCode, 429)
+        let rlJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(rlBody.utf8)) as? [String: Any])
+        XCTAssertEqual(rlJSON["error"] as? String, "busy")
+        XCTAssertNotNil(rlJSON["retryAfterSec"] as? Int)
         XCTAssertEqual(runCurl(["-sk", "--max-time", "3", "--cert", pairedCert.path, "--key", pairedKey.path, "https://127.0.0.1:\(rlPort)/depth3d/v1/media"]).0, 200)
 
-        // 4. Round-5 #2: Reserved paired-cert connection slots!
+        // 4. Round-5 #2 + Round-6 #5: Reserved paired-cert connection slots!
         //    maxConnections=4, reservedPairedSlots=2 => unauthCeiling=2.
-        //    Fill 2 unauthenticated slots with raw idle TCP connections -> 3rd unauth `/info` gets 503,
-        //    while paired client cert `/media` STILL gets 200 using a reserved slot!
+        //    Fill 2 unauthenticated slots with raw idle TCP connections -> 3rd unauth `/info` gets 429 {"error":"busy","retryAfterSec":...}
+        //    (NEVER 503, which is reserved for stream_not_ready), while paired client cert `/media` STILL gets 200!
         let resServer = ControlHTTPSServer(
             identity: serverId.secIdentity,
             router: router,
@@ -662,13 +764,16 @@ final class ControlProtocolTests: XCTestCase {
         defer { Darwin.close(u1); Darwin.close(u2) }
         try await Task.sleep(nanoseconds: 150_000_000)
 
-        // 3rd unauthenticated client hits the reserved zone -> 503!
-        let (unauthOverCode, _) = runCurl([
+        // 3rd unauthenticated client hits the reserved zone -> 429 {"error":"busy","retryAfterSec":...}!
+        let (unauthOverCode, unauthOverBody) = runCurl([
             "-sk", "--max-time", "3",
             "--cert", unknownCert.path, "--key", unknownKey.path,
             "https://127.0.0.1:\(resPort)/depth3d/v1/info"
         ])
-        XCTAssertEqual(unauthOverCode, 503, "Round-5 #2: Unauthenticated client must be rejected when only reserved paired slots remain")
+        XCTAssertEqual(unauthOverCode, 429, "Round-6 #5: Reserved-slot rejection must return 429 busy (not 503)")
+        let overJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(unauthOverBody.utf8)) as? [String: Any])
+        XCTAssertEqual(overJSON["error"] as? String, "busy")
+        XCTAssertGreaterThanOrEqual(overJSON["retryAfterSec"] as? Int ?? 0, 1)
 
         // Bound-fingerprint paired client STILL succeeds with 200 via reserved paired slot!
         let (pairedReservedCode, _) = runCurl([
@@ -940,17 +1045,16 @@ final class ControlProtocolTests: XCTestCase {
         let tmpIn = FileManager.default.temporaryDirectory.appendingPathComponent("tls-cv-\(UUID().uuidString).bin")
         try data.write(to: tmpIn)
         defer { try? FileManager.default.removeItem(at: tmpIn) }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/openssl")
-        p.arguments = ["dgst", "-sha256", "-sign", keyURL.path, tmpIn.path]
-        let out = Pipe()
-        p.standardOutput = out
-        p.standardError = FileHandle.nullDevice
-        try p.run()
-        let sig = out.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        XCTAssertEqual(p.terminationStatus, 0)
-        return sig
+        let res = try TestProcessRunner.run(
+            executable: "/usr/bin/openssl",
+            arguments: ["dgst", "-sha256", "-sign", keyURL.path, tmpIn.path],
+            captureStdout: true,
+            captureStderr: false,
+            timeout: 10.0
+        )
+        XCTAssertFalse(res.timedOut)
+        XCTAssertEqual(res.exitCode, 0)
+        return res.stdout
     }
 
     private func wrapHandshake(type: UInt8, body: Data) -> Data {
@@ -1026,35 +1130,97 @@ final class ControlProtocolTests: XCTestCase {
         return Data(base64Encoded: b64)
     }
 
+    private func sendHTTPSGetAndHalfCloseWrite(port: UInt16, path: String) throws -> String {
+        try performHalfCloseHTTPSGet(port: port, path: path)
+    }
+
+    @available(macOS, deprecated: 10.15)
+    private func performHalfCloseHTTPSGet(port: UInt16, path: String) throws -> String {
+        let fd = connectLoopback(port: port)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { Darwin.close(fd) }
+        var tv = timeval(tv_sec: 4, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        let ctx = try XCTUnwrap(SSLCreateContext(kCFAllocatorDefault, .clientSide, .streamType))
+        let fdBox = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
+        fdBox.initialize(to: fd)
+        defer { fdBox.deinitialize(count: 1); fdBox.deallocate() }
+
+        SSLSetIOFuncs(ctx, { conn, data, lenPtr in
+            let s = conn.assumingMemoryBound(to: Int32.self).pointee
+            let wanted = lenPtr.pointee
+            var total = 0
+            while total < wanted {
+                let n = Darwin.recv(s, data.advanced(by: total), wanted - total, 0)
+                if n > 0 { total += n }
+                else if n == 0 { lenPtr.pointee = total; return errSSLClosedGraceful }
+                else if errno == EINTR { continue }
+                else { lenPtr.pointee = total; return errSSLClosedAbort }
+            }
+            lenPtr.pointee = total
+            return noErr
+        }, { conn, data, lenPtr in
+            let s = conn.assumingMemoryBound(to: Int32.self).pointee
+            let wanted = lenPtr.pointee
+            var total = 0
+            while total < wanted {
+                let n = Darwin.send(s, data.advanced(by: total), wanted - total, 0)
+                if n > 0 { total += n }
+                else if n < 0 && errno == EINTR { continue }
+                else { lenPtr.pointee = total; return errSSLClosedAbort }
+            }
+            lenPtr.pointee = total
+            return noErr
+        })
+        SSLSetConnection(ctx, fdBox)
+        SSLSetProtocolVersionMin(ctx, .tlsProtocol12)
+        SSLSetSessionOption(ctx, .breakOnServerAuth, true)
+
+        var hs = SSLHandshake(ctx)
+        while hs == errSSLPeerAuthCompleted || hs == errSSLWouldBlock {
+            hs = SSLHandshake(ctx)
+        }
+        XCTAssertEqual(hs, noErr)
+
+        let req = Data("GET \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".utf8)
+        req.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var written = 0
+            _ = SSLWrite(ctx, base, req.count, &written)
+        }
+        // Half-close TCP write end immediately after sending request!
+        _ = Darwin.shutdown(fd, SHUT_WR)
+
+        var response = Data()
+        var buf = [UInt8](repeating: 0, count: 4096)
+        while true {
+            var readCount = 0
+            let st = SSLRead(ctx, &buf, buf.count, &readCount)
+            if readCount > 0 { response.append(buf, count: readCount) }
+            if st != noErr && st != errSSLWouldBlock { break }
+        }
+        return String(decoding: response, as: UTF8.self)
+    }
+
     private func generateSelfSignedCert(keyURL: URL, certURL: URL, cn: String) throws {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/openssl")
-        proc.arguments = [
-            "req", "-x509", "-newkey", "rsa:2048",
-            "-keyout", keyURL.path, "-out", certURL.path,
-            "-days", "1", "-nodes", "-subj", "/CN=\(cn)"
-        ]
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
-        try proc.run()
-        proc.waitUntilExit()
-        XCTAssertEqual(proc.terminationStatus, 0)
+        let res = try TestProcessRunner.run(
+            executable: "/usr/bin/openssl",
+            arguments: [
+                "req", "-x509", "-newkey", "rsa:2048",
+                "-keyout", keyURL.path, "-out", certURL.path,
+                "-days", "1", "-nodes", "-subj", "/CN=\(cn)"
+            ],
+            captureStdout: false,
+            captureStderr: false,
+            timeout: 15.0
+        )
+        XCTAssertFalse(res.timedOut)
+        XCTAssertEqual(res.exitCode, 0)
     }
 
     private func runCurl(_ args: [String]) -> (Int, String) {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-        p.arguments = ["--noproxy", "*"] + args + ["-w", "\n%{http_code}"]
-        let out = Pipe()
-        p.standardOutput = out
-        p.standardError = FileHandle.nullDevice
-        try? p.run()
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        let raw = String(data: data, encoding: .utf8) ?? ""
-        let lines = raw.components(separatedBy: "\n")
-        let code = Int(lines.last ?? "") ?? 0
-        let body = lines.dropLast().joined(separator: "\n")
-        return (code, body)
+        TestProcessRunner.runCurl(args, timeout: 15.0)
     }
 }

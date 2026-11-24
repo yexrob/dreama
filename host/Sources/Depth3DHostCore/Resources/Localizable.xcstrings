@@ -1311,6 +1311,16 @@
         }
       }
     },
+    "protocol.stream.cleanup_failed": {
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "清理旧配对记录失败，请稍后重试"
+          }
+        }
+      }
+    },
     "protocol.stream.unavailable": {
       "localizations": {
         "zh-Hans": {

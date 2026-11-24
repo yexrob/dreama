@@ -517,19 +517,6 @@ final class WebDAVTests: XCTestCase {
     }
 
     private func curl(_ args: [String]) -> (Int, String) {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-        p.arguments = ["--noproxy", "*", "--max-time", "15"] + args + ["-w", "\n%{http_code}"]
-        let out = Pipe()
-        p.standardOutput = out
-        p.standardError = FileHandle.nullDevice
-        try? p.run()
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        let raw = String(data: data, encoding: .utf8) ?? ""
-        let lines = raw.components(separatedBy: "\n")
-        let code = Int(lines.last ?? "") ?? 0
-        let body = lines.dropLast().joined(separator: "\n")
-        return (code, body)
+        TestProcessRunner.runCurl(["--max-time", "15"] + args, timeout: 20.0)
     }
 }

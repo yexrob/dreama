@@ -105,6 +105,11 @@ public final class EngineSupervisor: @unchecked Sendable {
     private var onActiveSessionCountChanged: (@Sendable (Int) -> Void)?
     private var lastReportedSessionCount = 0
 
+    /// Deterministic test hook invoked on `queue` immediately after `try proc.run()` and BEFORE
+    /// `activeLaunch` / `ledger` registration, allowing tests to inject a concurrent `stop()` in
+    /// that exact race window and verify serialization prevents process leaks.
+    internal var onAfterProcessRunForTesting: (() -> Void)?
+
     public init(
         paths: HostPaths,
         adminCredentials: EngineAdminCredentials,
@@ -369,6 +374,7 @@ public final class EngineSupervisor: @unchecked Sendable {
 
         do {
             try proc.run()
+            onAfterProcessRunForTesting?()
             let topPID = proc.processIdentifier
             let realChildPID: Int32
             if usedGuard {
