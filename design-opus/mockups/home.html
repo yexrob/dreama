@@ -1,0 +1,257 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>depth3d · 首页播放墙</title><style>/* ===== depth3d design-opus · shared base (identical in every mockup) ===== */
+:root{
+  --bg:#0E0F12;          /* 面板底色 */
+  --surface:#17191D;     /* 卡片、列表行、骨架 */
+  --surface-hi:#202328;  /* 悬停时的行底 */
+  --sheet:#1A1C20;       /* 弹层 */
+  --fill:rgba(255,255,255,.10);
+  --fill-hi:rgba(255,255,255,.18);
+  --sel:rgba(255,255,255,.20);
+  --text:#ECECEE;        /* 16.2:1 */
+  --text-2:#A6A9B0;      /* 8.1:1 */
+  --text-3:#7D818A;      /* 4.9:1，只用于禁用 */
+  --accent:#E3A857;      /* 进度与「已开启」 */
+  --danger:#EE8577;
+  --r-xl:28px; --r:16px; --m:64px;
+  --ease:cubic-bezier(.2,.8,.2,1);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+[hidden]{display:none!important}
+html,body{width:100%;height:100%;overflow:hidden;background:#0a0a0b}
+body{font-family:"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",system-ui,sans-serif;
+  color:var(--text);-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums}
+.canvas{position:absolute;left:0;top:0;width:1600px;height:1000px;overflow:hidden;transform-origin:0 0}
+.abs{position:absolute}
+.ic{width:28px;height:28px;flex:none;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+
+/* ---------- 透视房间（示意，不是设计的一部分） ---------- */
+.room{position:absolute;inset:0;overflow:hidden;filter:saturate(.55) blur(1.2px)}
+.room i{position:absolute;display:block}
+.room .wall{inset:0;background:linear-gradient(180deg,#b9b2a7 0%,#c8c1b6 30%,#bfb7ab 75%,#b2a99c 100%)}
+.room .spill{left:-200px;top:0;width:900px;height:1000px;background:radial-gradient(ellipse at 20% 45%,rgba(255,252,244,.55),rgba(255,252,244,0) 60%)}
+.room .ceil{left:0;right:0;top:0;height:46px;background:#d6d0c6}
+.room .win{left:30px;top:120px;width:300px;height:600px;background:linear-gradient(180deg,#f4f6f5,#e2e8e7 70%,#cdd8cf);border:14px solid #e4dfd6}
+.room .win::before{content:"";position:absolute;left:50%;top:0;bottom:0;width:10px;margin-left:-5px;background:#e4dfd6}
+.room .win::after{content:"";position:absolute;left:0;right:0;top:46%;height:10px;background:#e4dfd6}
+.room .tree{left:50px;top:470px;width:240px;height:220px;border-radius:50% 50% 10% 10%;background:#9fb19a;opacity:.6;filter:blur(8px)}
+.room .curtain{left:330px;top:100px;width:70px;height:700px;background:linear-gradient(90deg,#d8d0c2,#c9c0b1 60%,#d3cbbd)}
+.room .floor{left:0;right:0;top:820px;bottom:0;background:linear-gradient(180deg,#958a7c,#7f7568)}
+.room .base{left:0;right:0;top:812px;height:10px;background:#ddd6cb}
+.room .shelf{left:1360px;top:250px;width:220px;height:570px;background:#8f8273}
+.room .shelf b{position:absolute;left:12px;right:12px;height:8px;background:#a99b8a}
+.room .books{position:absolute;left:18px;height:70px;display:flex;gap:4px;align-items:flex-end}
+.room .books u{display:block;width:16px;text-decoration:none}
+.room .lamp{left:1250px;top:560px;width:6px;height:260px;background:#55504a}
+.room .shade{left:1210px;top:500px;width:86px;height:70px;border-radius:8px 8px 2px 2px;background:#efe7d8}
+.room .plant{left:70px;top:740px;width:150px;height:150px;border-radius:50%;background:#6f7d60}
+.room .pot{left:105px;top:860px;width:80px;height:90px;border-radius:6px;background:#5d554c}
+.room .sofa{left:420px;top:900px;width:760px;height:140px;border-radius:30px 30px 0 0;background:#6b665f}
+.grain{position:absolute;inset:0;opacity:.10;mix-blend-mode:overlay;pointer-events:none}
+
+/* ---------- 面板外壳 ---------- */
+.stage{position:absolute;left:160px;top:130px;width:1280px;height:720px}
+.panel{position:absolute;inset:0;border-radius:var(--r-xl);background:var(--bg);overflow:hidden;
+  box-shadow:0 24px 70px rgba(30,24,16,.35)}
+.handle{position:absolute;left:570px;top:744px;width:140px;height:10px;border-radius:5px;background:rgba(255,255,255,.75)}
+
+/* ---------- 标注（不是设计的一部分） ---------- */
+.anno{position:absolute;z-index:100;font:500 15px/1.45 "SF Mono",Menlo,monospace;color:#f2f2f2;background:rgba(18,18,20,.78);
+  border-radius:8px;padding:6px 10px;letter-spacing:0}
+.anno b{font-weight:600;color:#fff}
+.anno.t{left:20px;top:18px;max-width:900px}
+.anno.t span{color:#b9b9b9}
+.anno.home{right:20px;top:18px;text-decoration:none}
+.anno.st{left:20px;bottom:18px;display:flex;gap:4px;align-items:center}
+.anno.st a{color:#d0d0d0;text-decoration:none;padding:2px 8px;border-radius:5px}
+.anno.st a.on{background:#f2f2f2;color:#111}
+.anno.note{right:20px;bottom:18px;max-width:640px;text-align:right}
+
+/* ---------- 字号阶梯 ---------- */
+.t-display{font-size:64px;line-height:1.1;font-weight:600}
+.t-title{font-size:44px;line-height:1.2;font-weight:600}
+.t-head{font-size:32px;line-height:1.3;font-weight:600}
+.t-body{font-size:28px;line-height:1.5;font-weight:400}
+.t-cap{font-size:24px;line-height:1.4;font-weight:500}
+.c2{color:var(--text-2)} .c3{color:var(--text-3)} .ca{color:var(--accent)} .cd{color:var(--danger)}
+.one{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ---------- 顶部导航 ---------- */
+.nav{position:absolute;left:0;right:0;top:0;height:96px;padding:0 var(--m);display:flex;align-items:center;gap:8px;z-index:10}
+.nav.solid{background:var(--bg)}
+.tab{height:60px;padding:0 26px;border-radius:30px;display:inline-flex;align-items:center;font-size:28px;font-weight:500;color:var(--text-2);white-space:nowrap}
+.tab.sel{background:var(--sel);color:var(--text);font-weight:600}
+.tab:not(.sel):hover,.tab.is-hover{background:var(--fill);color:var(--text)}
+.nav-r{margin-left:auto;display:flex;gap:16px}
+.ibtn{width:64px;height:64px;border-radius:50%;display:inline-grid;place-items:center;color:var(--text);flex:none;transition:transform .12s var(--ease),background .12s}
+.ibtn .ic{width:30px;height:30px}
+.ibtn.bg{background:var(--fill)}
+.ibtn.sel{background:var(--sel)}
+.ibtn:hover,.ibtn.is-hover{background:var(--fill-hi);transform:scale(1.06)}
+
+/* ---------- 按钮 ---------- */
+.btn{height:64px;padding:0 32px;border-radius:var(--r);display:inline-flex;align-items:center;justify-content:center;gap:12px;
+  font-size:28px;font-weight:600;color:var(--text);background:var(--fill);white-space:nowrap;flex:none;
+  transition:transform .12s var(--ease),background .12s}
+.btn .ic{width:28px;height:28px}
+.btn.primary{background:var(--text);color:#0E0F12}
+.btn.ghost{background:transparent;color:var(--text-2)}
+.btn.sm{height:60px;padding:0 24px;font-size:24px}
+.btn.sm .ic{width:24px;height:24px}
+.btn:hover,.btn.is-hover{transform:scale(1.04);background:var(--fill-hi)}
+.btn.primary:hover,.btn.primary.is-hover{background:#fff}
+.btn.ghost:hover,.btn.ghost.is-hover{background:var(--fill);color:var(--text)}
+.btn.off{opacity:.45}
+.btns{display:flex;gap:16px;align-items:center}
+
+/* ---------- 分段选择 / 开关 ---------- */
+.seg{display:inline-flex;gap:4px;flex:none}
+.seg span{height:60px;min-width:92px;padding:0 22px;border-radius:14px;display:inline-flex;align-items:center;justify-content:center;
+  font-size:24px;font-weight:500;color:var(--text-2);white-space:nowrap}
+.seg span.sel{background:var(--sel);color:var(--text);font-weight:600}
+.seg span:not(.sel):hover,.seg span.is-hover{background:var(--fill);color:var(--text)}
+.tog{width:76px;height:44px;border-radius:22px;background:rgba(255,255,255,.18);position:relative;flex:none}
+.tog::after{content:"";position:absolute;left:5px;top:5px;width:34px;height:34px;border-radius:50%;background:#B9BCC2}
+.tog.on{background:var(--accent)}
+.tog.on::after{left:37px;background:#fff}
+
+/* ---------- 列表行 ---------- */
+.list{display:flex;flex-direction:column;gap:8px}
+.row{display:flex;align-items:center;gap:24px;min-height:88px;padding:0 24px;border-radius:var(--r);transition:background .12s}
+.row:hover,.row.is-hover{background:var(--surface-hi)}
+.row.sel{background:var(--sel)}
+.row .lead{width:36px;height:36px;color:var(--text-2)}
+.row.sel .lead{color:var(--text)}
+.row .main{flex:1;min-width:0}
+.row .label{font-size:28px;line-height:1.3;font-weight:500}
+.row .sub{font-size:24px;line-height:1.35;font-weight:500;color:var(--text-2);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row .val{font-size:24px;font-weight:500;color:var(--text-2);display:flex;align-items:center;gap:6px;white-space:nowrap}
+.row .val .ic{width:24px;height:24px}
+
+/* ---------- 海报与卡片 ---------- */
+.shelf-row{position:absolute;left:var(--m);display:flex;gap:24px}
+.sec-title{position:absolute;left:var(--m);display:flex;align-items:center;gap:6px;font-size:32px;line-height:1.3;font-weight:600}
+.sec-title .ic{width:28px;height:28px;color:var(--text-2)}
+.poster{position:relative;width:168px;height:252px;border-radius:14px;overflow:hidden;flex:none;transition:transform .14s var(--ease),box-shadow .14s}
+.poster.lg{width:176px;height:264px}
+.poster .pt{position:absolute;left:14px;right:14px;bottom:18px;font-size:26px;line-height:1.2;font-weight:600;color:#F4F2EE;letter-spacing:.02em;z-index:2}
+.poster .pt.top{top:18px;bottom:auto}
+.poster .pt.v{writing-mode:vertical-rl;left:auto;right:16px;top:20px;bottom:auto;letter-spacing:.16em;font-size:28px}
+.poster .pt.dk{color:#1D2024}
+.poster:hover,.poster.is-hover,.card:hover .img,.card.is-hover .img,.tile:hover,.tile.is-hover{transform:scale(1.06);box-shadow:0 18px 44px rgba(0,0,0,.6)}
+.poster.dim,.card.dim{opacity:.4}
+.card{position:relative;width:264px;flex:none}
+.card .img{position:relative;width:100%;aspect-ratio:16/9;border-radius:14px;overflow:hidden;transition:transform .14s var(--ease),box-shadow .14s}
+.prog{position:absolute;left:14px;right:14px;bottom:12px;height:6px;border-radius:3px;background:rgba(14,15,18,.6);z-index:3}
+.prog b{display:block;height:100%;border-radius:3px;background:var(--accent)}
+.card .cap{margin-top:14px;font-size:24px;line-height:1.4;font-weight:500;display:flex;gap:12px;white-space:nowrap}
+.card .cap .tt{font-weight:600;overflow:hidden;text-overflow:ellipsis}
+.card .cap .mt{color:var(--text-2);margin-left:auto}
+.card .cap .mt.l{margin-left:0}
+.playglyph{position:absolute;left:50%;top:50%;width:64px;height:64px;margin:-32px 0 0 -32px;border-radius:50%;background:rgba(236,236,238,.92);
+  display:grid;place-items:center;color:#0E0F12;z-index:3}
+.playglyph .ic{width:28px;height:28px;margin-left:3px}
+.tile{position:relative;border-radius:var(--r);overflow:hidden;transition:transform .14s var(--ease),box-shadow .14s}
+
+/* ---------- 遮罩（仅用在图片上，保证文字可读） ---------- */
+.scrim-l{position:absolute;inset:0;background:linear-gradient(90deg,rgba(14,15,18,.88) 0%,rgba(14,15,18,.62) 34%,rgba(14,15,18,0) 66%)}
+.scrim-b{position:absolute;left:0;right:0;bottom:0;height:46%;background:linear-gradient(180deg,rgba(14,15,18,0),#0E0F12)}
+.scrim-t{position:absolute;left:0;right:0;top:0;height:170px;background:linear-gradient(180deg,rgba(14,15,18,.62),rgba(14,15,18,0))}
+.tile .shade{position:absolute;inset:0;background:linear-gradient(180deg,rgba(14,15,18,0) 35%,rgba(14,15,18,.78))}
+
+/* ---------- 骨架 / 弹层 / 光标 ---------- */
+.sk{background:var(--surface);border-radius:12px;animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.55}}
+.spin{animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.breath{width:14px;height:14px;border-radius:50%;background:var(--text-2);flex:none;animation:breath 2.4s ease-in-out infinite}
+@keyframes breath{50%{opacity:.35}}
+.scrim{position:absolute;inset:0;background:rgba(8,9,11,.66);z-index:30}
+.sheet{position:absolute;z-index:31;background:var(--sheet);border-radius:var(--r-xl);padding:40px 48px;box-shadow:0 30px 80px rgba(0,0,0,.5)}
+.cursor{position:absolute;width:22px;height:22px;margin:-11px 0 0 -11px;border-radius:50%;background:#fff;box-shadow:0 0 0 3px rgba(0,0,0,.45),0 2px 8px rgba(0,0,0,.4);z-index:60;pointer-events:none}
+.back{position:absolute;left:var(--m);top:32px;z-index:12}
+.notice{display:flex;align-items:center;gap:12px;font-size:24px;font-weight:500}
+.notice .ic{width:26px;height:26px}
+
+/* ---------- 画面占位（内容，不是界面） ---------- */
+.scene{position:absolute;inset:0;overflow:hidden}
+.scene i{position:absolute;display:block}
+.sc-harbor{background:linear-gradient(180deg,#4d5b63 0%,#7c898d 38%,#a1a9a8 57%,#55626a 57.4%,#3a454b 100%)}
+.sc-harbor .fog{left:0;right:0;top:38%;height:30%;background:linear-gradient(180deg,rgba(214,220,219,0),rgba(214,220,219,.45) 50%,rgba(214,220,219,0))}
+.sc-harbor .pier{left:54%;width:46%;top:55%;height:3%;background:#2a3438}
+.sc-harbor .post{left:90%;top:47%;width:.9%;height:9%;background:#2a3438}
+.sc-harbor .crane{left:68%;top:22%;width:1.2%;height:35.6%;background:#2d373b}
+.sc-harbor .arm{left:60%;top:22%;width:20%;height:1.3%;background:#2d373b}
+.sc-harbor .cab{left:67%;top:22%;width:3.4%;height:4%;background:#2d373b}
+.sc-harbor .lamp{left:90.05%;top:45.5%;width:.8%;aspect-ratio:1;border-radius:50%;background:#efc583}
+.sc-harbor .ref{left:86%;top:60%;width:9%;height:.6%;background:rgba(239,197,131,.35)}
+.sc-tide{background:linear-gradient(180deg,#1e3245 0%,#4c677d 40%,#c2ae94 57%)}
+.sc-tide .sun{left:63%;top:48%;width:9%;aspect-ratio:1;border-radius:50%;background:#efd3a6}
+.sc-tide .sea{left:0;right:0;top:57%;bottom:0;background:linear-gradient(180deg,#36566c,#20384a 45%,#182b39)}
+.sc-tide .w{left:0;right:0;height:.6%;background:rgba(255,255,255,.12)}
+.sc-night{background:linear-gradient(180deg,#0b1222 0%,#1a2440 58%,#090d15 58%)}
+.sc-night .lights{left:0;right:0;top:55.6%;height:1.4%;background:repeating-linear-gradient(90deg,rgba(242,205,140,.85) 0 .7%,transparent .7% 2.6%)}
+.sc-night .moon{left:72%;top:14%;width:7%;aspect-ratio:1;border-radius:50%;background:#d6dbe5;opacity:.85}
+.sc-night .bl{bottom:42%;background:#0f1729}
+.sc-summer{background:linear-gradient(180deg,#e8cc95 0%,#dcab69 54%,#8a8240 54.3%,#59592a 100%)}
+.sc-summer .sun{left:24%;top:24%;width:12%;aspect-ratio:1;border-radius:50%;background:#f8e8c0}
+.sc-summer .tree{left:68%;top:38%;width:10%;height:17%;background:#4b4b23;border-radius:50% 50% 10% 10%}
+.sc-train{background:linear-gradient(180deg,#9cab92 0%,#cfd0b2 48%,#66734d 48.3%,#3e4732 100%)}
+.sc-train .rails{left:0;right:0;top:48.3%;bottom:0;background:#30362a;clip-path:polygon(48% 0,52% 0,78% 100%,22% 100%)}
+.sc-train .pole{left:30%;top:22%;width:1%;height:27%;background:#4a5140}
+.sc-train .wire{left:0;right:0;top:25%;height:.5%;background:#4a5140}
+.sc-glass{background:linear-gradient(180deg,#9bb0bd 0%,#d9e2e6 72%,#c3ccd1 100%)}
+.sc-glass .b{bottom:0;background:#6a808f}
+.sc-dusk{background:linear-gradient(180deg,#252a4b 0%,#7b4e67 46%,#d6925f 68%,#e7b27a 78%)}
+.sc-dusk .m1{left:0;right:0;bottom:0;height:46%;background:#2a2c48;clip-path:polygon(0 55%,16% 22%,30% 46%,50% 8%,68% 42%,84% 26%,100% 50%,100% 100%,0 100%)}
+.sc-dusk .m2{left:0;right:0;bottom:0;height:26%;background:#16182a;clip-path:polygon(0 40%,24% 10%,46% 46%,70% 18%,100% 52%,100% 100%,0 100%)}
+.sc-dusk .fire{left:44%;bottom:13%;width:1.2%;aspect-ratio:1;border-radius:50%;background:#f3c27c}
+.sc-echo{background:radial-gradient(circle at 50% 62%,#6a4470 0 7%,#52325a 7% 15%,#43284b 15% 25%,#36203e 25% 37%,#2a1830 37% 52%,#211327 52%)}
+.sc-shift{background:linear-gradient(180deg,#13221e,#0d1714)}
+.sc-shift .win{left:56%;top:30%;width:16%;height:22%;background:#e6d6a5}
+.sc-shift .win2{left:20%;top:30%;width:16%;height:22%;background:#1c2e29}
+.sc-shift .fig{left:61%;top:38%;width:4%;height:14%;border-radius:40% 40% 0 0;background:#2a2a20}
+.sc-rust{background:linear-gradient(180deg,#5a2e22 0%,#a5573b 54%,#6b3524 54.3%,#3b1e16 100%)}
+.sc-rust .pyl{top:36%;width:.8%;height:19%;background:#2b1610}
+.sc-salt{background:linear-gradient(180deg,#e9e4da 0%,#dcd6ca 58%,#c7bfb0 58.3%,#b8af9f 100%)}
+.sc-salt .fig{left:62%;top:50%;width:1.6%;height:8.4%;border-radius:40% 40% 0 0;background:#2d2a26}
+.sc-salt .line{left:0;right:0;top:58%;height:.5%;background:#a59b8a}
+.sc-snow{background:linear-gradient(180deg,#c5ced5 0%,#eef1f2 56%,#e0e6e9 100%)}
+.sc-snow .t{bottom:30%;width:1.2%;background:#3d4448}
+.sc-snow .gnd{left:0;right:0;bottom:0;height:30%;background:#f3f5f6}
+.qr{background:#fff;border-radius:18px;padding:16px;flex:none;align-self:flex-start}
+.qr svg{display:block}
+
+.opt{position:relative;background:var(--surface);border-radius:20px;padding:32px;transition:transform .14s var(--ease),background .14s}
+.opt:hover,.opt.is-hover{background:var(--surface-hi);transform:scale(1.03)}
+.opt.on{background:var(--sel)}
+.opt .lead{width:40px;height:40px;color:var(--text-2)}
+.opt .chk{position:absolute;right:28px;top:28px;width:40px;height:40px;border-radius:50%;box-shadow:inset 0 0 0 2.5px rgba(255,255,255,.35);display:grid;place-items:center}
+.opt.on .chk{background:var(--text);box-shadow:none;color:#0E0F12}
+.opt .chk .ic{width:24px;height:24px;stroke-width:3}
+.vbtn{flex:1;height:96px;padding:0 22px;border-radius:16px;background:rgba(255,255,255,.08);display:flex;flex-direction:column;justify-content:center;min-width:0;transition:transform .12s var(--ease),background .12s}
+.vbtn:hover,.vbtn.is-hover{background:var(--fill-hi);transform:scale(1.03)}
+.vbtn .v{font-size:28px;line-height:1.3;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pbar{height:6px;border-radius:3px;background:rgba(255,255,255,.22);flex:none}
+.pbar b{display:block;height:100%;border-radius:3px;background:var(--accent)}
+.dots{position:absolute;left:0;right:0;top:44px;display:flex;justify-content:center;gap:10px}
+.dots i{display:block;width:10px;height:10px;border-radius:5px;background:rgba(255,255,255,.28)}
+.dots i.on{width:30px;background:var(--text)}
+.pc{width:368px;height:96px;padding:0 24px;border-radius:var(--r);background:var(--surface);display:flex;align-items:center;gap:20px;transition:transform .14s var(--ease),background .14s}
+.pc:hover,.pc.is-hover{background:var(--surface-hi);transform:scale(1.03)}
+.pc .lead{width:36px;height:36px;color:var(--text-2)}
+.typ{height:132px;border-radius:var(--r);background:var(--surface);display:flex;flex-direction:column;justify-content:center;align-items:center;gap:14px;font-size:24px;font-weight:500}
+.typ:hover,.typ.is-hover{background:var(--surface-hi);transform:scale(1.04)}
+.typ .ic{width:36px;height:36px;color:var(--text-2)}
+.row.c{min-height:72px}
+.circ{width:88px;height:88px;border-radius:50%;background:var(--fill);display:grid;place-items:center}
+.circ .ic{width:44px;height:44px}
+.step{display:flex;gap:18px;font-size:28px;line-height:1.5}
+.step b{font-weight:600;color:var(--text-2);width:20px;flex:none}
+.addr{display:inline-block;margin-top:20px;padding:14px 24px;border-radius:14px;background:var(--surface);font-size:32px;font-weight:600;letter-spacing:.02em}
+</style></head><body data-default="default"><svg width="0" height="0" style="position:absolute" aria-hidden="true"><symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.6v12.8c0 .9 1 1.4 1.7.9l9.6-6.4a1.1 1.1 0 0 0 0-1.8L9.7 4.7C9 4.2 8 4.7 8 5.6z" fill="currentColor" stroke="none"/></symbol><symbol id="i-pause" viewBox="0 0 24 24"><rect x="6.3" y="5" width="4" height="14" rx="1.3" fill="currentColor" stroke="none"/><rect x="13.7" y="5" width="4" height="14" rx="1.3" fill="currentColor" stroke="none"/></symbol><symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.2"/><path d="M15.3 15.3 20 20"/></symbol><symbol id="i-gear" viewBox="0 0 24 24"><path d="M18.98 9.87 L21.48 10.50 L21.48 13.50 L18.98 14.13 L18.45 15.43 L19.77 17.64 L17.64 19.77 L15.43 18.45 L14.13 18.98 L13.50 21.48 L10.50 21.48 L9.87 18.98 L8.57 18.45 L6.36 19.77 L4.23 17.64 L5.55 15.43 L5.02 14.13 L2.52 13.50 L2.52 10.50 L5.02 9.87 L5.55 8.57 L4.23 6.36 L6.36 4.23 L8.57 5.55 L9.87 5.02 L10.50 2.52 L13.50 2.52 L14.13 5.02 L15.43 5.55 L17.64 4.23 L19.77 6.36 L18.45 8.57 Z"/><circle cx="12" cy="12" r="3.1"/></symbol><symbol id="i-chev-l" viewBox="0 0 24 24"><path d="M14.5 5.5 8 12l6.5 6.5"/></symbol><symbol id="i-chev-r" viewBox="0 0 24 24"><path d="M9.5 5.5 16 12l-6.5 6.5"/></symbol><symbol id="i-chev-d" viewBox="0 0 24 24"><path d="M6 9.5l6 6 6-6"/></symbol><symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol><symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.6 4.6L19 7.5"/></symbol><symbol id="i-close" viewBox="0 0 24 24"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></symbol><symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h8.5M17.5 7H20M4 17h2.5M11.5 17H20"/><circle cx="15" cy="7" r="2.4"/><circle cx="9" cy="17" r="2.4"/></symbol><symbol id="i-heart" viewBox="0 0 24 24"><path d="M12 19.3s-7.4-4.5-7.4-9.9A4.1 4.1 0 0 1 12 7.1a4.1 4.1 0 0 1 7.4 2.3c0 5.4-7.4 9.9-7.4 9.9z"/></symbol><symbol id="i-restart" viewBox="0 0 24 24"><path d="M5 12a7 7 0 1 0 2.1-5"/><path d="M5 4.8V9h4.2"/></symbol><symbol id="i-cast" viewBox="0 0 24 24"><path d="M9 4.5h10a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-5"/><rect x="3" y="10" width="7" height="10.5" rx="1.8"/></symbol><symbol id="i-computer" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M9 20h6M12 16.5V20"/></symbol><symbol id="i-tablet" viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2.5"/><path d="M10.8 18h2.4"/></symbol><symbol id="i-phone" viewBox="0 0 24 24"><rect x="7" y="2.8" width="10" height="18.4" rx="2.4"/><path d="M10.8 18.2h2.4"/></symbol><symbol id="i-server" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="7" rx="1.8"/><rect x="4" y="13" width="16" height="7" rx="1.8"/><path d="M8 7.5h.01M8 16.5h.01"/></symbol><symbol id="i-cloud" viewBox="0 0 24 24"><path d="M7.6 18.5h9.6a3.9 3.9 0 0 0 .5-7.8 5.5 5.5 0 0 0-10.6 1.5 3.2 3.2 0 0 0 .5 6.3z"/></symbol><symbol id="i-folder" viewBox="0 0 24 24"><path d="M3.5 7.3a1.9 1.9 0 0 1 1.9-1.9h3.9l2 2.1h7.3a1.9 1.9 0 0 1 1.9 1.9v7.9a1.9 1.9 0 0 1-1.9 1.9H5.4a1.9 1.9 0 0 1-1.9-1.9z"/></symbol><symbol id="i-headset" viewBox="0 0 24 24"><path d="M3.5 9.6A2.6 2.6 0 0 1 6.1 7h11.8a2.6 2.6 0 0 1 2.6 2.6v4.8a2.6 2.6 0 0 1-2.6 2.6h-2.7l-1.9-2.2a1.7 1.7 0 0 0-2.6 0L8.8 17H6.1a2.6 2.6 0 0 1-2.6-2.6z"/></symbol><symbol id="i-refresh" viewBox="0 0 24 24"><path d="M19 12a7 7 0 1 1-2.1-5"/><path d="M19 4.8V9h-4.2"/></symbol><symbol id="i-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.6"/><path d="M12 7.6v5.2M12 16.3h.01"/></symbol><symbol id="i-cube" viewBox="0 0 24 24"><path d="M12 3.6l7.4 4v8.8L12 20.4l-7.4-4V7.6z"/><path d="M4.6 7.6 12 11.6l7.4-4M12 11.6v8.8"/></symbol><symbol id="i-screen" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 10V8.5h1.6M17 10V8.5h-1.6M7 14v1.5h1.6M17 14v1.5h-1.6"/></symbol><symbol id="i-subtitles" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2.4"/><path d="M7 12.5h3.5M13 12.5h4M7 15.5h7"/></symbol><symbol id="i-audio" viewBox="0 0 24 24"><path d="M4.5 9.5h3l4.5-4v13l-4.5-4h-3z"/><path d="M15.5 9.2a4 4 0 0 1 0 5.6M18 6.7a7.6 7.6 0 0 1 0 10.6"/></symbol><symbol id="i-env" viewBox="0 0 24 24"><path d="M3 18.5 9 10.5l3.6 4.8 2.4-3 6 6.2z"/><circle cx="16.5" cy="6.8" r="1.8"/></symbol><symbol id="i-move" viewBox="0 0 24 24"><path d="M12 4v16M4 12h16M9.2 6.8 12 4l2.8 2.8M9.2 17.2 12 20l2.8-2.8M6.8 9.2 4 12l2.8 2.8M17.2 9.2 20 12l-2.8 2.8"/></symbol><symbol id="i-tap" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.6"/><circle cx="12" cy="12" r="3.4" fill="currentColor" stroke="none"/></symbol><symbol id="i-stick" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.2"/><path d="M5.6 9 2.8 12l2.8 3M18.4 9l2.8 3-2.8 3"/></symbol><symbol id="i-wifi" viewBox="0 0 24 24"><path d="M3.5 9.6a12 12 0 0 1 17 0M6.6 12.9a7.6 7.6 0 0 1 10.8 0M9.6 16.1a3.3 3.3 0 0 1 4.8 0"/><path d="M12 19.4h.01"/></symbol><symbol id="i-spinner" viewBox="0 0 24 24"><path d="M12 3.5a8.5 8.5 0 1 1-8.5 8.5"/></symbol><symbol id="i-dim" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor" stroke="none"/></symbol></svg><div class="canvas"><div class="room"><i class="wall"></i><i class="spill"></i><i class="ceil"></i><i class="win"></i><i class="tree"></i><i class="curtain"></i><i class="shelf"><b style="top:130px"></b><b style="top:270px"></b><b style="top:410px"></b><span class="books" style="top:60px"><u style="height:62px;background:#a39a8a"></u><u style="height:52px;background:#a39a8a"></u><u style="height:59px;background:#5b5148"></u><u style="height:59px;background:#b0a796"></u><u style="height:69px;background:#c5b9a5"></u><u style="height:47px;background:#5b5148"></u><u style="height:44px;background:#b0a796"></u></span><span class="books" style="top:200px"><u style="height:46px;background:#a39a8a"></u><u style="height:55px;background:#56606a"></u><u style="height:67px;background:#6e7b6a"></u><u style="height:52px;background:#c5b9a5"></u><u style="height:63px;background:#7a5a48"></u><u style="height:62px;background:#56606a"></u></span><span class="books" style="top:340px"><u style="height:62px;background:#56606a"></u><u style="height:55px;background:#5b5148"></u><u style="height:64px;background:#a39a8a"></u><u style="height:63px;background:#7a5a48"></u><u style="height:70px;background:#5b5148"></u><u style="height:52px;background:#c5b9a5"></u><u style="height:50px;background:#5b5148"></u></span></i><i class="lamp"></i><i class="shade"></i><i class="floor"></i><i class="base"></i><i class="plant"></i><i class="pot"></i></div><svg class="grain" width="1600" height="1000"><filter id="grain-f"><feTurbulence type="fractalNoise" baseFrequency=".85" numOctaves="2" stitchTiles="stitch"/><feColorMatrix type="saturate" values="0"/></filter><rect width="1600" height="1000" filter="url(#grain-f)"/></svg><div class="stage"><div class="panel"><div data-st="default"><div class="abs" style="left:0;top:0;width:1280px;height:560px"><div class="scene sc-harbor" style=""><i class="fog"></i><i class="pier"></i><i class="post"></i><i class="lamp"></i><i class="ref"></i><i class="crane"></i><i class="arm"></i><i class="cab"></i></div><div class="scrim-l"></div><div class="scrim-b"></div><div class="scrim-t"></div></div><div class="nav"><span class="tab sel">首页</span><span class="tab">媒体库</span><span class="tab">投屏</span><div class="nav-r"><span class="ibtn"><svg class="ic " style=""><use href="#i-search"/></svg></span><span class="ibtn"><svg class="ic " style=""><use href="#i-gear"/></svg></span></div></div><div class="abs" style="left:64px;top:128px;width:640px"><div class="t-cap c2">上次看到 · 来自 NAS</div><div class="t-display" style="margin-top:6px">雾港</div><div class="t-cap c2" style="margin-top:12px">2025 · 剧情 · 剩余 38 分钟</div><div class="btns" style="margin-top:28px"><span class="btn primary"><svg class="ic " style=""><use href="#i-play"/></svg>继续播放</span><span class="btn">详情</span></div></div><div class="sec-title" style="top:424px">继续观看</div><div class="shelf-row" style="top:482px"><div class="card "><div class="img"><div class="scene sc-night" style=""><i class="moon"></i><i class="bl" style="left:3%;width:8%;height:12%"></i><i class="bl" style="left:12%;width:6%;height:20%"></i><i class="bl" style="left:19%;width:10%;height:9%"></i><i class="bl" style="left:34%;width:7%;height:16%"></i><i class="bl" style="left:47%;width:9%;height:11%"></i><i class="bl" style="left:63%;width:6%;height:19%"></i><i class="bl" style="left:76%;width:9%;height:13%"></i><i class="bl" style="left:88%;width:10%;height:17%"></i><i class="lights"></i></div><div class="prog"><b style="width:45%"></b></div></div><div class="cap"><span class="tt">长夜将尽</span><span class="mt l">剩 65 分钟</span></div></div><div class="card is-hover"><div class="img"><div class="scene sc-tide" style=""><i class="sun"></i><i class="sea"></i><i class="w" style="top:64%"></i><i class="w" style="top:72%"></i><i class="w" style="top:83%"></i></div><div class="prog"><b style="width:56%"></b></div><div class="playglyph"><svg class="ic " style=""><use href="#i-play"/></svg></div></div><div class="cap"><span class="tt">潮汐表</span><span class="mt l">第 4 集</span></div></div><div class="card "><div class="img"><div class="scene sc-train" style=""><i class="wire"></i><i class="pole"></i><i class="rails"></i></div><div class="prog"><b style="width:88%"></b></div></div><div class="cap"><span class="tt">慢车</span><span class="mt l">剩 12 分钟</span></div></div><div class="card "><div class="img"><div class="scene sc-summer" style=""><i class="sun"></i><i class="tree"></i></div><div class="prog"><b style="width:22%"></b></div></div><div class="cap"><span class="tt">第七个夏天</span><span class="mt l">剩 80 分钟</span></div></div><div class="card "><div class="img"><div class="scene sc-echo" style=""></div><div class="prog"><b style="width:60%"></b></div></div><div class="cap"><span class="tt">回声测距</span><span class="mt l">剩 40 分钟</span></div></div></div><div class="cursor" style="left:566px;top:600px"></div></div><div data-st="scrolled"><div class="nav solid"><span class="tab sel">首页</span><span class="tab">媒体库</span><span class="tab">投屏</span><div class="nav-r"><span class="ibtn"><svg class="ic " style=""><use href="#i-search"/></svg></span><span class="ibtn"><svg class="ic " style=""><use href="#i-gear"/></svg></span></div></div><div class="sec-title" style="top:112px">最近添加</div><div class="shelf-row" style="top:166px"><div class="poster " style=""><div class="scene sc-glass" style=""><i class="b" style="left:4%;width:10%;height:40%"></i><i class="b" style="left:16%;width:8%;height:58%"></i><i class="b" style="left:26%;width:12%;height:34%"></i><i class="b" style="left:41%;width:9%;height:64%"></i><i class="b" style="left:53%;width:13%;height:46%"></i><i class="b" style="left:69%;width:8%;height:72%"></i><i class="b" style="left:79%;width:12%;height:38%"></i><i class="b" style="left:93%;width:7%;height:52%"></i></div><div class="pt dk">玻璃城</div></div><div class="poster is-hover" style=""><div class="scene sc-summer" style=""><i class="sun"></i><i class="tree"></i></div><div class="pt dk">第七个夏天</div></div><div class="poster " style=""><div class="scene sc-dusk" style=""><i class="m1"></i><i class="m2"></i><i class="fire"></i></div><div class="pt v">远山灯火</div></div><div class="poster " style=""><div class="scene sc-shift" style=""><i class="win2"></i><i class="win"></i><i class="fig"></i></div><div class="pt top">晚班</div></div><div class="poster " style=""><div class="scene sc-salt" style=""><i class="line"></i><i class="fig"></i></div><div class="pt dk top">盐湖</div></div><div class="poster " style=""><div class="scene sc-rust" style=""><i class="pyl" style="left:14%;height:24%;top:31%"></i><i class="pyl" style="left:40%;height:16%;top:39%"></i><i class="pyl" style="left:60%;height:11%;top:44%"></i><i class="pyl" style="left:75%;height:8%;top:47%"></i><i class="pyl" style="left:86%;height:6%;top:49%"></i></div><div class="pt ">无人区信号</div></div><div class="poster " style=""><div class="scene sc-snow" style=""><i class="gnd"></i><i class="t" style="left:10%;height:30%"></i><i class="t" style="left:16%;height:22%"></i><i class="t" style="left:70%;height:26%"></i><i class="t" style="left:78%;height:34%"></i><i class="t" style="left:85%;height:20%"></i></div><div class="pt v dk">冬至以后</div></div></div><div class="sec-title" style="top:462px">NAS · 电影<svg class="ic " style=""><use href="#i-chev-r"/></svg></div><div class="shelf-row" style="top:516px"><div class="poster " style=""><div class="scene sc-harbor" style=""><i class="fog"></i><i class="pier"></i><i class="post"></i><i class="lamp"></i><i class="ref"></i><i class="crane"></i><i class="arm"></i><i class="cab"></i></div><div class="pt ">雾港</div></div><div class="poster " style=""><div class="scene sc-night" style=""><i class="moon"></i><i class="bl" style="left:3%;width:8%;height:12%"></i><i class="bl" style="left:12%;width:6%;height:20%"></i><i class="bl" style="left:19%;width:10%;height:9%"></i><i class="bl" style="left:34%;width:7%;height:16%"></i><i class="bl" style="left:47%;width:9%;height:11%"></i><i class="bl" style="left:63%;width:6%;height:19%"></i><i class="bl" style="left:76%;width:9%;height:13%"></i><i class="bl" style="left:88%;width:10%;height:17%"></i><i class="lights"></i></div><div class="pt v">长夜将尽</div></div><div class="poster " style=""><div class="scene sc-train" style=""><i class="wire"></i><i class="pole"></i><i class="rails"></i></div><div class="pt top">慢车</div></div><div class="poster " style=""><div class="scene sc-echo" style=""></div><div class="pt ">回声测距</div></div><div class="poster " style=""><div class="scene sc-glass" style=""><i class="b" style="left:4%;width:10%;height:40%"></i><i class="b" style="left:16%;width:8%;height:58%"></i><i class="b" style="left:26%;width:12%;height:34%"></i><i class="b" style="left:41%;width:9%;height:64%"></i><i class="b" style="left:53%;width:13%;height:46%"></i><i class="b" style="left:69%;width:8%;height:72%"></i><i class="b" style="left:79%;width:12%;height:38%"></i><i class="b" style="left:93%;width:7%;height:52%"></i></div><div class="pt dk">玻璃城</div></div><div class="poster " style=""><div class="scene sc-dusk" style=""><i class="m1"></i><i class="m2"></i><i class="fire"></i></div><div class="pt v">远山灯火</div></div><div class="poster " style=""><div class="scene sc-salt" style=""><i class="line"></i><i class="fig"></i></div><div class="pt dk top">盐湖</div></div></div><div class="cursor" style="left:354px;top:300px"></div></div><div data-st="error"><div class="nav solid"><span class="tab sel">首页</span><span class="tab">媒体库</span><span class="tab">投屏</span><div class="nav-r"><span class="ibtn"><svg class="ic " style=""><use href="#i-search"/></svg></span><span class="ibtn"><svg class="ic " style=""><use href="#i-gear"/></svg></span></div></div><div class="sec-title" style="top:112px">最近添加</div><div class="shelf-row" style="top:166px"><div class="poster " style=""><div class="scene sc-glass" style=""><i class="b" style="left:4%;width:10%;height:40%"></i><i class="b" style="left:16%;width:8%;height:58%"></i><i class="b" style="left:26%;width:12%;height:34%"></i><i class="b" style="left:41%;width:9%;height:64%"></i><i class="b" style="left:53%;width:13%;height:46%"></i><i class="b" style="left:69%;width:8%;height:72%"></i><i class="b" style="left:79%;width:12%;height:38%"></i><i class="b" style="left:93%;width:7%;height:52%"></i></div><div class="pt dk">玻璃城</div></div><div class="poster " style=""><div class="scene sc-summer" style=""><i class="sun"></i><i class="tree"></i></div><div class="pt dk">第七个夏天</div></div><div class="poster " style=""><div class="scene sc-dusk" style=""><i class="m1"></i><i class="m2"></i><i class="fire"></i></div><div class="pt v">远山灯火</div></div><div class="poster " style=""><div class="scene sc-shift" style=""><i class="win2"></i><i class="win"></i><i class="fig"></i></div><div class="pt top">晚班</div></div><div class="poster " style=""><div class="scene sc-salt" style=""><i class="line"></i><i class="fig"></i></div><div class="pt dk top">盐湖</div></div><div class="poster " style=""><div class="scene sc-rust" style=""><i class="pyl" style="left:14%;height:24%;top:31%"></i><i class="pyl" style="left:40%;height:16%;top:39%"></i><i class="pyl" style="left:60%;height:11%;top:44%"></i><i class="pyl" style="left:75%;height:8%;top:47%"></i><i class="pyl" style="left:86%;height:6%;top:49%"></i></div><div class="pt ">无人区信号</div></div><div class="poster " style=""><div class="scene sc-snow" style=""><i class="gnd"></i><i class="t" style="left:10%;height:30%"></i><i class="t" style="left:16%;height:22%"></i><i class="t" style="left:70%;height:26%"></i><i class="t" style="left:78%;height:34%"></i><i class="t" style="left:85%;height:20%"></i></div><div class="pt v dk">冬至以后</div></div></div><div class="sec-title" style="top:462px">NAS · 电影</div><div class="abs" style="left:290px;top:452px;display:flex;align-items:center;gap:20px"><span class="notice cd"><svg class="ic " style=""><use href="#i-alert"/></svg>连不上 NAS，下面是 2 小时前的内容</span><span class="btn sm is-hover"><svg class="ic " style=""><use href="#i-refresh"/></svg>重试</span></div><div class="shelf-row" style="top:532px"><div class="poster dim" style=""><div class="scene sc-harbor" style=""><i class="fog"></i><i class="pier"></i><i class="post"></i><i class="lamp"></i><i class="ref"></i><i class="crane"></i><i class="arm"></i><i class="cab"></i></div><div class="pt ">雾港</div></div><div class="poster dim" style=""><div class="scene sc-night" style=""><i class="moon"></i><i class="bl" style="left:3%;width:8%;height:12%"></i><i class="bl" style="left:12%;width:6%;height:20%"></i><i class="bl" style="left:19%;width:10%;height:9%"></i><i class="bl" style="left:34%;width:7%;height:16%"></i><i class="bl" style="left:47%;width:9%;height:11%"></i><i class="bl" style="left:63%;width:6%;height:19%"></i><i class="bl" style="left:76%;width:9%;height:13%"></i><i class="bl" style="left:88%;width:10%;height:17%"></i><i class="lights"></i></div><div class="pt v">长夜将尽</div></div><div class="poster dim" style=""><div class="scene sc-train" style=""><i class="wire"></i><i class="pole"></i><i class="rails"></i></div><div class="pt top">慢车</div></div><div class="poster dim" style=""><div class="scene sc-echo" style=""></div><div class="pt ">回声测距</div></div><div class="poster dim" style=""><div class="scene sc-glass" style=""><i class="b" style="left:4%;width:10%;height:40%"></i><i class="b" style="left:16%;width:8%;height:58%"></i><i class="b" style="left:26%;width:12%;height:34%"></i><i class="b" style="left:41%;width:9%;height:64%"></i><i class="b" style="left:53%;width:13%;height:46%"></i><i class="b" style="left:69%;width:8%;height:72%"></i><i class="b" style="left:79%;width:12%;height:38%"></i><i class="b" style="left:93%;width:7%;height:52%"></i></div><div class="pt dk">玻璃城</div></div><div class="poster dim" style=""><div class="scene sc-dusk" style=""><i class="m1"></i><i class="m2"></i><i class="fire"></i></div><div class="pt v">远山灯火</div></div><div class="poster dim" style=""><div class="scene sc-salt" style=""><i class="line"></i><i class="fig"></i></div><div class="pt dk top">盐湖</div></div></div><div class="cursor" style="left:858px;top:488px"></div></div><div data-st="empty"><div class="nav solid"><span class="tab sel">首页</span><span class="tab">媒体库</span><span class="tab">投屏</span><div class="nav-r"><span class="ibtn"><svg class="ic " style=""><use href="#i-search"/></svg></span><span class="ibtn"><svg class="ic " style=""><use href="#i-gear"/></svg></span></div></div><div class="abs" style="left:64px;right:64px;top:148px;text-align:center"><div class="t-title">还没有可以看的片子</div><div class="t-body c2" style="margin-top:12px">添加一个播放源，或者直接从 iPad、手机投屏过来。</div></div><div class="abs" style="left:88px;top:318px;display:flex;gap:24px"><div class="opt is-hover" style="width:352px;height:216px"><svg class="ic lead" style=""><use href="#i-server"/></svg><div class="t-head" style="margin-top:22px">局域网媒体库</div><div class="t-cap " style="margin-top:4px">找到 NAS（Jellyfin）</div></div><div class="opt" style="width:352px;height:216px"><svg class="ic lead" style=""><use href="#i-headset"/></svg><div class="t-head" style="margin-top:22px">头显里的视频</div><div class="t-cap c2" style="margin-top:4px">需要允许访问存储</div></div><div class="opt" style="width:352px;height:216px"><svg class="ic lead" style=""><use href="#i-cast"/></svg><div class="t-head" style="margin-top:22px">投屏</div><div class="t-cap c2" style="margin-top:4px">iPad、手机，不用设置</div></div></div><div class="abs" style="left:0;right:0;top:584px;display:flex;justify-content:center"><span class="btn ghost sm">片子在 Mac 或网盘里？在 Mac 上装 depth3d Host<svg class="ic " style=""><use href="#i-chev-r"/></svg></span></div><div class="cursor" style="left:392px;top:372px"></div></div><div data-st="loading"><div class="nav solid"><span class="tab sel">首页</span><span class="tab">媒体库</span><span class="tab">投屏</span><div class="nav-r"><span class="ibtn"><svg class="ic " style=""><use href="#i-search"/></svg></span><span class="ibtn"><svg class="ic " style=""><use href="#i-gear"/></svg></span></div></div><div class="sk abs" style="left:64px;top:134px;width:220px;height:26px;border-radius:12px"></div><div class="sk abs" style="left:64px;top:178px;width:300px;height:62px;border-radius:12px"></div><div class="sk abs" style="left:64px;top:256px;width:340px;height:26px;border-radius:12px"></div><div class="sk abs" style="left:64px;top:312px;width:236px;height:64px;border-radius:16px"></div><div class="sk abs" style="left:316px;top:312px;width:120px;height:64px;border-radius:16px"></div><div class="sk abs" style="left:64px;top:430px;width:160px;height:32px;border-radius:12px"></div><div class="sk abs" style="left:64px;top:482px;width:264px;height:149px;border-radius:14px"></div><div class="sk abs" style="left:64px;top:647px;width:150px;height:26px;border-radius:12px"></div><div class="sk abs" style="left:352px;top:482px;width:264px;height:149px;border-radius:14px"></div><div class="sk abs" style="left:352px;top:647px;width:150px;height:26px;border-radius:12px"></div><div class="sk abs" style="left:640px;top:482px;width:264px;height:149px;border-radius:14px"></div><div class="sk abs" style="left:640px;top:647px;width:150px;height:26px;border-radius:12px"></div><div class="sk abs" style="left:928px;top:482px;width:264px;height:149px;border-radius:14px"></div><div class="sk abs" style="left:928px;top:647px;width:150px;height:26px;border-radius:12px"></div><div class="sk abs" style="left:1216px;top:482px;width:264px;height:149px;border-radius:14px"></div><div class="sk abs" style="left:1216px;top:647px;width:150px;height:26px;border-radius:12px"></div></div></div><div class="handle"></div></div><div class="anno t"><b>首页播放墙</b> <span>· 面板 1280×720 · 1° ≈ 24 px</span></div><a class="anno home" href="index.html">总览</a><div class="anno st">状态：<a href="#default">默认</a><a href="#scrolled">向下滚动</a><a href="#empty">没有播放源</a><a href="#loading">加载中</a><a href="#error">一个源连不上</a></div><div class="anno note" data-st="default">首页第一屏：上次看的片子当主角，下面一行继续观看。悬停的卡片放大 6%，出现播放符号：点卡片直接续播。</div><div class="anno note" data-st="scrolled">滚动后英雄区收起，导航改为实底。每个播放源一行海报，行标题可点，进入该分类。</div><div class="anno note" data-st="empty">第一次进来、什么都没加时。局域网里已经找到的服务器排第一，点一下就能加；投屏不需要任何设置。</div><div class="anno note" data-st="loading">超过 300 ms 才出骨架。骨架与真实布局同尺寸，只做 1.6 秒的明暗呼吸，不做横扫高光。</div><div class="anno note" data-st="error">只有出问题的那一行说话：显示缓存内容并压暗，旁边一个「重试」。其他行照常。</div></div><script>(function(){var c=document.querySelector('.canvas');
+function fit(){var s=Math.min(innerWidth/1600,innerHeight/1000);c.style.transform='translate('+(innerWidth-1600*s)/2+'px,'+(innerHeight-1000*s)/2+'px) scale('+s+')'}
+addEventListener('resize',fit);fit();var D=document.body.getAttribute('data-default');
+function st(){var s=(location.hash||'#'+D).slice(1);document.body.setAttribute('data-state',s);
+document.querySelectorAll('[data-st]').forEach(function(e){e.hidden=e.getAttribute('data-st').split(' ').indexOf(s)<0});
+document.querySelectorAll('.anno.st a').forEach(function(a){a.classList.toggle('on',a.getAttribute('href')=='#'+s)})}
+addEventListener('hashchange',st);st()})();</script></body></html>
