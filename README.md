@@ -27,7 +27,7 @@
 
 1. **桌面原型（`proto/`，已跑通）**：把视频转成全宽 SBS，在 PICO 4 自带播放器里按左右 3D 看，先验证效果、调参数。
 2. **模型上头显**：把 ZipDepth NPU 版导出成 256 int8 的 TFLite，在 PICO 4 上实测 CPU（XNNPACK）和 GPU delegate 的耗时，确认每秒 12 张深度图做不做得到。
-3. **PICO 4 原生播放器**：OpenXR（PICO 的 loader）+ MediaCodec 解码本地或网盘视频 + GLES 实现上面的 warp（双边上采样、偏移搜索、采样三个 pass）+ 两个视角各一个 layer。渲染部分打算直接借 MoonlightXR 的 `xr-renderer`，所以整个项目跟着用 **GPLv3**。
+3. **PICO 4 原生播放器（`player/`，第一版已跑通）**：OpenXR（PICO 的 loader）+ MediaCodec 解码本地或网盘视频 + GLES 实现上面的 warp（双边上采样、偏移搜索、采样三个 pass）+ 两个视角各一个 layer。渲染部分打算直接借 MoonlightXR 的 `xr-renderer`，所以整个项目跟着用 **GPLv3**。
 
 ## PICO 4 实测（2026-11-24）
 
@@ -45,6 +45,28 @@
 结论：深度模型走 CPU int8 256、4 线程，把 GPU 留给解码后的 warp 和合成。每秒 12 张只占约 20% 的时间，还有余量提到 15–20 张。播放时有解码和渲染负载，数字会变差，要在播放器里再测一次。
 
 PICO 4 自带播放器的「3D 左右」按半宽格式解。原型默认输出 `--layout pico`：整帧 2W×2H，每只眼保留全部横向分辨率。
+
+## 播放器实测（2026-11-24，PICO 4，1920×800 24fps H.264）
+
+| 项目 | 数值 |
+|---|---|
+| 深度模型 | ZipDepth fp16 512×288，GPU delegate（MoonlightXR 默认路线） |
+| 推理 | 约 26 ms 一张，每秒 19.6–20.5 张（上限 20），没有因忙跳帧 |
+| 深度滞后 | 平均 49 ms（1.2 帧），最差 127 ms |
+| 显示 | 72 Hz，warp 每帧 GPU 1.93 ms，丢帧 0，漏刷新 0 |
+
+主观：非常流畅。播放时 GPU 推理比空闲时 benchmark 的 34 ms 还快，所以不用退回 CPU int8 那条路。
+
+### 播放器构建
+
+```bash
+cd player
+export JAVA_HOME=$(brew --prefix openjdk@17)/libexec/openjdk.jdk/Contents/Home ANDROID_HOME=$HOME/Library/Android/sdk
+./gradlew assembleNonRootDebug
+adb install -r -g app/build/outputs/apk/nonRoot/debug/app-nonRoot-debug.apk
+```
+
+头显应用库里叫 **depth3d (Debug)**，打开后列出所有视频，点一个就用 3D 播放。扳机键暂停或继续，摇杆每推一下跳 10 秒。基于 MoonlightXR 75d92f2，代码在 `player/app/src/main/java/com/limelight/local/`。
 
 ## 原型用法
 
