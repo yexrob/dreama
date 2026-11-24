@@ -154,7 +154,9 @@ abstract class CopyPluginSchemas extends DefaultTask {
         def src = sourceDir.get().asFile
         def dst = new File(outputDir.get().asFile, 'plugin-schema')
         dst.mkdirs()
-        src.listFiles({ f -> f.isFile() && f.name.endsWith('.schema.json') } as FileFilter)?.each { file ->
+        src.listFiles({ f ->
+            f.isFile() && (f.name.endsWith('.schema.json') || f.name.endsWith('.js') || f.name.endsWith('.json'))
+        } as FileFilter)?.each { file ->
             new File(dst, file.name).bytes = file.bytes
         }
     }
@@ -331,6 +333,18 @@ android {
             excludes += '/META-INF/*.md'
         }
     }
+
+    sourceSets {
+        // Expose Room exported schemas to Robolectric MigrationTestHelper in debug unit tests only
+        debug.assets.srcDirs += files("$projectDir/schemas")
+        test.assets.srcDirs += files("$projectDir/schemas")
+    }
+
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
+        }
+    }
 }
 
 // Desktop JVM unit tests cannot load the Android .so inside quickjs-kt-android,
@@ -388,8 +402,10 @@ dependencies {
     // parser Android itself reads host answers with, so tests can read them too
     testImplementation 'net.sf.kxml:kxml2:2.3.0'
     // Plugin runtime unit tests: MockWebServer (Apache 2.0), coroutines-test (Apache 2.0),
-    // and SQLite JDBC (Apache 2.0) to execute real Room SQL migrations on the JVM.
+    // Room MigrationTestHelper (Apache 2.0), Robolectric (MIT), and SQLite JDBC (Apache 2.0).
     testImplementation 'com.squareup.okhttp3:mockwebserver:5.5.0'
     testImplementation 'org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0'
+    testImplementation 'androidx.room:room-testing:2.8.5'
+    testImplementation 'org.robolectric:robolectric:4.18.1'
     testImplementation 'org.xerial:sqlite-jdbc:3.54.1.0'
 }

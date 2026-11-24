@@ -1,11 +1,19 @@
-// depth3d Jellyfin Plugin (Official Jellyfin REST API)
+// depth3d Jellyfin Plugin (Modern Jellyfin 10.10 / 10.11 / 12.x REST API)
 // Supports authentication, home shelves (Resume / NextUp / Latest per library),
 // library categories & browsing with sorting/filtering/pagination, series/seasons/episodes,
 // search & suggestions, progress reporting, favorites, played status, external subtitles,
-// and Direct Play vs HLS transcode quality selection.
+// and Direct Play (H.264/HEVC/AV1) vs HLS transcode quality selection.
+//
+// Security & protocol §11 compliance (S10):
+// - Maps depth3d codec names ('avc' -> 'h264') for Jellyfin DeviceProfile
+// - Never maps H.264 MVC to MV-HEVC
+// - Never embeds api_key / ApiKey in image, stream, or subtitle URLs (uses Authorization header)
+// - Keeps MediaSourceId lookup in a bounded in-memory LRU cache (never writes unbounded keys to ctx.storage)
+// - Awaits all async ctx.storage.* calls
 
 const TICKS_PER_MS = 10_000;
 const PAGE_LIMIT = 40;
+const MAX_MEDIA_SOURCE_CACHE = 64;
 
 const QUALITY_PROFILES = {
   direct: { id: 'direct', label: '原画直连', bitrate: 0, maxWidth: 0, maxHeight: 0 },
@@ -13,6 +21,19 @@ const QUALITY_PROFILES = {
   '720p': { id: '720p', label: '720P (4 Mbps)', bitrate: 4_000_000, maxWidth: 1280, maxHeight: 720 },
   '480p': { id: '480p', label: '480P (1.5 Mbps)', bitrate: 1_500_000, maxWidth: 854, maxHeight: 480 },
 };
+
+// Bounded in-memory LRU map: itemId -> mediaSourceId (never persisted unboundedly to ctx.storage)
+const mediaSourceCache = new Map();
+
+function rememberMediaSourceId(itemId, mediaSourceId) {
+  if (!itemId || !mediaSourceId) return;
+  if (mediaSourceCache.has(itemId)) mediaSourceCache.delete(itemId);
+  mediaSourceCache.set(itemId, String(mediaSourceId));
+  if (mediaSourceCache.size > MAX_MEDIA_SOURCE_CACHE) {
+    const oldest = mediaSourceCache.keys().next().value;
+    mediaSourceCache.delete(oldest);
+  }
+}
 
 function getServerBase(ctx) {
   const raw = (ctx.config.server || '').trim().replace(/\/+$/, '');
@@ -22,36 +43,64 @@ function getServerBase(ctx) {
   return raw;
 }
 
-function getDeviceId(ctx) {
-  let id = ctx.storage.get('deviceId');
+async function getDeviceId(ctx) {
+  let id = await ctx.storage.get('deviceId');
   if (!id) {
     id = `depth3d-${ctx.crypto.sha256(ctx.instanceId).slice(0, 16)}`;
-    ctx.storage.set('deviceId', id);
+    await ctx.storage.set('deviceId', id);
   }
   return id;
 }
 
-function buildAuthHeader(ctx, token) {
+async function buildAuthHeader(ctx, token) {
   const device = encodeURIComponent(ctx.device.model || 'depth3d');
   const version = encodeURIComponent(ctx.device.appVersion || '1.0.0');
-  const deviceId = encodeURIComponent(getDeviceId(ctx));
+  const deviceId = encodeURIComponent(await getDeviceId(ctx));
   let header = `MediaBrowser Client="depth3d", Device="${device}", DeviceId="${deviceId}", Version="${version}"`;
   if (token) header += `, Token="${token}"`;
   return header;
 }
 
-function requireSession(ctx) {
+async function requireSession(ctx) {
   const base = getServerBase(ctx);
-  const session = ctx.storage.get('session');
+  const session = await ctx.storage.get('session');
   if (!session || !session.accessToken || !session.userId) {
     throw new ctx.Error('NeedsAuth', ctx.t('err_needs_auth'));
   }
-  return { base, session };
+  const authHeader = await buildAuthHeader(ctx, session.accessToken);
+  return { base, session, authHeader };
+}
+
+function stripApiKeyFromUrl(rawUrl) {
+  const qIdx = rawUrl.indexOf('?');
+  if (qIdx < 0) return rawUrl;
+  const pathPart = rawUrl.slice(0, qIdx);
+  const queryPart = rawUrl.slice(qIdx + 1);
+  const kept = queryPart
+    .split('&')
+    .filter((pair) => {
+      if (!pair) return false;
+      const eq = pair.indexOf('=');
+      const key = (eq >= 0 ? pair.slice(0, eq) : pair).toLowerCase();
+      return key !== 'api_key' && key !== 'apikey';
+    });
+  return kept.length > 0 ? `${pathPart}?${kept.join('&')}` : pathPart;
+}
+
+function mapDeviceCodecsForJellyfin(codecs) {
+  const list = Array.isArray(codecs) && codecs.length > 0 ? codecs : ['avc', 'hevc'];
+  const mapped = [];
+  for (const raw of list) {
+    const c = String(raw || '').toLowerCase();
+    const jf = c === 'avc' ? 'h264' : c;
+    if (jf && !mapped.includes(jf)) mapped.push(jf);
+  }
+  return mapped.length > 0 ? mapped : ['h264', 'hevc'];
 }
 
 async function apiRequest(ctx, path, { method = 'GET', query = null, body = null, requireAuth = true } = {}) {
   const base = getServerBase(ctx);
-  const session = requireAuth ? requireSession(ctx).session : ctx.storage.get('session');
+  const session = requireAuth ? (await requireSession(ctx)).session : (await ctx.storage.get('session'));
   let url = `${base}${path.startsWith('/') ? path : `/${path}`}`;
   if (query) {
     const qs = new URLSearchParams();
@@ -64,11 +113,8 @@ async function apiRequest(ctx, path, { method = 'GET', query = null, body = null
 
   const headers = {
     Accept: 'application/json',
-    Authorization: buildAuthHeader(ctx, session?.accessToken),
+    Authorization: await buildAuthHeader(ctx, session?.accessToken),
   };
-  if (session?.accessToken) {
-    headers['X-Emby-Token'] = session.accessToken;
-  }
 
   let resp;
   try {
@@ -84,7 +130,7 @@ async function apiRequest(ctx, path, { method = 'GET', query = null, body = null
 
   if (resp.status === 401) {
     if (requireAuth) {
-      ctx.storage.remove('session');
+      await ctx.storage.remove('session');
       throw new ctx.Error('NeedsAuth', ctx.t('err_needs_auth'));
     }
     throw new ctx.Error('AuthFailed', ctx.t('err_auth_failed'));
@@ -118,14 +164,14 @@ async function apiRequest(ctx, path, { method = 'GET', query = null, body = null
   }
 }
 
-function buildImage(base, token, itemId, imageType, tag, blurHashMap, maxWidth) {
+function buildImage(base, authHeader, itemId, imageType, tag, blurHashMap, maxWidth) {
   if (!tag) return undefined;
-  const url = `${base}/Items/${encodeURIComponent(itemId)}/Images/${imageType}?tag=${encodeURIComponent(tag)}&maxWidth=${maxWidth}&quality=90&api_key=${encodeURIComponent(token)}`;
+  // S10: Never embed api_key in URL; authenticate image loads via Authorization header
+  const url = `${base}/Items/${encodeURIComponent(itemId)}/Images/${imageType}?tag=${encodeURIComponent(tag)}&maxWidth=${maxWidth}&quality=90`;
   const blurhash = blurHashMap?.[imageType]?.[tag];
-  if (blurhash) {
-    return { url, blurhash };
-  }
-  return url;
+  const img = { url, headers: { Authorization: authHeader } };
+  if (blurhash) img.blurhash = blurhash;
+  return img;
 }
 
 function mapKind(jfType) {
@@ -148,6 +194,7 @@ function mapKind(jfType) {
 }
 
 function mapStereo(video3DFormat) {
+  // S10: Do NOT map H.264 MVC to mvhevc
   switch (video3DFormat) {
     case 'HalfSideBySide':
     case 'FullSideBySide':
@@ -155,8 +202,6 @@ function mapStereo(video3DFormat) {
     case 'HalfTopAndBottom':
     case 'FullTopAndBottom':
       return 'ou';
-    case 'MVC':
-      return 'mvhevc';
     default:
       return undefined;
   }
@@ -194,21 +239,21 @@ function extractBadges(raw) {
   return badges.length > 0 ? badges : undefined;
 }
 
-function mapItem(raw, base, token, includeFullDetails = false) {
+function mapItem(raw, base, authHeader, includeFullDetails = false) {
   const id = String(raw.Id);
   const kind = mapKind(raw.Type);
   const tags = raw.ImageTags || {};
   const blur = raw.ImageBlurHashes || {};
 
-  const poster = buildImage(base, token, id, 'Primary', tags.Primary, blur, 600);
-  const thumb = buildImage(base, token, id, 'Thumb', tags.Thumb, blur, 960)
-    || (kind === 'episode' ? buildImage(base, token, id, 'Primary', tags.Primary, blur, 960) : undefined);
+  const poster = buildImage(base, authHeader, id, 'Primary', tags.Primary, blur, 600);
+  const thumb = buildImage(base, authHeader, id, 'Thumb', tags.Thumb, blur, 960)
+    || (kind === 'episode' ? buildImage(base, authHeader, id, 'Primary', tags.Primary, blur, 960) : undefined);
 
   let backdrop;
   if (Array.isArray(raw.BackdropImageTags) && raw.BackdropImageTags.length > 0) {
-    backdrop = buildImage(base, token, id, 'Backdrop', raw.BackdropImageTags[0], blur, 1440);
+    backdrop = buildImage(base, authHeader, id, 'Backdrop', raw.BackdropImageTags[0], blur, 1440);
   } else if (raw.ParentBackdropItemId && Array.isArray(raw.ParentBackdropImageTags) && raw.ParentBackdropImageTags.length > 0) {
-    backdrop = buildImage(base, token, raw.ParentBackdropItemId, 'Backdrop', raw.ParentBackdropImageTags[0], blur, 1440);
+    backdrop = buildImage(base, authHeader, raw.ParentBackdropItemId, 'Backdrop', raw.ParentBackdropImageTags[0], blur, 1440);
   }
 
   const item = {
@@ -266,7 +311,7 @@ function mapItem(raw, base, token, includeFullDetails = false) {
           if (p.Role || p.Type) person.role = String(p.Role || p.Type);
           if (p.Id) person.id = String(p.Id);
           if (p.Id && p.PrimaryImageTag) {
-            person.image = buildImage(base, token, p.Id, 'Primary', p.PrimaryImageTag, null, 300);
+            person.image = buildImage(base, authHeader, p.Id, 'Primary', p.PrimaryImageTag, null, 300);
           }
           return person;
         });
@@ -326,11 +371,15 @@ export default {
       userName: data.User.Name || username,
       serverId: data.ServerId || '',
     };
-    ctx.storage.set('session', session);
+    await ctx.storage.set('session', session);
 
+    const authHeader = await buildAuthHeader(ctx, session.accessToken);
     const user = { name: session.userName };
     if (data.User.PrimaryImageTag) {
-      user.avatar = `${base}/Users/${encodeURIComponent(session.userId)}/Images/Primary?tag=${encodeURIComponent(data.User.PrimaryImageTag)}&api_key=${encodeURIComponent(session.accessToken)}`;
+      user.avatar = {
+        url: `${base}/Users/${encodeURIComponent(session.userId)}/Images/Primary?tag=${encodeURIComponent(data.User.PrimaryImageTag)}`,
+        headers: { Authorization: authHeader },
+      };
     }
     return { ok: true, user };
   },
@@ -341,17 +390,17 @@ export default {
     } catch {
       // Ignore network errors when signing out locally
     }
-    ctx.storage.remove('session');
+    await ctx.storage.remove('session');
   },
 
   async home(ctx) {
-    const { base, session } = requireSession(ctx);
-    const uid = encodeURIComponent(session.userId);
+    const { base, session, authHeader } = await requireSession(ctx);
     const shelves = [];
 
-    // 1. Continue Watching (Resume)
-    const resume = await apiRequest(ctx, `/Users/${uid}/Items/Resume`, {
+    // 1. Continue Watching (Resume) — modern Jellyfin route /UserItems/Resume
+    const resume = await apiRequest(ctx, '/UserItems/Resume', {
       query: {
+        userId: session.userId,
         Limit: 12,
         Recursive: 'true',
         MediaTypes: 'Video',
@@ -363,14 +412,14 @@ export default {
         id: 'jf-resume',
         title: ctx.t('shelf_resume'),
         style: 'continue',
-        items: resume.Items.map((it) => mapItem(it, base, session.accessToken)),
+        items: resume.Items.map((it) => mapItem(it, base, authHeader)),
       });
     }
 
     // 2. Next Up (TV Episodes)
     const nextUp = await apiRequest(ctx, '/Shows/NextUp', {
       query: {
-        UserId: session.userId,
+        userId: session.userId,
         Limit: 12,
         Fields: 'Overview,UserData',
       },
@@ -380,18 +429,21 @@ export default {
         id: 'jf-nextup',
         title: ctx.t('shelf_next_up'),
         style: 'thumb',
-        items: nextUp.Items.map((it) => mapItem(it, base, session.accessToken)),
+        items: nextUp.Items.map((it) => mapItem(it, base, authHeader)),
       });
     }
 
-    // 3. Latest per library view
-    const views = await apiRequest(ctx, `/Users/${uid}/Views`);
+    // 3. Latest per library view — modern /UserViews + /Items/Latest
+    const views = await apiRequest(ctx, '/UserViews', {
+      query: { userId: session.userId },
+    });
     const videoViews = (views?.Items || []).filter((v) =>
       !['music', 'books', 'photos'].includes(String(v.CollectionType || '').toLowerCase())
     );
     for (const view of videoViews.slice(0, 4)) {
-      const latest = await apiRequest(ctx, `/Users/${uid}/Items/Latest`, {
+      const latest = await apiRequest(ctx, '/Items/Latest', {
         query: {
+          userId: session.userId,
           ParentId: view.Id,
           Limit: 16,
           Fields: 'Overview,Genres,UserData,MediaSources',
@@ -403,7 +455,7 @@ export default {
           title: ctx.t('shelf_latest', { name: view.Name }),
           style: 'poster',
           more: String(view.Id),
-          items: latest.map((it) => mapItem(it, base, session.accessToken)),
+          items: latest.map((it) => mapItem(it, base, authHeader)),
         });
       }
     }
@@ -412,9 +464,10 @@ export default {
   },
 
   async categories(ctx) {
-    const { session } = requireSession(ctx);
-    const uid = encodeURIComponent(session.userId);
-    const views = await apiRequest(ctx, `/Users/${uid}/Views`);
+    const { session } = await requireSession(ctx);
+    const views = await apiRequest(ctx, '/UserViews', {
+      query: { userId: session.userId },
+    });
     return (views?.Items || [])
       .filter((v) => !['music', 'books', 'photos'].includes(String(v.CollectionType || '').toLowerCase()))
       .map((v) => ({
@@ -425,14 +478,15 @@ export default {
   },
 
   async browse(ctx, { categoryId = '', cursor = null, sort = null, filters = null } = {}) {
-    const { base, session } = requireSession(ctx);
-    const uid = encodeURIComponent(session.userId);
+    const { base, session, authHeader } = await requireSession(ctx);
 
     if (!categoryId) {
-      const views = await apiRequest(ctx, `/Users/${uid}/Views`);
+      const views = await apiRequest(ctx, '/UserViews', {
+        query: { userId: session.userId },
+      });
       const items = (views?.Items || [])
         .filter((v) => !['music', 'books', 'photos'].includes(String(v.CollectionType || '').toLowerCase()))
-        .map((v) => mapItem(v, base, session.accessToken));
+        .map((v) => mapItem(v, base, authHeader));
       return { items, next: null };
     }
 
@@ -444,6 +498,7 @@ export default {
     else if (sort === 'rating_desc') { sortBy = 'CommunityRating'; sortOrder = 'Descending'; }
 
     const query = {
+      userId: session.userId,
       ParentId: categoryId,
       StartIndex: startIndex,
       Limit: PAGE_LIMIT,
@@ -454,12 +509,12 @@ export default {
     if (filters?.status) query.Filters = filters.status;
     if (filters?.type) query.IncludeItemTypes = filters.type;
 
-    const data = await apiRequest(ctx, `/Users/${uid}/Items`, { query });
+    const data = await apiRequest(ctx, '/Items', { query });
     const rawItems = Array.isArray(data?.Items) ? data.Items : [];
     const total = Number(data?.TotalRecordCount ?? rawItems.length);
     const nextIdx = startIndex + rawItems.length;
     return {
-      items: rawItems.map((it) => mapItem(it, base, session.accessToken)),
+      items: rawItems.map((it) => mapItem(it, base, authHeader)),
       next: nextIdx < total ? String(nextIdx) : null,
     };
   },
@@ -496,36 +551,38 @@ export default {
   },
 
   async detail(ctx, { itemId }) {
-    const { base, session } = requireSession(ctx);
-    const uid = encodeURIComponent(session.userId);
-    const raw = await apiRequest(ctx, `/Users/${uid}/Items/${encodeURIComponent(itemId)}`, {
-      query: { Fields: 'Overview,Genres,People,MediaSources,MediaStreams,Studios,ChildCount,UserData' },
+    const { base, session, authHeader } = await requireSession(ctx);
+    const raw = await apiRequest(ctx, `/Items/${encodeURIComponent(itemId)}`, {
+      query: {
+        userId: session.userId,
+        Fields: 'Overview,Genres,People,MediaSources,MediaStreams,Studios,ChildCount,UserData',
+      },
     });
-    const item = mapItem(raw, base, session.accessToken, true);
+    const item = mapItem(raw, base, authHeader, true);
 
     if (raw.Type === 'Series') {
       const seasonsResp = await apiRequest(ctx, `/Shows/${encodeURIComponent(itemId)}/Seasons`, {
-        query: { UserId: session.userId, Fields: 'Overview,ChildCount,UserData' },
+        query: { userId: session.userId, Fields: 'Overview,ChildCount,UserData' },
       });
-      item.seasons = (seasonsResp?.Items || []).map((s) => mapItem(s, base, session.accessToken));
+      item.seasons = (seasonsResp?.Items || []).map((s) => mapItem(s, base, authHeader));
     } else if (raw.Type === 'Season' && raw.SeriesId) {
       const epsResp = await apiRequest(ctx, `/Shows/${encodeURIComponent(raw.SeriesId)}/Episodes`, {
         query: {
           SeasonId: itemId,
-          UserId: session.userId,
+          userId: session.userId,
           Fields: 'Overview,UserData,MediaSources',
         },
       });
-      item.episodes = (epsResp?.Items || []).map((e) => mapItem(e, base, session.accessToken));
+      item.episodes = (epsResp?.Items || []).map((e) => mapItem(e, base, authHeader));
     }
 
     if (raw.Type === 'Movie' || raw.Type === 'Series') {
       try {
         const similar = await apiRequest(ctx, `/Items/${encodeURIComponent(itemId)}/Similar`, {
-          query: { UserId: session.userId, Limit: 8, Fields: 'UserData' },
+          query: { userId: session.userId, Limit: 8, Fields: 'UserData' },
         });
         if (Array.isArray(similar?.Items) && similar.Items.length > 0) {
-          item.related = similar.Items.map((r) => mapItem(r, base, session.accessToken));
+          item.related = similar.Items.map((r) => mapItem(r, base, authHeader));
         }
       } catch {
         // Similar items are optional
@@ -536,51 +593,85 @@ export default {
   },
 
   async playback(ctx, { itemId, quality = null, audio = null }) {
-    const { base, session } = requireSession(ctx);
+    const { base, session, authHeader } = await requireSession(ctx);
     const selectedQuality = quality && QUALITY_PROFILES[quality]
       ? quality
       : (QUALITY_PROFILES[ctx.config.quality] ? ctx.config.quality : 'direct');
     const profile = QUALITY_PROFILES[selectedQuality];
-    const codecs = Array.isArray(ctx.device.codecs) && ctx.device.codecs.length > 0
-      ? ctx.device.codecs
-      : ['avc', 'hevc'];
+    const jfCodecs = mapDeviceCodecsForJellyfin(ctx.device.codecs);
+    const wantTranscodeProfile = selectedQuality !== 'direct';
+    const maxBitrate = profile.bitrate > 0 ? profile.bitrate : 120_000_000;
+
+    const transcodeConditions = [];
+    if (profile.maxWidth > 0) {
+      transcodeConditions.push({
+        Condition: 'LessThanEqual',
+        Property: 'Width',
+        Value: String(profile.maxWidth),
+        IsRequired: false,
+      });
+    }
+    if (profile.maxHeight > 0) {
+      transcodeConditions.push({
+        Condition: 'LessThanEqual',
+        Property: 'Height',
+        Value: String(profile.maxHeight),
+        IsRequired: false,
+      });
+    }
+
+    const body = {
+      UserId: session.userId,
+      MaxStreamingBitrate: maxBitrate,
+      AutoOpenLiveStream: true,
+      DeviceProfile: {
+        Name: 'depth3d',
+        MaxStreamingBitrate: maxBitrate,
+        DirectPlayProfiles: wantTranscodeProfile
+          ? []
+          : [
+              {
+                Container: 'mp4,m4v,mkv,webm,mov,ts',
+                Type: 'Video',
+                VideoCodec: jfCodecs.join(','),
+                AudioCodec: 'aac,ac3,eac3,mp3,opus,flac',
+              },
+            ],
+        TranscodingProfiles: [
+          {
+            Container: 'ts',
+            Type: 'Video',
+            Protocol: 'hls',
+            VideoCodec: jfCodecs.includes('hevc') ? 'h264,hevc' : 'h264',
+            AudioCodec: 'aac',
+            Context: 'Streaming',
+          },
+        ],
+        CodecProfiles: transcodeConditions.length > 0
+          ? [
+              {
+                Type: 'Video',
+                Conditions: transcodeConditions,
+              },
+            ]
+          : [],
+        SubtitleProfiles: [
+          { Format: 'srt', Method: 'External' },
+          { Format: 'vtt', Method: 'External' },
+          { Format: 'ass', Method: 'External' },
+          { Format: 'ssa', Method: 'External' },
+        ],
+      },
+    };
+    if (audio !== null && audio !== undefined && String(audio).trim() !== '') {
+      const audioIdx = parseInt(String(audio), 10);
+      if (Number.isFinite(audioIdx)) body.AudioStreamIndex = audioIdx;
+    }
 
     const pbResp = await apiRequest(ctx, `/Items/${encodeURIComponent(itemId)}/PlaybackInfo`, {
       method: 'POST',
-      query: { UserId: session.userId },
-      body: {
-        UserId: session.userId,
-        MaxStreamingBitrate: profile.bitrate > 0 ? profile.bitrate : 120_000_000,
-        AutoOpenLiveStream: true,
-        DeviceProfile: {
-          Name: 'depth3d',
-          MaxStreamingBitrate: profile.bitrate > 0 ? profile.bitrate : 120_000_000,
-          DirectPlayProfiles: [
-            {
-              Container: 'mp4,m4v,mkv,webm,mov,ts',
-              Type: 'Video',
-              VideoCodec: codecs.join(','),
-              AudioCodec: 'aac,ac3,eac3,mp3,opus,flac',
-            },
-          ],
-          TranscodingProfiles: [
-            {
-              Container: 'ts',
-              Type: 'Video',
-              Protocol: 'hls',
-              VideoCodec: codecs.includes('hevc') ? 'hevc,h264' : 'h264',
-              AudioCodec: 'aac',
-              Context: 'Streaming',
-            },
-          ],
-          SubtitleProfiles: [
-            { Format: 'srt', Method: 'External' },
-            { Format: 'vtt', Method: 'External' },
-            { Format: 'ass', Method: 'External' },
-            { Format: 'ssa', Method: 'External' },
-          ],
-        },
-      },
+      query: { userId: session.userId },
+      body,
     });
 
     const source = pbResp?.MediaSources?.[0];
@@ -590,9 +681,9 @@ export default {
 
     const mediaSourceId = source.Id || itemId;
     const playSessionId = pbResp.PlaySessionId || `jf-${Date.now()}`;
+    const deviceId = await getDeviceId(ctx);
     const headers = {
-      'X-Emby-Token': session.accessToken,
-      Authorization: buildAuthHeader(ctx, session.accessToken),
+      Authorization: authHeader,
     };
 
     const streams = Array.isArray(source.MediaStreams) ? source.MediaStreams : [];
@@ -609,14 +700,14 @@ export default {
       if (s.Type !== 'Subtitle') continue;
       const fmt = mapSubtitleFormat(s.Codec);
       if (!fmt) continue;
-      const subUrl = s.DeliveryUrl
+      const rawSubUrl = s.DeliveryUrl
         ? (s.DeliveryUrl.startsWith('http') ? s.DeliveryUrl : `${base}${s.DeliveryUrl}`)
-        : `${base}/Videos/${encodeURIComponent(itemId)}/${encodeURIComponent(mediaSourceId)}/Subtitles/${s.Index}/0/Stream.${fmt}?api_key=${encodeURIComponent(session.accessToken)}`;
+        : `${base}/Videos/${encodeURIComponent(itemId)}/${encodeURIComponent(mediaSourceId)}/Subtitles/${s.Index}/0/Stream.${fmt}`;
       subtitles.push({
         id: String(s.Index),
         label: s.DisplayTitle || s.Title || s.Language || `字幕 ${s.Index}`,
         ...(s.Language ? { lang: String(s.Language) } : {}),
-        url: subUrl,
+        url: stripApiKeyFromUrl(rawSubUrl),
         format: fmt,
         headers,
         ...(s.IsDefault ? { default: true } : {}),
@@ -625,30 +716,31 @@ export default {
 
     let url;
     let mime;
-    const wantTranscode = selectedQuality !== 'direct' || source.SupportsDirectPlay === false;
-    if (!wantTranscode) {
+    const useTranscode = wantTranscodeProfile || source.SupportsDirectPlay === false;
+    if (!useTranscode) {
       const qs = new URLSearchParams({
         Static: 'true',
         MediaSourceId: mediaSourceId,
         PlaySessionId: playSessionId,
-        DeviceId: getDeviceId(ctx),
-        api_key: session.accessToken,
+        DeviceId: deviceId,
       });
       url = `${base}/Videos/${encodeURIComponent(itemId)}/stream?${qs.toString()}`;
     } else if (source.TranscodingUrl) {
-      url = source.TranscodingUrl.startsWith('http') ? source.TranscodingUrl : `${base}${source.TranscodingUrl}`;
+      const fullTranscodeUrl = source.TranscodingUrl.startsWith('http')
+        ? source.TranscodingUrl
+        : `${base}${source.TranscodingUrl}`;
+      url = stripApiKeyFromUrl(fullTranscodeUrl);
       mime = 'application/x-mpegURL';
     } else {
       const qs = new URLSearchParams({
         MediaSourceId: mediaSourceId,
         PlaySessionId: playSessionId,
-        DeviceId: getDeviceId(ctx),
-        VideoCodec: codecs.includes('hevc') ? 'hevc,h264' : 'h264',
+        DeviceId: deviceId,
+        VideoCodec: jfCodecs.includes('hevc') ? 'h264,hevc' : 'h264',
         AudioCodec: 'aac',
         VideoBitrate: String(profile.bitrate || 8_000_000),
         MaxWidth: String(profile.maxWidth || 1920),
         MaxHeight: String(profile.maxHeight || 1080),
-        api_key: session.accessToken,
       });
       if (audio) qs.set('AudioStreamIndex', String(audio));
       url = `${base}/Videos/${encodeURIComponent(itemId)}/master.m3u8?${qs.toString()}`;
@@ -667,6 +759,9 @@ export default {
       qualities,
       session: playSessionId,
     };
+    if (typeof source.RunTimeTicks === 'number' && source.RunTimeTicks > 0) {
+      result.durationMs = Math.floor(source.RunTimeTicks / TICKS_PER_MS);
+    }
     if (mime) result.mime = mime;
     if (subtitles.length > 0) result.subtitles = subtitles;
     if (audios.length > 0) result.audios = audios;
@@ -674,13 +769,12 @@ export default {
     const stereo = mapStereo(source.Video3DFormat);
     if (stereo) result.stereo = stereo;
 
-    ctx.storage.set(`ms_${itemId}`, mediaSourceId);
+    rememberMediaSourceId(itemId, mediaSourceId);
     return result;
   },
 
   async search(ctx, { query = '', cursor = null, kind = null } = {}) {
-    const { base, session } = requireSession(ctx);
-    const uid = encodeURIComponent(session.userId);
+    const { base, session, authHeader } = await requireSession(ctx);
     const startIndex = cursor ? Math.max(0, parseInt(String(cursor), 10) || 0) : 0;
     const typeMap = {
       movie: 'Movie',
@@ -689,8 +783,9 @@ export default {
       collection: 'BoxSet',
       video: 'Video',
     };
-    const data = await apiRequest(ctx, `/Users/${uid}/Items`, {
+    const data = await apiRequest(ctx, '/Items', {
       query: {
+        userId: session.userId,
         SearchTerm: query,
         Recursive: 'true',
         IncludeItemTypes: (kind && typeMap[kind]) || 'Movie,Series,Episode,Video,BoxSet',
@@ -703,23 +798,23 @@ export default {
     const total = Number(data?.TotalRecordCount ?? rawItems.length);
     const nextIdx = startIndex + rawItems.length;
     return {
-      items: rawItems.map((it) => mapItem(it, base, session.accessToken)),
+      items: rawItems.map((it) => mapItem(it, base, authHeader)),
       next: nextIdx < total ? String(nextIdx) : null,
     };
   },
 
   async suggest(ctx, { query = '' } = {}) {
-    const { session } = requireSession(ctx);
+    const { session } = await requireSession(ctx);
     const data = await apiRequest(ctx, '/Search/Hints', {
-      query: { SearchTerm: query, UserId: session.userId, Limit: 8 },
+      query: { searchTerm: query, userId: session.userId, limit: 8 },
     });
     return (data?.SearchHints || []).map((h) => String(h.Name)).filter(Boolean);
   },
 
   async reportProgress(ctx, { itemId, positionMs = 0, durationMs = 0, event = 'progress', session = null }) {
-    requireSession(ctx);
+    await requireSession(ctx);
     const ticks = Math.max(0, Math.floor(Number(positionMs) * TICKS_PER_MS));
-    const mediaSourceId = ctx.storage.get(`ms_${itemId}`) || itemId;
+    const mediaSourceId = mediaSourceCache.get(itemId) || itemId;
     const payload = {
       ItemId: itemId,
       MediaSourceId: mediaSourceId,
@@ -737,18 +832,18 @@ export default {
   },
 
   async setFavorite(ctx, { itemId, favorite }) {
-    const { session } = requireSession(ctx);
-    const uid = encodeURIComponent(session.userId);
-    await apiRequest(ctx, `/Users/${uid}/FavoriteItems/${encodeURIComponent(itemId)}`, {
+    const { session } = await requireSession(ctx);
+    await apiRequest(ctx, `/UserFavoriteItems/${encodeURIComponent(itemId)}`, {
       method: favorite ? 'POST' : 'DELETE',
+      query: { userId: session.userId },
     });
   },
 
   async setPlayed(ctx, { itemId, played }) {
-    const { session } = requireSession(ctx);
-    const uid = encodeURIComponent(session.userId);
-    await apiRequest(ctx, `/Users/${uid}/PlayedItems/${encodeURIComponent(itemId)}`, {
+    const { session } = await requireSession(ctx);
+    await apiRequest(ctx, `/UserPlayedItems/${encodeURIComponent(itemId)}`, {
       method: played ? 'POST' : 'DELETE',
+      query: { userId: session.userId },
     });
   },
 };

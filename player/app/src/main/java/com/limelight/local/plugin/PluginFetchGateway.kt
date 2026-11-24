@@ -1,7 +1,11 @@
 package com.limelight.local.plugin
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.Cookie
 import okhttp3.Dns
 import okhttp3.Headers.Companion.toHeaders
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -12,8 +16,11 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.InetAddress
+import java.net.Proxy
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 data class FetchRequest(
     val url: String,
@@ -35,30 +42,84 @@ data class FetchResponse(
 class FetchResponseTooLargeException(message: String) : IOException(message)
 
 /**
- * Sandboxed HTTP gateway backing `ctx.fetch` (protocol §5 & §7):
- * - Enforces [NetworkPolicy] on the initial URL and on every redirect hop
- * - Pins the validated DNS resolution to prevent DNS rebinding
+ * Thread-safe byte budget shared across all concurrent in-flight fetches and
+ * buffered responses for one plugin instance (§11.1: 16 MB total).
+ */
+class InFlightByteBudget(
+    val maxBytes: Long = PluginFetchGateway.MAX_INFLIGHT_BYTES.toLong(),
+) {
+    private val used = AtomicLong(0)
+
+    fun reserve(bytes: Long) {
+        if (bytes <= 0) return
+        while (true) {
+            val cur = used.get()
+            val next = cur + bytes
+            if (next > maxBytes) {
+                throw FetchResponseTooLargeException(
+                    "并发请求在途字节超过上限（${maxBytes / (1024 * 1024)} MB）",
+                )
+            }
+            if (used.compareAndSet(cur, next)) return
+        }
+    }
+
+    fun release(bytes: Long) {
+        if (bytes <= 0) return
+        while (true) {
+            val cur = used.get()
+            val next = (cur - bytes).coerceAtLeast(0L)
+            if (used.compareAndSet(cur, next)) return
+        }
+    }
+
+    fun currentUsed(): Long = used.get()
+}
+
+/**
+ * Sandboxed HTTP gateway backing `ctx.fetch` (protocol §5, §7, §11.1, §11.3):
+ * - Enforces [NetworkPolicy] on initial request + every redirect hop
+ * - Rejects HTTPS -> HTTP downgrade redirects
+ * - Connects strictly to validated pinned IPs with `.proxy(Proxy.NO_PROXY)`
  * - Rejects `Host` request header overrides
- * - Uses the instance's isolated [PluginCookieJar]
- * - Caps response body size at 16 MB while streaming
+ * - Merges explicit `Cookie` header on top of instance [PluginCookieJar]
+ *   (explicit wins on name collision, §11.1) and captures `Set-Cookie` per hop
+ * - Enforces 8 MB single-response limit, max 4 concurrent fetches per instance,
+ *   and 16 MB total in-flight byte budget (§11.1, B2)
+ * - Tracks live OkHttp [Call]s so [cancelAllActive] aborts every in-flight
+ *   request immediately on call settle or timeout (S3)
  */
 class PluginFetchGateway(
     private val policy: NetworkPolicy,
     private val cookieJar: PluginCookieJar,
     baseClient: OkHttpClient = DEFAULT_CLIENT,
     private val maxResponseBytes: Int = MAX_RESPONSE_BYTES,
+    private val maxConcurrentFetches: Int = MAX_CONCURRENT_FETCHES,
+    val inFlightBudget: InFlightByteBudget = InFlightByteBudget(MAX_INFLIGHT_BYTES.toLong()),
     private val maxRedirects: Int = MAX_REDIRECTS,
 ) {
     private val client: OkHttpClient = baseClient.newBuilder()
+        .proxy(Proxy.NO_PROXY)
         .followRedirects(false)
         .followSslRedirects(false)
-        .cookieJar(cookieJar)
         .build()
 
-    suspend fun fetch(req: FetchRequest, defaultTimeoutMs: Long = DEFAULT_TIMEOUT_MS): FetchResponse =
-        withContext(Dispatchers.IO) {
-            executeBlocking(req, defaultTimeoutMs)
+    private val concurrencySemaphore = Semaphore(maxConcurrentFetches)
+    private val callSeq = AtomicLong(1)
+    private val activeCalls = ConcurrentHashMap<Long, Call>()
+
+    /**
+     * Suspends respecting the 4-concurrent-fetch limit and runs the HTTP
+     * request on [Dispatchers.IO]. Cancelling the coroutine cancels the live
+     * OkHttp [Call] immediately.
+     */
+    suspend fun fetch(req: FetchRequest, defaultTimeoutMs: Long = DEFAULT_TIMEOUT_MS): FetchResponse {
+        return concurrencySemaphore.withPermit {
+            withContext(Dispatchers.IO) {
+                executeBlocking(req, defaultTimeoutMs)
+            }
         }
+    }
 
     fun executeBlocking(req: FetchRequest, defaultTimeoutMs: Long = DEFAULT_TIMEOUT_MS): FetchResponse {
         val redirectMode = req.redirect.lowercase(Locale.ROOT)
@@ -77,17 +138,18 @@ class PluginFetchGateway(
         val timeout = (req.timeoutMs ?: defaultTimeoutMs).coerceIn(100L, MAX_TIMEOUT_MS)
 
         var currentUrl = req.url
+        var prevScheme: String? = null
         var currentMethod = method
-        var currentHeaders = LinkedHashMap(req.headers)
+        val currentHeaders = LinkedHashMap(req.headers)
         var currentBody: ByteArray? = req.body
         var currentContentType: String? = req.contentType
         var hops = 0
 
         while (true) {
-            val validated = policy.validateFetchUrl(currentUrl)
+            val validated = policy.validateFetchUrl(currentUrl, previousScheme = prevScheme)
             val pinnedDns = object : Dns {
                 override fun lookup(hostname: String): List<InetAddress> {
-                    if (hostname.equals(validated.url.host, ignoreCase = true)) {
+                    if (NetworkPolicy.canonicalizeHost(hostname) == validated.canonicalHost) {
                         return validated.resolvedAddresses
                     }
                     return policy.validateFetchUrl("https://$hostname/").resolvedAddresses
@@ -101,11 +163,27 @@ class PluginFetchGateway(
                 .callTimeout(timeout, TimeUnit.MILLISECONDS)
                 .build()
 
+            // §11.1: merge jar cookies with explicit Cookie header (explicit takes precedence on collision)
+            val effectiveHeaders = LinkedHashMap<String, String>()
+            var explicitCookie: String? = null
+            for ((k, v) in currentHeaders) {
+                if (k.equals("Cookie", ignoreCase = true)) {
+                    explicitCookie = v
+                } else {
+                    effectiveHeaders[k] = v
+                }
+            }
+            val jarHeader = cookieJar.getHeaderForUrl(validated.url.toString())
+            val mergedCookie = PluginCookieJar.mergeCookieHeaders(jarHeader, explicitCookie)
+            if (mergedCookie.isNotEmpty()) {
+                effectiveHeaders["Cookie"] = mergedCookie
+            }
+
             val okBody: RequestBody? = when {
                 currentMethod == "GET" || currentMethod == "HEAD" -> null
                 currentBody != null -> {
                     val ct = currentContentType
-                        ?: currentHeaders.entries.firstOrNull { it.key.equals("Content-Type", ignoreCase = true) }?.value
+                        ?: effectiveHeaders.entries.firstOrNull { it.key.equals("Content-Type", ignoreCase = true) }?.value
                     currentBody.toRequestBody(ct?.toMediaTypeOrNull())
                 }
                 currentMethod in setOf("POST", "PUT", "PATCH") -> ByteArray(0).toRequestBody(null)
@@ -114,54 +192,76 @@ class PluginFetchGateway(
 
             val okReq = Request.Builder()
                 .url(validated.url)
-                .headers(currentHeaders.toHeaders())
+                .headers(effectiveHeaders.toHeaders())
                 .method(currentMethod, okBody)
                 .build()
 
-            hopClient.newCall(okReq).execute().use { resp ->
-                val code = resp.code
-                val location = resp.header("Location")
-                if (code in REDIRECT_CODES && location != null) {
-                    when (redirectMode) {
-                        "error" -> throw IOException("请求触发重定向且 redirect=error（状态码 $code）")
-                        "manual" -> return buildResponse(resp, validated.url.toString())
-                        "follow" -> {
-                            hops += 1
-                            if (hops > maxRedirects) {
-                                throw IOException("重定向次数过多（超过 $maxRedirects 次）")
-                            }
-                            val resolved = validated.url.resolve(location)
-                                ?: throw NetworkPolicyException("无效的重定向目标地址")
-                            val prevHost = validated.url.host
-                            val nextHost = resolved.host
-                            // Strip sensitive headers on cross-origin redirect
-                            if (!prevHost.equals(nextHost, ignoreCase = true) ||
-                                validated.url.scheme != resolved.scheme ||
-                                validated.url.port != resolved.port
-                            ) {
-                                currentHeaders.keys.removeAll {
-                                    it.equals("Authorization", ignoreCase = true) ||
-                                        it.equals("Cookie", ignoreCase = true)
+            val callId = callSeq.getAndIncrement()
+            val call = hopClient.newCall(okReq)
+            activeCalls[callId] = call
+            try {
+                call.execute().use { resp ->
+                    // Save Set-Cookie headers from every hop into instance cookie jar
+                    val setCookies = Cookie.parseAll(validated.url, resp.headers)
+                    if (setCookies.isNotEmpty()) {
+                        cookieJar.saveFromResponse(validated.url, setCookies)
+                    }
+
+                    val code = resp.code
+                    val location = resp.header("Location")
+                    if (code in REDIRECT_CODES && location != null) {
+                        when (redirectMode) {
+                            "error" -> throw IOException("请求触发重定向且 redirect=error（状态码 $code）")
+                            "manual" -> return buildResponse(resp, validated.url.toString())
+                            "follow" -> {
+                                hops += 1
+                                if (hops > maxRedirects) {
+                                    throw IOException("重定向次数过多（超过 $maxRedirects 次）")
                                 }
-                            }
-                            if (code == 303 || ((code == 301 || code == 302) && currentMethod == "POST")) {
-                                currentMethod = "GET"
-                                currentBody = null
-                                currentContentType = null
-                                currentHeaders.keys.removeAll {
-                                    it.equals("Content-Type", ignoreCase = true) ||
-                                        it.equals("Content-Length", ignoreCase = true)
+                                val resolved = validated.url.resolve(location)
+                                    ?: throw NetworkPolicyException("无效的重定向目标地址")
+                                if (NetworkPolicy.originKey(validated.url) != NetworkPolicy.originKey(resolved)) {
+                                    currentHeaders.keys.removeAll {
+                                        it.equals("Authorization", ignoreCase = true) ||
+                                            it.equals("Cookie", ignoreCase = true)
+                                    }
                                 }
+                                if (code == 303 || ((code == 301 || code == 302) && currentMethod == "POST")) {
+                                    currentMethod = "GET"
+                                    currentBody = null
+                                    currentContentType = null
+                                    currentHeaders.keys.removeAll {
+                                        it.equals("Content-Type", ignoreCase = true) ||
+                                            it.equals("Content-Length", ignoreCase = true)
+                                    }
+                                }
+                                prevScheme = validated.url.scheme
+                                currentUrl = resolved.toString()
+                                continue
                             }
-                            currentUrl = resolved.toString()
-                            continue
                         }
                     }
+                    return buildResponse(resp, validated.url.toString())
                 }
-                return buildResponse(resp, validated.url.toString())
+            } finally {
+                activeCalls.remove(callId)
             }
         }
     }
+
+    /**
+     * Immediately cancels every active OkHttp call for this instance (called
+     * when a plugin invocation settles, times out, or shuts down — §11.1 / S3).
+     */
+    fun cancelAllActive() {
+        val calls = activeCalls.values.toList()
+        activeCalls.clear()
+        for (c in calls) {
+            runCatching { c.cancel() }
+        }
+    }
+
+    fun activeCallCount(): Int = activeCalls.size
 
     private fun buildResponse(resp: okhttp3.Response, finalUrl: String): FetchResponse {
         val headerMap = LinkedHashMap<String, String>()
@@ -184,35 +284,52 @@ class PluginFetchGateway(
         )
         val buf = ByteArray(16_384)
         var total = 0L
-        resp.body.byteStream().use { stream ->
-            while (true) {
-                val read = stream.read(buf)
-                if (read < 0) break
-                total += read
-                if (total > maxResponseBytes) {
-                    throw FetchResponseTooLargeException(
-                        "响应体超过大小限制（上限 ${maxResponseBytes / (1024 * 1024)} MB）",
-                    )
+        var reserved = 0L
+        try {
+            resp.body.byteStream().use { stream ->
+                while (true) {
+                    val read = stream.read(buf)
+                    if (read < 0) break
+                    total += read
+                    if (total > maxResponseBytes) {
+                        throw FetchResponseTooLargeException(
+                            "响应体超过大小限制（上限 ${maxResponseBytes / (1024 * 1024)} MB）",
+                        )
+                    }
+                    inFlightBudget.reserve(read.toLong())
+                    reserved += read
+                    out.write(buf, 0, read)
                 }
-                out.write(buf, 0, read)
             }
+            val bytes = out.toByteArray()
+            // Release download stream reservation; caller (PluginRuntime) retains or releases budget
+            inFlightBudget.release(reserved)
+            return FetchResponse(
+                status = resp.code,
+                url = finalUrl,
+                headers = headerMap,
+                body = bytes,
+            )
+        } catch (t: Throwable) {
+            inFlightBudget.release(reserved)
+            throw t
         }
-        return FetchResponse(
-            status = resp.code,
-            url = finalUrl,
-            headers = headerMap,
-            body = out.toByteArray(),
-        )
     }
 
     companion object {
-        const val MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+        /** §11.1: single fetch response cap is 8 MB. */
+        const val MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+        /** §11.1: max 4 concurrent fetches per instance. */
+        const val MAX_CONCURRENT_FETCHES = 4
+        /** §11.1: max 16 MB total in-flight bytes per instance. */
+        const val MAX_INFLIGHT_BYTES = 16 * 1024 * 1024
         const val MAX_REDIRECTS = 10
         const val DEFAULT_TIMEOUT_MS = 15_000L
         const val MAX_TIMEOUT_MS = 30_000L
         private val REDIRECT_CODES = setOf(301, 302, 303, 307, 308)
         private val ALLOWED_METHODS = setOf("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
         private val DEFAULT_CLIENT = OkHttpClient.Builder()
+            .proxy(Proxy.NO_PROXY)
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(15, TimeUnit.SECONDS)
             .build()

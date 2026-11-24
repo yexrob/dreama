@@ -17,16 +17,69 @@ const CAPABILITY_EXPORTS = {
   categories: ['categories'],
 };
 
-function validatePlaybackUrls(playbackInfo, policy, errors) {
+const MPD_BASE_URL_RE = /<BaseURL\b[^>]*>\s*([^<]+?)\s*<\/BaseURL>/gi;
+const MPD_ATTR_URL_RE = /\b(?:media|initialization|sourceURL)\s*=\s*"([^"]+)"/gi;
+
+function extractUrlsFromMpd(mpdXml) {
+  const out = [];
+  for (const m of String(mpdXml).matchAll(MPD_BASE_URL_RE)) {
+    const u = m[1].trim();
+    if (u.includes('://') || u.startsWith('file:') || u.startsWith('content:')) out.push(u);
+  }
+  for (const m of String(mpdXml).matchAll(MPD_ATTR_URL_RE)) {
+    const u = m[1].trim();
+    if (u.includes('://') || u.startsWith('file:') || u.startsWith('content:')) out.push(u);
+  }
+  return out;
+}
+
+export function validateImageUrl(label, img, policy, errors) {
+  if (img === null || img === undefined) return;
+  const url = typeof img === 'string' ? img : (typeof img === 'object' ? img.url : null);
+  if (!url) return;
+  try {
+    policy.validateResourceUrlPrecheck(url);
+  } catch (e) {
+    errors.push(`${label} rejected by network policy: ${e.message}`);
+  }
+}
+
+export function validateItemUrls(prefix, item, policy, errors) {
+  if (!item || typeof item !== 'object') return;
+  validateImageUrl(`${prefix}.poster`, item.poster, policy, errors);
+  validateImageUrl(`${prefix}.thumb`, item.thumb, policy, errors);
+  validateImageUrl(`${prefix}.backdrop`, item.backdrop, policy, errors);
+  for (let i = 0; i < (item.people || []).length; i++) {
+    validateImageUrl(`${prefix}.people[${i}].image`, item.people[i]?.image, policy, errors);
+  }
+  for (let i = 0; i < (item.seasons || []).length; i++) {
+    validateItemUrls(`${prefix}.seasons[${i}]`, item.seasons[i], policy, errors);
+  }
+  for (let i = 0; i < (item.episodes || []).length; i++) {
+    validateItemUrls(`${prefix}.episodes[${i}]`, item.episodes[i], policy, errors);
+  }
+  for (let i = 0; i < (item.related || []).length; i++) {
+    validateItemUrls(`${prefix}.related[${i}]`, item.related[i], policy, errors);
+  }
+}
+
+export function validatePlaybackResult(playbackInfo, policy, errors) {
+  if (!playbackInfo || typeof playbackInfo !== 'object') return;
+  if (playbackInfo.live === true && playbackInfo.dash) {
+    errors.push('playback: live=true combined with dash is unsupported in protocol v1 (§11.2)');
+  }
   const check = (label, url) => {
     try {
-      policy.validatePlaybackUrlSyntax(url);
+      policy.validateResourceUrlPrecheck(url);
     } catch (e) {
       errors.push(`playback ${label} rejected by network policy: ${e.message}`);
     }
   };
   if (playbackInfo.url) check('url', playbackInfo.url);
   if (playbackInfo.dash) {
+    if (typeof playbackInfo.durationMs !== 'number' || playbackInfo.durationMs <= 0) {
+      errors.push('playback: dash mode requires positive durationMs (§11.2)');
+    }
     (playbackInfo.dash.video || []).forEach((t, i) => {
       check(`dash.video[${i}].url`, t.url);
       (t.backupUrls || []).forEach((b, j) => check(`dash.video[${i}].backupUrls[${j}]`, b));
@@ -36,7 +89,60 @@ function validatePlaybackUrls(playbackInfo, policy, errors) {
       (t.backupUrls || []).forEach((b, j) => check(`dash.audio[${i}].backupUrls[${j}]`, b));
     });
   }
+  if (playbackInfo.mpd) {
+    for (const u of extractUrlsFromMpd(playbackInfo.mpd)) {
+      check('mpd URL', u);
+    }
+  }
   (playbackInfo.subtitles || []).forEach((s, i) => check(`subtitles[${i}].url`, s.url));
+}
+
+export function validateMethodResult(method, result, manifest, policy) {
+  const errors = [];
+  const schemaMap = {
+    home: 'HomeResult',
+    browse: 'ItemPage',
+    detail: 'Item',
+    playback: 'PlaybackInfo',
+    search: 'ItemPage',
+    suggest: 'SuggestResult',
+    filters: 'FiltersResult',
+    danmaku: 'DanmakuResult',
+    categories: 'CategoriesResult',
+    login: 'FormLoginResult',
+    loginPoll: 'LoginPollResult',
+  };
+  const schemaDef = method === 'loginStart'
+    ? (manifest.auth === 'device' ? 'DeviceLoginStartResult' : 'QrLoginStartResult')
+    : schemaMap[method];
+
+  if (schemaDef) {
+    if (result === undefined || result === null) {
+      errors.push(`${method}() returned ${result}, expected ${schemaDef}`);
+      return errors;
+    }
+    const check = validateProtocolType(schemaDef, result);
+    if (!check.valid) {
+      errors.push(...check.errors.map((e) => `${method}(): ${e}`));
+    }
+  }
+
+  // Validate embedded URLs under §11.3 resource policy
+  if (method === 'home' && Array.isArray(result)) {
+    result.forEach((s, si) => (s?.items || []).forEach((it, ii) => validateItemUrls(`home[${si}].items[${ii}]`, it, policy, errors)));
+  } else if ((method === 'browse' || method === 'search') && result?.items) {
+    result.items.forEach((it, ii) => validateItemUrls(`${method}.items[${ii}]`, it, policy, errors));
+  } else if (method === 'detail' && result) {
+    validateItemUrls('detail', result, policy, errors);
+  } else if (method === 'playback' && result) {
+    validatePlaybackResult(result, policy, errors);
+  } else if (method === 'login' && result?.user?.avatar) {
+    validateImageUrl('login.user.avatar', result.user.avatar, policy, errors);
+  } else if (method === 'loginPoll' && result?.user?.avatar) {
+    validateImageUrl('loginPoll.user.avatar', result.user.avatar, policy, errors);
+  }
+
+  return errors;
 }
 
 export async function loadPluginSource(targetPath) {
@@ -118,12 +224,17 @@ export async function checkPlugin(targetPath, opts = {}) {
     }
     checks.push('QuickJS module load & exports');
 
-    // 3. Verify sandbox boundary (unauthorized host + loopback + Host header rejected)
+    // 3. Verify sandbox & §11.3 network boundary
     const probeRes = await host.runProbe(`
       const blocked = [];
       for (const target of [
         ['https://unauthorized.depth3d-check.invalid/test', {}],
         ['http://127.0.0.1:9999/secret', {}],
+        ['http://127.1:9999/secret', {}],
+        ['http://0x7f.0.0.1:9999/secret', {}],
+        ['http://localhost.:9999/secret', {}],
+        ['http://169.254.169.254/latest/meta-data/', {}],
+        ['file:///etc/passwd', {}],
         ['https://api.example.com/', { headers: { Host: 'evil.com' } }],
       ]) {
         try {
@@ -138,10 +249,10 @@ export async function checkPlugin(targetPath, opts = {}) {
     if (!Array.isArray(probeRes) || !probeRes.every(Boolean)) {
       errors.push('sandbox probe failed: unauthorized fetch was not blocked');
     } else {
-      checks.push('permission & sandbox boundary probe');
+      checks.push('permission & §11.3 sandbox boundary probe');
     }
 
-    // 4. Functional data-structure check (runs home -> browse -> detail -> playback + capabilities)
+    // 4. Functional data-structure & URL-policy check (runs home -> browse -> detail -> playback + capabilities)
     const hasRequiredConfig = (manifest.config || []).every((f) => {
       if (!f.required) return true;
       const val = host.config[f.key];
@@ -151,22 +262,15 @@ export async function checkPlugin(targetPath, opts = {}) {
     if (errors.length === 0) {
       try {
         const shelves = await host.invoke('home');
-        const hVal = validateProtocolType('HomeResult', shelves);
-        if (!hVal.valid) {
-          errors.push(...hVal.errors.map((e) => `home(): ${e}`));
-        } else {
-          checks.push(`home() schema (${shelves.length} shelves)`);
-        }
+        const hErrs = validateMethodResult('home', shelves, manifest, host.networkPolicy);
+        if (hErrs.length) errors.push(...hErrs);
+        else checks.push(`home() schema & image URLs (${shelves.length} shelves)`);
 
         const rootPage = await host.invoke('browse', { categoryId: '' });
-        const bVal = validateProtocolType('ItemPage', rootPage);
-        if (!bVal.valid) {
-          errors.push(...bVal.errors.map((e) => `browse(''): ${e}`));
-        } else {
-          checks.push(`browse('') schema (${rootPage.items.length} items)`);
-        }
+        const bErrs = validateMethodResult('browse', rootPage, manifest, host.networkPolicy);
+        if (bErrs.length) errors.push(...bErrs);
+        else checks.push(`browse('') schema & image URLs (${rootPage.items.length} items)`);
 
-        // Find a playable item for detail() + playback()
         const allItems = [
           ...(Array.isArray(shelves) ? shelves.flatMap((s) => s.items || []) : []),
           ...(rootPage?.items || []),
@@ -174,56 +278,63 @@ export async function checkPlugin(targetPath, opts = {}) {
         const playable = allItems.find((it) => ['movie', 'video', 'episode', 'live'].includes(it.kind)) || allItems[0];
         if (playable) {
           const detailItem = await host.invoke('detail', { itemId: playable.id });
-          const dVal = validateProtocolType('Item', detailItem);
-          if (!dVal.valid) errors.push(...dVal.errors.map((e) => `detail('${playable.id}'): ${e}`));
-          else checks.push(`detail('${playable.id}') schema`);
+          const dErrs = validateMethodResult('detail', detailItem, manifest, host.networkPolicy);
+          if (dErrs.length) errors.push(...dErrs);
+          else checks.push(`detail('${playable.id}') schema & image URLs`);
 
           const playTarget = ['movie', 'video', 'episode', 'live'].includes(detailItem?.kind)
             ? detailItem.id
             : detailItem?.episodes?.[0]?.id;
           if (playTarget) {
             const pb = await host.invoke('playback', { itemId: playTarget });
-            const pVal = validateProtocolType('PlaybackInfo', pb);
-            if (!pVal.valid) {
-              errors.push(...pVal.errors.map((e) => `playback('${playTarget}'): ${e}`));
-            } else {
-              validatePlaybackUrls(pb, host.networkPolicy, errors);
-              checks.push(`playback('${playTarget}') schema & URL policy`);
-            }
+            const pErrs = validateMethodResult('playback', pb, manifest, host.networkPolicy);
+            if (pErrs.length) errors.push(...pErrs);
+            else checks.push(`playback('${playTarget}') schema & URL policy`);
           }
         }
 
-        // Optional capabilities smoke check
         const caps = new Set(manifest.capabilities || []);
         if (caps.has('categories')) {
           const cats = await host.invoke('categories');
-          const cVal = validateProtocolType('CategoriesResult', cats);
-          if (!cVal.valid) errors.push(...cVal.errors.map((e) => `categories(): ${e}`));
+          const cErrs = validateMethodResult('categories', cats, manifest, host.networkPolicy);
+          if (cErrs.length) errors.push(...cErrs);
           else checks.push('categories() schema');
         }
         if (caps.has('search')) {
           const sr = await host.invoke('search', { query: 'test' });
-          const sVal = validateProtocolType('ItemPage', sr);
-          if (!sVal.valid) errors.push(...sVal.errors.map((e) => `search(): ${e}`));
-          else checks.push('search() schema');
+          const sErrs = validateMethodResult('search', sr, manifest, host.networkPolicy);
+          if (sErrs.length) errors.push(...sErrs);
+          else checks.push('search() schema & image URLs');
           if (exportSet.has('suggest')) {
             const sug = await host.invoke('suggest', { query: 'te' });
-            const sugVal = validateProtocolType('SuggestResult', sug);
-            if (!sugVal.valid) errors.push(...sugVal.errors.map((e) => `suggest(): ${e}`));
+            const sugErrs = validateMethodResult('suggest', sug, manifest, host.networkPolicy);
+            if (sugErrs.length) errors.push(...sugErrs);
             else checks.push('suggest() schema');
           }
         }
         if (caps.has('filters')) {
           const fl = await host.invoke('filters', { categoryId: '' });
-          const fVal = validateProtocolType('FiltersResult', fl);
-          if (!fVal.valid) errors.push(...fVal.errors.map((e) => `filters(): ${e}`));
+          const fErrs = validateMethodResult('filters', fl, manifest, host.networkPolicy);
+          if (fErrs.length) errors.push(...fErrs);
           else checks.push('filters() schema');
         }
         if (caps.has('danmaku') && playable) {
           const dm = await host.invoke('danmaku', { itemId: playable.id, fromMs: 0, toMs: 60000 });
-          const dmVal = validateProtocolType('DanmakuResult', dm);
-          if (!dmVal.valid) errors.push(...dmVal.errors.map((e) => `danmaku(): ${e}`));
+          const dmErrs = validateMethodResult('danmaku', dm, manifest, host.networkPolicy);
+          if (dmErrs.length) errors.push(...dmErrs);
           else checks.push('danmaku() schema');
+        }
+        if (manifest.auth === 'qr' || manifest.auth === 'device') {
+          const ls = await host.invoke('loginStart');
+          const lsErrs = validateMethodResult('loginStart', ls, manifest, host.networkPolicy);
+          if (lsErrs.length) errors.push(...lsErrs);
+          else checks.push('loginStart() schema');
+          if (ls?.state) {
+            const lp = await host.invoke('loginPoll', { state: ls.state });
+            const lpErrs = validateMethodResult('loginPoll', lp, manifest, host.networkPolicy);
+            if (lpErrs.length) errors.push(...lpErrs);
+            else checks.push('loginPoll() schema');
+          }
         }
       } catch (err) {
         if (err instanceof PluginCallError &&

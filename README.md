@@ -177,7 +177,7 @@ sh player/app/src/main/jni/airplay/mac/build.sh     # 需要 Xcode 命令行工�
 | ajv（共用 JSON Schema 校验） | 8.20.0，[ajv-validator/ajv](https://github.com/ajv-validator/ajv) | MIT | `tools/plugin-kit/package.json` |
 | linkedom（开发工具 `ctx.parse`） | 0.18.15，[WebReflection/linkedom](https://github.com/WebReflection/linkedom) | ISC | `tools/plugin-kit/package.json` |
 | jszip（`.d3plugin` 打包解包） | 3.10.2，[Stuk/jszip](https://github.com/Stuk/jszip) | MIT / GPL-3.0-or-later | `tools/plugin-kit/package.json` |
-| 测试依赖：`mockwebserver` 5.5.0、`kotlinx-coroutines-test` 1.11.0、`sqlite-jdbc` 3.54.1.0 | Maven Central | Apache-2.0 | `player/app/build.gradle`（`testImplementation`） |
+| 测试依赖：`mockwebserver` 5.5.0、`kotlinx-coroutines-test` 1.11.0、`sqlite-jdbc` 3.54.1.0、`room-testing` 2.8.5、`robolectric` 4.18.1 | Maven Central | Apache-2.0 / MIT（Robolectric） | `player/app/build.gradle`（`testImplementation`） |
 
 都和本项目的 GPLv3 兼容，许可原文在各自目录里。接入方式参考了 [jqssun/android-airplay-server](https://github.com/jqssun/android-airplay-server)；`jni/airplay/android/` 和 `local/airplay/` 是本项目自己写的。
 

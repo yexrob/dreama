@@ -134,7 +134,7 @@ data class PluginManifest(
     val id: String,
     val name: String,
     val version: String,
-    val author: String,
+    val author: String = "",
     val description: String = "",
     val homepage: String? = null,
     val license: String? = null,
@@ -180,10 +180,10 @@ data class SemVer(
     }
 
     companion object {
-        private val REGEX = Regex("^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-([0-9A-Za-z.-]+))?(?:\\+[0-9A-Za-z.-]+)?$")
+        private val REGEX = Regex("\\A(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-([0-9A-Za-z.-]+))?(?:\\+[0-9A-Za-z.-]+)?\\z")
 
         fun parse(raw: String): SemVer? {
-            val m = REGEX.matchEntire(raw.trim()) ?: return null
+            val m = REGEX.matchEntire(raw) ?: return null
             return SemVer(
                 major = m.groupValues[1].toInt(),
                 minor = m.groupValues[2].toInt(),
@@ -215,13 +215,12 @@ object ManifestParser {
 
         val permissionsObj = obj["permissions"] as? JsonObject
         val hosts = (permissionsObj?.get("hosts") as? JsonArray)
-            ?.mapNotNull { (it as? JsonPrimitive)?.content }
+            ?.mapNotNull { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content }
             ?: emptyList()
         for (host in hosts) {
-            val normalized = host.lowercase(Locale.ROOT)
-            val bare = normalized.removePrefix("*.")
-            if (bare == "localhost" || bare.endsWith(".localhost") || NetworkPolicy.isLoopbackLiteral(bare)) {
-                semanticErrors += "permissions.hosts must not include loopback host '$host'"
+            val bare = NetworkPolicy.canonicalizeHost(host.removePrefix("*."))
+            if (NetworkPolicy.isForbiddenHostName(bare) || NetworkPolicy.isAlwaysBlockedLiteral(bare)) {
+                semanticErrors += "permissions.hosts must not include loopback/reserved host '$host'"
             }
         }
         val permissions = PluginPermissions(
@@ -241,9 +240,9 @@ object ManifestParser {
             val type = ConfigFieldType.fromWire((f["type"] as JsonPrimitive).content)!!
             val label = (f["label"] as JsonPrimitive).content
             val required = (f["required"] as? JsonPrimitive)?.booleanOrNull ?: false
-            val discover = (f["discover"] as? JsonPrimitive)?.content
-            val placeholder = (f["placeholder"] as? JsonPrimitive)?.content
-            val defaultEl = f["default"]
+            val discover = f.optString("discover")
+            val placeholder = f.optString("placeholder")
+            val defaultEl = f["default"]?.takeUnless { it is JsonNull }
             val options = (f["options"] as? JsonArray)?.map { optEl ->
                 val opt = optEl as JsonObject
                 ConfigOption(
@@ -252,7 +251,7 @@ object ManifestParser {
                 )
             } ?: emptyList()
 
-            if (defaultEl != null && defaultEl !is JsonNull) {
+            if (defaultEl != null) {
                 val prim = defaultEl as? JsonPrimitive
                 when (type) {
                     ConfigFieldType.TEXT, ConfigFieldType.PASSWORD, ConfigFieldType.URL -> {
@@ -294,8 +293,9 @@ object ManifestParser {
             throw ManifestValidationException(semanticErrors)
         }
 
+        // §11.2: unknown capabilities are ignored gracefully for forward compatibility
         val capabilities = (obj["capabilities"] as? JsonArray)
-            ?.mapNotNull { (it as? JsonPrimitive)?.content?.let(PluginCapability::fromWire) }
+            ?.mapNotNull { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content?.let(PluginCapability::fromWire) }
             ?.toSet()
             ?: emptySet()
 
@@ -304,16 +304,22 @@ object ManifestParser {
             id = (obj["id"] as JsonPrimitive).content,
             name = (obj["name"] as JsonPrimitive).content,
             version = (obj["version"] as JsonPrimitive).content,
-            author = (obj["author"] as JsonPrimitive).content,
-            description = (obj["description"] as? JsonPrimitive)?.content ?: "",
-            homepage = (obj["homepage"] as? JsonPrimitive)?.content,
-            license = (obj["license"] as? JsonPrimitive)?.content,
-            minApp = (obj["minApp"] as? JsonPrimitive)?.content,
+            author = obj.optString("author") ?: "",
+            description = obj.optString("description") ?: "",
+            homepage = obj.optString("homepage"),
+            license = obj.optString("license"),
+            minApp = obj.optString("minApp"),
             multiInstance = (obj["multiInstance"] as? JsonPrimitive)?.booleanOrNull ?: false,
             capabilities = capabilities,
             permissions = permissions,
             config = configFields,
-            auth = PluginAuthMode.fromWire((obj["auth"] as? JsonPrimitive)?.content),
+            auth = PluginAuthMode.fromWire(obj.optString("auth")),
         )
+    }
+
+    private fun JsonObject.optString(key: String): String? {
+        val el = this[key] ?: return null
+        if (el is JsonNull) return null
+        return (el as? JsonPrimitive)?.takeIf { it.isString }?.content
     }
 }

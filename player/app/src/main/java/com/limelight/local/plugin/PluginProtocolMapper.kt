@@ -114,12 +114,18 @@ data class LoginPollResult(
 )
 
 /**
- * Validates raw JSON results returned by a plugin against the shared
- * `protocol-types.schema.json` and maps them into strongly-typed depth3d
- * models. Also enforces playback URL safety rules (protocol §7).
+ * Validates raw JSON results against shared `protocol-types.schema.json` and
+ * maps them to depth3d models following §11.2 forward-compatibility rules and
+ * §11.3 URL security boundaries:
+ * - Optional fields equal to `null` are treated as omitted
+ * - Items with unknown `kind` are silently dropped rather than failing the call
+ * - Unknown enum values fall back to defaults
+ * - Out-of-range numeric fields are ignored (mapped to `null`)
+ * - Danmaku `color` accepts `"#RRGGBB"` string or `0xRRGGBB` integer
+ * - Image, stream, MPD, and subtitle URLs are checked against [NetworkPolicy]
  */
 class PluginProtocolMapper(
-    private val networkPolicy: NetworkPolicy,
+    val networkPolicy: NetworkPolicy,
     private val logger: PluginLogger? = null,
     private val androidContext: Context? = null,
 ) {
@@ -132,8 +138,8 @@ class PluginProtocolMapper(
     fun mapItemPage(element: JsonElement, nextPageNumber: Int? = null): Page<Item> {
         requireSchema("ItemPage", element)
         val obj = element as JsonObject
-        val items = (obj["items"] as JsonArray).map { mapItem(it as JsonObject) }
-        val nextCursor = (obj["next"] as? JsonPrimitive)?.takeIf { it.isString && it.content.isNotEmpty() }?.content
+        val items = (obj["items"] as JsonArray).mapNotNull { mapItemOrNull(it as JsonObject) }
+        val nextCursor = obj.optString("next")?.takeIf { it.isNotEmpty() }
         return Page(
             items = items,
             nextPage = if (nextCursor != null) nextPageNumber else null,
@@ -143,24 +149,43 @@ class PluginProtocolMapper(
 
     fun mapItem(element: JsonElement): Item {
         requireSchema("Item", element)
-        return mapItem(element as JsonObject)
+        return mapItemOrNull(element as JsonObject)
+            ?: throw PluginErrorMapper.toException(
+                PluginErrorPayload(PluginErrorCode.UNSUPPORTED),
+                context = androidContext,
+            )
     }
 
-    fun mapPlayback(element: JsonElement, fallbackTitle: String): PlaybackInfo {
+    fun mapPlayback(element: JsonElement, fallbackTitle: String?): PlaybackInfo {
         requireSchema("PlaybackInfo", element)
         val obj = element as JsonObject
 
-        val url = (obj["url"] as? JsonPrimitive)?.content
-        if (url != null) {
-            validatePlaybackUrl(url)
+        val isLive = obj.optBoolean("live") ?: false
+        val dashObj = obj["dash"] as? JsonObject
+        if (isLive && dashObj != null) {
+            // §11.2: live: true with dash is unsupported in v1
+            throw PluginErrorMapper.toException(
+                PluginErrorPayload(PluginErrorCode.UNSUPPORTED),
+                context = androidContext,
+            )
         }
 
-        val dash = (obj["dash"] as? JsonObject)?.let { dashObj ->
-            val video = (dashObj["video"] as JsonArray).map { mapTrack(it as JsonObject) }
-            val audio = (dashObj["audio"] as JsonArray).map { mapTrack(it as JsonObject) }
+        val url = obj.optString("url")
+        if (url != null) {
+            validateResourceUrl(url)
+        }
+
+        val dash = dashObj?.let { d ->
+            val video = (d["video"] as JsonArray).map { mapTrack(it as JsonObject) }
+            val audio = (d["audio"] as JsonArray).map { mapTrack(it as JsonObject) }
             DashStream(video = video, audio = audio)
         }
-        val mpd = (obj["mpd"] as? JsonPrimitive)?.content
+        val mpd = obj.optString("mpd")
+        if (mpd != null) {
+            for (u in PlaybackMediaSourceFactory.extractUrlsFromMpd(mpd)) {
+                validateResourceUrl(u)
+            }
+        }
 
         val headers = mapHeaders(obj["headers"] as? JsonObject)
         val qualities = (obj["qualities"] as? JsonArray)?.map { qEl ->
@@ -168,30 +193,30 @@ class PluginProtocolMapper(
             QualityOption(
                 id = (q["id"] as JsonPrimitive).content,
                 label = (q["label"] as JsonPrimitive).content,
-                selected = (q["selected"] as? JsonPrimitive)?.booleanOrNull ?: false,
-                locked = (q["locked"] as? JsonPrimitive)?.content,
+                selected = q.optBoolean("selected") ?: false,
+                locked = q.optString("locked"),
             )
         } ?: emptyList()
 
-        val subtitles = (obj["subtitles"] as? JsonArray)?.map { sEl ->
+        val subtitles = (obj["subtitles"] as? JsonArray)?.mapNotNull { sEl ->
             val s = sEl as JsonObject
-            val subUrl = (s["url"] as JsonPrimitive).content
-            validatePlaybackUrl(subUrl)
             val fmt = when ((s["format"] as JsonPrimitive).content.lowercase(Locale.ROOT)) {
                 "srt" -> SubtitleFormat.SRT
                 "vtt" -> SubtitleFormat.VTT
                 "ass" -> SubtitleFormat.ASS
                 "json" -> SubtitleFormat.JSON
-                else -> SubtitleFormat.VTT
+                else -> return@mapNotNull null // §11.2: ignore unknown subtitle format gracefully
             }
+            val subUrl = (s["url"] as JsonPrimitive).content
+            validateResourceUrl(subUrl)
             SubtitleTrack(
                 id = (s["id"] as JsonPrimitive).content,
                 label = (s["label"] as JsonPrimitive).content,
-                lang = (s["lang"] as? JsonPrimitive)?.content,
+                lang = s.optString("lang"),
                 url = subUrl,
                 format = fmt,
                 headers = mapHeaders(s["headers"] as? JsonObject),
-                isDefault = (s["default"] as? JsonPrimitive)?.booleanOrNull ?: false,
+                isDefault = s.optBoolean("default") ?: false,
             )
         } ?: emptyList()
 
@@ -200,26 +225,32 @@ class PluginProtocolMapper(
             AudioTrackOption(
                 id = (a["id"] as JsonPrimitive).content,
                 label = (a["label"] as JsonPrimitive).content,
-                lang = (a["lang"] as? JsonPrimitive)?.content,
+                lang = a.optString("lang"),
             )
         } ?: emptyList()
+
+        val durationMs = obj.optDouble("durationMs")?.takeIf { it.isFinite() && it > 0.0 }?.toLong()
+        val startMs = obj.optDouble("startMs")?.takeIf { it.isFinite() && it >= 0.0 }?.toLong() ?: 0L
+        val expiresAt = obj.optDouble("expiresAt")?.takeIf { it.isFinite() && it > 0.0 }?.toLong()
+        val resolvedTitle = obj.optString("title")?.takeIf { it.isNotBlank() } ?: fallbackTitle
 
         return PlaybackInfo(
             url = url ?: "",
             headers = headers,
-            title = fallbackTitle,
-            startPositionMs = (obj["startMs"] as? JsonPrimitive)?.longOrNull ?: 0L,
-            stereoHint = mapStereo((obj["stereo"] as? JsonPrimitive)?.content),
+            title = resolvedTitle,
+            startPositionMs = startMs,
+            stereoHint = mapStereo(obj.optString("stereo")),
             dash = dash,
             mpd = mpd,
-            mimeType = (obj["mime"] as? JsonPrimitive)?.content,
+            mimeType = obj.optString("mime"),
+            durationMs = durationMs,
             qualities = qualities,
             subtitles = subtitles,
             audios = audios,
-            isLive = (obj["live"] as? JsonPrimitive)?.booleanOrNull ?: false,
-            expiresAtMs = (obj["expiresAt"] as? JsonPrimitive)?.longOrNull,
-            nextItemId = (obj["next"] as? JsonPrimitive)?.content,
-            sessionId = (obj["session"] as? JsonPrimitive)?.content,
+            isLive = isLive,
+            expiresAtMs = expiresAt,
+            nextItemId = obj.optString("next"),
+            sessionId = obj.optString("session"),
         )
     }
 
@@ -240,13 +271,15 @@ class PluginProtocolMapper(
 
     fun mapDanmaku(element: JsonElement): List<DanmakuItem> {
         requireSchema("DanmakuResult", element)
-        return (element as JsonArray).map { el ->
+        return (element as JsonArray).mapNotNull { el ->
             val o = el as JsonObject
+            val timeMs = o.optDouble("timeMs")?.takeIf { it.isFinite() && it >= 0.0 }?.toLong() ?: return@mapNotNull null
+            val color = parseDanmakuColor(o["color"])
             DanmakuItem(
-                timeMs = (o["timeMs"] as JsonPrimitive).doubleOrNull?.toLong() ?: 0L,
+                timeMs = timeMs,
                 text = (o["text"] as JsonPrimitive).content,
-                color = (o["color"] as? JsonPrimitive)?.content,
-                mode = DanmakuMode.fromWire((o["mode"] as? JsonPrimitive)?.content),
+                color = color,
+                mode = DanmakuMode.fromWire(o.optString("mode")),
             )
         }
     }
@@ -258,7 +291,7 @@ class PluginProtocolMapper(
             Category(
                 id = (o["id"] as JsonPrimitive).content,
                 title = (o["title"] as JsonPrimitive).content,
-                icon = (o["icon"] as? JsonPrimitive)?.content,
+                icon = o.optString("icon"),
             )
         }
     }
@@ -280,10 +313,11 @@ class PluginProtocolMapper(
     fun mapQrLoginStart(element: JsonElement): QrLoginStart {
         requireSchema("QrLoginStartResult", element)
         val obj = element as JsonObject
+        val exp = obj.optDouble("expiresInSec")?.takeIf { it.isFinite() && it > 0 }?.toInt() ?: 180
         return QrLoginStart(
             qr = (obj["qr"] as JsonPrimitive).content,
-            hint = (obj["hint"] as? JsonPrimitive)?.content,
-            expiresInSec = (obj["expiresInSec"] as JsonPrimitive).doubleOrNull?.toInt() ?: 180,
+            hint = obj.optString("hint"),
+            expiresInSec = exp,
             state = (obj["state"] as JsonPrimitive).content,
         )
     }
@@ -291,10 +325,11 @@ class PluginProtocolMapper(
     fun mapDeviceLoginStart(element: JsonElement): DeviceLoginStart {
         requireSchema("DeviceLoginStartResult", element)
         val obj = element as JsonObject
+        val exp = obj.optDouble("expiresInSec")?.takeIf { it.isFinite() && it > 0 }?.toInt() ?: 300
         return DeviceLoginStart(
             url = (obj["url"] as JsonPrimitive).content,
             code = (obj["code"] as JsonPrimitive).content,
-            expiresInSec = (obj["expiresInSec"] as JsonPrimitive).doubleOrNull?.toInt() ?: 300,
+            expiresInSec = exp,
             state = (obj["state"] as JsonPrimitive).content,
         )
     }
@@ -311,15 +346,15 @@ class PluginProtocolMapper(
     private fun mapShelf(obj: JsonObject): Shelf {
         val id = (obj["id"] as JsonPrimitive).content
         val title = (obj["title"] as JsonPrimitive).content
-        val items = (obj["items"] as JsonArray).map { mapItem(it as JsonObject) }
-        val style = when ((obj["style"] as? JsonPrimitive)?.content) {
+        val items = (obj["items"] as JsonArray).mapNotNull { mapItemOrNull(it as JsonObject) }
+        val style = when (obj.optString("style")) {
             "thumb" -> ShelfStyle.THUMB
             "continue" -> ShelfStyle.CONTINUE
             "hero" -> ShelfStyle.HERO
             "category" -> ShelfStyle.CATEGORY
             else -> ShelfStyle.POSTER
         }
-        val more = (obj["more"] as? JsonPrimitive)?.content
+        val more = obj.optString("more")
         return Shelf(
             category = Category(id = more ?: id, title = title, count = items.size),
             items = items,
@@ -328,40 +363,56 @@ class PluginProtocolMapper(
         )
     }
 
-    private fun mapItem(obj: JsonObject): Item {
+    /**
+     * Maps an Item object, returning `null` if `kind` is unrecognized (§11.2:
+     * "`kind` 不认识的条目被丢弃"). Out-of-range numeric fields are ignored.
+     */
+    private fun mapItemOrNull(obj: JsonObject): Item? {
+        val kind = mapKindOrNull((obj["kind"] as JsonPrimitive).content) ?: return null
+        val year = obj.optInt("year")?.takeIf { it in 1800..3000 }
+        val rating = obj.optFloat("rating")?.takeIf { it.isFinite() && it in 0f..10f }
+        val durationMs = obj.optDouble("durationMs")?.takeIf { it.isFinite() && it >= 0.0 }?.toLong()
+        val progressMs = obj.optDouble("progressMs")?.takeIf { it.isFinite() && it >= 0.0 }?.toLong()
+        val index = obj.optInt("index")?.takeIf { it >= 0 }
+        val childCount = obj.optInt("childCount")?.takeIf { it >= 0 }
+
         return Item(
             id = (obj["id"] as JsonPrimitive).content,
-            kind = mapKind((obj["kind"] as JsonPrimitive).content),
+            kind = kind,
             title = (obj["title"] as JsonPrimitive).content,
             poster = obj["poster"]?.let(::mapImage),
             backdrop = obj["backdrop"]?.let(::mapImage),
-            year = (obj["year"] as? JsonPrimitive)?.intOrNull,
-            overview = (obj["overview"] as? JsonPrimitive)?.content,
-            rating = (obj["rating"] as? JsonPrimitive)?.floatOrNull,
-            durationMs = (obj["durationMs"] as? JsonPrimitive)?.doubleOrNull?.toLong(),
-            progressMs = (obj["progressMs"] as? JsonPrimitive)?.doubleOrNull?.toLong(),
-            stereoHint = mapStereo((obj["stereo"] as? JsonPrimitive)?.content),
-            subtitle = (obj["subtitle"] as? JsonPrimitive)?.content,
-            childCount = (obj["childCount"] as? JsonPrimitive)?.intOrNull,
+            year = year,
+            overview = obj.optString("overview"),
+            rating = rating,
+            durationMs = durationMs,
+            progressMs = progressMs,
+            stereoHint = mapStereo(obj.optString("stereo")),
+            subtitle = obj.optString("subtitle"),
+            childCount = childCount,
             thumb = obj["thumb"]?.let(::mapImage),
-            played = (obj["played"] as? JsonPrimitive)?.booleanOrNull,
-            favorite = (obj["favorite"] as? JsonPrimitive)?.booleanOrNull,
-            badges = (obj["badges"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.content } ?: emptyList(),
-            parentId = (obj["parentId"] as? JsonPrimitive)?.content,
-            index = (obj["index"] as? JsonPrimitive)?.intOrNull,
-            seasons = (obj["seasons"] as? JsonArray)?.map { mapItem(it as JsonObject) } ?: emptyList(),
-            episodes = (obj["episodes"] as? JsonArray)?.map { mapItem(it as JsonObject) } ?: emptyList(),
-            related = (obj["related"] as? JsonArray)?.map { mapItem(it as JsonObject) } ?: emptyList(),
+            played = obj.optBoolean("played"),
+            favorite = obj.optBoolean("favorite"),
+            badges = (obj["badges"] as? JsonArray)
+                ?.mapNotNull { (it as? JsonPrimitive)?.takeIf { p -> p.isString && p.content.isNotEmpty() }?.content }
+                ?: emptyList(),
+            parentId = obj.optString("parentId"),
+            index = index,
+            seasons = (obj["seasons"] as? JsonArray)?.mapNotNull { mapItemOrNull(it as JsonObject) } ?: emptyList(),
+            episodes = (obj["episodes"] as? JsonArray)?.mapNotNull { mapItemOrNull(it as JsonObject) } ?: emptyList(),
+            related = (obj["related"] as? JsonArray)?.mapNotNull { mapItemOrNull(it as JsonObject) } ?: emptyList(),
             people = (obj["people"] as? JsonArray)?.map { pEl ->
                 val p = pEl as JsonObject
                 PersonCredit(
                     name = (p["name"] as JsonPrimitive).content,
-                    role = (p["role"] as? JsonPrimitive)?.content,
+                    role = p.optString("role"),
                     image = p["image"]?.let(::mapImage),
-                    id = (p["id"] as? JsonPrimitive)?.content,
+                    id = p.optString("id"),
                 )
             } ?: emptyList(),
-            genres = (obj["genres"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.content } ?: emptyList(),
+            genres = (obj["genres"] as? JsonArray)
+                ?.mapNotNull { (it as? JsonPrimitive)?.takeIf { p -> p.isString && p.content.isNotEmpty() }?.content }
+                ?: emptyList(),
             extra = (obj["extra"] as? JsonArray)?.map { eEl ->
                 val e = eEl as JsonObject
                 ExtraField(
@@ -374,38 +425,52 @@ class PluginProtocolMapper(
 
     private fun mapTrack(obj: JsonObject): MediaTrack {
         val url = (obj["url"] as JsonPrimitive).content
-        validatePlaybackUrl(url)
+        validateResourceUrl(url)
         val backups = (obj["backupUrls"] as? JsonArray)
-            ?.mapNotNull { (it as? JsonPrimitive)?.content }
-            ?.onEach(::validatePlaybackUrl)
+            ?.mapNotNull { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content }
+            ?.onEach(::validateResourceUrl)
             ?: emptyList()
+        val bw = obj.optDouble("bandwidth")?.takeIf { it.isFinite() && it >= 0.0 }?.toLong() ?: 0L
         return MediaTrack(
             id = (obj["id"] as JsonPrimitive).content,
             url = url,
             backupUrls = backups,
             mime = (obj["mime"] as JsonPrimitive).content,
             codecs = (obj["codecs"] as JsonPrimitive).content,
-            bandwidth = (obj["bandwidth"] as JsonPrimitive).doubleOrNull?.toLong() ?: 0L,
-            width = (obj["width"] as? JsonPrimitive)?.intOrNull,
-            height = (obj["height"] as? JsonPrimitive)?.intOrNull,
-            frameRate = (obj["frameRate"] as? JsonPrimitive)?.doubleOrNull,
-            quality = (obj["quality"] as? JsonPrimitive)?.content,
-            initRange = (obj["initRange"] as? JsonPrimitive)?.content,
-            indexRange = (obj["indexRange"] as? JsonPrimitive)?.content,
+            bandwidth = bw,
+            width = obj.optInt("width")?.takeIf { it > 0 },
+            height = obj.optInt("height")?.takeIf { it > 0 },
+            frameRate = obj.optDouble("frameRate")?.takeIf { it.isFinite() && it > 0.0 },
+            quality = obj.optString("quality"),
+            initRange = obj.optString("initRange")?.takeIf { RANGE_REGEX.matches(it) },
+            indexRange = obj.optString("indexRange")?.takeIf { RANGE_REGEX.matches(it) },
         )
     }
 
+    /**
+     * Maps and validates a plugin [Artwork] URL against §11.3 rules:
+     * rejects `file:`, `content:`, `data:`, loopback, link-local, reserved, and
+     * disallowed private URLs.
+     */
     private fun mapImage(el: JsonElement): Artwork? {
         if (el is JsonNull) return null
-        return when (el) {
-            is JsonPrimitive -> Artwork(url = el.content)
-            is JsonObject -> {
-                val url = (el["url"] as JsonPrimitive).content
-                val headers = mapHeaders(el["headers"] as? JsonObject)
-                val blurhash = (el["blurhash"] as? JsonPrimitive)?.content
-                Artwork(url = url, headers = headers, blurhash = blurhash)
+        val (url, headers, blurhash) = when (el) {
+            is JsonPrimitive -> {
+                if (!el.isString || el.content.isBlank()) return null
+                Triple(el.content, emptyMap(), null)
             }
-            else -> null
+            is JsonObject -> {
+                val u = el.optString("url") ?: return null
+                Triple(u, mapHeaders(el["headers"] as? JsonObject), el.optString("blurhash"))
+            }
+            else -> return null
+        }
+        return try {
+            networkPolicy.validateResourceUrlPrecheck(url)
+            Artwork(url = url, headers = headers, blurhash = blurhash)
+        } catch (e: NetworkPolicyException) {
+            logger?.warn("Rejected disallowed image URL: ${e.message}")
+            null
         }
     }
 
@@ -423,21 +488,39 @@ class PluginProtocolMapper(
         if (obj == null) return emptyMap()
         val out = LinkedHashMap<String, String>(obj.size)
         for ((k, v) in obj) {
-            if (v is JsonPrimitive) out[k] = v.content
+            if (v is JsonPrimitive && v !is JsonNull) out[k] = v.content
         }
         return out
     }
 
-    private fun mapKind(raw: String): ItemKind = when (raw) {
+    private fun parseDanmakuColor(el: JsonElement?): String? {
+        if (el == null || el is JsonNull) return null
+        val prim = el as? JsonPrimitive ?: return null
+        if (prim.isString) {
+            val s = prim.content.trim()
+            return if (HEX_COLOR_REGEX.matches(s)) {
+                if (s.startsWith("#")) s.uppercase(Locale.ROOT) else "#${s.uppercase(Locale.ROOT)}"
+            } else {
+                null
+            }
+        }
+        // §11.2: accept 0xRRGGBB integer
+        val intVal = prim.longOrNull ?: return null
+        if (intVal !in 0L..0xFFFFFFL) return null
+        return String.format(Locale.US, "#%06X", intVal)
+    }
+
+    private fun mapKindOrNull(raw: String): ItemKind? = when (raw) {
         "movie" -> ItemKind.MOVIE
         "series" -> ItemKind.SERIES
         "season" -> ItemKind.SEASON
         "episode" -> ItemKind.EPISODE
+        "video" -> ItemKind.VIDEO
         "folder" -> ItemKind.FOLDER
         "live" -> ItemKind.LIVE
         "collection" -> ItemKind.COLLECTION
         "person" -> ItemKind.PERSON
-        else -> ItemKind.VIDEO
+        else -> null
     }
 
     private fun mapStereo(raw: String?): StereoHint = when (raw) {
@@ -449,9 +532,9 @@ class PluginProtocolMapper(
         else -> StereoHint.MONO
     }
 
-    private fun validatePlaybackUrl(url: String) {
+    private fun validateResourceUrl(url: String) {
         try {
-            networkPolicy.validatePlaybackUrlSyntax(url)
+            networkPolicy.validateResourceUrlPrecheck(url)
         } catch (e: NetworkPolicyException) {
             logger?.error("Rejected PlaybackInfo URL by security policy: ${e.message}")
             throw PluginErrorMapper.toException(
@@ -471,5 +554,40 @@ class PluginProtocolMapper(
                 context = androidContext,
             )
         }
+    }
+
+    private fun JsonObject.optString(key: String): String? {
+        val el = this[key] ?: return null
+        if (el is JsonNull) return null
+        return (el as? JsonPrimitive)?.takeIf { it.isString }?.content
+    }
+
+    private fun JsonObject.optBoolean(key: String): Boolean? {
+        val el = this[key] ?: return null
+        if (el is JsonNull) return null
+        return (el as? JsonPrimitive)?.booleanOrNull
+    }
+
+    private fun JsonObject.optInt(key: String): Int? {
+        val el = this[key] ?: return null
+        if (el is JsonNull) return null
+        return (el as? JsonPrimitive)?.intOrNull
+    }
+
+    private fun JsonObject.optFloat(key: String): Float? {
+        val el = this[key] ?: return null
+        if (el is JsonNull) return null
+        return (el as? JsonPrimitive)?.floatOrNull
+    }
+
+    private fun JsonObject.optDouble(key: String): Double? {
+        val el = this[key] ?: return null
+        if (el is JsonNull) return null
+        return (el as? JsonPrimitive)?.doubleOrNull
+    }
+
+    companion object {
+        private val RANGE_REGEX = Regex("\\A\\d+-\\d+\\z")
+        private val HEX_COLOR_REGEX = Regex("\\A#?[0-9a-fA-F]{6}([0-9a-fA-F]{2})?\\z")
     }
 }

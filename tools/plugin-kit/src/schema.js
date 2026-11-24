@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Ajv2020 from 'ajv/dist/2020.js';
-import { isLoopbackLiteral } from './network-policy.js';
+import { canonicalizeHost, isAlwaysBlockedLiteral, isForbiddenHostName } from './network-policy.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const SCHEMA_DIR = path.resolve(__dirname, '../../../docs/specs/plugin-schema');
@@ -34,14 +34,14 @@ export function validateManifest(manifest) {
     return { valid: false, errors: errors.length ? errors : ['$: manifest must be an object'] };
   }
 
-  // Semantic checks matching Android ManifestParser.kt
+  // Semantic checks matching Android ManifestParser.kt (§11.3, §11.4)
   const hosts = manifest.permissions?.hosts;
   if (Array.isArray(hosts)) {
     for (const h of hosts) {
       if (typeof h !== 'string') continue;
-      const bare = h.toLowerCase().replace(/^\*\./, '');
-      if (bare === 'localhost' || bare.endsWith('.localhost') || isLoopbackLiteral(bare)) {
-        errors.push(`$.permissions.hosts: loopback host '${h}' is forbidden`);
+      const bare = canonicalizeHost(h.replace(/^\*\./, ''));
+      if (isForbiddenHostName(bare) || isAlwaysBlockedLiteral(bare)) {
+        errors.push(`$.permissions.hosts: forbidden loopback/reserved host '${h}'`);
       }
     }
   }

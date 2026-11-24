@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "database": {
     "version": 2,
-    "identityHash": "89e6a8139ccb14f564ea5dfb4b632058",
+    "identityHash": "8757ff0c582ecdc72fdda96cea2ba831",
     "entities": [
       {
         "tableName": "watch_progress",
@@ -55,7 +55,7 @@
       },
       {
         "tableName": "plugin_packages",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`pluginId` TEXT NOT NULL, `name` TEXT NOT NULL, `version` TEXT NOT NULL, `author` TEXT NOT NULL, `description` TEXT NOT NULL, `manifestJson` TEXT NOT NULL, `packagePath` TEXT NOT NULL, `sourceUrl` TEXT, `repoUrl` TEXT, `sha256` TEXT NOT NULL, `enabled` INTEGER NOT NULL, `needsPermissionReconfirm` INTEGER NOT NULL, `approvedPermissionsJson` TEXT NOT NULL, `installedAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`pluginId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`pluginId` TEXT NOT NULL, `name` TEXT NOT NULL, `version` TEXT NOT NULL, `author` TEXT NOT NULL, `description` TEXT NOT NULL, `manifestJson` TEXT NOT NULL, `packagePath` TEXT NOT NULL, `sourceUrl` TEXT, `repoUrl` TEXT, `sourceOrigin` TEXT NOT NULL, `sha256` TEXT NOT NULL, `enabled` INTEGER NOT NULL, `needsPermissionReconfirm` INTEGER NOT NULL, `approvedPermissionsJson` TEXT NOT NULL, `installedAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`pluginId`))",
         "fields": [
           {
             "fieldPath": "pluginId",
@@ -108,6 +108,12 @@
             "fieldPath": "repoUrl",
             "columnName": "repoUrl",
             "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "sourceOrigin",
+            "columnName": "sourceOrigin",
+            "affinity": "TEXT",
+            "notNull": true
           },
           {
             "fieldPath": "sha256",
@@ -280,7 +286,7 @@
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '89e6a8139ccb14f564ea5dfb4b632058')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '8757ff0c582ecdc72fdda96cea2ba831')"
     ]
   }
 }

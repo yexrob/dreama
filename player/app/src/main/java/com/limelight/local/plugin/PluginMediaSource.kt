@@ -11,21 +11,20 @@ import com.limelight.local.media.Shelf
 import com.limelight.local.media.Source
 import com.limelight.local.media.SourceKind
 import com.limelight.local.media.SourceNeedsAuthException
-import com.limelight.local.media.SourceNeedsSetupException
 import com.limelight.local.media.SourceUnsupportedException
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import okhttp3.OkHttpClient
 import java.io.Closeable
+import java.util.Collections
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
-/** Optional capability interface for plugins declaring `search`. */
 interface PluginSearchCapability {
     suspend fun search(query: String, cursor: String? = null, kind: ItemKind? = null): Page<Item>
     suspend fun suggest(query: String): List<String>
 }
 
-/** Optional capability interface for plugins declaring `progress`. */
 interface PluginProgressCapability {
     suspend fun reportProgress(
         itemId: String,
@@ -36,32 +35,26 @@ interface PluginProgressCapability {
     )
 }
 
-/** Optional capability interface for plugins declaring `favorites`. */
 interface PluginFavoritesCapability {
     suspend fun setFavorite(itemId: String, favorite: Boolean)
 }
 
-/** Optional capability interface for plugins declaring `played`. */
 interface PluginPlayedCapability {
     suspend fun setPlayed(itemId: String, played: Boolean)
 }
 
-/** Optional capability interface for plugins declaring `filters`. */
 interface PluginFiltersCapability {
     suspend fun filters(categoryId: String): FiltersSpec
 }
 
-/** Optional capability interface for plugins declaring `danmaku`. */
 interface PluginDanmakuCapability {
     suspend fun danmaku(itemId: String, fromMs: Long, toMs: Long): List<DanmakuItem>
 }
 
-/** Optional capability interface for plugins declaring `categories`. */
 interface PluginCategoriesCapability {
     suspend fun categories(): List<Category>
 }
 
-/** Login lifecycle interface covering protocol §4.3 (`form`, `qr`, `device`, `logout`). */
 interface PluginAuthCapability {
     val authMode: PluginAuthMode
     suspend fun loginForm(): FormLoginResult
@@ -73,8 +66,9 @@ interface PluginAuthCapability {
 
 /**
  * Adapts one installed plugin instance to depth3d's standard [MediaSource]
- * interface (home / browse / detail / playback) and exposes all protocol v1
- * optional capabilities and auth flows for the UI layer.
+ * interface and exposes all protocol v1 optional capabilities, auth flows,
+ * [PlaybackMediaSourceFactory], and [PluginImageFetcher] wired with this
+ * instance's real [NetworkPolicy] (§11.3, B1).
  */
 class PluginMediaSource(
     val instanceId: String,
@@ -82,6 +76,7 @@ class PluginMediaSource(
     val manifest: PluginManifest,
     private val runtime: PluginRuntime,
     private val mapper: PluginProtocolMapper,
+    private val okHttpClient: OkHttpClient = OkHttpClient(),
     private val stateGuard: suspend () -> Unit = {},
     private val onNeedsAuth: (suspend () -> Unit)? = null,
     private val onAuthSuccess: (suspend (UserProfile?) -> Unit)? = null,
@@ -107,18 +102,44 @@ class PluginMediaSource(
 
     override val authMode: PluginAuthMode = manifest.auth
     val capabilities: Set<PluginCapability> = manifest.capabilities
+    val networkPolicy: NetworkPolicy get() = mapper.networkPolicy
 
-    // Bridges integer page numbers (MediaSource) to opaque protocol cursors.
-    // Key: categoryId -> (pageIndex -> cursor passed for that page).
+    // Bounded LRU caches so long sessions cannot grow memory unboundedly
     private val pageCursors = ConcurrentHashMap<String, ConcurrentHashMap<Int, String>>()
-    // Remembers item titles seen in home/browse/detail so playback() can fill PlaybackInfo.title.
-    private val knownTitles = ConcurrentHashMap<String, String>()
+    private val knownTitles: MutableMap<String, String> = Collections.synchronizedMap(
+        object : LinkedHashMap<String, String>(64, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean =
+                size > MAX_KNOWN_TITLES
+        },
+    )
+
+    /** Creates a Media3 [PlaybackMediaSourceFactory] bound to this instance's [NetworkPolicy] and device codecs. */
+    fun createPlaybackFactory(client: OkHttpClient = okHttpClient): PlaybackMediaSourceFactory =
+        PlaybackMediaSourceFactory(
+            networkPolicy = mapper.networkPolicy,
+            deviceCodecs = runtime.deviceInfo.codecs,
+            okHttpClient = client,
+        )
+
+    /** Creates a [PlaybackSessionController] bound to this source and its [NetworkPolicy]. */
+    fun createPlaybackSessionController(
+        client: OkHttpClient = okHttpClient,
+        clockMs: () -> Long = System::currentTimeMillis,
+    ): PlaybackSessionController = PlaybackSessionController(
+        source = this,
+        factory = createPlaybackFactory(client),
+        clockMs = clockMs,
+    )
+
+    /** Creates a [PluginImageFetcher] enforcing §11.3 on all artwork loads for this instance. */
+    fun createImageFetcher(client: OkHttpClient = okHttpClient): PluginImageFetcher =
+        PluginImageFetcher(mapper.networkPolicy, client)
 
     override suspend fun home(): List<Shelf> = guarded {
         val raw = runtime.invoke("home")
         mapper.mapHome(raw).also { shelves ->
             for (shelf in shelves) {
-                for (item in shelf.items) knownTitles[item.id] = item.title
+                for (item in shelf.items) rememberTitle(item.id, item.title)
             }
         }
     }
@@ -161,7 +182,7 @@ class PluginMediaSource(
         }
         val raw = runtime.invoke("browse", arg)
         mapper.mapItemPage(raw).also { page ->
-            page.items.forEach { knownTitles[it.id] = it.title }
+            page.items.forEach { rememberTitle(it.id, it.title) }
         }
     }
 
@@ -169,9 +190,9 @@ class PluginMediaSource(
         val arg = buildJsonObject { put("itemId", itemId) }
         val raw = runtime.invoke("detail", arg, itemIdForErrors = itemId)
         mapper.mapItem(raw).also { item ->
-            knownTitles[item.id] = item.title
-            item.seasons.forEach { knownTitles[it.id] = it.title }
-            item.episodes.forEach { knownTitles[it.id] = it.title }
+            rememberTitle(item.id, item.title)
+            item.seasons.forEach { rememberTitle(it.id, it.title) }
+            item.episodes.forEach { rememberTitle(it.id, it.title) }
         }
     }
 
@@ -189,8 +210,8 @@ class PluginMediaSource(
             if (audio != null) put("audio", audio)
         }
         val raw = runtime.invoke("playback", arg, itemIdForErrors = itemId)
-        val title = knownTitles[itemId] ?: itemId
-        mapper.mapPlayback(raw, fallbackTitle = title)
+        // §11.2: PlaybackInfo.title is optional; fallback to cached item title if known, else null (never raw itemId)
+        mapper.mapPlayback(raw, fallbackTitle = knownTitles[itemId])
     }
 
     override suspend fun search(query: String, cursor: String?, kind: ItemKind?): Page<Item> = guarded {
@@ -202,7 +223,7 @@ class PluginMediaSource(
         }
         val raw = runtime.invoke("search", arg)
         mapper.mapItemPage(raw).also { page ->
-            page.items.forEach { knownTitles[it.id] = it.title }
+            page.items.forEach { rememberTitle(it.id, it.title) }
         }
     }
 
@@ -228,7 +249,12 @@ class PluginMediaSource(
             put("event", event.wireName)
             if (session != null) put("session", session)
         }
-        runtime.invoke("reportProgress", arg, itemIdForErrors = itemId)
+        // §11.1: periodic progress reports may be dropped if this instance is busy
+        if (event == ProgressEvent.PROGRESS) {
+            runtime.invokeIfNotBusy("reportProgress", arg, itemIdForErrors = itemId)
+        } else {
+            runtime.invoke("reportProgress", arg, itemIdForErrors = itemId)
+        }
         Unit
     }
 
@@ -275,7 +301,6 @@ class PluginMediaSource(
             val raw = runtime.invoke("categories")
             mapper.mapCategories(raw)
         } else {
-            // Protocol §4.2: fallback to browse('') when categories is not implemented
             browseCursor(MediaSource.ROOT).items.map { item ->
                 Category(id = item.id, title = item.title, count = item.childCount)
             }
@@ -346,6 +371,10 @@ class PluginMediaSource(
         runtime.close()
     }
 
+    private fun rememberTitle(itemId: String, title: String) {
+        if (title.isNotBlank()) knownTitles[itemId] = title
+    }
+
     private fun requireCapability(cap: PluginCapability) {
         if (!manifest.hasCapability(cap)) {
             throw SourceUnsupportedException(
@@ -365,6 +394,7 @@ class PluginMediaSource(
     }
 
     companion object {
+        const val MAX_KNOWN_TITLES = 512
         fun sourceIdFor(instanceId: String): String = "plugin:$instanceId"
     }
 }

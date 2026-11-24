@@ -3,7 +3,7 @@
   "$id": "https://depth3d.dev/schemas/plugin/v1/manifest.schema.json",
   "title": "depth3d Plugin Manifest (v1)",
   "type": "object",
-  "required": ["api", "id", "name", "version", "author"],
+  "required": ["api", "id", "name", "version"],
   "additionalProperties": true,
   "properties": {
     "api": {
@@ -26,54 +26,42 @@
       "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
     },
     "author": {
-      "type": "string",
-      "minLength": 1,
+      "type": ["string", "null"],
       "maxLength": 120
     },
     "description": {
-      "type": "string",
+      "type": ["string", "null"],
       "maxLength": 1000
     },
     "homepage": {
-      "type": "string",
+      "type": ["string", "null"],
       "pattern": "^https?://.+"
     },
     "license": {
-      "type": "string",
-      "minLength": 1,
+      "type": ["string", "null"],
       "maxLength": 100
     },
     "minApp": {
-      "type": "string",
+      "type": ["string", "null"],
       "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
     },
     "multiInstance": {
-      "type": "boolean"
+      "type": ["boolean", "null"]
     },
     "capabilities": {
-      "type": "array",
+      "type": ["array", "null"],
       "uniqueItems": true,
       "items": {
         "type": "string",
-        "enum": [
-          "search",
-          "progress",
-          "favorites",
-          "played",
-          "filters",
-          "subtitles",
-          "danmaku",
-          "live",
-          "categories"
-        ]
+        "minLength": 1
       }
     },
     "permissions": {
-      "type": "object",
+      "type": ["object", "null"],
       "additionalProperties": true,
       "properties": {
         "hosts": {
-          "type": "array",
+          "type": ["array", "null"],
           "uniqueItems": true,
           "items": {
             "type": "string",
@@ -83,22 +71,21 @@
           }
         },
         "userHosts": {
-          "type": "boolean"
+          "type": ["boolean", "null"]
         },
         "lan": {
-          "type": "boolean"
+          "type": ["boolean", "null"]
         }
       }
     },
     "config": {
-      "type": "array",
+      "type": ["array", "null"],
       "items": {
         "$ref": "#/$defs/ConfigField"
       }
     },
     "auth": {
-      "type": "string",
-      "enum": ["none", "form", "qr", "device"]
+      "type": ["string", "null"]
     }
   },
   "$defs": {
@@ -131,18 +118,17 @@
           "minLength": 1,
           "maxLength": 120
         },
-        "required": { "type": "boolean" },
+        "required": { "type": ["boolean", "null"] },
         "discover": {
-          "type": "string",
-          "minLength": 1,
+          "type": ["string", "null"],
           "pattern": "^_[a-zA-Z0-9-]+\\._(tcp|udp)\\.?$"
         },
-        "placeholder": { "type": "string" },
+        "placeholder": { "type": ["string", "null"] },
         "default": {
-          "type": ["string", "number", "boolean"]
+          "type": ["string", "number", "boolean", "null"]
         },
         "options": {
-          "type": "array",
+          "type": ["array", "null"],
           "minItems": 1,
           "items": { "$ref": "#/$defs/ConfigOption" }
         }
@@ -152,7 +138,10 @@
         "required": ["type"]
       },
       "then": {
-        "required": ["options"]
+        "required": ["options"],
+        "properties": {
+          "options": { "type": "array", "minItems": 1 }
+        }
       }
     }
   }

@@ -29,13 +29,16 @@ object JsonSchemaValidator {
     private val schemaCache = ConcurrentHashMap<String, JsonObject>()
     private val regexCache = ConcurrentHashMap<String, Regex>()
 
-    private fun loadSchema(fileName: String): JsonObject = schemaCache.getOrPut(fileName) {
+    fun loadBundledResourceText(fileName: String): String {
         val resourcePath = "plugin-schema/$fileName"
         val stream: InputStream = JsonSchemaValidator::class.java.classLoader
             ?.getResourceAsStream(resourcePath)
-            ?: throw IllegalStateException("Missing bundled plugin schema resource: $resourcePath")
-        val text = stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-        json.parseToJsonElement(text) as JsonObject
+            ?: throw IllegalStateException("Missing bundled plugin resource: $resourcePath")
+        return stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+    }
+
+    private fun loadSchema(fileName: String): JsonObject = schemaCache.getOrPut(fileName) {
+        json.parseToJsonElement(loadBundledResourceText(fileName)) as JsonObject
     }
 
     fun validateManifest(element: JsonElement): ValidationResult {
@@ -109,7 +112,8 @@ object JsonSchemaValidator {
             }
         }
 
-        // String constraints
+        // String constraints (matching ECMA-262 / Ajv semantics: ^ and $ match true string boundaries,
+        // NOT before a trailing \n as Java's default $ does — S2 / §11.4).
         if (value is JsonPrimitive && value.isString) {
             val s = value.content
             (schema["minLength"] as? JsonPrimitive)?.intOrNull?.let { min ->
@@ -119,8 +123,13 @@ object JsonSchemaValidator {
                 if (s.length > max) errors += "$path: string length ${s.length} > maxLength $max"
             }
             (schema["pattern"] as? JsonPrimitive)?.content?.let { pat ->
-                val regex = regexCache.getOrPut(pat) { Regex(pat) }
-                if (!regex.containsMatchIn(s)) {
+                val regex = compileEcmaLikeRegex(pat)
+                val matched = if (pat.startsWith("^") && pat.endsWith("$")) {
+                    regex.matches(s)
+                } else {
+                    regex.containsMatchIn(s)
+                }
+                if (!matched) {
                     errors += "$path: string '$s' does not match pattern $pat"
                 }
             }
@@ -241,6 +250,20 @@ object JsonSchemaValidator {
         }
     }
 
+    private fun compileEcmaLikeRegex(pat: String): Regex = regexCache.getOrPut(pat) {
+        // In Java regex, '$' matches before a final '\n' even without MULTILINE.
+        // Translate leading '^' to '\A' and trailing unescaped '$' to '\z' so
+        // anchored JSON Schema patterns enforce exact full-string match just like JS/Ajv.
+        var translated = pat
+        if (translated.startsWith("^")) {
+            translated = "\\A" + translated.substring(1)
+        }
+        if (translated.endsWith("$") && !translated.endsWith("\\$")) {
+            translated = translated.substring(0, translated.length - 1) + "\\z"
+        }
+        Regex(translated)
+    }
+
     private fun validateSub(value: JsonElement, schema: JsonObject, root: JsonObject): Boolean {
         val subErrors = ArrayList<String>()
         check(value, schema, root, "$", subErrors)
@@ -285,7 +308,6 @@ object JsonSchemaValidator {
 
     private fun jsonEquals(a: JsonElement, b: JsonElement): Boolean {
         if (a == b) return true
-        // Numeric equality (e.g., 1 == 1.0)
         if (a is JsonPrimitive && b is JsonPrimitive && !a.isString && !b.isString &&
             a !is JsonNull && b !is JsonNull && a.booleanOrNull == null && b.booleanOrNull == null
         ) {

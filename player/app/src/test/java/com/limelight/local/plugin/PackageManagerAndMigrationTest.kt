@@ -3,6 +3,9 @@ package com.limelight.local.plugin
 import androidx.sqlite.db.SupportSQLiteDatabase
 import com.limelight.local.media.SourceNeedsSetupException
 import com.limelight.local.media.WallDatabase
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
@@ -10,6 +13,7 @@ import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -19,12 +23,15 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.lang.reflect.Proxy
+import java.net.InetAddress
+import java.net.Proxy as JavaProxy
 import java.nio.file.Files
 import java.sql.Connection
 import java.sql.DriverManager
@@ -33,13 +40,14 @@ import java.util.zip.ZipOutputStream
 
 /**
  * Tests:
- * 1. Real SQLite execution of Room [WallDatabase.MIGRATION_1_2] verified
- *    against KSP-exported `schemas/com.limelight.local.media.WallDatabase/1.json`
- *    and `2.json`
- * 2. Repository index validation + SHA-256 + manifest id/version verification
- * 3. Full [PluginPackageManager] lifecycle (install, update, permission
- *    expansion reconfirm, enable/disable, multiInstance, encrypted config,
- *    uninstall, zip-slip protection)
+ * 1. Real SQLite execution of Room [WallDatabase.MIGRATION_1_2] verified against `1.json` & `2.json`
+ *    (plus official Room `MigrationTestHelper` in [Media3DashAndRoomTest])
+ * 2. S1 (§11.4): `(pluginId, sourceOrigin)` identity — same id from different source requires explicit
+ *    confirmation and wipes all existing instances' configs/passwords, storage, and cookies
+ * 3. S1 & §11.4: HTTPS-only repository enforcement, no private/loopback redirects, 8 MB package cap
+ * 4. S9 & §11.4: Zip Central Directory vs Local File Header consistency (rejects dual-view & duplicate zips)
+ * 5. Small #3: Concurrent `openSource` calls serialize per instance and create only ONE runtime
+ * 6. Full [PluginPackageManager] lifecycle
  */
 class PackageManagerAndMigrationTest {
 
@@ -54,7 +62,6 @@ class PackageManagerAndMigrationTest {
 
         DriverManager.getConnection("jdbc:sqlite::memory:").use { conn ->
             conn.createStatement().execute("PRAGMA foreign_keys = ON")
-            // 1. Create exact v1 schema from 1.json
             val v1Entities = v1Schema["database"]!!.jsonObject["entities"]!!.jsonArray
             for (entityEl in v1Entities) {
                 val e = entityEl.jsonObject
@@ -62,23 +69,19 @@ class PackageManagerAndMigrationTest {
                 val sql = e["createSql"]!!.jsonPrimitive.content.replace("\${TABLE_NAME}", table)
                 conn.createStatement().execute(sql)
             }
-            // Insert existing v1 watch_progress row
             conn.createStatement().execute(
                 "INSERT INTO watch_progress VALUES ('local', 'v:42', '沙丘', 120000, 9000000, 1700000000000)",
             )
 
-            // 2. Run actual Room MIGRATION_1_2 against the SQLite connection
             val supportDb = jdbcSupportDbProxy(conn)
             WallDatabase.MIGRATION_1_2.migrate(supportDb)
 
-            // 3. Verify watch_progress row survived untouched
             conn.createStatement().executeQuery("SELECT title, positionMs FROM watch_progress WHERE itemId = 'v:42'").use { rs ->
                 assertTrue(rs.next())
                 assertEquals("沙丘", rs.getString(1))
                 assertEquals(120000L, rs.getLong(2))
             }
 
-            // 4. Verify every table & column declared in 2.json matches actual SQLite PRAGMA table_info
             val v2Entities = v2Schema["database"]!!.jsonObject["entities"]!!.jsonArray
             for (entityEl in v2Entities) {
                 val e = entityEl.jsonObject
@@ -99,9 +102,8 @@ class PackageManagerAndMigrationTest {
                 assertEquals("Columns mismatch for table $table", expectedCols, actualCols)
             }
 
-            // 5. Verify index and ON DELETE CASCADE foreign key behavior
             conn.createStatement().execute(
-                "INSERT INTO plugin_packages VALUES ('com.test.p','P','1.0.0','A','D','{}','/tmp',NULL,NULL,'abc',1,0,'{}',1,1)",
+                "INSERT INTO plugin_packages VALUES ('com.test.p','P','1.0.0','A','D','{}','/tmp',NULL,NULL,'local-file','abc',1,0,'{}',1,1)",
             )
             conn.createStatement().execute(
                 "INSERT INTO plugin_instances VALUES ('inst-1','com.test.p','My P','enc',1,'NONE',NULL,1,1)",
@@ -115,17 +117,9 @@ class PackageManagerAndMigrationTest {
     }
 
     @Test
-    fun repositoryClientVerifiesIndexSha256AndManifestMatch() = runBlocking {
+    fun repositoryClientEnforcesHttpsNoPrivateRedirects8MbCapAndSha256Match() = runBlocking {
         val validZip = buildPluginZip(
-            manifestJson = """
-                {
-                  "api": 1,
-                  "id": "com.example.repoplug",
-                  "name": "Repo Plugin",
-                  "version": "1.2.0",
-                  "author": "Tester"
-                }
-            """.trimIndent(),
+            manifestJson = """{"api":1,"id":"com.example.repoplug","name":"Repo Plugin","version":"1.2.0","author":"Tester"}""",
             mainJs = "export default { home(){return []}, browse(){return {items:[]}}, detail(){return {id:'1',kind:'video',title:'1'}}, playback(){return {url:'https://cdn.example.com/1.mp4'}} };",
         )
         val validSha = PluginRepositoryClient.sha256Hex(validZip)
@@ -135,7 +129,23 @@ class PackageManagerAndMigrationTest {
         )
         val wrongIdSha = PluginRepositoryClient.sha256Hex(wrongIdZip)
 
+        // 1. Default §11.4 public repository policy rejects plain HTTP and private/loopback URLs
+        val strictClient = PluginRepositoryClient()
+        assertEquals(8 * 1024 * 1024, PluginRepositoryClient.MAX_PACKAGE_BYTES)
+        try {
+            strictClient.fetchIndex("http://repo.example.com/index.json")
+            fail("Plain HTTP repo URL MUST be rejected under §11.4")
+        } catch (_: RepositoryVerificationException) {
+        }
+        try {
+            strictClient.fetchIndex("https://192.168.1.10/index.json")
+            fail("Private IP repo URL MUST be rejected under §11.4")
+        } catch (_: RepositoryVerificationException) {
+        }
+
+        // 2. Live MockWebServer verification: valid package, tampered SHA-256, manifest id mismatch, private redirect, >8MB
         val server = MockWebServer()
+        val fakePublicHost = "93.184.216.34"
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
                 "/index.json" -> MockResponse().setBody(
@@ -147,22 +157,36 @@ class PackageManagerAndMigrationTest {
                           "id": "com.example.repoplug",
                           "name": "Repo Plugin",
                           "version": "1.2.0",
-                          "url": "${server.url("/valid.d3plugin")}",
+                          "url": "http://$fakePublicHost:${server.port}/valid.d3plugin",
                           "sha256": "$validSha"
                         },
                         {
                           "id": "com.example.repoplug",
                           "name": "Tampered",
                           "version": "1.2.0",
-                          "url": "${server.url("/valid.d3plugin")}",
+                          "url": "http://$fakePublicHost:${server.port}/valid.d3plugin",
                           "sha256": "${"0".repeat(64)}"
                         },
                         {
                           "id": "com.example.repoplug",
                           "name": "MismatchedId",
                           "version": "1.2.0",
-                          "url": "${server.url("/wrong-id.d3plugin")}",
+                          "url": "http://$fakePublicHost:${server.port}/wrong-id.d3plugin",
                           "sha256": "$wrongIdSha"
+                        },
+                        {
+                          "id": "com.example.repoplug",
+                          "name": "PrivateRedirect",
+                          "version": "1.2.0",
+                          "url": "http://$fakePublicHost:${server.port}/redir-private",
+                          "sha256": "$validSha"
+                        },
+                        {
+                          "id": "com.example.repoplug",
+                          "name": "Oversized",
+                          "version": "1.2.0",
+                          "url": "http://$fakePublicHost:${server.port}/oversized.d3plugin",
+                          "sha256": "$validSha"
                         }
                       ]
                     }
@@ -170,32 +194,38 @@ class PackageManagerAndMigrationTest {
                 )
                 "/valid.d3plugin" -> MockResponse().setBody(Buffer().write(validZip))
                 "/wrong-id.d3plugin" -> MockResponse().setBody(Buffer().write(wrongIdZip))
+                "/redir-private" -> MockResponse().setResponseCode(302)
+                    .addHeader("Location", "http://192.168.1.50:${server.port}/valid.d3plugin")
+                "/oversized.d3plugin" -> MockResponse().setBody(Buffer().write(ByteArray(8 * 1024 * 1024 + 1024)))
                 else -> MockResponse().setResponseCode(404)
             }
         }
         server.start()
         try {
-            val client = PluginRepositoryClient()
-            val index = client.fetchIndex(server.url("/index.json").toString())
+            // Test-injected policy allowing HTTP only for our synthetic MockWebServer host while still blocking private/loopback IPs
+            val testPolicy = NetworkPolicy(
+                permissions = PluginPermissions(hosts = emptyList(), userHosts = false, lan = false),
+                dnsResolver = { host -> listOf(InetAddress.getByName(host)) },
+                requireHttpsAlways = false,
+            )
+            val testHttp = OkHttpClient.Builder()
+                .proxy(JavaProxy.NO_PROXY)
+                .socketFactory(LocalRedirectSocketFactory(fakePublicHost, server.port))
+                .build()
+            val client = PluginRepositoryClient(httpClient = testHttp, publicPolicy = testPolicy)
+            val index = client.fetchIndex("http://$fakePublicHost:${server.port}/index.json")
             assertEquals("测试插件仓库", index.name)
-            assertEquals(3, index.plugins.size)
+            assertEquals(5, index.plugins.size)
 
-            // 1. Valid package succeeds
             val ok = client.downloadVerifiedPackage(index.plugins[0])
             assertEquals(validSha, ok.sha256)
 
-            // 2. Tampered sha256 fails
-            try {
-                client.downloadVerifiedPackage(index.plugins[1])
-                fail("Expected SHA-256 mismatch to fail")
-            } catch (_: RepositoryVerificationException) {
-            }
-
-            // 3. Manifest id mismatch fails
-            try {
-                client.downloadVerifiedPackage(index.plugins[2])
-                fail("Expected manifest id mismatch to fail")
-            } catch (_: RepositoryVerificationException) {
+            for (badIdx in 1..4) {
+                try {
+                    client.downloadVerifiedPackage(index.plugins[badIdx])
+                    fail("Expected entry #$badIdx (${index.plugins[badIdx].name}) to fail verification")
+                } catch (_: RepositoryVerificationException) {
+                }
             }
         } finally {
             server.shutdown()
@@ -203,7 +233,137 @@ class PackageManagerAndMigrationTest {
     }
 
     @Test
-    fun packageManagerHandlesInstallUpgradePermissionReconfirmDisableAndUninstall() = runBlocking {
+    fun rejectsDualViewAndDuplicateZipArchivesS9() {
+        val goodZip = buildPluginZip(
+            manifestJson = """{"api":1,"id":"com.example.zip","name":"Zip","version":"1.0.0"}""",
+            mainJs = "export default { home(){return []}, browse(){return {items:[]}}, detail(){return {id:'1',kind:'video',title:'1'}}, playback(){return {url:'https://cdn.example.com/1.mp4'}} };",
+        )
+        // Baseline passes
+        assertEquals("com.example.zip", ManifestParser.parseAndValidate(PluginPackageArchive.inspect(goodZip).manifestJson).id)
+
+        // 1. Tamper Central Directory filename so it disagrees with Local File Header (dual-view attack)
+        val tampered = goodZip.copyOf()
+        val cdSigIdx = findBytes(tampered, byteArrayOf(0x50, 0x4b, 0x01, 0x02))
+        assertTrue("Expected Central Directory signature in zip", cdSigIdx > 0)
+        tampered[cdSigIdx + 46] = if (tampered[cdSigIdx + 46] == 'm'.code.toByte()) 'x'.code.toByte() else 'm'.code.toByte()
+        try {
+            PluginPackageArchive.inspect(tampered)
+            fail("Expected CD-vs-LFH filename mismatch to be rejected")
+        } catch (_: PackageInstallException) {
+        }
+
+        // 2. Duplicate entry (two manifest.json entries) rejected
+        val dupZip = buildDuplicateManifestZip()
+        try {
+            PluginPackageArchive.inspect(dupZip)
+            fail("Expected duplicate manifest.json zip to be rejected")
+        } catch (_: PackageInstallException) {
+        }
+
+        // 3. Oversized > 8 MB archive rejected
+        try {
+            PluginPackageArchive.inspect(ByteArray(8 * 1024 * 1024 + 64))
+            fail("Expected > 8 MB package to be rejected")
+        } catch (_: PackageInstallException) {
+        }
+    }
+
+    @Test
+    fun s1BlocksDifferentSourceReplacementWithoutConfirmationAndWipesAllInstanceDataWhenConfirmed() = runBlocking {
+        val rootDir = Files.createTempDirectory("d3-s1-test").toFile()
+        val store = InMemoryPluginStore()
+        val secretBox = SoftwareAesSecretBox()
+        val mgr = PluginPackageManager(rootDir = rootDir, store = store, secretBox = secretBox)
+
+        try {
+            val v1Js = """
+                export default {
+                  async home(ctx) {
+                    await ctx.storage.set('secretToken', 'tok-from-repo-a');
+                    await ctx.cookies.set('https://api.example.com/', 'sid=cookie-from-repo-a; Path=/; Secure');
+                    return [{ id: 's1', title: ctx.config.pass || 'none', items: [] }];
+                  },
+                  browse() { return { items: [] }; },
+                  detail() { return { id: '1', kind: 'video', title: '1' }; },
+                  playback() { return { url: 'https://cdn.example.com/1.mp4' }; },
+                };
+            """.trimIndent()
+            val v1Zip = buildPluginZip(
+                """{"api":1,"id":"com.example.jellyfin","name":"JF Official","version":"1.0.0","permissions":{"hosts":["api.example.com"]},"config":[{"key":"pass","type":"password","label":"密码"}]}""",
+                v1Js,
+            )
+            val v2EvilZip = buildPluginZip(
+                """{"api":1,"id":"com.example.jellyfin","name":"JF Hijack","version":"9.9.9","permissions":{"hosts":["evil.example.org"]},"config":[{"key":"pass","type":"password","label":"密码"}]}""",
+                v1Js,
+            )
+
+            // 1. Install v1.0.0 from Official Repo A and populate instance password, storage, cookies
+            val r1 = mgr.installFromBytes(
+                zipBytes = v1Zip,
+                sourceUrl = "https://repo-a.example.com/jf-1.0.0.d3plugin",
+                repoUrl = "https://repo-a.example.com/index.json",
+            )
+            assertEquals("repo:https://repo-a.example.com/index.json", r1.entity.sourceOrigin)
+            val inst = mgr.createInstance(
+                pluginId = "com.example.jellyfin",
+                displayName = "My JF",
+                config = mapOf("pass" to JsonPrimitive("SuperSecretPassword")),
+            )
+            val src = mgr.openSource(inst.instanceId)
+            assertEquals("SuperSecretPassword", src.home().first().category.title)
+            val instDir = File(rootDir, "instances/${inst.instanceId}")
+            assertTrue(File(instDir, "storage.enc").exists())
+            assertTrue(File(instDir, "cookies.enc").exists())
+
+            // 2. S1: Same id + higher version from DIFFERENT Repo B MUST fail without explicit confirmation
+            try {
+                mgr.installFromBytes(
+                    zipBytes = v2EvilZip,
+                    sourceUrl = "https://repo-b.example.org/jf-9.9.9.d3plugin",
+                    repoUrl = "https://repo-b.example.org/index.json",
+                )
+                fail("S1: Different-source package MUST be rejected without confirmation")
+            } catch (e: PluginSourceMismatchException) {
+                assertEquals("com.example.jellyfin", e.pluginId)
+                assertEquals("repo:https://repo-a.example.com/index.json", e.existingSourceOrigin)
+                assertEquals("repo:https://repo-b.example.org/index.json", e.newSourceOrigin)
+            }
+            // Existing plugin, instance, password config, storage, and cookies MUST still be intact!
+            assertEquals("1.0.0", store.getPackage("com.example.jellyfin")?.version)
+            assertNotNull(store.getInstance(inst.instanceId))
+            assertTrue(File(instDir, "storage.enc").exists())
+
+            // 3. S1: Same id from local file (different source) ALSO blocked without confirmation
+            try {
+                mgr.installFromBytes(zipBytes = v2EvilZip, sourceUrl = "file:///sdcard/jf-9.9.9.d3plugin")
+                fail("S1: Local file replacing repo plugin MUST require confirmation")
+            } catch (_: PluginSourceMismatchException) {
+            }
+
+            // 4. S1: Confirmed replacement MUST wipe ALL existing instances, passwords, storage, and cookies!
+            val replaced = mgr.installFromBytes(
+                zipBytes = v2EvilZip,
+                sourceUrl = "https://repo-b.example.org/jf-9.9.9.d3plugin",
+                repoUrl = "https://repo-b.example.org/index.json",
+                confirmReplaceFromDifferentSource = true,
+            )
+            assertFalse("Replacement from different source is NOT an update", replaced.isUpdate)
+            assertTrue(replaced.replacedDifferentSource)
+            assertEquals("9.9.9", replaced.entity.version)
+            assertEquals("repo:https://repo-b.example.org/index.json", replaced.entity.sourceOrigin)
+            assertTrue(
+                "All previous instances MUST be deleted on different-source replacement",
+                store.listInstancesForPlugin("com.example.jellyfin").isEmpty(),
+            )
+            assertFalse("Old instance storage/cookies dir MUST be wiped from disk", instDir.exists())
+        } finally {
+            mgr.shutdownAll()
+            rootDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun packageManagerHandlesLifecycleAndConcurrentOpenSourceWithoutRace() = runBlocking {
         val rootDir = Files.createTempDirectory("d3-pkgmgr-test").toFile()
         val store = InMemoryPluginStore()
         val secretBox = SoftwareAesSecretBox()
@@ -265,7 +425,6 @@ class PackageManagerAndMigrationTest {
             assertFalse(r1.isUpdate)
             assertFalse(r1.needsPermissionReconfirm)
 
-            // Create instance + verify encrypted config at rest + single-instance enforcement
             val inst = mgr.createInstance(
                 pluginId = "com.example.app",
                 displayName = "实例一",
@@ -282,17 +441,24 @@ class PackageManagerAndMigrationTest {
             } catch (_: PackageInstallException) {
             }
 
-            val src = mgr.openSource(inst.instanceId)
-            assertEquals("默认名", src.home().first().category.title)
+            // Small #3: 10 concurrent openSource calls MUST serialize and return the exact same instance
+            val concurrentSources = (1..10).map {
+                async(Dispatchers.Default) { mgr.openSource(inst.instanceId) }
+            }.awaitAll()
+            val first = concurrentSources.first()
+            for (other in concurrentSources) {
+                assertSame("Concurrent openSource must not instantiate duplicate PluginMediaSource", first, other)
+            }
+            assertEquals("默认名", first.home().first().category.title)
 
-            // Downgrade / same version rejected
+            // Same-source downgrade / same version rejected
             try {
                 mgr.installFromBytes(v1Zip)
                 fail("Same version update must be rejected")
             } catch (_: PackageInstallException) {
             }
 
-            // Upgrade to v1.1.0 with EXPANDED permissions (adds lan: true) -> needsPermissionReconfirm
+            // Same-source upgrade v1.1.0 with EXPANDED permissions -> needsPermissionReconfirm
             val v2Zip = buildPluginZip(
                 """
                 {
@@ -303,9 +469,7 @@ class PackageManagerAndMigrationTest {
                   "author": "A",
                   "multiInstance": false,
                   "permissions": { "hosts": ["api.example.com"], "lan": true },
-                  "config": [
-                    { "key": "label", "type": "text", "label": "名称", "default": "默认名" }
-                  ]
+                  "config": [{ "key": "label", "type": "text", "label": "名称", "default": "默认名" }]
                 }
                 """.trimIndent(),
                 minimalJs,
@@ -314,7 +478,6 @@ class PackageManagerAndMigrationTest {
             assertTrue(r2.isUpdate)
             assertTrue(r2.needsPermissionReconfirm)
 
-            // Blocked until user re-confirms expanded permissions
             val src2 = mgr.openSource(inst.instanceId)
             try {
                 src2.home()
@@ -325,18 +488,15 @@ class PackageManagerAndMigrationTest {
             mgr.confirmPermissions("com.example.app")
             assertEquals("默认名", src2.home().first().category.title)
 
-            // Disable blocks calls; re-enable restores
             mgr.setPluginEnabled("com.example.app", false)
-            val srcDisabled = mgr.openSource(inst.instanceId)
             try {
-                srcDisabled.home()
+                mgr.openSource(inst.instanceId).home()
                 fail("Disabled plugin must reject calls")
             } catch (_: SourceNeedsSetupException) {
             }
             mgr.setPluginEnabled("com.example.app", true)
             assertEquals("默认名", mgr.openSource(inst.instanceId).home().first().category.title)
 
-            // Uninstall removes package, instances, and files on disk
             mgr.uninstall("com.example.app")
             assertNull(store.getPackage("com.example.app"))
             assertTrue(store.listInstancesForPlugin("com.example.app").isEmpty())
@@ -346,6 +506,64 @@ class PackageManagerAndMigrationTest {
             mgr.shutdownAll()
             rootDir.deleteRecursively()
         }
+    }
+
+    private fun findBytes(haystack: ByteArray, needle: ByteArray): Int {
+        outer@ for (i in 0..(haystack.size - needle.size)) {
+            for (j in needle.indices) {
+                if (haystack[i + j] != needle[j]) continue@outer
+            }
+            return i
+        }
+        return -1
+    }
+
+    private fun buildDuplicateManifestZip(): ByteArray {
+        val m1 = """{"api":1,"id":"com.example.a","name":"A","version":"1.0.0"}""".toByteArray()
+        val m2 = """{"api":1,"id":"com.example.b","name":"B","version":"1.0.0"}""".toByteArray()
+        val js = "export default {};".toByteArray()
+        val bos = ByteArrayOutputStream()
+        // Java ZipOutputStream rejects duplicate names, so build minimal STORED zip with two manifest.json entries
+        val entries = listOf("manifest.json" to m1, "manifest.json" to m2, "main.js" to js)
+        val offsets = ArrayList<Int>()
+        val crcs = ArrayList<Long>()
+        for ((name, data) in entries) {
+            offsets += bos.size()
+            val crc = java.util.zip.CRC32().apply { update(data) }.value
+            crcs += crc
+            val nameBytes = name.toByteArray()
+            writeU32(bos, 0x04034b50L)
+            writeU16(bos, 20); writeU16(bos, 0); writeU16(bos, 0); writeU16(bos, 0); writeU16(bos, 0)
+            writeU32(bos, crc); writeU32(bos, data.size.toLong()); writeU32(bos, data.size.toLong())
+            writeU16(bos, nameBytes.size); writeU16(bos, 0)
+            bos.write(nameBytes); bos.write(data)
+        }
+        val cdOffset = bos.size()
+        entries.forEachIndexed { idx, (name, data) ->
+            val nameBytes = name.toByteArray()
+            writeU32(bos, 0x02014b50L)
+            writeU16(bos, 20); writeU16(bos, 20); writeU16(bos, 0); writeU16(bos, 0); writeU16(bos, 0); writeU16(bos, 0)
+            writeU32(bos, crcs[idx]); writeU32(bos, data.size.toLong()); writeU32(bos, data.size.toLong())
+            writeU16(bos, nameBytes.size); writeU16(bos, 0); writeU16(bos, 0); writeU16(bos, 0); writeU16(bos, 0)
+            writeU32(bos, 0L); writeU32(bos, offsets[idx].toLong())
+            bos.write(nameBytes)
+        }
+        val cdSize = bos.size() - cdOffset
+        writeU32(bos, 0x06054b50L)
+        writeU16(bos, 0); writeU16(bos, 0); writeU16(bos, entries.size); writeU16(bos, entries.size)
+        writeU32(bos, cdSize.toLong()); writeU32(bos, cdOffset.toLong()); writeU16(bos, 0)
+        return bos.toByteArray()
+    }
+
+    private fun writeU16(out: ByteArrayOutputStream, v: Int) {
+        out.write(v and 0xFF); out.write((v ushr 8) and 0xFF)
+    }
+
+    private fun writeU32(out: ByteArrayOutputStream, v: Long) {
+        out.write((v and 0xFF).toInt())
+        out.write(((v ushr 8) and 0xFF).toInt())
+        out.write(((v ushr 16) and 0xFF).toInt())
+        out.write(((v ushr 24) and 0xFF).toInt())
     }
 
     private fun jdbcSupportDbProxy(conn: Connection): SupportSQLiteDatabase {

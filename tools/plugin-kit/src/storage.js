@@ -9,14 +9,17 @@ export class PluginStorage {
     this.maxBytes = maxBytes;
     this.data = {};
     if (filePath && fs.existsSync(filePath)) {
+      let parsed;
       try {
-        const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          this.data = parsed;
-        }
-      } catch {
-        this.data = {};
+        parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      } catch (err) {
+        // Preserve corrupted file untouched and report error (do not silently wipe)
+        throw new Error(`插件存储文件已损坏，未覆盖原文件：${err.message}`);
       }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('插件存储文件格式无效，未覆盖原文件');
+      }
+      this.data = parsed;
     }
   }
 

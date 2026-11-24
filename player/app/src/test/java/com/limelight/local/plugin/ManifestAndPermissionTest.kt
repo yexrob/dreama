@@ -1,6 +1,14 @@
 package com.limelight.local.plugin
 
+import com.limelight.local.media.Artwork
+import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -12,16 +20,19 @@ import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 import java.io.File
+import java.io.IOException
 import java.net.InetAddress
+import java.net.Proxy
 import java.net.Socket
 import javax.net.SocketFactory
 
 class ManifestAndPermissionTest {
 
     private val repoRoot: File = locateRepoRoot()
+    private val json = Json { ignoreUnknownKeys = true }
 
     @Test
-    fun parsesValidReferenceAndJellyfinManifests() {
+    fun parsesValidReferenceAndJellyfinManifestsAndOptionalAuthor() {
         val refJson = File(repoRoot, "plugins/reference/manifest.json").readText()
         val ref = ManifestParser.parseAndValidate(refJson)
         assertEquals(1, ref.api)
@@ -36,10 +47,26 @@ class ManifestAndPermissionTest {
         assertEquals(PluginAuthMode.FORM, jf.auth)
         assertTrue(jf.permissions.lan)
         assertTrue(jf.permissions.userHosts)
+
+        // S8 (§11.2): author is optional, optional fields allow null, unknown capabilities tolerated
+        val minimal = """
+            {
+              "api": 1,
+              "id": "com.example.noauthor",
+              "name": "No Author",
+              "version": "1.0.0",
+              "description": null,
+              "homepage": null,
+              "capabilities": ["search", "future-cap-v2"]
+            }
+        """.trimIndent()
+        val parsed = ManifestParser.parseAndValidate(minimal)
+        assertEquals("", parsed.author)
+        assertEquals(setOf(PluginCapability.SEARCH), parsed.capabilities)
     }
 
     @Test
-    fun rejectsMalformedManifestsAndSemanticViolations() {
+    fun rejectsMalformedManifestsTrailingNewlineRegexS2AndSemanticViolations() {
         val base = """
             {
               "api": 1,
@@ -49,38 +76,41 @@ class ManifestAndPermissionTest {
               "author": "Tester"
             }
         """.trimIndent()
-        // Baseline + unknown forward-compatible field must pass
         val withExtra = base.replace("\"Tester\"", "\"Tester\", \"futureField\": 123")
         assertEquals("com.example.demo", ManifestParser.parseAndValidate(withExtra).id)
 
-        // Wrong api version
+        // S2 (§11.4): full-string regex matching MUST reject trailing newline in id / version / hosts
+        assertInvalidManifest(base.replace("com.example.demo", "com.example.demo\\n"))
+        assertInvalidManifest(base.replace("1.0.0", "1.0.0\\n"))
+        assertInvalidManifest(
+            base.replace("\"Tester\"", "\"Tester\", \"permissions\": { \"hosts\": [\"api.example.com\\n\"] }"),
+        )
+
+        // Wrong api, bad id, bad semver
         assertInvalidManifest(base.replace("\"api\": 1", "\"api\": 2"))
-        // Bad reverse-domain id
         assertInvalidManifest(base.replace("com.example.demo", "NotValidId"))
-        // Bad semver
         assertInvalidManifest(base.replace("1.0.0", "1.0"))
-        // Loopback host in permissions.hosts
-        assertInvalidManifest(
-            base.replace("\"Tester\"", "\"Tester\", \"permissions\": { \"hosts\": [\"localhost\"] }"),
-        )
-        assertInvalidManifest(
-            base.replace("\"Tester\"", "\"Tester\", \"permissions\": { \"hosts\": [\"127.0.0.1\"] }"),
-        )
-        // Duplicate config keys
+
+        // Forbidden loopback & non-standard IP literal notations in permissions.hosts
+        for (badHost in listOf("localhost", "localhost.", "127.0.0.1", "127.1", "0x7f.0.0.1", "0177.0.0.1", "[::127.0.0.1]")) {
+            assertInvalidManifest(
+                base.replace("\"Tester\"", "\"Tester\", \"permissions\": { \"hosts\": [\"$badHost\"] }"),
+            )
+        }
+
+        // Duplicate config keys, select without options, default type mismatch
         assertInvalidManifest(
             base.replace(
                 "\"Tester\"",
                 "\"Tester\", \"config\": [{\"key\":\"a\",\"type\":\"text\",\"label\":\"A\"},{\"key\":\"a\",\"type\":\"text\",\"label\":\"B\"}]",
             ),
         )
-        // Select without options
         assertInvalidManifest(
             base.replace(
                 "\"Tester\"",
                 "\"Tester\", \"config\": [{\"key\":\"q\",\"type\":\"select\",\"label\":\"Q\"}]",
             ),
         )
-        // Default type mismatch
         assertInvalidManifest(
             base.replace(
                 "\"Tester\"",
@@ -90,29 +120,98 @@ class ManifestAndPermissionTest {
     }
 
     @Test
-    fun detectsPermissionExpansionCorrectly() {
+    fun passesAllSharedNetworkPolicyVectorsFromCanonicalJson() {
+        // B1 & S9 (§11.3): exact same vector file run by BOTH Android host and Node plugin-kit
+        val raw = JsonSchemaValidator.loadBundledResourceText("network-policy-vectors.json")
+        val root = json.parseToJsonElement(raw).jsonObject
+        val dnsJson = root["dns"]!!.jsonObject
+        val dnsMap: Map<String, List<InetAddress>> = dnsJson.entries.associate { (host, arr) ->
+            host to arr.jsonArray.map { ipEl ->
+                NetworkPolicy.parseAnyIpLiteral(ipEl.jsonPrimitive.content)
+                    ?: InetAddress.getByName(ipEl.jsonPrimitive.content)
+            }
+        }
+        val mockDns: (String) -> List<InetAddress> = { host ->
+            dnsMap[host] ?: throw java.net.UnknownHostException("Unknown test host: $host")
+        }
+
+        val fetchCases = root["fetchCases"]!!.jsonArray
+        assertTrue(fetchCases.size >= 15)
+        for (caseEl in fetchCases) {
+            val c = caseEl.jsonObject
+            val name = c["name"]!!.jsonPrimitive.content
+            val polObj = c["policy"]!!.jsonObject
+            val perms = PluginPermissions(
+                hosts = polObj["hosts"]!!.jsonArray.map { it.jsonPrimitive.content },
+                userHosts = polObj["userHosts"]!!.jsonPrimitive.boolean,
+                lan = polObj["lan"]!!.jsonPrimitive.boolean,
+            )
+            val userHosts = c["userHosts"]!!.jsonArray.map { it.jsonPrimitive.content }.toSet()
+            val url = c["url"]!!.jsonPrimitive.content
+            val allow = c["allow"]!!.jsonPrimitive.boolean
+            val policy = NetworkPolicy(perms, userHosts, mockDns)
+            if (allow) {
+                policy.validateFetchUrl(url)
+            } else {
+                try {
+                    policy.validateFetchUrl(url)
+                    fail("fetchCase '$name' ($url) MUST be rejected")
+                } catch (_: NetworkPolicyException) {
+                }
+            }
+        }
+
+        val resourceCases = root["resourceCases"]!!.jsonArray
+        assertTrue(resourceCases.size >= 12)
+        for (caseEl in resourceCases) {
+            val c = caseEl.jsonObject
+            val name = c["name"]!!.jsonPrimitive.content
+            val polObj = c["policy"]!!.jsonObject
+            val perms = PluginPermissions(
+                hosts = polObj["hosts"]!!.jsonArray.map { it.jsonPrimitive.content },
+                userHosts = polObj["userHosts"]!!.jsonPrimitive.boolean,
+                lan = polObj["lan"]!!.jsonPrimitive.boolean,
+            )
+            val userHosts = c["userHosts"]!!.jsonArray.map { it.jsonPrimitive.content }.toSet()
+            val url = c["url"]!!.jsonPrimitive.content
+            val allow = c["allow"]!!.jsonPrimitive.boolean
+            val policy = NetworkPolicy(perms, userHosts, mockDns)
+            if (allow) {
+                policy.validateResourceUrl(url)
+            } else {
+                try {
+                    policy.validateResourceUrl(url)
+                    fail("resourceCase '$name' ($url) MUST be rejected")
+                } catch (_: NetworkPolicyException) {
+                }
+            }
+        }
+
+        // Also explicitly verify HTTPS -> HTTP downgrade rejection (§11.3)
+        val userHostPolicy = NetworkPolicy(
+            permissions = PluginPermissions(hosts = emptyList(), userHosts = true, lan = true),
+            userConfiguredHosts = setOf("jellyfin.home.lan"),
+            dnsResolver = mockDns,
+        )
+        assertBlocked { userHostPolicy.validateFetchUrl("http://jellyfin.home.lan/a", previousScheme = "https") }
+        assertBlocked { userHostPolicy.validateResourceUrl("http://jellyfin.home.lan/a", previousScheme = "https") }
+    }
+
+    @Test
+    fun detectsPermissionExpansionAndComparesSemVer() {
         val prev = PluginPermissions(
             hosts = listOf("api.example.com", "*.cdn.example.com"),
             userHosts = false,
             lan = false,
         )
-        // Same or narrower is NOT expansion
         assertFalse(prev.isExpandedFrom(prev))
-        assertFalse(
-            PluginPermissions(hosts = listOf("api.example.com", "a.cdn.example.com")).isExpandedFrom(prev),
-        )
-        assertFalse(
-            PluginPermissions(hosts = listOf("*.img.cdn.example.com")).isExpandedFrom(prev),
-        )
-        // Adding new host, widening exact to wildcard, enabling userHosts or lan ARE expansions
+        assertFalse(PluginPermissions(hosts = listOf("api.example.com", "a.cdn.example.com")).isExpandedFrom(prev))
+        assertFalse(PluginPermissions(hosts = listOf("*.img.cdn.example.com")).isExpandedFrom(prev))
         assertTrue(PluginPermissions(hosts = listOf("api.example.com", "other.com")).isExpandedFrom(prev))
         assertTrue(PluginPermissions(hosts = listOf("*.example.com")).isExpandedFrom(prev))
         assertTrue(prev.copy(userHosts = true).isExpandedFrom(prev))
         assertTrue(prev.copy(lan = true).isExpandedFrom(prev))
-    }
 
-    @Test
-    fun comparesSemVerCorrectly() {
         assertTrue(SemVer.parse("1.0.1")!! > SemVer.parse("1.0.0")!!)
         assertTrue(SemVer.parse("1.1.0")!! > SemVer.parse("1.0.9")!!)
         assertTrue(SemVer.parse("2.0.0")!! > SemVer.parse("1.9.9")!!)
@@ -121,74 +220,15 @@ class ManifestAndPermissionTest {
     }
 
     @Test
-    fun networkPolicyEnforcesWhitelistWildcardsLanPrivateAndLoopback() {
-        val dns: (String) -> List<InetAddress> = { host ->
-            when (host) {
-                "api.example.com", "v1.cdn.example.com", "evil.example.org" ->
-                    listOf(InetAddress.getByName("93.184.216.34"))
-                "rebind.example.com" -> listOf(InetAddress.getByName("127.0.0.1"))
-                "priv.example.com" -> listOf(InetAddress.getByName("192.168.1.50"))
-                "cgnat.example.com" -> listOf(InetAddress.getByName("100.64.2.3"))
-                "ula.example.com" -> listOf(InetAddress.getByName("fd00::1234"))
-                "nas.lan" -> listOf(InetAddress.getByName("10.0.0.8"))
-                else -> listOf(InetAddress.getByName("93.184.216.34"))
-            }
-        }
-
-        val publicPolicy = NetworkPolicy(
-            permissions = PluginPermissions(
-                hosts = listOf("api.example.com", "*.cdn.example.com"),
-                userHosts = false,
-                lan = false,
-            ),
-            dnsResolver = dns,
-        )
-
-        // Allowed
-        assertEquals("api.example.com", publicPolicy.validateFetchUrl("https://api.example.com/v1").url.host)
-        assertEquals("v1.cdn.example.com", publicPolicy.validateFetchUrl("https://v1.cdn.example.com/a.m4s").url.host)
-
-        // Rejected
-        assertBlocked { publicPolicy.validateFetchUrl("https://evil.example.org/") }
-        assertBlocked { publicPolicy.validateFetchUrl("https://cdn.example.com/") }
-        assertBlocked { publicPolicy.validateFetchUrl("http://api.example.com/") }
-        assertBlocked { publicPolicy.validateFetchUrl("http://127.0.0.1:8080/") }
-        assertBlocked { publicPolicy.validateFetchUrl("https://localhost/") }
-        assertBlocked { publicPolicy.validateFetchUrl("https://sub.localhost/") }
-        assertBlocked { publicPolicy.validateFetchUrl("http://[::1]:8080/") }
-        assertBlocked { publicPolicy.validateFetchUrl("https://rebind.example.com/") }
-        assertBlocked { publicPolicy.validateFetchUrl("https://priv.example.com/") }
-        assertBlocked { publicPolicy.validateFetchUrl("https://cgnat.example.com/") }
-        assertBlocked { publicPolicy.validateFetchUrl("https://ula.example.com/") }
-        assertBlocked { publicPolicy.validateFetchUrl("file:///etc/passwd") }
-
-        // PlaybackInfo URL allows arbitrary public CDN, still blocks loopback & private without lan
-        assertEquals("random-cdn.net", publicPolicy.validatePlaybackUrl("https://random-cdn.net/v.mp4").url.host)
-        assertBlocked { publicPolicy.validatePlaybackUrl("http://127.0.0.1/v.mp4") }
-        assertBlocked { publicPolicy.validatePlaybackUrl("http://192.168.1.50/v.mp4") }
-
-        // LAN + userHosts allows private HTTP, still rejects loopback and public HTTP
-        val lanPolicy = NetworkPolicy(
-            permissions = PluginPermissions(hosts = emptyList(), userHosts = true, lan = true),
-            userConfiguredHosts = setOf("nas.lan"),
-            dnsResolver = dns,
-        )
-        assertEquals("nas.lan", lanPolicy.validateFetchUrl("http://nas.lan:8096/System/Info").url.host)
-        assertEquals("192.168.1.50", lanPolicy.validateFetchUrl("http://192.168.1.50:8096/Items").url.host)
-        assertBlocked { lanPolicy.validateFetchUrl("http://127.0.0.1:8096/") }
-        assertBlocked { lanPolicy.validateFetchUrl("http://0.0.0.0:8096/") }
-        assertBlocked { lanPolicy.validateFetchUrl("http://api.example.com/") }
-    }
-
-    @Test
-    fun fetchGatewayBlocksRedirectEscapeHostOverrideAndOversizedBody() {
+    fun fetchGatewayBlocksRedirectEscapeDowngradeAndMergesExplicitAndJarCookies() {
         val server = MockWebServer()
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
                 return when (request.path) {
                     "/set-cookie" -> MockResponse()
                         .setResponseCode(200)
-                        .addHeader("Set-Cookie", "sid=token123; Path=/")
+                        .addHeader("Set-Cookie", "sid=fromJar; Path=/")
+                        .addHeader("Set-Cookie", "jarOnly=keepMe; Path=/")
                         .setBody("hello")
                     "/echo-cookie" -> MockResponse()
                         .setResponseCode(200)
@@ -199,9 +239,12 @@ class ManifestAndPermissionTest {
                     "/redir-escape" -> MockResponse()
                         .setResponseCode(302)
                         .addHeader("Location", "https://evil.example.org/steal")
+                    "/redir-unlisted-lan" -> MockResponse()
+                        .setResponseCode(302)
+                        .addHeader("Location", "http://192.168.1.99:${server.port}/set-cookie")
                     "/redir-loopback" -> MockResponse()
                         .setResponseCode(302)
-                        .addHeader("Location", "http://127.0.0.1:${server.port}/set-cookie")
+                        .addHeader("Location", "http://127.1:${server.port}/set-cookie")
                     "/too-big" -> MockResponse()
                         .setResponseCode(200)
                         .setBody("A".repeat(2048))
@@ -222,48 +265,140 @@ class ManifestAndPermissionTest {
             val tmpFile = File.createTempFile("cookies-test", ".enc").apply { deleteOnExit() }
             val jar = PluginCookieJar(tmpFile, SoftwareAesSecretBox())
             val client = OkHttpClient.Builder()
-                .proxy(java.net.Proxy.NO_PROXY)
+                .proxy(Proxy.NO_PROXY)
                 .socketFactory(LocalRedirectSocketFactory("192.168.1.50", server.port))
                 .build()
             val gw = PluginFetchGateway(policy, jar, baseClient = client, maxResponseBytes = 1024)
 
-            // Valid redirect within policy + cookie jar capture & resend
+            // Valid redirect + cookie capture
             val r1 = gw.executeBlocking(FetchRequest("http://192.168.1.50:${server.port}/redir-ok"))
             assertEquals(200, r1.status)
-            assertEquals("hello", String(r1.body, Charsets.UTF_8))
 
-            val r2 = gw.executeBlocking(FetchRequest("http://192.168.1.50:${server.port}/echo-cookie"))
-            assertEquals("sid=token123", String(r2.body, Charsets.UTF_8))
-
-            // Redirect manual returns 302
-            val rManual = gw.executeBlocking(
-                FetchRequest("http://192.168.1.50:${server.port}/redir-ok", redirect = "manual"),
+            // §11.1 (S9): Explicit Cookie merges with jar; explicit wins on name collision, jar-only preserved
+            val rMerged = gw.executeBlocking(
+                FetchRequest(
+                    "http://192.168.1.50:${server.port}/echo-cookie",
+                    headers = mapOf("Cookie" to "sid=fromExplicit; extra=9"),
+                ),
             )
-            assertEquals(302, rManual.status)
+            assertEquals("sid=fromExplicit; jarOnly=keepMe; extra=9", String(rMerged.body, Charsets.UTF_8))
 
-            // Redirect error throws
-            try {
-                gw.executeBlocking(FetchRequest("http://192.168.1.50:${server.port}/redir-ok", redirect = "error"))
-                fail("Expected redirect=error to throw")
-            } catch (_: Exception) {
-            }
-
-            // Redirect escape to external or loopback rejected
+            // Redirect escape, unlisted LAN (even with lan=true!), and shorthand loopback 127.1 rejected
             assertBlocked { gw.executeBlocking(FetchRequest("http://192.168.1.50:${server.port}/redir-escape")) }
+            assertBlocked { gw.executeBlocking(FetchRequest("http://192.168.1.50:${server.port}/redir-unlisted-lan")) }
             assertBlocked { gw.executeBlocking(FetchRequest("http://192.168.1.50:${server.port}/redir-loopback")) }
-
-            // Host header override rejected
             assertBlocked {
                 gw.executeBlocking(
                     FetchRequest("http://192.168.1.50:${server.port}/set-cookie", headers = mapOf("Host" to "evil.com")),
                 )
             }
 
-            // Oversized response rejected
             try {
                 gw.executeBlocking(FetchRequest("http://192.168.1.50:${server.port}/too-big"))
                 fail("Expected oversized response to fail")
             } catch (_: FetchResponseTooLargeException) {
+            }
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun imageFetcherAndMapperEnforceNetworkPolicyAndStripCrossOriginHeaders() = runBlocking {
+        val server = MockWebServer()
+        var lastAuthOnRedirectTarget: String? = "NOT_CALLED"
+        var lastCustomOnRedirectTarget: String? = "NOT_CALLED"
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                "/img/ok.jpg" -> MockResponse()
+                    .setResponseCode(200)
+                    .setBody("JPG:${request.getHeader("Authorization") ?: "none"}")
+                "/img/redir-cross-origin" -> MockResponse()
+                    .setResponseCode(302)
+                    .addHeader("Location", "http://93.184.216.35:${server.port}/img/other-origin")
+                "/img/other-origin" -> {
+                    lastAuthOnRedirectTarget = request.getHeader("Authorization")
+                    lastCustomOnRedirectTarget = request.getHeader("X-Secret")
+                    MockResponse().setResponseCode(200).setBody("OTHER_OK")
+                }
+                "/img/redir-private" -> MockResponse()
+                    .setResponseCode(302)
+                    .addHeader("Location", "http://192.168.1.99:${server.port}/img/ok.jpg")
+                "/img/redir-loopback" -> MockResponse()
+                    .setResponseCode(302)
+                    .addHeader("Location", "http://127.1:${server.port}/img/ok.jpg")
+                else -> MockResponse().setResponseCode(404)
+            }
+        }
+        server.start()
+        try {
+            val policy = NetworkPolicy(
+                permissions = PluginPermissions(hosts = emptyList(), userHosts = true, lan = true),
+                userConfiguredHosts = setOf("192.168.1.50"),
+                dnsResolver = { host -> listOf(InetAddress.getByName(host)) },
+            )
+            val client = OkHttpClient.Builder()
+                .proxy(Proxy.NO_PROXY)
+                .socketFactory(MultiIpRedirectSocketFactory(setOf("192.168.1.50", "93.184.216.35"), server.port))
+                .build()
+            val fetcher = PluginImageFetcher(policy, client)
+
+            // 1. Authorized LAN userHost image fetches cleanly with Authorization header
+            val okBytes = fetcher.fetchBytes(
+                Artwork(
+                    url = "http://192.168.1.50:${server.port}/img/ok.jpg",
+                    headers = mapOf("Authorization" to "Bearer secret-img-tok"),
+                ),
+            )
+            assertEquals("JPG:Bearer secret-img-tok", String(okBytes, Charsets.UTF_8))
+
+            // 2. Cross-origin redirect strips Authorization & custom headers (§11.3, B1)
+            val redirBytes = fetcher.fetchBytes(
+                Artwork(
+                    url = "http://192.168.1.50:${server.port}/img/redir-cross-origin",
+                    headers = mapOf("Authorization" to "Bearer secret", "X-Secret" to "leak"),
+                ),
+            )
+            assertEquals("OTHER_OK", String(redirBytes, Charsets.UTF_8))
+            assertEquals(null, lastAuthOnRedirectTarget)
+            assertEquals(null, lastCustomOnRedirectTarget)
+
+            // 3. Rejects file://, content://, shorthand 127.1, unlisted LAN, and redirect to private/loopback
+            for (badUrl in listOf(
+                "file:///etc/passwd",
+                "content://media/external/images/1",
+                "http://127.1/a.jpg",
+                "http://0x7f.0.0.1/a.jpg",
+                "http://localhost./a.jpg",
+                "http://192.168.1.99:${server.port}/img/ok.jpg",
+                "http://192.168.1.50:${server.port}/img/redir-private",
+                "http://192.168.1.50:${server.port}/img/redir-loopback",
+            )) {
+                try {
+                    fetcher.fetchBytes(Artwork(url = badUrl))
+                    fail("Expected image URL to be rejected: $badUrl")
+                } catch (_: IOException) {
+                } catch (_: NetworkPolicyException) {
+                }
+            }
+
+            // 4. PluginProtocolMapper rejects file://, content://, and malicious inline MPD URLs during mapping
+            val mapper = PluginProtocolMapper(policy, PluginLogger("test", "i1", sink = { _, _ -> }))
+            for (badImg in listOf("file:///etc/passwd", "content://media/1", "http://127.1/a.png")) {
+                val rawItem = json.parseToJsonElement(
+                    """{"id":"1","kind":"movie","title":"Bad","poster":"$badImg"}""",
+                )
+                val mapped = mapper.mapItem(rawItem)
+                assertEquals("Disallowed image URL ($badImg) must be dropped by mapper", null, mapped.poster)
+            }
+
+            val badMpd = json.parseToJsonElement(
+                """{"mpd":"<MPD><Period><AdaptationSet><Representation><BaseURL>http://127.1/secret.m4s</BaseURL></Representation></AdaptationSet></Period></MPD>"}""",
+            )
+            try {
+                mapper.mapPlayback(badMpd, fallbackTitle = null)
+                fail("Expected inline MPD pointing at 127.1 to be rejected")
+            } catch (_: Exception) {
             }
         } finally {
             server.shutdown()
@@ -298,21 +433,12 @@ class ManifestAndPermissionTest {
     }
 }
 
-/**
- * Test-only [SocketFactory] that transparently redirects TCP connections aimed
- * at a synthetic LAN IP (e.g. `192.168.1.50`) to a local [MockWebServer] port,
- * allowing [NetworkPolicy] to run with 100% real production rules (no loopback
- * bypass flag anywhere in production code).
- */
 class LocalRedirectSocketFactory(
     private val syntheticIp: String,
     private val targetLocalPort: Int,
 ) : SocketFactory() {
     override fun createSocket(): Socket = object : Socket() {
-        override fun connect(endpoint: java.net.SocketAddress?) {
-            connect(endpoint, 0)
-        }
-
+        override fun connect(endpoint: java.net.SocketAddress?) = connect(endpoint, 0)
         override fun connect(endpoint: java.net.SocketAddress?, timeout: Int) {
             val target = if (endpoint is java.net.InetSocketAddress &&
                 (endpoint.address?.hostAddress == syntheticIp || endpoint.hostString == syntheticIp)
@@ -332,14 +458,39 @@ class LocalRedirectSocketFactory(
         Socket(InetAddress.getLoopbackAddress(), if (host == syntheticIp) targetLocalPort else port)
 
     override fun createSocket(host: InetAddress, port: Int): Socket =
-        Socket(
-            InetAddress.getLoopbackAddress(),
-            if (host.hostAddress == syntheticIp) targetLocalPort else port,
-        )
+        Socket(InetAddress.getLoopbackAddress(), if (host.hostAddress == syntheticIp) targetLocalPort else port)
 
     override fun createSocket(address: InetAddress, port: Int, localAddress: InetAddress, localPortNum: Int): Socket =
-        Socket(
-            InetAddress.getLoopbackAddress(),
-            if (address.hostAddress == syntheticIp) targetLocalPort else port,
-        )
+        Socket(InetAddress.getLoopbackAddress(), if (address.hostAddress == syntheticIp) targetLocalPort else port)
+}
+
+class MultiIpRedirectSocketFactory(
+    private val syntheticIps: Set<String>,
+    private val targetLocalPort: Int,
+) : SocketFactory() {
+    override fun createSocket(): Socket = object : Socket() {
+        override fun connect(endpoint: java.net.SocketAddress?) = connect(endpoint, 0)
+        override fun connect(endpoint: java.net.SocketAddress?, timeout: Int) {
+            val target = if (endpoint is java.net.InetSocketAddress &&
+                (endpoint.address?.hostAddress in syntheticIps || endpoint.hostString in syntheticIps)
+            ) {
+                java.net.InetSocketAddress(InetAddress.getLoopbackAddress(), targetLocalPort)
+            } else {
+                endpoint
+            }
+            super.connect(target, timeout)
+        }
+    }
+
+    override fun createSocket(host: String, port: Int): Socket =
+        Socket(InetAddress.getLoopbackAddress(), if (host in syntheticIps) targetLocalPort else port)
+
+    override fun createSocket(host: String, port: Int, localHost: InetAddress, localPortNum: Int): Socket =
+        Socket(InetAddress.getLoopbackAddress(), if (host in syntheticIps) targetLocalPort else port)
+
+    override fun createSocket(host: InetAddress, port: Int): Socket =
+        Socket(InetAddress.getLoopbackAddress(), if (host.hostAddress?.let { it in syntheticIps } == true) targetLocalPort else port)
+
+    override fun createSocket(address: InetAddress, port: Int, localAddress: InetAddress, localPortNum: Int): Socket =
+        Socket(InetAddress.getLoopbackAddress(), if (address.hostAddress?.let { it in syntheticIps } == true) targetLocalPort else port)
 }

@@ -39,7 +39,7 @@ data class Shelf(
 enum class ItemKind { MOVIE, SERIES, SEASON, EPISODE, FOLDER, VIDEO, LIVE, COLLECTION, PERSON }
 
 /** How the picture is laid out, so native 3D can skip the depth model later. */
-enum class StereoHint { MONO, SBS, OU, MVHEVC, VR180, VR360 }
+enum class StereoHint { MONO, SBS, OU, VR180, VR360, MVHEVC }
 
 /**
  * Something to draw for an item. A source with no artwork points at the
@@ -156,12 +156,13 @@ data class AudioTrackOption(
 data class PlaybackInfo(
     val url: String,
     val headers: Map<String, String> = emptyMap(),
-    val title: String,
+    val title: String? = null,
     val startPositionMs: Long = 0,
     val stereoHint: StereoHint = StereoHint.MONO,
     val dash: DashStream? = null,
     val mpd: String? = null,
     val mimeType: String? = null,
+    val durationMs: Long? = null,
     val qualities: List<QualityOption> = emptyList(),
     val subtitles: List<SubtitleTrack> = emptyList(),
     val audios: List<AudioTrackOption> = emptyList(),
@@ -174,11 +175,15 @@ data class PlaybackInfo(
 /** The source cannot be reached right now; the wall shows it as "连不上". */
 open class SourceUnavailableException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
-/** The source works but the user has to do something first (a permission, a login). */
+/** The source works but the user has to do something first (a permission, initial configuration). */
 open class SourceNeedsSetupException(message: String) : Exception(message)
 
-/** Credentials are missing or expired and the user must sign in again. */
-class SourceNeedsAuthException(message: String) : SourceNeedsSetupException(message)
+/**
+ * Credentials are missing or expired and the user must sign in again.
+ * Intentionally does NOT extend [SourceNeedsSetupException] so legacy wall
+ * screens do not mislabel re-authentication as storage permission setup.
+ */
+class SourceNeedsAuthException(message: String) : Exception(message)
 
 /** Login attempt failed with a user-facing reason. */
 class SourceAuthFailedException(message: String) : Exception(message)

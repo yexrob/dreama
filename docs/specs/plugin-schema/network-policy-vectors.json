@@ -1,0 +1,288 @@
+{
+  "dns": {
+    "api.example.com": ["93.184.216.34"],
+    "v1.cdn.example.com": ["93.184.216.34"],
+    "other-cdn.example.net": ["93.184.216.35"],
+    "evil.example.org": ["93.184.216.36"],
+    "127.0.0.1.nip.io": ["127.0.0.1"],
+    "10.0.0.5.nip.io": ["10.0.0.5"],
+    "192.168.1.50.nip.io": ["192.168.1.50"],
+    "jellyfin.home.lan": ["192.168.1.50"],
+    "unlisted.home.lan": ["192.168.1.99"],
+    "nas.public.example": ["93.184.216.40"],
+    "linklocal.example.com": ["169.254.169.254"],
+    "reserved240.example.com": ["240.1.2.3"],
+    "broadcast.example.com": ["255.255.255.255"],
+    "nat64-loopback.example": ["64:ff9b::7f00:1"],
+    "nat64-private.example": ["64:ff9b::c0a8:132"],
+    "nat64-public.example": ["64:ff9b::5db8:d822"],
+    "v4compat-loopback.example": ["::127.0.0.1"],
+    "v4mapped-private.example": ["::ffff:10.0.0.1"],
+    "ula.example.com": ["fd12:3456:789a::1"],
+    "cgnat.example.com": ["100.64.1.5"],
+    "mixed-evil.example.com": ["93.184.216.34", "127.0.0.1"]
+  },
+  "fetchCases": [
+    {
+      "name": "public https whitelisted exact",
+      "policy": { "hosts": ["api.example.com"], "userHosts": false, "lan": false },
+      "userHosts": [],
+      "url": "https://api.example.com/v1/home",
+      "allow": true
+    },
+    {
+      "name": "public https whitelisted wildcard",
+      "policy": { "hosts": ["*.cdn.example.com"], "userHosts": false, "lan": false },
+      "userHosts": [],
+      "url": "https://v1.cdn.example.com/seg.m4s",
+      "allow": true
+    },
+    {
+      "name": "public http rejected without userHosts",
+      "policy": { "hosts": ["api.example.com"], "userHosts": false, "lan": false },
+      "userHosts": [],
+      "url": "http://api.example.com/v1/home",
+      "allow": false
+    },
+    {
+      "name": "user-configured public host allows http (§11.3)",
+      "policy": { "hosts": [], "userHosts": true, "lan": false },
+      "userHosts": ["nas.public.example"],
+      "url": "http://nas.public.example:8096/System/Info",
+      "allow": true
+    },
+    {
+      "name": "lan=true allows private userHost over http (§11.3)",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": ["jellyfin.home.lan"],
+      "url": "http://jellyfin.home.lan:8096/Items",
+      "allow": true
+    },
+    {
+      "name": "lan=true does NOT open unlisted LAN hosts (§11.3)",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": ["jellyfin.home.lan"],
+      "url": "http://unlisted.home.lan:8096/Items",
+      "allow": false
+    },
+    {
+      "name": "lan=true does NOT open unlisted raw private IP (§11.3)",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": ["192.168.1.50"],
+      "url": "http://192.168.1.99:8096/Items",
+      "allow": false
+    },
+    {
+      "name": "lan=false rejects private userHost",
+      "policy": { "hosts": [], "userHosts": true, "lan": false },
+      "userHosts": ["jellyfin.home.lan"],
+      "url": "https://jellyfin.home.lan/Items",
+      "allow": false
+    },
+    {
+      "name": "loopback localhost with trailing dot blocked even with lan=true",
+      "policy": { "hosts": ["localhost"], "userHosts": true, "lan": true },
+      "userHosts": ["localhost", "localhost."],
+      "url": "http://localhost.:8080/",
+      "allow": false
+    },
+    {
+      "name": "shorthand loopback 127.1 blocked",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": ["127.1"],
+      "url": "http://127.1:8080/",
+      "allow": false
+    },
+    {
+      "name": "hex loopback 0x7f.0.0.1 blocked",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": ["0x7f.0.0.1"],
+      "url": "http://0x7f.0.0.1:8080/",
+      "allow": false
+    },
+    {
+      "name": "octal loopback 0177.0.0.1 blocked",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": ["0177.0.0.1"],
+      "url": "http://0177.0.0.1:8080/",
+      "allow": false
+    },
+    {
+      "name": "shorthand private 10.1 blocked without lan",
+      "policy": { "hosts": [], "userHosts": true, "lan": false },
+      "userHosts": ["10.1"],
+      "url": "https://10.1/",
+      "allow": false
+    },
+    {
+      "name": "ipv4-compatible ipv6 loopback [::127.0.0.1] blocked",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": ["::127.0.0.1"],
+      "url": "http://[::127.0.0.1]:8080/",
+      "allow": false
+    },
+    {
+      "name": "NAT64 loopback blocked",
+      "policy": { "hosts": ["nat64-loopback.example"], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "https://nat64-loopback.example/",
+      "allow": false
+    },
+    {
+      "name": "NAT64 private blocked without lan",
+      "policy": { "hosts": ["nat64-private.example"], "userHosts": false, "lan": false },
+      "userHosts": [],
+      "url": "https://nat64-private.example/",
+      "allow": false
+    },
+    {
+      "name": "link-local 169.254.169.254 blocked even with lan=true",
+      "policy": { "hosts": ["linklocal.example.com"], "userHosts": true, "lan": true },
+      "userHosts": ["169.254.169.254"],
+      "url": "http://linklocal.example.com/latest/meta-data/",
+      "allow": false
+    },
+    {
+      "name": "reserved 240/4 blocked even with lan=true",
+      "policy": { "hosts": ["reserved240.example.com"], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "https://reserved240.example.com/",
+      "allow": false
+    },
+    {
+      "name": "broadcast 255.255.255.255 blocked even with lan=true",
+      "policy": { "hosts": ["broadcast.example.com"], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "https://broadcast.example.com/",
+      "allow": false
+    },
+    {
+      "name": "nip.io resolving to 127.0.0.1 blocked",
+      "policy": { "hosts": ["*.nip.io"], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "https://127.0.0.1.nip.io/",
+      "allow": false
+    },
+    {
+      "name": "mixed DNS with one loopback IP blocked",
+      "policy": { "hosts": ["mixed-evil.example.com"], "userHosts": false, "lan": false },
+      "userHosts": [],
+      "url": "https://mixed-evil.example.com/",
+      "allow": false
+    }
+  ],
+  "resourceCases": [
+    {
+      "name": "arbitrary public CDN allowed for playback/image",
+      "policy": { "hosts": ["api.example.com"], "userHosts": false, "lan": false },
+      "userHosts": [],
+      "url": "https://other-cdn.example.net/video.m4s",
+      "allow": true
+    },
+    {
+      "name": "file scheme rejected for image/playback",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "file:///etc/passwd",
+      "allow": false
+    },
+    {
+      "name": "content scheme rejected for image/playback",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "content://media/external/video/media/1",
+      "allow": false
+    },
+    {
+      "name": "shorthand 127.1 rejected for playback",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": ["127.1"],
+      "url": "http://127.1/a.mp4",
+      "allow": false
+    },
+    {
+      "name": "hex 0x7f.0.0.1 rejected for playback",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "http://0x7f.0.0.1/a.mp4",
+      "allow": false
+    },
+    {
+      "name": "octal 0177.0.0.1 rejected for playback",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "http://0177.0.0.1/a.mp4",
+      "allow": false
+    },
+    {
+      "name": "shorthand 10.1 rejected without lan",
+      "policy": { "hosts": [], "userHosts": false, "lan": false },
+      "userHosts": [],
+      "url": "http://10.1/a.mp4",
+      "allow": false
+    },
+    {
+      "name": "ipv4-compatible [::127.0.0.1] rejected for playback",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "http://[::127.0.0.1]/a.mp4",
+      "allow": false
+    },
+    {
+      "name": "localhost. trailing dot rejected for playback",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "http://localhost./a.mp4",
+      "allow": false
+    },
+    {
+      "name": "nip.io private IP rejected without lan",
+      "policy": { "hosts": [], "userHosts": false, "lan": false },
+      "userHosts": [],
+      "url": "https://10.0.0.5.nip.io/a.mp4",
+      "allow": false
+    },
+    {
+      "name": "unlisted LAN IP rejected for playback even when lan=true (§11.3)",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": ["192.168.1.50"],
+      "url": "http://192.168.1.99/a.mp4",
+      "allow": false
+    },
+    {
+      "name": "userHost LAN IP allowed for playback when lan=true (§11.3)",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": ["192.168.1.50"],
+      "url": "http://192.168.1.50:8096/Videos/1/stream",
+      "allow": true
+    },
+    {
+      "name": "240/4 rejected for playback",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "https://240.0.0.1/a.mp4",
+      "allow": false
+    },
+    {
+      "name": "255.255.255.255 rejected for playback",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "https://255.255.255.255/a.mp4",
+      "allow": false
+    },
+    {
+      "name": "NAT64 private rejected without lan",
+      "policy": { "hosts": [], "userHosts": false, "lan": false },
+      "userHosts": [],
+      "url": "https://nat64-private.example/a.mp4",
+      "allow": false
+    },
+    {
+      "name": "NAT64 public allowed for playback",
+      "policy": { "hosts": [], "userHosts": false, "lan": false },
+      "userHosts": [],
+      "url": "https://nat64-public.example/a.mp4",
+      "allow": true
+    }
+  ]
+}

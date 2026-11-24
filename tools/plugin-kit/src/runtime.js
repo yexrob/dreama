@@ -1,3 +1,6 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { getQuickJS } from 'quickjs-emscripten';
 import { pluginCrypto } from './crypto.js';
 import { PluginCookieJar } from './cookies.js';
@@ -6,12 +9,20 @@ import { FetchGateway } from './fetch-gateway.js';
 import { PluginLocale } from './locale.js';
 import { PluginLogger } from './logger.js';
 import { NetworkPolicy, extractUserHosts } from './network-policy.js';
+import { SCHEMA_DIR } from './schema.js';
 import { PluginStorage } from './storage.js';
 
 const ERR_MARKER = '__D3_PLUGIN_ERR__:';
-export const DEFAULT_MEMORY_LIMIT = 32 * 1024 * 1024;
+/** §11.1 (B2): 64 MB QuickJS heap limit, matching Android PluginRuntime.kt. */
+export const DEFAULT_MEMORY_LIMIT = 64 * 1024 * 1024;
 export const DEFAULT_TIMEOUT_MS = 15_000;
 export const PLAYBACK_TIMEOUT_MS = 30_000;
+
+/**
+ * S9: Single shared bootstrap script loaded from docs/specs/plugin-schema/runtime-bootstrap.js
+ * (the exact same file bundled into Android resources by Gradle).
+ */
+const BOOTSTRAP_JS = fs.readFileSync(path.join(SCHEMA_DIR, 'runtime-bootstrap.js'), 'utf8');
 
 export class PluginCallError extends Error {
   constructor(code, message, retryAfterSec = null) {
@@ -55,376 +66,6 @@ async function loadQuickJS() {
   if (!cachedQuickJS) cachedQuickJS = await getQuickJS();
   return cachedQuickJS;
 }
-
-const BOOTSTRAP_JS = `
-(function() {
-  const host = globalThis.__d3_host;
-  delete globalThis.__d3_host;
-  const ERR_MARKER = host.getErrorMarker();
-
-  function deepFreeze(obj) {
-    if (obj === null || typeof obj !== 'object') return obj;
-    Object.freeze(obj);
-    for (const key of Object.keys(obj)) deepFreeze(obj[key]);
-    return obj;
-  }
-
-  function utf8Encode(str) {
-    const s = String(str);
-    const bytes = [];
-    for (let i = 0; i < s.length; i++) {
-      let cp = s.charCodeAt(i);
-      if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < s.length) {
-        const lo = s.charCodeAt(++i);
-        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-      }
-      if (cp < 0x80) bytes.push(cp);
-      else if (cp < 0x800) bytes.push(0xC0 | (cp >> 6), 0x80 | (cp & 0x3F));
-      else if (cp < 0x10000) bytes.push(0xE0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
-      else bytes.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
-    }
-    return new Uint8Array(bytes);
-  }
-
-  function utf8Decode(bytes) {
-    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-    let out = '';
-    let i = 0;
-    while (i < u8.length) {
-      const b0 = u8[i++];
-      if (b0 < 0x80) out += String.fromCharCode(b0);
-      else if ((b0 & 0xE0) === 0xC0 && i < u8.length) {
-        out += String.fromCharCode(((b0 & 0x1F) << 6) | (u8[i++] & 0x3F));
-      } else if ((b0 & 0xF0) === 0xE0 && i + 1 < u8.length) {
-        const b1 = u8[i++], b2 = u8[i++];
-        out += String.fromCharCode(((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F));
-      } else if ((b0 & 0xF8) === 0xF0 && i + 2 < u8.length) {
-        const b1 = u8[i++], b2 = u8[i++], b3 = u8[i++];
-        const cp = (((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)) - 0x10000;
-        out += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
-      } else out += '\\uFFFD';
-    }
-    return out;
-  }
-
-  const B64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  const B64_LOOKUP = new Int16Array(128).fill(-1);
-  for (let i = 0; i < B64_CHARS.length; i++) B64_LOOKUP[B64_CHARS.charCodeAt(i)] = i;
-  B64_LOOKUP['-'.charCodeAt(0)] = 62;
-  B64_LOOKUP['_'.charCodeAt(0)] = 63;
-
-  function bytesToBase64(u8) {
-    let out = '';
-    for (let i = 0; i < u8.length; i += 3) {
-      const a = u8[i], b = i + 1 < u8.length ? u8[i + 1] : 0, c = i + 2 < u8.length ? u8[i + 2] : 0;
-      const n = (a << 16) | (b << 8) | c;
-      out += B64_CHARS[(n >> 18) & 63];
-      out += B64_CHARS[(n >> 12) & 63];
-      out += i + 1 < u8.length ? B64_CHARS[(n >> 6) & 63] : '=';
-      out += i + 2 < u8.length ? B64_CHARS[n & 63] : '=';
-    }
-    return out;
-  }
-
-  function base64ToBytes(str) {
-    const s = String(str).replace(/[\\r\\n\\s=]+/g, '');
-    const out = new Uint8Array(Math.floor(s.length * 3 / 4));
-    let p = 0;
-    for (let i = 0; i < s.length; i += 4) {
-      const a = B64_LOOKUP[s.charCodeAt(i)] ?? 0;
-      const b = B64_LOOKUP[s.charCodeAt(i + 1)] ?? 0;
-      const c = i + 2 < s.length ? (B64_LOOKUP[s.charCodeAt(i + 2)] ?? 0) : 0;
-      const d = i + 3 < s.length ? (B64_LOOKUP[s.charCodeAt(i + 3)] ?? 0) : 0;
-      out[p++] = (a << 2) | (b >> 4);
-      if (i + 2 < s.length) out[p++] = ((b & 15) << 4) | (c >> 2);
-      if (i + 3 < s.length) out[p++] = ((c & 3) << 6) | d;
-    }
-    return out.subarray(0, p);
-  }
-
-  function toInputBase64(input) {
-    if (input instanceof Uint8Array) return bytesToBase64(input);
-    if (ArrayBuffer.isView(input)) return bytesToBase64(new Uint8Array(input.buffer, input.byteOffset, input.byteLength));
-    if (input instanceof ArrayBuffer) return bytesToBase64(new Uint8Array(input));
-    return bytesToBase64(utf8Encode(input ?? ''));
-  }
-
-  if (typeof globalThis.TextEncoder === 'undefined') {
-    globalThis.TextEncoder = class TextEncoder { encode(s) { return utf8Encode(s); } };
-  }
-  if (typeof globalThis.TextDecoder === 'undefined') {
-    globalThis.TextDecoder = class TextDecoder { decode(b) { return utf8Decode(b); } };
-  }
-  if (typeof globalThis.URLSearchParams === 'undefined') {
-    globalThis.URLSearchParams = class URLSearchParams {
-      constructor(init) {
-        this._pairs = [];
-        if (typeof init === 'string') {
-          const q = init.startsWith('?') ? init.slice(1) : init;
-          if (q) {
-            for (const part of q.split('&')) {
-              if (!part) continue;
-              const idx = part.indexOf('=');
-              const k = decodeURIComponent((idx >= 0 ? part.slice(0, idx) : part).replace(/\\+/g, ' '));
-              const v = decodeURIComponent((idx >= 0 ? part.slice(idx + 1) : '').replace(/\\+/g, ' '));
-              this._pairs.push([k, v]);
-            }
-          }
-        } else if (init && typeof init === 'object') {
-          for (const [k, v] of Object.entries(init)) {
-            if (v !== undefined && v !== null) this._pairs.push([String(k), String(v)]);
-          }
-        }
-      }
-      append(k, v) { this._pairs.push([String(k), String(v)]); }
-      set(k, v) {
-        const ks = String(k);
-        this._pairs = this._pairs.filter(([key]) => key !== ks);
-        this._pairs.push([ks, String(v)]);
-      }
-      get(k) { const f = this._pairs.find(([key]) => key === String(k)); return f ? f[1] : null; }
-      delete(k) { this._pairs = this._pairs.filter(([key]) => key !== String(k)); }
-      toString() { return this._pairs.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&'); }
-    };
-  }
-
-  let currentGen = 0;
-  let nextTimerId = 1;
-  const cancelledTimers = new Set();
-
-  globalThis.setTimeout = function(fn, delayMs, ...args) {
-    if (typeof fn !== 'function') throw new TypeError('setTimeout requires a function');
-    const id = nextTimerId++;
-    const gen = currentGen;
-    const ms = Number(delayMs) || 0;
-    host.sleep(ms, gen).then((stillActive) => {
-      if (stillActive && gen === currentGen && !cancelledTimers.has(id)) {
-        cancelledTimers.delete(id);
-        fn(...args);
-      }
-    }).catch(() => {});
-    return id;
-  };
-  globalThis.clearTimeout = function(id) { cancelledTimers.add(id); };
-
-  function wrapElement(info) {
-    if (!info) return null;
-    const el = {
-      tag: info.tag,
-      text: info.text,
-      html: info.html,
-      outerHtml: info.outerHtml,
-      attrs: deepFreeze(Object.assign({}, info.attrs || {})),
-      attr(name) {
-        const v = info.attrs ? info.attrs[String(name)] : undefined;
-        return v === undefined ? null : v;
-      },
-      querySelector(sel) {
-        const raw = host.domSelectFirst(info.id, String(sel));
-        return raw ? wrapElement(JSON.parse(raw)) : null;
-      },
-      selectFirst(sel) { return el.querySelector(sel); },
-      querySelectorAll(sel) { return JSON.parse(host.domSelectAll(info.id, String(sel))).map(wrapElement); },
-      select(sel) { return el.querySelectorAll(sel); },
-      get children() { return JSON.parse(host.domChildren(info.id)).map(wrapElement); },
-    };
-    return Object.freeze(el);
-  }
-
-  class PluginError extends Error {
-    constructor(code, message, options) {
-      super(message === undefined || message === null ? '' : String(message));
-      this.name = 'PluginError';
-      this.code = String(code || 'Internal');
-      this.__d3Error = true;
-      if (options && typeof options === 'object' && options.retryAfterSec !== undefined) {
-        this.retryAfterSec = Number(options.retryAfterSec);
-      }
-    }
-  }
-
-  function formatLogArgs(args) {
-    return args.map((a) => {
-      if (typeof a === 'string') return a;
-      try { return JSON.stringify(a); } catch { return String(a); }
-    }).join(' ');
-  }
-
-  const ctx = Object.freeze({
-    Error: PluginError,
-    config: deepFreeze(JSON.parse(host.getConfigJson())),
-    instanceId: host.getInstanceId(),
-    device: deepFreeze(JSON.parse(host.getDeviceJson())),
-
-    async fetch(url, opts) {
-      const o = opts || {};
-      const req = {
-        url: String(url),
-        method: o.method ? String(o.method) : 'GET',
-        headers: {},
-        redirect: o.redirect ? String(o.redirect) : 'follow',
-      };
-      if (o.timeoutMs !== undefined && o.timeoutMs !== null) req.timeoutMs = Number(o.timeoutMs);
-      if (o.headers && typeof o.headers === 'object') {
-        for (const [k, v] of Object.entries(o.headers)) {
-          if (v !== undefined && v !== null) req.headers[String(k)] = String(v);
-        }
-      }
-      if (o.body !== undefined && o.body !== null) {
-        if (o.body instanceof Uint8Array || ArrayBuffer.isView(o.body) || o.body instanceof ArrayBuffer) {
-          req.bodyBase64 = toInputBase64(o.body);
-        } else if (typeof o.body === 'string') {
-          req.bodyText = o.body;
-        } else {
-          req.bodyText = JSON.stringify(o.body);
-          if (!Object.keys(req.headers).some((k) => k.toLowerCase() === 'content-type')) {
-            req.headers['Content-Type'] = 'application/json; charset=utf-8';
-          }
-        }
-      }
-      const rawResp = await host.fetch(JSON.stringify(req));
-      const parsed = JSON.parse(rawResp);
-      let cachedBytes = null;
-      let cachedText = null;
-      const headers = deepFreeze(parsed.headers || {});
-      const resp = {
-        status: parsed.status,
-        ok: parsed.status >= 200 && parsed.status < 300,
-        url: parsed.url,
-        headers,
-        bytes() {
-          if (cachedBytes === null) cachedBytes = base64ToBytes(parsed.bodyBase64 || '');
-          return new Uint8Array(cachedBytes);
-        },
-        text() {
-          if (cachedText === null) cachedText = utf8Decode(resp.bytes());
-          return cachedText;
-        },
-        json() { return JSON.parse(resp.text()); },
-      };
-      return Object.freeze(resp);
-    },
-
-    storage: Object.freeze({
-      get(key) {
-        const raw = host.storageGet(String(key));
-        return raw === null || raw === undefined ? null : JSON.parse(raw);
-      },
-      set(key, value) { host.storageSet(String(key), JSON.stringify(value === undefined ? null : value)); },
-      remove(key) { host.storageRemove(String(key)); },
-      keys() { return JSON.parse(host.storageKeys()); },
-    }),
-
-    cookies: Object.freeze({
-      get(url) { return host.cookiesGet(String(url)); },
-      set(url, cookie) { host.cookiesSet(String(url), String(cookie)); },
-      clear() { host.cookiesClear(); },
-    }),
-
-    crypto: Object.freeze({
-      md5(data) { return host.cryptoHash('md5', toInputBase64(data)); },
-      sha1(data) { return host.cryptoHash('sha1', toInputBase64(data)); },
-      sha256(data) { return host.cryptoHash('sha256', toInputBase64(data)); },
-      hmac(algo, key, data) { return host.cryptoHmac(String(algo), toInputBase64(key), toInputBase64(data)); },
-      aes: Object.freeze({
-        encrypt(modeOrOpts, key, iv, data, aad) {
-          if (modeOrOpts && typeof modeOrOpts === 'object') {
-            const o = modeOrOpts;
-            return base64ToBytes(host.cryptoAes(true, String(o.mode || 'GCM'), toInputBase64(o.key), toInputBase64(o.iv), toInputBase64(o.data), o.aad !== undefined ? toInputBase64(o.aad) : ''));
-          }
-          return base64ToBytes(host.cryptoAes(true, String(modeOrOpts), toInputBase64(key), toInputBase64(iv), toInputBase64(data), aad !== undefined ? toInputBase64(aad) : ''));
-        },
-        decrypt(modeOrOpts, key, iv, data, aad) {
-          if (modeOrOpts && typeof modeOrOpts === 'object') {
-            const o = modeOrOpts;
-            return base64ToBytes(host.cryptoAes(false, String(o.mode || 'GCM'), toInputBase64(o.key), toInputBase64(o.iv), toInputBase64(o.data), o.aad !== undefined ? toInputBase64(o.aad) : ''));
-          }
-          return base64ToBytes(host.cryptoAes(false, String(modeOrOpts), toInputBase64(key), toInputBase64(iv), toInputBase64(data), aad !== undefined ? toInputBase64(aad) : ''));
-        },
-      }),
-      rsa: Object.freeze({
-        encrypt(pubOrOpts, data, padding) {
-          if (pubOrOpts && typeof pubOrOpts === 'object') {
-            return base64ToBytes(host.cryptoRsaEncrypt(String(pubOrOpts.publicKey), toInputBase64(pubOrOpts.data), String(pubOrOpts.padding || 'PKCS1')));
-          }
-          return base64ToBytes(host.cryptoRsaEncrypt(String(pubOrOpts), toInputBase64(data), String(padding || 'PKCS1')));
-        },
-      }),
-      randomBytes(n) { return base64ToBytes(host.cryptoRandomBytes(Number(n))); },
-      base64: Object.freeze({
-        encode(data, urlSafe) { return host.cryptoBase64Encode(toInputBase64(data), Boolean(urlSafe)); },
-        decode(str) { return base64ToBytes(host.cryptoBase64Decode(String(str))); },
-      }),
-      hex: Object.freeze({
-        encode(data) { return host.cryptoHexEncode(toInputBase64(data)); },
-        decode(str) { return base64ToBytes(host.cryptoHexDecode(String(str))); },
-      }),
-    }),
-
-    parse: Object.freeze({
-      html(text) { return wrapElement(JSON.parse(host.parseHtml(String(text ?? '')))); },
-      xml(text) { return wrapElement(JSON.parse(host.parseXml(String(text ?? '')))); },
-    }),
-
-    log: Object.freeze({
-      debug(...args) { host.log('DEBUG', formatLogArgs(args)); },
-      info(...args) { host.log('INFO', formatLogArgs(args)); },
-      warn(...args) { host.log('WARN', formatLogArgs(args)); },
-      error(...args) { host.log('ERROR', formatLogArgs(args)); },
-    }),
-
-    t(key, vars) { return host.translate(String(key), vars ? JSON.stringify(vars) : 'null'); },
-  });
-
-  let pluginExport = null;
-  globalThis.__d3_register = function(mod) {
-    if (!mod || typeof mod !== 'object') throw new Error('Plugin main.js must export a default object');
-    pluginExport = mod;
-  };
-  globalThis.__d3_exports = function() {
-    if (!pluginExport) return '[]';
-    return JSON.stringify(Object.keys(pluginExport).filter((k) => typeof pluginExport[k] === 'function'));
-  };
-
-  async function callPlugin(method, argJson, hasArg, gen, optional) {
-    currentGen = gen;
-    cancelledTimers.clear();
-    if (!pluginExport) throw new Error('Plugin not loaded');
-    const fn = pluginExport[method];
-    if (typeof fn !== 'function') {
-      if (optional) return 'undefined';
-      throw new Error('Plugin does not implement method: ' + method);
-    }
-    try {
-      const res = hasArg ? await fn.call(pluginExport, ctx, JSON.parse(argJson)) : await fn.call(pluginExport, ctx);
-      return res === undefined ? 'undefined' : JSON.stringify(res);
-    } catch (err) {
-      if (err && err.__d3Error) {
-        const payload = { code: err.code || 'Internal' };
-        if (err.message) payload.message = String(err.message);
-        if (typeof err.retryAfterSec === 'number' && Number.isFinite(err.retryAfterSec)) {
-          payload.retryAfterSec = Math.round(err.retryAfterSec);
-        }
-        throw new Error(ERR_MARKER + JSON.stringify(payload));
-      }
-      throw err;
-    }
-  }
-
-  globalThis.__d3_invoke = function(method, argJson, hasArg, gen) {
-    return callPlugin(method, argJson, hasArg, gen, false);
-  };
-  globalThis.__d3_invoke_optional = function(method, argJson, hasArg, gen) {
-    return callPlugin(method, argJson, hasArg, gen, true);
-  };
-  globalThis.__d3_eval_probe = async function(fnCode, gen) {
-    currentGen = gen;
-    const fn = new Function('ctx', 'return (async () => { ' + fnCode + ' })();');
-    const res = await fn(ctx);
-    return res === undefined ? 'undefined' : JSON.stringify(res);
-  };
-})();
-`;
 
 export class QuickJsPluginHost {
   constructor({
@@ -474,11 +115,20 @@ export class QuickJsPluginHost {
 
     this.rt = null;
     this.vm = null;
+    this.bridgeToken = null;
     this.initialized = false;
     this.creationCount = 0;
     this.callGen = 0;
     this.deadlineMs = Infinity;
-    this.activeTimers = new Set();
+    /** Map<timerId, { timer: NodeJS.Timeout, resolve: (val: boolean) => void }> */
+    this.activeTimers = new Map();
+    /** Set<QuickJSDeferredPromise> tracked so _destroyVm disposes any unsettled handles cleanly */
+    this.pendingDeferreds = new Set();
+    /** Map<handleId, { buf: Buffer, bytes: number }> */
+    this.callResponseBodies = new Map();
+    this.nextResponseHandle = 1;
+    /** Serial execution chain per instance (§11.1) */
+    this._serialQueue = Promise.resolve();
   }
 
   _applyDefaults(manifest, provided) {
@@ -491,6 +141,12 @@ export class QuickJsPluginHost {
       if (!(k in out)) out[k] = v;
     }
     return out;
+  }
+
+  _serialized(task) {
+    const next = this._serialQueue.then(task, task);
+    this._serialQueue = next.catch(() => {});
+    return next;
   }
 
   async _ensureInitialized(timeoutMs) {
@@ -512,13 +168,19 @@ export class QuickJsPluginHost {
     const vm = rt.newContext();
     this.rt = rt;
     this.vm = vm;
+    this.bridgeToken = crypto.randomBytes(16).toString('hex');
     this.creationCount += 1;
 
     try {
-      this._bindHostObject(vm);
+      this._bindHostObject(vm, this.bridgeToken);
       this.deadlineMs = Date.now() + timeoutMs;
       const bootHandle = this._unwrapOrThrow(vm, vm.evalCode(BOOTSTRAP_JS, '__d3_bootstrap.js'));
       bootHandle.dispose();
+      const sealHandle = this._unwrapOrThrow(
+        vm,
+        vm.evalCode(`__d3_seal_bootstrap(${JSON.stringify(this.bridgeToken)})`, '__d3_seal.js'),
+      );
+      sealHandle.dispose();
       const entryRes = vm.evalCode(
         `import __p from 'plugin/main.js'; globalThis.__d3_register(__p);`,
         '__d3_entry.js',
@@ -528,7 +190,7 @@ export class QuickJsPluginHost {
       entryHandle.dispose();
       this._drainJobs();
 
-      // Run optional init(ctx)
+      // Run optional init(ctx) — if it fails, destroy VM so next call retries init (§11.1)
       const gen = ++this.callGen;
       await this._evalAsyncExpr(`__d3_invoke_optional('init', 'null', false, ${gen})`, timeoutMs);
       this.initialized = true;
@@ -536,73 +198,106 @@ export class QuickJsPluginHost {
       this._destroyVm();
       throw this._mapHostError(err);
     } finally {
+      this._cleanupAfterCall();
       this.deadlineMs = Infinity;
     }
   }
 
   async exportedMethods() {
-    await this._ensureInitialized(this.defaultTimeoutMs);
-    const res = this._unwrapOrThrow(this.vm, this.vm.evalCode('__d3_exports()', '__d3_exports.js'));
-    const raw = this.vm.dump(res);
-    res.dispose();
-    return JSON.parse(raw);
+    return this._serialized(async () => {
+      await this._ensureInitialized(this.defaultTimeoutMs);
+      const res = this._unwrapOrThrow(this.vm, this.vm.evalCode('__d3_exports()', '__d3_exports.js'));
+      const raw = this.vm.dump(res);
+      res.dispose();
+      return JSON.parse(raw);
+    });
   }
 
   async invoke(method, arg = undefined, opts = {}) {
-    const timeoutMs = opts.timeoutMs ?? (method === 'playback' ? this.playbackTimeoutMs : this.defaultTimeoutMs);
-    await this._ensureInitialized(timeoutMs);
+    return this._serialized(async () => {
+      const timeoutMs = opts.timeoutMs ?? (method === 'playback' ? this.playbackTimeoutMs : this.defaultTimeoutMs);
+      await this._ensureInitialized(timeoutMs);
 
-    const gen = ++this.callGen;
-    this.domParser.clear();
-    const hasArg = arg !== undefined;
-    const argJson = hasArg ? JSON.stringify(arg) : 'null';
-    const expr = `__d3_invoke(${JSON.stringify(method)}, ${JSON.stringify(argJson)}, ${hasArg}, ${gen})`;
-
-    try {
-      const raw = await this._evalAsyncExpr(expr, timeoutMs);
-      if (raw === undefined || raw === null || raw === 'undefined') return undefined;
-      return JSON.parse(raw);
-    } catch (err) {
-      const mapped = this._mapHostError(err);
-      if (mapped.code === 'Unavailable' || this._isOom(err)) {
-        this._destroyVm();
-      }
-      throw mapped;
-    } finally {
-      this.callGen += 1;
-      this._clearActiveTimers();
+      const gen = ++this.callGen;
       this.domParser.clear();
-    }
+      this._releaseResponseBodies();
+      const hasArg = arg !== undefined;
+      const argJson = hasArg ? JSON.stringify(arg) : 'null';
+      const expr = `__d3_invoke(${JSON.stringify(method)}, ${JSON.stringify(argJson)}, ${hasArg}, ${gen})`;
+
+      try {
+        const raw = await this._evalAsyncExpr(expr, timeoutMs);
+        if (raw === undefined || raw === null || raw === 'undefined') return undefined;
+        return JSON.parse(raw);
+      } catch (err) {
+        const mapped = this._mapHostError(err);
+        if (mapped.code === 'Unavailable' || this._isOom(err)) {
+          this._destroyVm();
+        }
+        throw mapped;
+      } finally {
+        this.callGen += 1;
+        this._cleanupAfterCall();
+      }
+    });
   }
 
   async runProbe(code, timeoutMs = 5000) {
-    await this._ensureInitialized(timeoutMs);
-    const gen = ++this.callGen;
-    try {
-      const raw = await this._evalAsyncExpr(`__d3_eval_probe(${JSON.stringify(code)}, ${gen})`, timeoutMs);
-      return raw === undefined || raw === 'undefined' ? undefined : JSON.parse(raw);
-    } finally {
-      this.callGen += 1;
-      this._clearActiveTimers();
+    return this._serialized(async () => {
+      await this._ensureInitialized(timeoutMs);
+      const gen = ++this.callGen;
       this.domParser.clear();
-    }
+      this._releaseResponseBodies();
+      try {
+        const raw = await this._evalAsyncExpr(`__d3_eval_probe(${JSON.stringify(code)}, ${gen})`, timeoutMs);
+        return raw === undefined || raw === 'undefined' ? undefined : JSON.parse(raw);
+      } catch (err) {
+        if (this._isOom(err) || String(err?.message || err).toLowerCase().includes('timeout')) {
+          this._destroyVm();
+        }
+        throw err;
+      } finally {
+        this.callGen += 1;
+        this._cleanupAfterCall();
+      }
+    });
   }
 
   async dispose() {
-    if (this.rt && this.vm && this.initialized) {
-      try {
-        const gen = ++this.callGen;
-        await this._evalAsyncExpr(`__d3_invoke_optional('dispose', 'null', false, ${gen})`, 2000);
-      } catch {
-        // best effort
+    return this._serialized(async () => {
+      if (this.rt && this.vm && this.initialized) {
+        try {
+          const gen = ++this.callGen;
+          await this._evalAsyncExpr(`__d3_invoke_optional('dispose', 'null', false, ${gen})`, 2000);
+        } catch {
+          // best effort
+        }
       }
+      this._destroyVm();
+    });
+  }
+
+  _cleanupAfterCall() {
+    this._clearActiveTimers();
+    this.fetchGateway.cancelAllActive();
+    this._releaseResponseBodies();
+    this.domParser.clear();
+    try { this.cookieJar.flush(); } catch {}
+  }
+
+  _releaseResponseBodies() {
+    for (const entry of this.callResponseBodies.values()) {
+      this.fetchGateway.inFlightBudget.release(entry.bytes);
     }
-    this._destroyVm();
+    this.callResponseBodies.clear();
   }
 
   _destroyVm() {
-    this._clearActiveTimers();
-    this.domParser.clear();
+    this._cleanupAfterCall();
+    for (const deferred of [...this.pendingDeferreds]) {
+      this.pendingDeferreds.delete(deferred);
+      try { deferred.dispose(); } catch {}
+    }
     if (this.vm) {
       try { this.vm.dispose(); } catch {}
       this.vm = null;
@@ -611,11 +306,23 @@ export class QuickJsPluginHost {
       try { this.rt.dispose(); } catch {}
       this.rt = null;
     }
+    this.bridgeToken = null;
     this.initialized = false;
   }
 
+  _cancelTimerById(timerId) {
+    const entry = this.activeTimers.get(timerId);
+    if (!entry) return;
+    this.activeTimers.delete(timerId);
+    clearTimeout(entry.timer);
+    entry.resolve(false);
+  }
+
   _clearActiveTimers() {
-    for (const t of this.activeTimers) clearTimeout(t);
+    for (const entry of this.activeTimers.values()) {
+      clearTimeout(entry.timer);
+      entry.resolve(false);
+    }
     this.activeTimers.clear();
   }
 
@@ -634,7 +341,6 @@ export class QuickJsPluginHost {
 
   async _evalAsyncExpr(expr, timeoutMs) {
     const vm = this.vm;
-    const rt = this.rt;
     this.deadlineMs = Date.now() + timeoutMs;
 
     let timer = null;
@@ -647,6 +353,8 @@ export class QuickJsPluginHost {
 
       const timeoutPromise = new Promise((_, reject) => {
         timer = setTimeout(() => {
+          this.fetchGateway.cancelAllActive();
+          this._clearActiveTimers();
           reject(new Error('interrupted: execution timeout'));
         }, timeoutMs);
       });
@@ -691,19 +399,38 @@ export class QuickJsPluginHost {
     return new PluginCallError('Internal', msg || '插件内部错误');
   }
 
-  _bindHostObject(vm) {
+  _bindHostObject(vm, expectedToken) {
     const hostObj = vm.newObject();
+
+    const requireToken = (args) => {
+      if (args.length === 0 || args[0] !== expectedToken) {
+        throw new Error('Unauthorized host bridge call');
+      }
+      return args.slice(1);
+    };
+
+    const toHandle = (myVm, out) => {
+      if (out === undefined) return { handle: myVm.undefined, dispose: false };
+      if (out === null) return { handle: myVm.null, dispose: false };
+      if (Buffer.isBuffer(out) || out instanceof Uint8Array) {
+        const ab = out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
+        return { handle: myVm.newArrayBuffer(ab), dispose: true };
+      }
+      if (out instanceof ArrayBuffer) {
+        return { handle: myVm.newArrayBuffer(out), dispose: true };
+      }
+      if (typeof out === 'string') return { handle: myVm.newString(out), dispose: true };
+      if (typeof out === 'number') return { handle: myVm.newNumber(out), dispose: true };
+      if (typeof out === 'boolean') return { handle: out ? myVm.true : myVm.false, dispose: false };
+      return { handle: myVm.newString(JSON.stringify(out)), dispose: true };
+    };
 
     const addSync = (name, fn) => {
       const h = vm.newFunction(name, (...argHandles) => {
-        const args = argHandles.map((a) => vm.dump(a));
+        const rawArgs = argHandles.map((a) => vm.dump(a));
+        const args = requireToken(rawArgs);
         const out = fn(...args);
-        if (out === undefined) return vm.undefined;
-        if (out === null) return vm.null;
-        if (typeof out === 'string') return vm.newString(out);
-        if (typeof out === 'number') return vm.newNumber(out);
-        if (typeof out === 'boolean') return out ? vm.true : vm.false;
-        return vm.newString(JSON.stringify(out));
+        return toHandle(vm, out).handle;
       });
       vm.setProp(hostObj, name, h);
       h.dispose();
@@ -711,29 +438,25 @@ export class QuickJsPluginHost {
 
     const addAsync = (name, fn) => {
       const h = vm.newFunction(name, (...argHandles) => {
-        const args = argHandles.map((a) => vm.dump(a));
+        const rawArgs = argHandles.map((a) => vm.dump(a));
+        const args = requireToken(rawArgs);
         const deferred = vm.newPromise();
+        this.pendingDeferreds.add(deferred);
         const myVm = vm;
         const myRt = this.rt;
         Promise.resolve()
           .then(() => fn(...args))
           .then(
             (res) => {
+              this.pendingDeferreds.delete(deferred);
               if (this.vm !== myVm || this.rt !== myRt) return;
-              const valHandle =
-                res === undefined ? myVm.undefined
-                : res === null ? myVm.null
-                : typeof res === 'string' ? myVm.newString(res)
-                : typeof res === 'boolean' ? (res ? myVm.true : myVm.false)
-                : typeof res === 'number' ? myVm.newNumber(res)
-                : myVm.newString(JSON.stringify(res));
-              deferred.resolve(valHandle);
-              if (typeof res === 'string' || typeof res === 'number' || (res !== null && typeof res === 'object')) {
-                valHandle.dispose();
-              }
+              const { handle, dispose } = toHandle(myVm, res);
+              deferred.resolve(handle);
+              if (dispose) handle.dispose();
               try { this._drainJobs(); } catch {}
             },
             (err) => {
+              this.pendingDeferreds.delete(deferred);
               if (this.vm !== myVm || this.rt !== myRt) return;
               const errHandle = myVm.newError(String(err?.message || err));
               deferred.reject(errHandle);
@@ -742,7 +465,9 @@ export class QuickJsPluginHost {
             },
           );
         deferred.settled.then(() => {
+          this.pendingDeferreds.delete(deferred);
           if (this.vm === myVm) {
+            try { deferred.dispose(); } catch {}
             try { this._drainJobs(); } catch {}
           }
         });
@@ -757,20 +482,32 @@ export class QuickJsPluginHost {
     addSync('getDeviceJson', () => JSON.stringify(this.device));
     addSync('getErrorMarker', () => ERR_MARKER);
 
-    addAsync('sleep', (ms, gen) => new Promise((resolve) => {
+    // §11.1 (S3): true host-side cancellable timer
+    addAsync('sleep', (timerId, ms, gen) => new Promise((resolve) => {
       if (gen !== this.callGen) {
         resolve(false);
         return;
       }
       const clamped = Math.min(Math.max(Number(ms) || 0, 0), 60_000);
       const t = setTimeout(() => {
-        this.activeTimers.delete(t);
+        this.activeTimers.delete(timerId);
         resolve(gen === this.callGen);
       }, clamped);
-      this.activeTimers.add(t);
+      this.activeTimers.set(timerId, { timer: t, resolve });
     }));
 
-    addAsync('fetch', async (reqJson) => {
+    addSync('cancelTimer', (timerId) => {
+      this._cancelTimerById(Number(timerId));
+    });
+
+    addSync('finishCall', (gen) => {
+      if (gen === this.callGen) {
+        this._cleanupAfterCall();
+      }
+    });
+
+    // §11.1 (B2): binary fetchMeta + fetchReadBytes (ArrayBuffer) + fetchReadText
+    addAsync('fetchMeta', async (reqJson, gen) => {
       const req = JSON.parse(reqJson);
       let body = null;
       if (req.bodyBase64 !== undefined) body = Buffer.from(req.bodyBase64, 'base64');
@@ -783,27 +520,52 @@ export class QuickJsPluginHost {
         timeoutMs: req.timeoutMs,
         redirect: req.redirect,
       });
+      if (gen !== this.callGen) {
+        throw new Error('请求已取消');
+      }
+      const bytes = resp.body.length;
+      this.fetchGateway.inFlightBudget.reserve(bytes);
+      const handleId = this.nextResponseHandle++;
+      this.callResponseBodies.set(handleId, { buf: resp.body, bytes });
       return JSON.stringify({
+        handleId,
         status: resp.status,
         url: resp.url,
         headers: resp.headers,
-        bodyBase64: resp.body.toString('base64'),
       });
     });
 
-    addSync('storageGet', (k) => {
+    addSync('fetchReadBytes', (handleId) => {
+      const entry = this.callResponseBodies.get(Number(handleId));
+      return entry ? entry.buf : Buffer.alloc(0);
+    });
+
+    addSync('fetchReadText', (handleId) => {
+      const entry = this.callResponseBodies.get(Number(handleId));
+      return entry ? entry.buf.toString('utf8') : '';
+    });
+
+    // §11.1 (S9): async ctx.storage.* returning Promises
+    addAsync('storageGet', async (k) => {
       const v = this.storage.get(k);
       return v === null ? null : JSON.stringify(v);
     });
-    addSync('storageSet', (k, vJson) => {
+    addAsync('storageSet', async (k, vJson) => {
       this.storage.set(k, JSON.parse(vJson));
     });
-    addSync('storageRemove', (k) => { this.storage.remove(k); });
-    addSync('storageKeys', () => JSON.stringify(this.storage.keys()));
+    addAsync('storageRemove', async (k) => {
+      this.storage.remove(k);
+    });
+    addAsync('storageKeys', async () => JSON.stringify(this.storage.keys()));
 
-    addSync('cookiesGet', (u) => this.cookieJar.getHeaderForUrl(u));
-    addSync('cookiesSet', (u, c) => { this.cookieJar.setCookie(u, c); });
-    addSync('cookiesClear', () => { this.cookieJar.clear(); });
+    // §11.1 (S9): async ctx.cookies.* returning Promises
+    addAsync('cookiesGet', async (u) => this.cookieJar.getHeaderForUrl(u));
+    addAsync('cookiesSet', async (u, c) => {
+      this.cookieJar.setCookie(u, c);
+    });
+    addAsync('cookiesClear', async () => {
+      this.cookieJar.clear();
+    });
 
     addSync('cryptoHash', (algo, b64) => {
       const buf = Buffer.from(b64, 'base64');
@@ -833,14 +595,18 @@ export class QuickJsPluginHost {
     addSync('cryptoHexEncode', (dataB64) => pluginCrypto.hexEncode(Buffer.from(dataB64, 'base64')));
     addSync('cryptoHexDecode', (hex) => pluginCrypto.hexDecode(hex).toString('base64'));
 
-    addSync('parseHtml', (text) => JSON.stringify(this.domParser.parseHtml(text)));
-    addSync('parseXml', (text) => JSON.stringify(this.domParser.parseXml(text)));
-    addSync('domSelectFirst', (id, sel) => {
-      const r = this.domParser.selectFirst(id, sel);
-      return r ? JSON.stringify(r) : null;
-    });
-    addSync('domSelectAll', (id, sel) => JSON.stringify(this.domParser.selectAll(id, sel)));
-    addSync('domChildren', (id) => JSON.stringify(this.domParser.children(id)));
+    // §11.1 (S4): lazy DOM handle bridge
+    addSync('parseHtml', (text) => this.domParser.parseHtml(text));
+    addSync('parseXml', (text) => this.domParser.parseXml(text));
+    addSync('domTag', (id) => this.domParser.tag(Number(id)));
+    addSync('domText', (id) => this.domParser.text(Number(id)));
+    addSync('domHtml', (id) => this.domParser.html(Number(id)));
+    addSync('domOuterHtml', (id) => this.domParser.outerHtml(Number(id)));
+    addSync('domAttrs', (id) => this.domParser.attrsJson(Number(id)));
+    addSync('domAttr', (id, name) => this.domParser.attr(Number(id), String(name)));
+    addSync('domSelectFirstId', (id, sel) => this.domParser.selectFirstId(Number(id), String(sel)));
+    addSync('domSelectAllIds', (id, sel) => JSON.stringify(this.domParser.selectAllIds(Number(id), String(sel))));
+    addSync('domChildrenIds', (id) => JSON.stringify(this.domParser.childrenIds(Number(id))));
 
     addSync('log', (level, msg) => { this.logger.log(level, msg); });
     addSync('translate', (key, varsJson) => {

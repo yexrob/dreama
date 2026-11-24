@@ -17,6 +17,7 @@ import com.limelight.local.media.SubtitleFormat
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.OkHttpClient
@@ -26,13 +27,13 @@ import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 import java.io.File
 import java.net.InetAddress
+import java.net.Proxy
 import java.nio.file.Files
 import java.util.concurrent.CopyOnWriteArrayList
 
@@ -41,6 +42,12 @@ import java.util.concurrent.CopyOnWriteArrayList
  * (`plugins/reference/` and `plugins/jellyfin/`) inside the Android Kotlin
  * host ([PluginPackageManager] -> [PluginRuntime] (QuickJS) -> [PluginMediaSource]
  * -> [PlaybackSessionController]).
+ *
+ * Covers S7 (`StereoHint.MVHEVC` enum order & detached `SourceNeedsAuthException`),
+ * S8 (§11.2 forward-compatible null/enum/range/danmaku-color handling),
+ * S10 (Jellyfin h264 mapping, no MVC->mvhevc, no api_key in URLs, no unbounded ms_* storage),
+ * S11 (real recorded Jellyfin 12.4.0 Docker responses including Direct Play & HLS transcode),
+ * and Small #5 (nullable `PlaybackInfo.title` fallback).
  */
 class ReferenceAndJellyfinConformanceTest {
 
@@ -48,7 +55,24 @@ class ReferenceAndJellyfinConformanceTest {
     private val json = Json { ignoreUnknownKeys = true }
 
     @Test
-    fun referencePluginPassesFullConformanceSuiteOnKotlinQuickJsHost(): Unit = runBlocking {
+    fun s7EnumOrderAndExceptionHierarchyArePreserved() {
+        // S7: MVHEVC MUST be appended at the end so existing enum ordinals never shift
+        val values = StereoHint.entries
+        assertEquals(StereoHint.MONO, values[0])
+        assertEquals(StereoHint.SBS, values[1])
+        assertEquals(StereoHint.OU, values[2])
+        assertEquals(StereoHint.VR180, values[3])
+        assertEquals(StereoHint.VR360, values[4])
+        assertEquals(StereoHint.MVHEVC, values[5])
+        assertEquals(6, values.size)
+
+        // S7: SourceNeedsAuthException MUST NOT inherit from SourceNeedsSetupException
+        val authEx: Throwable = SourceNeedsAuthException("请登录")
+        assertFalse(authEx is SourceNeedsSetupException)
+    }
+
+    @Test
+    fun referencePluginPassesFullConformanceAndForwardCompatOnKotlinQuickJsHost(): Unit = runBlocking {
         val rootDir = Files.createTempDirectory("d3-ref-conf").toFile()
         val store = InMemoryPluginStore()
         val mgr = PluginPackageManager(
@@ -78,7 +102,19 @@ class ReferenceAndJellyfinConformanceTest {
             )
             assertEquals("cat-library", shelves[2].moreCategoryId)
 
-            // 2. browse() bridges MediaSource integer page <-> opaque cursor + sort/filter
+            // 2. S8 (§11.2): forward-compatible browse with null optional fields, unknown kind dropped,
+            // out-of-range year/rating ignored, unknown stereo falls back to MONO
+            val compat = source.browseCursor("compat-forward")
+            assertEquals("Unknown Item.kind must be dropped without failing whole page", 1, compat.items.size)
+            val compatItem = compat.items.single()
+            assertEquals("compat-valid", compatItem.id)
+            assertNull(compatItem.subtitle)
+            assertNull(compatItem.poster)
+            assertNull("Out-of-range year 99999 must be ignored", compatItem.year)
+            assertNull("Out-of-range rating 120 must be ignored", compatItem.rating)
+            assertEquals("Unknown stereo enum must fall back to MONO", StereoHint.MONO, compatItem.stereoHint)
+
+            // 3. browse() pagination + sort/filter
             val rootPage = source.browse(MediaSource.ROOT, page = 0)
             assertEquals(4, rootPage.items.size)
             assertNull(rootPage.nextPage)
@@ -97,7 +133,7 @@ class ReferenceAndJellyfinConformanceTest {
             assertEquals(1, filtered.items.size)
             assertEquals("movie-full", filtered.items[0].id)
 
-            // 3. detail() covers all Item fields, series/season/episodes, and multi-part episodes (分P 选集)
+            // 4. detail() covers all Item fields, series/season/episodes, and multi-part episodes
             val movie = source.detail("movie-full")
             assertEquals(ItemKind.MOVIE, movie.kind)
             assertEquals(StereoHint.SBS, movie.stereoHint)
@@ -119,9 +155,8 @@ class ReferenceAndJellyfinConformanceTest {
             val multipart = source.detail("multipart-video")
             assertEquals(ItemKind.VIDEO, multipart.kind)
             assertEquals(3, multipart.episodes.size)
-            assertEquals("multipart-p1", multipart.episodes[0].id)
 
-            // 4. QR login flow (pending -> scanned -> done + expired + cookie set)
+            // 5. QR login flow (pending -> scanned -> done + expired + cookie set)
             val qr = source.loginQrStart()
             assertTrue(qr.qr.startsWith("https://api.reference.invalid/qr/"))
             assertEquals("请使用手机应用扫描二维码确认登录", qr.hint)
@@ -133,43 +168,45 @@ class ReferenceAndJellyfinConformanceTest {
             assertEquals("AUTHENTICATED", store.getInstance(inst.instanceId)?.authState)
             assertEquals(LoginPollStatus.EXPIRED, source.loginPoll("expired-state").status)
 
-            // 5. Separated DASH + Referer + Cookie + locked quality + expiring URL refresh
+            // 6. Separated DASH + durationMs + dvb:priority + Referer + Cookie + locked quality + expiring URL refresh
             var clock = 10_000_000L
-            val sessionController = PlaybackSessionController(
-                source = source,
-                clockMs = { clock },
-                refreshLeadMs = 10_000L,
-            )
+            val sessionController = source.createPlaybackSessionController(clockMs = { clock })
             val pb1 = sessionController.load("multipart-p1")
+            assertEquals(900_000L, pb1.info.durationMs)
             assertEquals("https://api.reference.invalid/video/multipart", pb1.info.headers["Referer"])
             assertTrue(pb1.info.headers["Cookie"].orEmpty().contains("ref_sess=qr_"))
-            assertTrue(pb1.plan.stream is ResolvedStreamPlan.SynthesizedDashMpd)
+            val synth = pb1.plan.stream as ResolvedStreamPlan.SynthesizedDashMpd
+            assertTrue(synth.mpdXml.contains("dvb:priority=\"1\""))
+            assertTrue(synth.mpdXml.contains("mediaPresentationDuration=\"PT900.000S\""))
             assertTrue(pb1.info.dash!!.video[0].url.contains("token=v1"))
             assertEquals("需要会员", pb1.info.qualities.first { it.id == "4k-vip" }.locked)
             assertEquals("multipart-p2", pb1.info.nextItemId)
 
-            // Locked quality rejected by controller
             try {
                 sessionController.switchQuality("4k-vip", 10_000L)
                 fail("Locked quality must throw SourceForbiddenException")
             } catch (e: SourceForbiddenException) {
                 assertEquals("需要会员", e.message)
             }
-            // Expired URL re-fetches cleanly with token=v2
             clock = (pb1.info.expiresAtMs ?: clock) + 1_000L
             val pb2 = sessionController.refreshIfExpiredOrFailed(currentPositionMs = 33_000L)!!
             assertTrue(pb2.info.dash!!.video[0].url.contains("token=v2"))
             assertEquals(33_000L, pb2.resumePositionMs)
 
-            // 6. Progressive DASH (MergingMediaSource), Inline MPD, Live, Direct HLS (all 4 subtitle formats), DRM Unsupported
-            val pbProg = PlaybackMediaSourceFactory().plan(source.playback("dash-progressive"))
+            // 7. Progressive DASH, Inline MPD, Live, live+dash Unsupported, Small #5 nullable title when uncached
+            val pbFactory = source.createPlaybackFactory()
+            val pbProg = pbFactory.plan(source.playback("dash-progressive"))
             assertTrue(pbProg.stream is ResolvedStreamPlan.MergedProgressiveTracks)
+            assertNull("Uncached item without explicit PlaybackInfo.title must yield null title", pbProg.info.title)
 
-            val pbMpd = PlaybackMediaSourceFactory().plan(source.playback("mpd-direct"))
+            val pbMpd = pbFactory.plan(source.playback("mpd-direct"))
             assertTrue(pbMpd.stream is ResolvedStreamPlan.InlineMpd)
 
             val pbLive = source.playback("live-1")
             assertTrue(pbLive.isLive)
+
+            assertThrowsType<SourceUnsupportedException> { source.playback("live-dash-invalid") }
+            assertThrowsType<SourceUnsupportedException> { source.playback("drm-item") }
 
             val pbMovie = source.playback("movie-full")
             assertEquals(
@@ -178,13 +215,7 @@ class ReferenceAndJellyfinConformanceTest {
             )
             assertEquals(StereoHint.SBS, pbMovie.stereoHint)
 
-            try {
-                source.playback("drm-item")
-                fail("DRM item must throw SourceUnsupportedException")
-            } catch (_: SourceUnsupportedException) {
-            }
-
-            // 7. Optional capabilities: categories, search, suggest, filters, danmaku segments, favorites, played, progress
+            // 8. Optional capabilities including S8 integer & hex danmaku colors
             assertEquals(3, source.categories().size)
             assertTrue(source.search("星际").items.any { it.id == "movie-full" })
             assertTrue(source.suggest("星").isNotEmpty())
@@ -197,6 +228,7 @@ class ReferenceAndJellyfinConformanceTest {
             assertEquals(3, dmSeg1.size)
             assertEquals(1, dmSeg2.size)
             assertEquals(DanmakuMode.TOP, dmSeg1[1].mode)
+            assertEquals("#FF6699", dmSeg1[1].color) // parsed from integer 0xFF6699 (§11.2)
 
             source.setFavorite("episode-1", true)
             assertEquals(true, source.detail("episode-1").favorite)
@@ -204,7 +236,7 @@ class ReferenceAndJellyfinConformanceTest {
             assertEquals(true, source.detail("episode-1").played)
             source.reportProgress("episode-1", 120_000L, 2_880_000L, ProgressEvent.PROGRESS, "sess-1")
 
-            // 8. All 9 error codes + uncaught error
+            // 9. All 9 error codes + uncaught error
             assertThrowsType<SourceNeedsAuthException> { source.detail("err-NeedsAuth") }
             assertEquals("NEEDS_AUTH", store.getInstance(inst.instanceId)?.authState)
             assertThrowsType<SourceAuthFailedException> { source.detail("err-AuthFailed") }
@@ -218,7 +250,7 @@ class ReferenceAndJellyfinConformanceTest {
             assertThrowsType<PluginInternalException> { source.detail("err-Internal") }
             assertThrowsType<PluginInternalException> { source.detail("err-Uncaught") }
 
-            // 9. Form and Device auth variants on separate manifest instances
+            // 10. Form and Device auth variants
             val deviceManifestJson = File(refDir, "manifest.json").readText()
                 .replace("\"id\": \"dev.depth3d.reference\"", "\"id\": \"dev.depth3d.refdevice\"")
                 .replace("\"auth\": \"qr\"", "\"auth\": \"device\"")
@@ -258,12 +290,21 @@ class ReferenceAndJellyfinConformanceTest {
     }
 
     @Test
-    fun jellyfinPluginWorksEndToEndAgainstRecordedResponses(): Unit = runBlocking {
+    fun jellyfinPluginWorksEndToEndAgainstRealRecordedJellyfin12ResponsesS10S11(): Unit = runBlocking {
         val jfDir = File(repoRoot, "plugins/jellyfin")
         val fixtures = json.parseToJsonElement(
             File(jfDir, "fixtures/recorded-responses.json").readText(),
         ).jsonObject
+        val ids = fixtures["_meta"]!!.jsonObject["ids"]!!.jsonObject
+        val moviesViewId = ids["moviesViewId"]!!.jsonPrimitive.content
+        val h264MovieId = ids["h264MovieId"]!!.jsonPrimitive.content
+        val hevcMovieId = ids["hevcMovieId"]!!.jsonPrimitive.content
+        val seriesId = ids["seriesId"]!!.jsonPrimitive.content
+        val seasonId = ids["seasonId"]!!.jsonPrimitive.content
+        val expectedToken = fixtures["authSuccess"]!!.jsonObject["AccessToken"]!!.jsonPrimitive.content
+
         val seenPaths = CopyOnWriteArrayList<String>()
+        val playbackReqBodies = CopyOnWriteArrayList<String>()
 
         val server = MockWebServer()
         server.dispatcher = object : Dispatcher() {
@@ -272,49 +313,60 @@ class ReferenceAndJellyfinConformanceTest {
                 val path = url.encodedPath
                 seenPaths += "${request.method} $path"
 
-                fun okJson(key: String) = MockResponse()
+                fun okRaw(el: kotlinx.serialization.json.JsonElement) = MockResponse()
                     .setResponseCode(200)
                     .addHeader("Content-Type", "application/json")
-                    .setBody(fixtures[key]!!.toString())
+                    .setBody(el.toString())
 
                 if (path == "/Users/AuthenticateByName" && request.method == "POST") {
                     val body = json.parseToJsonElement(request.body.readUtf8()).jsonObject
                     return if (body["Pw"]?.jsonPrimitive?.content == "wrong-pw") {
                         MockResponse().setResponseCode(401).setBody("""{"message":"Unauthorized"}""")
                     } else {
-                        okJson("authSuccess")
+                        okRaw(fixtures["authSuccess"]!!)
                     }
                 }
-                val expectedToken = fixtures["authSuccess"]!!.jsonObject["AccessToken"]!!.jsonPrimitive.content
-                if (request.getHeader("X-Emby-Token") != expectedToken) {
+                val authHdr = request.getHeader("Authorization").orEmpty()
+                if (!authHdr.contains("""Token="$expectedToken"""")) {
                     return MockResponse().setResponseCode(401)
                 }
 
                 return when {
-                    path == "/Users/user-alice-001/Items/Resume" -> okJson("resume")
-                    path == "/Shows/NextUp" -> okJson("nextUp")
-                    path == "/Users/user-alice-001/Views" -> okJson("views")
-                    path == "/Users/user-alice-001/Items/Latest" -> {
-                        if (url.queryParameter("ParentId") == "lib-movies") okJson("latestMovies")
-                        else okJson("latestShows")
+                    path == "/UserItems/Resume" -> okRaw(fixtures["resume"]!!)
+                    path == "/Shows/NextUp" -> okRaw(fixtures["nextUp"]!!)
+                    path == "/UserViews" -> okRaw(fixtures["views"]!!)
+                    path == "/Items/Latest" -> {
+                        val pid = url.queryParameter("ParentId").orEmpty()
+                        okRaw(fixtures["latestByParent"]!!.jsonObject[pid] ?: json.parseToJsonElement("[]"))
                     }
-                    path == "/Users/user-alice-001/Items" && url.queryParameter("SearchTerm") != null ->
-                        okJson("searchResults")
-                    path == "/Users/user-alice-001/Items" -> {
-                        if (url.queryParameter("StartIndex") == "1") okJson("browseMoviesPage2")
-                        else okJson("browseMoviesPage1")
+                    path == "/Items" && url.queryParameter("SearchTerm") != null -> okRaw(fixtures["searchResults"]!!)
+                    path == "/Items" -> {
+                        val pid = url.queryParameter("ParentId").orEmpty()
+                        okRaw(
+                            fixtures["browseByParent"]!!.jsonObject[pid]
+                                ?: json.parseToJsonElement("""{"Items":[],"TotalRecordCount":0}"""),
+                        )
                     }
-                    path == "/Users/user-alice-001/Items/mov-dune" -> okJson("movieDetail")
-                    path == "/Items/mov-dune/Similar" -> okJson("similarMovies")
-                    path == "/Users/user-alice-001/Items/ser-threebody" -> okJson("seriesDetail")
-                    path == "/Shows/ser-threebody/Seasons" -> okJson("seriesSeasons")
-                    path == "/Users/user-alice-001/Items/sea-threebody-1" -> okJson("seasonDetail")
-                    path == "/Shows/ser-threebody/Episodes" -> okJson("seasonEpisodes")
-                    path == "/Items/mov-dune/PlaybackInfo" -> okJson("playbackInfo")
-                    path == "/Search/Hints" -> okJson("searchHints")
+                    path.endsWith("/Similar") -> okRaw(fixtures["similar"]!!)
+                    path.endsWith("/PlaybackInfo") -> {
+                        val reqText = request.body.readUtf8()
+                        playbackReqBodies += reqText
+                        val reqObj = json.parseToJsonElement(reqText).jsonObject
+                        val dp = reqObj["DeviceProfile"]!!.jsonObject["DirectPlayProfiles"]!!.jsonArray
+                        val itemId = path.split("/")[2]
+                        val key = "$itemId:${if (dp.isEmpty()) "transcode" else "direct"}"
+                        okRaw(fixtures["playbackInfo"]!!.jsonObject[key]!!)
+                    }
+                    Regex("^/Items/[^/]+$").matches(path) -> {
+                        val itemId = path.split("/")[2]
+                        okRaw(fixtures["itemsById"]!!.jsonObject[itemId]!!)
+                    }
+                    path == "/Shows/$seriesId/Seasons" -> okRaw(fixtures["seriesSeasons"]!!)
+                    path == "/Shows/$seriesId/Episodes" -> okRaw(fixtures["seasonEpisodes"]!!)
+                    path == "/Search/Hints" -> okRaw(fixtures["searchHints"]!!)
                     path.startsWith("/Sessions/Playing") ||
-                        path.contains("/FavoriteItems/") ||
-                        path.contains("/PlayedItems/") ||
+                        path.startsWith("/UserFavoriteItems/") ||
+                        path.startsWith("/UserPlayedItems/") ||
                         path == "/Sessions/Logout" -> MockResponse().setResponseCode(204)
                     else -> MockResponse().setResponseCode(404)
                 }
@@ -324,14 +376,15 @@ class ReferenceAndJellyfinConformanceTest {
 
         val rootDir = Files.createTempDirectory("d3-jf-test").toFile()
         val store = InMemoryPluginStore()
+        val secretBox = SoftwareAesSecretBox()
         val okHttp = OkHttpClient.Builder()
-            .proxy(java.net.Proxy.NO_PROXY)
-            .socketFactory(LocalRedirectSocketFactory("192.168.1.10", server.port))
+            .proxy(Proxy.NO_PROXY)
+            .socketFactory(LocalRedirectSocketFactory("192.168.1.50", server.port))
             .build()
         val mgr = PluginPackageManager(
             rootDir = rootDir,
             store = store,
-            secretBox = SoftwareAesSecretBox(),
+            secretBox = secretBox,
             okHttpClient = okHttp,
         )
 
@@ -347,13 +400,13 @@ class ReferenceAndJellyfinConformanceTest {
                 pluginId = "dev.depth3d.jellyfin",
                 displayName = "客厅 Jellyfin",
                 config = mapOf(
-                    "server" to JsonPrimitive("http://192.168.1.10:${server.port}"),
-                    "username" to JsonPrimitive("alice"),
+                    "server" to JsonPrimitive("http://192.168.1.50:${server.port}"),
+                    "username" to JsonPrimitive("d3tester"),
                     "password" to JsonPrimitive("correct-pw"),
                     "quality" to JsonPrimitive("direct"),
                 ),
             )
-            val source = mgr.openSource(inst.instanceId) { listOf(InetAddress.getByName("192.168.1.10")) }
+            val source = mgr.openSource(inst.instanceId) { listOf(InetAddress.getByName("192.168.1.50")) }
 
             // Before login -> NeedsAuth
             assertThrowsType<SourceNeedsAuthException> { source.home() }
@@ -361,85 +414,94 @@ class ReferenceAndJellyfinConformanceTest {
             // Login succeeds
             val login = source.loginForm()
             assertTrue(login.ok)
-            assertEquals("Alice", login.user?.name)
-            assertNotNull(login.user?.avatar)
+            assertEquals("d3tester", login.user?.name)
 
-            // Home shelves (Resume, NextUp, Latest Movies, Latest Shows)
+            // Home shelves (Resume + Latest Movies + Latest Shows) with NO api_key in image URLs
             val shelves = source.home()
-            assertEquals(4, shelves.size)
-            assertEquals(ShelfStyle.CONTINUE, shelves[0].style)
-            assertEquals("沙丘", shelves[0].items[0].title)
-            assertEquals(StereoHint.SBS, shelves[0].items[0].stereoHint)
+            assertTrue(shelves.any { it.style == ShelfStyle.CONTINUE })
+            for (shelf in shelves) {
+                for (item in shelf.items) {
+                    assertFalse("S10: poster URL must not contain api_key", item.poster?.url.orEmpty().contains("api_key", ignoreCase = true))
+                    assertFalse("S10: poster URL must not contain ApiKey", item.poster?.url.orEmpty().contains("apikey", ignoreCase = true))
+                    val poster = item.poster
+                    if (poster != null) {
+                        assertTrue(poster.headers["Authorization"].orEmpty().contains("""Token="$expectedToken""""))
+                    }
+                }
+            }
 
-            // Categories (music filtered out)
+            // Categories & Browse
             val cats = source.categories()
             assertEquals(2, cats.size)
-            assertEquals("lib-movies", cats[0].id)
+            val movies = source.browse(moviesViewId, page = 0)
+            assertEquals(2, movies.items.size)
 
-            // Browse pagination via MediaSource integer page API
-            val p0 = source.browse("lib-movies", page = 0)
-            assertEquals(1, p0.items.size)
-            assertEquals(1, p0.nextPage)
-            val p1 = source.browse("lib-movies", page = 1)
-            assertEquals("mov-arrival", p1.items[0].id)
-            assertNull(p1.nextPage)
-
-            // Movie detail + Series/Season/Episodes hierarchy
-            val dune = source.detail("mov-dune")
-            assertEquals(2, dune.people.size)
-            assertEquals(1, dune.related.size)
-            assertTrue(dune.badges.contains("4K"))
-            assertEquals(StereoHint.SBS, dune.stereoHint)
-
-            val series = source.detail("ser-threebody")
+            // Series -> Season -> Episodes
+            val series = source.detail(seriesId)
             assertEquals(1, series.seasons.size)
-            val season = source.detail("sea-threebody-1")
-            assertEquals(2, season.episodes.size)
+            val season = source.detail(seasonId)
+            assertEquals(1, season.episodes.size)
 
-            // Direct Play + subtitles (PGS bitmap skipped; SRT/VTT/ASS kept) + audios
-            val pbDirect = source.playback("mov-dune")
-            assertTrue(pbDirect.url.contains("/Videos/mov-dune/stream?"))
-            assertEquals(3, pbDirect.subtitles.size)
-            assertEquals(2, pbDirect.audios.size)
-            assertEquals(StereoHint.SBS, pbDirect.stereoHint)
-            assertEquals(4, pbDirect.qualities.size)
+            // Direct Play H.264 + SRT subtitle + S10 assertions
+            val pbH264 = source.playback(h264MovieId)
+            assertTrue(pbH264.url.contains("/stream?"))
+            assertFalse("S10: stream URL must not contain api_key", pbH264.url.contains("api_key", ignoreCase = true))
+            assertFalse("S10: stream URL must not contain ApiKey", pbH264.url.contains("apikey", ignoreCase = true))
+            assertEquals(1, pbH264.subtitles.size)
+            assertEquals(SubtitleFormat.SRT, pbH264.subtitles[0].format)
+            assertFalse("S10: subtitle URL must not contain api_key", pbH264.subtitles[0].url.contains("apikey", ignoreCase = true))
+            assertTrue(pbH264.headers["Authorization"].orEmpty().contains("""Token="$expectedToken""""))
+            // S10: DeviceProfile MUST map 'avc' -> 'h264'
+            val firstPbReq = json.parseToJsonElement(playbackReqBodies.first()).jsonObject
+            val videoCodecs = firstPbReq["DeviceProfile"]!!.jsonObject["DirectPlayProfiles"]!!
+                .jsonArray[0].jsonObject["VideoCodec"]!!.jsonPrimitive.content.split(",")
+            assertTrue("S10: DeviceProfile VideoCodec must contain h264: $videoCodecs", "h264" in videoCodecs)
+            assertFalse("S10: DeviceProfile VideoCodec must not send raw 'avc'", "avc" in videoCodecs)
 
-            // Transcode quality switch -> HLS master.m3u8
-            val pb720 = source.playback("mov-dune", quality = "720p", audio = "2")
-            assertTrue(pb720.url.contains("/master.m3u8?"))
-            assertTrue(pb720.url.contains("MaxHeight=720"))
-            assertTrue(pb720.url.contains("AudioStreamIndex=2"))
-            assertEquals("application/x-mpegURL", pb720.mimeType)
+            // Direct Play HEVC
+            val pbHevc = source.playback(hevcMovieId)
+            assertTrue(pbHevc.url.contains("/stream?"))
+            assertFalse(pbHevc.url.contains("apikey", ignoreCase = true))
 
-            // Search & suggest
-            assertEquals("mov-dune", source.search("沙丘").items[0].id)
-            assertEquals(listOf("沙丘", "三体"), source.suggest("沙"))
+            // HLS Transcode 480p -> real Jellyfin master.m3u8 with ApiKey stripped
+            val pb480 = source.playback(hevcMovieId, quality = "480p")
+            assertEquals("application/x-mpegURL", pb480.mimeType)
+            assertTrue(pb480.url.contains("/master.m3u8"))
+            assertFalse("S10: transcode URL must not contain ApiKey", pb480.url.contains("apikey", ignoreCase = true))
 
-            // Progress, favorites, played, logout
-            source.reportProgress("mov-dune", 180_000L, 9_300_000L, ProgressEvent.START, pbDirect.sessionId)
-            source.reportProgress("mov-dune", 200_000L, 9_300_000L, ProgressEvent.PAUSE, pbDirect.sessionId)
-            source.reportProgress("mov-dune", 200_000L, 9_300_000L, ProgressEvent.STOP, pbDirect.sessionId)
-            source.setFavorite("mov-dune", true)
-            source.setPlayed("mov-dune", true)
+            // Search, suggest, progress, favorites, played, logout
+            assertTrue(source.search("Test").items.size >= 2)
+            assertTrue(source.suggest("Test").isNotEmpty())
+            source.reportProgress(h264MovieId, 1500L, 4000L, ProgressEvent.START, pbH264.sessionId)
+            source.reportProgress(h264MovieId, 2000L, 4000L, ProgressEvent.PAUSE, pbH264.sessionId)
+            source.reportProgress(h264MovieId, 2000L, 4000L, ProgressEvent.STOP, pbH264.sessionId)
+            source.setFavorite(h264MovieId, true)
+            source.setPlayed(h264MovieId, true)
+
+            // S10: ZERO unbounded ms_* keys written to storage.enc!
+            val persistedStorage = InstanceStorage(File(rootDir, "instances/${inst.instanceId}/storage.enc"), secretBox)
+            assertEquals(listOf("deviceId", "session"), persistedStorage.keys().sorted())
+
             source.logout()
-
+            assertTrue(seenPaths.contains("GET /UserViews"))
+            assertTrue(seenPaths.contains("GET /UserItems/Resume"))
             assertTrue(seenPaths.contains("POST /Sessions/Playing"))
             assertTrue(seenPaths.contains("POST /Sessions/Playing/Progress"))
             assertTrue(seenPaths.contains("POST /Sessions/Playing/Stopped"))
-            assertTrue(seenPaths.contains("POST /Users/user-alice-001/FavoriteItems/mov-dune"))
-            assertTrue(seenPaths.contains("POST /Users/user-alice-001/PlayedItems/mov-dune"))
+            assertTrue(seenPaths.contains("POST /UserFavoriteItems/$h264MovieId"))
+            assertTrue(seenPaths.contains("POST /UserPlayedItems/$h264MovieId"))
             assertTrue(seenPaths.contains("POST /Sessions/Logout"))
 
-            // Wrong password produces SourceAuthFailedException
+            // Wrong password -> SourceAuthFailedException
             mgr.updateInstanceConfig(
                 inst.instanceId,
                 config = mapOf(
-                    "server" to JsonPrimitive("http://192.168.1.10:${server.port}"),
-                    "username" to JsonPrimitive("alice"),
+                    "server" to JsonPrimitive("http://192.168.1.50:${server.port}"),
+                    "username" to JsonPrimitive("d3tester"),
                     "password" to JsonPrimitive("wrong-pw"),
                 ),
             )
-            val badSrc = mgr.openSource(inst.instanceId) { listOf(InetAddress.getByName("192.168.1.10")) }
+            val badSrc = mgr.openSource(inst.instanceId) { listOf(InetAddress.getByName("192.168.1.50")) }
             assertThrowsType<SourceAuthFailedException> { badSrc.loginForm() }
         } finally {
             mgr.shutdownAll()

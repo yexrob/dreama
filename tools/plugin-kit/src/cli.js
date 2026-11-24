@@ -1,9 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { checkPlugin, loadPluginSource } from './check.js';
+import { checkPlugin, loadPluginSource, validateMethodResult } from './check.js';
 import { packPluginToFile } from './pack.js';
 import { PluginCallError, QuickJsPluginHost } from './runtime.js';
-import { validateManifest, validateProtocolType } from './schema.js';
+import { validateManifest } from './schema.js';
 import { startDevServer } from './serve.js';
 import { PluginStorage } from './storage.js';
 
@@ -90,7 +90,7 @@ Usage:
   d3plugin check <pluginDir|.d3plugin>... [--config <json|file>]
     Validates manifest.json against shared JSON Schema, loads main.js in
     QuickJS, verifies exports, probes sandbox/network isolation, and validates
-    output shapes against protocol-types.schema.json.
+    output shapes and URL policies against protocol-types.schema.json.
 
   d3plugin pack <pluginDir> [-o <output.d3plugin>]
     Packages a plugin directory into a .d3plugin zip and prints its SHA-256.
@@ -100,20 +100,6 @@ Usage:
     for headset developer mode.
 `);
 }
-
-const METHOD_RETURN_SCHEMA = {
-  home: 'HomeResult',
-  browse: 'ItemPage',
-  detail: 'Item',
-  playback: 'PlaybackInfo',
-  search: 'ItemPage',
-  suggest: 'SuggestResult',
-  filters: 'FiltersResult',
-  danmaku: 'DanmakuResult',
-  categories: 'CategoriesResult',
-  login: 'FormLoginResult',
-  loginPoll: 'LoginPollResult',
-};
 
 function buildMethodArg(method, flags) {
   switch (method) {
@@ -223,17 +209,14 @@ export async function main(argv) {
       try {
         const arg = buildMethodArg(method, flags);
         const result = await host.invoke(method, arg);
-        const schemaDef = method === 'loginStart'
-          ? (loaded.manifest.auth === 'device' ? 'DeviceLoginStartResult' : 'QrLoginStartResult')
-          : METHOD_RETURN_SCHEMA[method];
-        if (schemaDef && result !== undefined) {
-          const check = validateProtocolType(schemaDef, result);
-          if (!check.valid) {
-            console.error(`Warning: ${method}() return value failed ${schemaDef} schema:`);
-            check.errors.forEach((e) => console.error(`  - ${e}`));
-          }
-        }
+        // S9: Strictly validate return schema & URL policies (fail non-zero, not just warn)
+        const validationErrors = validateMethodResult(method, result, loaded.manifest, host.networkPolicy);
         console.log(JSON.stringify(result === undefined ? null : result, null, 2));
+        if (validationErrors.length > 0) {
+          console.error(`Validation failed for ${method}():`);
+          validationErrors.forEach((e) => console.error(`  - ${e}`));
+          return 1;
+        }
         return 0;
       } catch (err) {
         if (err instanceof PluginCallError) {

@@ -6,10 +6,10 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.common.util.Util
 import androidx.media3.datasource.BaseDataSource
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
-import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.dash.DashMediaSource
 import androidx.media3.exoplayer.dash.manifest.DashManifestParser
@@ -20,6 +20,7 @@ import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.exoplayer.source.SingleSampleMediaSource
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
+import com.limelight.local.media.Artwork
 import com.limelight.local.media.DashStream
 import com.limelight.local.media.MediaTrack
 import com.limelight.local.media.PlaybackInfo
@@ -27,40 +28,43 @@ import com.limelight.local.media.SourceForbiddenException
 import com.limelight.local.media.SourceUnsupportedException
 import com.limelight.local.media.SubtitleFormat
 import com.limelight.local.media.SubtitleTrack
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.longOrNull
+import okhttp3.Dns
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.io.InputStream
+import java.net.InetAddress
+import java.net.Proxy
 import java.net.URI
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
-/**
- * Resolved playback strategy derived from [PlaybackInfo]:
- * - [DirectUrl]: progressive, HLS, or DASH manifest URL
- * - [SynthesizedDashMpd]: separated DASH video/audio tracks carrying fMP4
- *   `initRange`/`indexRange` synthesized into a standard DASH MPD XML (supports
- *   byte-range seeking, multi-track selection, and multi-BaseURL CDN failover)
- * - [MergedProgressiveTracks]: separated video/audio tracks without DASH byte
- *   ranges, combined via Media3 [MergingMediaSource] with per-track backup URL
- *   failover
- * - [InlineMpd]: plugin-supplied raw DASH MPD XML document
- */
 sealed interface ResolvedStreamPlan {
     data class DirectUrl(
         val url: String,
         val streamType: DirectStreamType,
         val mimeType: String?,
         val headers: Map<String, String>,
+        val trustedOrigins: Set<String>,
     ) : ResolvedStreamPlan
 
     data class SynthesizedDashMpd(
         val mpdXml: String,
         val baseUrl: String,
         val headers: Map<String, String>,
+        val trustedOrigins: Set<String>,
         val videoBackupChains: List<List<String>>,
         val audioBackupChains: List<List<String>>,
     ) : ResolvedStreamPlan
@@ -71,12 +75,14 @@ sealed interface ResolvedStreamPlan {
         val videoMime: String,
         val audioMime: String?,
         val headers: Map<String, String>,
+        val trustedOrigins: Set<String>,
     ) : ResolvedStreamPlan
 
     data class InlineMpd(
         val mpdXml: String,
         val baseUrl: String,
         val headers: Map<String, String>,
+        val trustedOrigins: Set<String>,
     ) : ResolvedStreamPlan
 }
 
@@ -85,6 +91,7 @@ enum class DirectStreamType { PROGRESSIVE, HLS, DASH }
 data class ResolvedSubtitlePlan(
     val track: SubtitleTrack,
     val effectiveHeaders: Map<String, String>,
+    val trustedOrigins: Set<String>,
     val media3MimeType: String,
     val requiresJsonToVttConversion: Boolean,
 )
@@ -96,16 +103,11 @@ data class PlaybackPlan(
 )
 
 /**
- * Synthesizes a standards-compliant DASH MPD XML document from protocol §3
- * `dash: { video: Track[], audio: Track[] }` streams.
- *
- * Design rationale:
- * When tracks provide `initRange`/`indexRange` (standard fMP4 SegmentBase used
- * by modern video platforms), synthesizing an MPD XML gives Media3's
- * [DashMediaSource] native byte-range seeking, adaptive/manual track switching,
- * and automatic `<BaseURL>` failover across `backupUrls`.
- * When tracks omit byte ranges (plain separate progressive files), the factory
- * falls back to [MergingMediaSource] with [FailoverUrlDataSource].
+ * Synthesizes a standards-compliant DVB-DASH MPD XML document from protocol §3
+ * `dash: { video: Track[], audio: Track[] }` streams with explicit ascending
+ * `dvb:priority` (1 = primary, 2+ = backups) and `mediaPresentationDuration`
+ * so Media3 deterministically prefers the primary CDN and fails over to backups
+ * in order (B3, S6, §11.2).
  */
 object DashMpdSynthesizer {
     fun hasSegmentRanges(dash: DashStream): Boolean {
@@ -115,19 +117,18 @@ object DashMpdSynthesizer {
         }
     }
 
-    fun synthesize(dash: DashStream, isLive: Boolean = false, durationMs: Long? = null): String {
+    fun synthesize(dash: DashStream, durationMs: Long): String {
         require(dash.video.isNotEmpty()) { "DASH stream must contain at least one video track" }
-        val typeAttr = if (isLive) "dynamic" else "static"
-        val durationAttr = if (!isLive && durationMs != null && durationMs > 0) {
-            " mediaPresentationDuration=\"${formatIsoDuration(durationMs)}\""
-        } else {
-            ""
-        }
+        require(durationMs > 0L) { "DASH stream requires positive durationMs (§11.2)" }
         val sb = StringBuilder(2048)
         sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
-        sb.append("<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"$typeAttr\"$durationAttr ")
-        sb.append("minBufferTime=\"PT1.5S\" profiles=\"urn:mpeg:dash:profile:isoff-on-demand:2011\">\n")
-        sb.append("  <Period id=\"0\">\n")
+        sb.append(
+            "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" " +
+                "xmlns:dvb=\"urn:dvb:dash:profile:dvb-dash:2014\" " +
+                "type=\"static\" mediaPresentationDuration=\"${formatIsoDuration(durationMs)}\" " +
+                "minBufferTime=\"PT1.5S\" profiles=\"urn:mpeg:dash:profile:isoff-on-demand:2011\">\n",
+        )
+        sb.append("  <Period id=\"0\" duration=\"${formatIsoDuration(durationMs)}\">\n")
 
         appendAdaptationSet(sb, id = 0, contentType = "video", tracks = dash.video)
         if (dash.audio.isNotEmpty()) {
@@ -156,9 +157,13 @@ object DashMpdSynthesizer {
             track.frameRate?.let { sb.append(" frameRate=\"${formatFrameRate(it)}\"") }
             sb.append(">\n")
 
-            val urls = listOf(track.url) + track.backupUrls
+            val urls = (listOf(track.url) + track.backupUrls).distinct()
             urls.forEachIndexed { idx, candidate ->
-                sb.append("        <BaseURL serviceLocation=\"cdn-$idx\">${xmlEscape(candidate)}</BaseURL>\n")
+                val priority = idx + 1
+                sb.append(
+                    "        <BaseURL dvb:priority=\"$priority\" dvb:weight=\"1\" " +
+                        "serviceLocation=\"cdn-$idx\">${xmlEscape(candidate)}</BaseURL>\n",
+                )
             }
 
             if (!track.initRange.isNullOrBlank() && !track.indexRange.isNullOrBlank()) {
@@ -196,9 +201,7 @@ object DashMpdSynthesizer {
 }
 
 /**
- * Converts JSON subtitle payloads (`format: "json"`, supporting both BCC
- * `{ body: [{ from, to, content }] }` seconds format and generic
- * `[{ startMs, endMs, text }]` arrays) into standard WebVTT for Media3.
+ * Converts JSON subtitle payloads (`format: "json"`) into WebVTT.
  */
 object JsonSubtitleConverter {
     private val json = Json { ignoreUnknownKeys = true }
@@ -243,9 +246,261 @@ object JsonSubtitleConverter {
 }
 
 /**
- * Stateful candidate-URL failover selector used both by [FailoverUrlDataSource]
- * and directly in unit tests. Remembers the last healthy index so subsequent
- * range requests stay on the working CDN until another error occurs.
+ * Shared OkHttp executor used by BOTH [SafePluginHttpDataSource] (for Media3
+ * streams, manifests, segments, subtitles) and [PluginImageFetcher] (for
+ * plugin artwork).
+ *
+ * Enforces protocol §11.3 on EVERY request and EVERY redirect hop:
+ * - Resolves and validates via [NetworkPolicy.validateResourceUrl]
+ * - Connects strictly to the validated IP with `.proxy(Proxy.NO_PROXY)`
+ * - Rejects HTTPS -> HTTP downgrade redirects
+ * - Sends plugin-supplied headers ONLY to origins explicitly trusted for this
+ *   resource; strips `Authorization`, `Cookie`, and all plugin custom headers on
+ *   any untrusted origin or cross-origin redirect
+ */
+class SafePluginHttpExecutor(
+    private val networkPolicy: NetworkPolicy,
+    baseClient: OkHttpClient = DEFAULT_CLIENT,
+    private val userAgent: String = PlaybackMediaSourceFactory.DEFAULT_USER_AGENT,
+    private val maxRedirects: Int = 10,
+) {
+    private val client: OkHttpClient = baseClient.newBuilder()
+        .proxy(Proxy.NO_PROXY)
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .build()
+
+    fun openStream(
+        rawUrl: String,
+        pluginHeaders: Map<String, String>,
+        trustedOrigins: Set<String>,
+        rangeHeader: String? = null,
+    ): Response {
+        var currentUrl = rawUrl
+        var prevScheme: String? = null
+        var hops = 0
+        var activePluginHeaders = LinkedHashMap(pluginHeaders)
+
+        while (true) {
+            val validated = try {
+                networkPolicy.validateResourceUrl(currentUrl, previousScheme = prevScheme)
+            } catch (e: NetworkPolicyException) {
+                throw IOException(e.message, e)
+            }
+
+            val currentOrigin = NetworkPolicy.originKey(validated.url)
+            val sendPluginHeaders = currentOrigin in trustedOrigins
+
+            val pinnedDns = object : Dns {
+                override fun lookup(hostname: String): List<InetAddress> {
+                    if (NetworkPolicy.canonicalizeHost(hostname) == validated.canonicalHost) {
+                        return validated.resolvedAddresses
+                    }
+                    return networkPolicy.validateResourceUrl("https://$hostname/").resolvedAddresses
+                }
+            }
+            val hopClient = client.newBuilder().dns(pinnedDns).build()
+
+            val reqBuilder = Request.Builder().url(validated.url).get()
+            var hasUa = false
+            if (sendPluginHeaders) {
+                for ((k, v) in activePluginHeaders) {
+                    if (k.equals("Host", ignoreCase = true)) continue
+                    if (k.equals("User-Agent", ignoreCase = true)) hasUa = true
+                    reqBuilder.header(k, v)
+                }
+            }
+            if (!hasUa) reqBuilder.header("User-Agent", userAgent)
+            if (rangeHeader != null) reqBuilder.header("Range", rangeHeader)
+
+            val resp = hopClient.newCall(reqBuilder.build()).execute()
+            val code = resp.code
+            val location = resp.header("Location")
+            if (code in REDIRECT_CODES && location != null) {
+                resp.close()
+                hops += 1
+                if (hops > maxRedirects) {
+                    throw IOException("重定向次数过多（超过 $maxRedirects 次）")
+                }
+                val resolved = validated.url.resolve(location)
+                    ?: throw IOException("无效的重定向目标地址")
+                val nextOrigin = NetworkPolicy.originKey(resolved)
+                if (nextOrigin != currentOrigin) {
+                    // §11.3: strip Authorization, Cookie, and ALL plugin custom headers on cross-origin redirect
+                    activePluginHeaders.clear()
+                }
+                prevScheme = validated.url.scheme
+                currentUrl = resolved.toString()
+                continue
+            }
+            return resp
+        }
+    }
+
+    companion object {
+        private val REDIRECT_CODES = setOf(301, 302, 303, 307, 308)
+        private val DEFAULT_CLIENT = OkHttpClient.Builder()
+            .proxy(Proxy.NO_PROXY)
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
+            .build()
+    }
+}
+
+/**
+ * Media3 [DataSource] enforcing [NetworkPolicy] on every request and redirect
+ * hop (MPD BaseURL/SegmentTemplate, HLS sub-playlists & segments, progressive
+ * streams, backup URLs, subtitles) and scoping `PlaybackInfo.headers` strictly
+ * to plugin-declared origins (§11.3, B1).
+ */
+@OptIn(UnstableApi::class)
+class SafePluginHttpDataSource(
+    private val executor: SafePluginHttpExecutor,
+    private val pluginHeaders: Map<String, String>,
+    private val trustedOrigins: Set<String>,
+) : BaseDataSource(/* isNetwork = */ true) {
+
+    private var response: Response? = null
+    private var inputStream: InputStream? = null
+    private var openedUri: Uri? = null
+    private var bytesToRead: Long = C.LENGTH_UNSET.toLong()
+    private var bytesRead: Long = 0
+
+    override fun open(dataSpec: DataSpec): Long {
+        transferInitializing(dataSpec)
+        val rawUrl = dataSpec.uri.toString()
+        val range = buildRangeHeader(dataSpec.position, dataSpec.length)
+        val resp = executor.openStream(rawUrl, pluginHeaders, trustedOrigins, range)
+        if (!resp.isSuccessful) {
+            val code = resp.code
+            val msg = resp.message
+            val headersMap = resp.headers.toMultimap()
+            resp.close()
+            throw HttpDataSource.InvalidResponseCodeException(
+                code,
+                msg,
+                null,
+                headersMap,
+                dataSpec,
+                Util.EMPTY_BYTE_ARRAY,
+            )
+        }
+        response = resp
+        inputStream = resp.body.byteStream()
+        openedUri = runCatching { Uri.parse(resp.request.url.toString()) }.getOrNull() ?: dataSpec.uri
+        val contentLength = resp.body.contentLength()
+        bytesToRead = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
+            dataSpec.length
+        } else if (contentLength >= 0L) {
+            contentLength
+        } else {
+            C.LENGTH_UNSET.toLong()
+        }
+        bytesRead = 0
+        transferStarted(dataSpec)
+        return bytesToRead
+    }
+
+    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+        if (length == 0) return 0
+        if (bytesToRead != C.LENGTH_UNSET.toLong()) {
+            val remaining = bytesToRead - bytesRead
+            if (remaining <= 0L) return C.RESULT_END_OF_INPUT
+            val capped = minOf(length.toLong(), remaining).toInt()
+            val n = inputStream?.read(buffer, offset, capped) ?: return C.RESULT_END_OF_INPUT
+            if (n < 0) return C.RESULT_END_OF_INPUT
+            bytesRead += n
+            bytesTransferred(n)
+            return n
+        }
+        val n = inputStream?.read(buffer, offset, length) ?: return C.RESULT_END_OF_INPUT
+        if (n < 0) return C.RESULT_END_OF_INPUT
+        bytesRead += n
+        bytesTransferred(n)
+        return n
+    }
+
+    override fun getUri(): Uri? = openedUri
+
+    override fun getResponseHeaders(): Map<String, List<String>> =
+        response?.headers?.toMultimap() ?: emptyMap()
+
+    override fun close() {
+        val stream = inputStream
+        val resp = response
+        inputStream = null
+        response = null
+        openedUri = null
+        if (stream != null || resp != null) {
+            try {
+                stream?.close()
+            } finally {
+                resp?.close()
+                transferEnded()
+            }
+        }
+    }
+
+    private fun buildRangeHeader(position: Long, length: Long): String? {
+        if (position == 0L && length == C.LENGTH_UNSET.toLong()) return null
+        return if (length == C.LENGTH_UNSET.toLong()) {
+            "bytes=$position-"
+        } else {
+            "bytes=$position-${position + length - 1}"
+        }
+    }
+}
+
+/**
+ * Safe image fetcher enforcing the exact same §11.3 [NetworkPolicy], DNS
+ * pinning, redirect-hop validation, HTTPS downgrade block, and cross-origin
+ * header stripping for plugin artwork (`poster`, `thumb`, `backdrop`, `avatar`).
+ */
+class PluginImageFetcher(
+    networkPolicy: NetworkPolicy,
+    baseClient: OkHttpClient = OkHttpClient(),
+    private val maxImageBytes: Int = MAX_IMAGE_BYTES,
+) {
+    private val executor = SafePluginHttpExecutor(networkPolicy, baseClient)
+
+    suspend fun fetchBytes(artwork: Artwork): ByteArray = withContext(Dispatchers.IO) {
+        val parsed = artwork.url.trim().toHttpUrlOrNull()
+            ?: throw NetworkPolicyException("不支持或无效的图片地址")
+        val trustedOrigins = setOf(NetworkPolicy.originKey(parsed))
+        executor.openStream(artwork.url, artwork.headers, trustedOrigins).use { resp ->
+            if (!resp.isSuccessful) {
+                throw IOException("图片请求失败（HTTP ${resp.code}）")
+            }
+            val len = resp.body.contentLength()
+            if (len > maxImageBytes) {
+                throw IOException("图片超过大小限制（上限 ${maxImageBytes / (1024 * 1024)} MB）")
+            }
+            val out = ByteArrayOutputStream()
+            val buf = ByteArray(16_384)
+            var total = 0L
+            resp.body.byteStream().use { s ->
+                while (true) {
+                    val n = s.read(buf)
+                    if (n < 0) break
+                    total += n
+                    if (total > maxImageBytes) {
+                        throw IOException("图片超过大小限制（上限 ${maxImageBytes / (1024 * 1024)} MB）")
+                    }
+                    out.write(buf, 0, n)
+                }
+            }
+            out.toByteArray()
+        }
+    }
+
+    companion object {
+        const val MAX_IMAGE_BYTES = 16 * 1024 * 1024
+    }
+}
+
+/**
+ * Stateful candidate-URL failover selector used by [FailoverUrlDataSource]
+ * (for plain separated progressive video/audio tracks without DASH byte ranges).
  */
 class FailoverUrlSelector(
     urls: List<String>,
@@ -277,10 +532,6 @@ class FailoverUrlSelector(
     fun allCandidates(): List<String> = candidates
 }
 
-/**
- * Media3 [DataSource] that tries a primary URL followed by backup URLs on
- * connection or HTTP errors, preserving byte ranges and request headers.
- */
 @OptIn(UnstableApi::class)
 class FailoverUrlDataSource(
     private val upstreamFactory: DataSource.Factory,
@@ -336,10 +587,6 @@ class FailoverUrlDataSource(
     }
 }
 
-/**
- * Media3 [DataSource] that fetches a `format: "json"` external subtitle and
- * transparently converts it to WebVTT bytes for ExoPlayer's subtitle decoder.
- */
 @OptIn(UnstableApi::class)
 class JsonSubtitleVttDataSource(
     private val upstreamFactory: DataSource.Factory,
@@ -355,7 +602,7 @@ class JsonSubtitleVttDataSource(
         val raw = try {
             delegate.open(dataSpec)
             val buf = ByteArray(8192)
-            val out = java.io.ByteArrayOutputStream()
+            val out = ByteArrayOutputStream()
             while (true) {
                 val n = delegate.read(buf, 0, buf.size)
                 if (n < 0) break
@@ -397,54 +644,62 @@ class JsonSubtitleVttDataSource(
 
 /**
  * Translates protocol v1 [PlaybackInfo] (`url` / `dash` / `mpd`, `headers`,
- * `qualities`, `subtitles`, `expiresAt`) into a Media3 [ExoMediaSource].
+ * `qualities`, `subtitles`, `expiresAt`, `durationMs`) into a Media3
+ * [ExoMediaSource] with mandatory [NetworkPolicy] enforcement on every network
+ * request and redirect hop (§11.3, B1, B3, S6).
  */
 @OptIn(UnstableApi::class)
 class PlaybackMediaSourceFactory(
+    private val networkPolicy: NetworkPolicy,
+    private val deviceCodecs: List<String> = listOf("avc", "hevc"),
+    private val okHttpClient: OkHttpClient = OkHttpClient(),
     private val userAgent: String = DEFAULT_USER_AGENT,
-    private val httpFactoryProvider: (Map<String, String>) -> DataSource.Factory = { headers ->
-        DefaultHttpDataSource.Factory()
-            .setUserAgent(userAgent)
-            .setAllowCrossProtocolRedirects(true)
-            .setDefaultRequestProperties(headers)
-    },
-    private val networkPolicy: NetworkPolicy? = null,
 ) {
-    /**
-     * Pure-JVM planning step: validates URLs, selects stream mode (DirectUrl,
-     * SynthesizedDashMpd, MergedProgressiveTracks, or InlineMpd), selects
-     * tracks matching the active quality, and resolves subtitle MIME & headers.
-     */
-    fun plan(info: PlaybackInfo, selectedQualityId: String? = null, durationMs: Long? = null): PlaybackPlan {
+    private val httpExecutor = SafePluginHttpExecutor(networkPolicy, okHttpClient, userAgent)
+
+    fun plan(
+        info: PlaybackInfo,
+        selectedQualityId: String? = null,
+        selectedAudioId: String? = null,
+        fallbackDurationMs: Long? = null,
+    ): PlaybackPlan {
+        // §11.2: live: true combined with dash is unsupported in v1
+        if (info.isLive && info.dash != null) {
+            throw SourceUnsupportedException("直播暂不支持音视频分离的 DASH 模式，请使用 HLS 等单地址流。")
+        }
+
         val effectiveQuality = selectedQualityId
             ?: info.qualities.firstOrNull { it.selected && it.locked == null }?.id
+        val effectiveDurationMs = info.durationMs ?: fallbackDurationMs
 
         val streamPlan: ResolvedStreamPlan = when {
-            info.dash != null -> planDash(info.dash, info.headers, info.isLive, effectiveQuality, durationMs)
-            !info.mpd.isNullOrBlank() -> {
-                val baseUrl = info.url.ifBlank { "https://inline.depth3d.invalid/manifest.mpd" }
-                ResolvedStreamPlan.InlineMpd(
-                    mpdXml = info.mpd,
-                    baseUrl = baseUrl,
-                    headers = info.headers,
-                )
-            }
+            info.dash != null -> planDash(
+                dash = info.dash,
+                headers = info.headers,
+                selectedQualityId = effectiveQuality,
+                selectedAudioId = selectedAudioId,
+                durationMs = effectiveDurationMs,
+            )
+            !info.mpd.isNullOrBlank() -> planInlineMpd(info.mpd, info.url, info.headers)
             info.url.isNotBlank() -> {
-                validateUrlIfNeeded(info.url)
+                val validated = networkPolicy.validateResourceUrlPrecheck(info.url)
                 val streamType = detectDirectStreamType(info.url, info.mimeType)
                 ResolvedStreamPlan.DirectUrl(
                     url = info.url,
                     streamType = streamType,
                     mimeType = info.mimeType ?: defaultMimeFor(streamType),
                     headers = info.headers,
+                    trustedOrigins = setOf(NetworkPolicy.originKey(validated)),
                 )
             }
             else -> throw SourceUnsupportedException("这个内容没有可用的播放地址，请尝试切换清晰度或片源。")
         }
 
         val subtitlePlans = info.subtitles.map { sub ->
-            validateUrlIfNeeded(sub.url)
-            val headers = if (sub.headers.isNotEmpty()) sub.headers else info.headers
+            val validatedSub = networkPolicy.validateResourceUrlPrecheck(sub.url)
+            // §11.2: subtitle headers overlay on top of PlaybackInfo.headers (same-name override)
+            val mergedHeaders = LinkedHashMap<String, String>(info.headers)
+            mergedHeaders.putAll(sub.headers)
             val (mime, needsJsonConv) = when (sub.format) {
                 SubtitleFormat.SRT -> MimeTypes.APPLICATION_SUBRIP to false
                 SubtitleFormat.VTT -> MimeTypes.TEXT_VTT to false
@@ -453,7 +708,8 @@ class PlaybackMediaSourceFactory(
             }
             ResolvedSubtitlePlan(
                 track = sub,
-                effectiveHeaders = headers,
+                effectiveHeaders = mergedHeaders,
+                trustedOrigins = setOf(NetworkPolicy.originKey(validatedSub)),
                 media3MimeType = mime,
                 requiresJsonToVttConversion = needsJsonConv,
             )
@@ -462,23 +718,19 @@ class PlaybackMediaSourceFactory(
         return PlaybackPlan(info = info, stream = streamPlan, subtitles = subtitlePlans)
     }
 
-    /**
-     * Builds the runnable Media3 [ExoMediaSource] from a [PlaybackInfo].
-     */
     fun createMediaSource(
         info: PlaybackInfo,
         selectedQualityId: String? = null,
-        durationMs: Long? = null,
-    ): ExoMediaSource {
-        val plan = plan(info, selectedQualityId, durationMs)
-        return createMediaSource(plan)
-    }
+        selectedAudioId: String? = null,
+        fallbackDurationMs: Long? = null,
+    ): ExoMediaSource = createMediaSource(plan(info, selectedQualityId, selectedAudioId, fallbackDurationMs))
 
+    @Suppress("DEPRECATION")
     fun createMediaSource(plan: PlaybackPlan): ExoMediaSource {
         val primarySource: ExoMediaSource = when (val s = plan.stream) {
             is ResolvedStreamPlan.DirectUrl -> buildDirectUrlSource(s)
-            is ResolvedStreamPlan.SynthesizedDashMpd -> buildMpdSource(s.mpdXml, s.baseUrl, s.headers)
-            is ResolvedStreamPlan.InlineMpd -> buildMpdSource(s.mpdXml, s.baseUrl, s.headers)
+            is ResolvedStreamPlan.SynthesizedDashMpd -> buildMpdSource(s.mpdXml, s.baseUrl, s.headers, s.trustedOrigins)
+            is ResolvedStreamPlan.InlineMpd -> buildMpdSource(s.mpdXml, s.baseUrl, s.headers, s.trustedOrigins)
             is ResolvedStreamPlan.MergedProgressiveTracks -> buildMergedTrackSource(s)
         }
 
@@ -489,7 +741,7 @@ class PlaybackMediaSourceFactory(
         val sources = ArrayList<ExoMediaSource>(1 + plan.subtitles.size)
         sources += primarySource
         for (sub in plan.subtitles) {
-            val baseSubFactory = httpFactoryProvider(sub.effectiveHeaders)
+            val baseSubFactory = safeDataSourceFactory(sub.effectiveHeaders, sub.trustedOrigins)
             val subDataSourceFactory = if (sub.requiresJsonToVttConversion) {
                 DataSource.Factory { JsonSubtitleVttDataSource(baseSubFactory) }
             } else {
@@ -510,19 +762,30 @@ class PlaybackMediaSourceFactory(
         return MergingMediaSource(*sources.toTypedArray())
     }
 
+    /** Exposed for unit tests to verify real `SafePluginHttpDataSource` behavior. */
+    fun safeDataSourceFactory(
+        pluginHeaders: Map<String, String>,
+        trustedOrigins: Set<String>,
+    ): DataSource.Factory = DataSource.Factory {
+        SafePluginHttpDataSource(httpExecutor, pluginHeaders, trustedOrigins)
+    }
+
     private fun planDash(
         dash: DashStream,
         headers: Map<String, String>,
-        isLive: Boolean,
         selectedQualityId: String?,
+        selectedAudioId: String?,
         durationMs: Long?,
     ): ResolvedStreamPlan {
         if (dash.video.isEmpty()) {
             throw SourceUnsupportedException("这个视频缺少可用的视频轨，无法播放。")
         }
+        val trustedOrigins = LinkedHashSet<String>()
         for (track in dash.video + dash.audio) {
-            validateUrlIfNeeded(track.url)
-            track.backupUrls.forEach(::validateUrlIfNeeded)
+            trustedOrigins += NetworkPolicy.originKey(networkPolicy.validateResourceUrlPrecheck(track.url))
+            for (backup in track.backupUrls) {
+                trustedOrigins += NetworkPolicy.originKey(networkPolicy.validateResourceUrlPrecheck(backup))
+            }
         }
 
         val matchingVideo = if (selectedQualityId != null) {
@@ -530,32 +793,74 @@ class PlaybackMediaSourceFactory(
         } else {
             dash.video
         }
-        val filteredDash = DashStream(video = matchingVideo, audio = dash.audio)
+        val codecCompatibleVideo = matchingVideo.filter { isCodecSupported(it.codecs) }.ifEmpty { matchingVideo }
+        val matchingAudio = if (selectedAudioId != null) {
+            dash.audio.filter { it.id == selectedAudioId }.ifEmpty { dash.audio }
+        } else {
+            dash.audio
+        }
+        val filteredDash = DashStream(video = codecCompatibleVideo, audio = matchingAudio)
 
         return if (DashMpdSynthesizer.hasSegmentRanges(filteredDash)) {
-            val mpdXml = DashMpdSynthesizer.synthesize(filteredDash, isLive = isLive, durationMs = durationMs)
+            if (durationMs == null || durationMs <= 0L) {
+                throw SourceUnsupportedException("DASH 音视频分离流缺少有效的视频时长信息。")
+            }
+            val mpdXml = DashMpdSynthesizer.synthesize(filteredDash, durationMs = durationMs)
             ResolvedStreamPlan.SynthesizedDashMpd(
                 mpdXml = mpdXml,
-                baseUrl = matchingVideo.first().url,
+                baseUrl = codecCompatibleVideo.first().url,
                 headers = headers,
-                videoBackupChains = matchingVideo.map { listOf(it.url) + it.backupUrls },
-                audioBackupChains = dash.audio.map { listOf(it.url) + it.backupUrls },
+                trustedOrigins = trustedOrigins,
+                videoBackupChains = codecCompatibleVideo.map { (listOf(it.url) + it.backupUrls).distinct() },
+                audioBackupChains = matchingAudio.map { (listOf(it.url) + it.backupUrls).distinct() },
             )
         } else {
-            val chosenVideo = matchingVideo.maxByOrNull { it.bandwidth } ?: matchingVideo.first()
-            val chosenAudio = dash.audio.maxByOrNull { it.bandwidth }
+            // S6: select highest bandwidth among device-supported video codecs, and respect selectedAudioId
+            val chosenVideo = codecCompatibleVideo.maxByOrNull { it.bandwidth } ?: codecCompatibleVideo.first()
+            val chosenAudio = if (selectedAudioId != null) {
+                dash.audio.firstOrNull { it.id == selectedAudioId } ?: dash.audio.maxByOrNull { it.bandwidth }
+            } else {
+                dash.audio.maxByOrNull { it.bandwidth }
+            }
             ResolvedStreamPlan.MergedProgressiveTracks(
-                videoUrls = listOf(chosenVideo.url) + chosenVideo.backupUrls,
-                audioUrls = chosenAudio?.let { listOf(it.url) + it.backupUrls } ?: emptyList(),
+                videoUrls = (listOf(chosenVideo.url) + chosenVideo.backupUrls).distinct(),
+                audioUrls = chosenAudio?.let { (listOf(it.url) + it.backupUrls).distinct() } ?: emptyList(),
                 videoMime = chosenVideo.mime,
                 audioMime = chosenAudio?.mime,
                 headers = headers,
+                trustedOrigins = trustedOrigins,
             )
         }
     }
 
+    private fun planInlineMpd(
+        mpdXml: String,
+        fallbackBaseUrl: String,
+        headers: Map<String, String>,
+    ): ResolvedStreamPlan.InlineMpd {
+        val extractedUrls = extractUrlsFromMpd(mpdXml)
+        val trustedOrigins = LinkedHashSet<String>()
+        for (u in extractedUrls) {
+            val validated = networkPolicy.validateResourceUrlPrecheck(u)
+            trustedOrigins += NetworkPolicy.originKey(validated)
+        }
+        val baseUrl = if (fallbackBaseUrl.isNotBlank()) {
+            val v = networkPolicy.validateResourceUrlPrecheck(fallbackBaseUrl)
+            trustedOrigins += NetworkPolicy.originKey(v)
+            fallbackBaseUrl
+        } else {
+            extractedUrls.firstOrNull() ?: "https://inline.depth3d.invalid/manifest.mpd"
+        }
+        return ResolvedStreamPlan.InlineMpd(
+            mpdXml = mpdXml,
+            baseUrl = baseUrl,
+            headers = headers,
+            trustedOrigins = trustedOrigins,
+        )
+    }
+
     private fun buildDirectUrlSource(plan: ResolvedStreamPlan.DirectUrl): ExoMediaSource {
-        val dsFactory = httpFactoryProvider(plan.headers)
+        val dsFactory = safeDataSourceFactory(plan.headers, plan.trustedOrigins)
         val item = MediaItem.Builder()
             .setUri(Uri.parse(plan.url))
             .apply { plan.mimeType?.let(::setMimeType) }
@@ -573,8 +878,9 @@ class PlaybackMediaSourceFactory(
         mpdXml: String,
         baseUrl: String,
         headers: Map<String, String>,
+        trustedOrigins: Set<String>,
     ): ExoMediaSource {
-        val dsFactory = httpFactoryProvider(headers)
+        val dsFactory = safeDataSourceFactory(headers, trustedOrigins)
         val manifest = DashManifestParser().parse(
             Uri.parse(baseUrl),
             ByteArrayInputStream(mpdXml.toByteArray(Charsets.UTF_8)),
@@ -585,7 +891,7 @@ class PlaybackMediaSourceFactory(
     }
 
     private fun buildMergedTrackSource(plan: ResolvedStreamPlan.MergedProgressiveTracks): ExoMediaSource {
-        val baseFactory = httpFactoryProvider(plan.headers)
+        val baseFactory = safeDataSourceFactory(plan.headers, plan.trustedOrigins)
         val videoSelector = FailoverUrlSelector(plan.videoUrls)
         val videoSource = ProgressiveMediaSource.Factory(
             DataSource.Factory { FailoverUrlDataSource(baseFactory, videoSelector) },
@@ -606,11 +912,18 @@ class PlaybackMediaSourceFactory(
         return MergingMediaSource(videoSource, audioSource)
     }
 
-    private fun validateUrlIfNeeded(url: String) {
-        networkPolicy?.validatePlaybackUrlSyntax(url)
+    private fun isCodecSupported(codecsStr: String): Boolean {
+        val lower = codecsStr.lowercase(Locale.ROOT)
+        val family = when {
+            lower.startsWith("avc") || lower.contains("h264") -> "avc"
+            lower.startsWith("hvc") || lower.startsWith("hev") || lower.contains("hevc") -> "hevc"
+            lower.startsWith("av01") || lower.contains("av1") -> "av1"
+            else -> return true
+        }
+        return deviceCodecs.any { it.equals(family, ignoreCase = true) }
     }
 
-    private class LocationFallbackLoadErrorPolicy : DefaultLoadErrorHandlingPolicy() {
+    class LocationFallbackLoadErrorPolicy : DefaultLoadErrorHandlingPolicy() {
         override fun getFallbackSelectionFor(
             fallbackOptions: LoadErrorHandlingPolicy.FallbackOptions,
             loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo,
@@ -627,6 +940,29 @@ class PlaybackMediaSourceFactory(
 
     companion object {
         const val DEFAULT_USER_AGENT = "depth3d/1.0 (Android; OpenXR)"
+
+        private val MPD_BASE_URL_REGEX = Regex("<BaseURL\\b[^>]*>\\s*([^<]+?)\\s*</BaseURL>", RegexOption.IGNORE_CASE)
+        private val MPD_ATTR_URL_REGEX = Regex("""\b(?:media|initialization|sourceURL)\s*=\s*"([^"]+)"""", RegexOption.IGNORE_CASE)
+
+        fun extractUrlsFromMpd(mpdXml: String): List<String> {
+            val out = LinkedHashSet<String>()
+            for (m in MPD_BASE_URL_REGEX.findAll(mpdXml)) {
+                val u = unescapeXml(m.groupValues[1].trim())
+                if (u.contains("://") || u.startsWith("file:") || u.startsWith("content:")) out += u
+            }
+            for (m in MPD_ATTR_URL_REGEX.findAll(mpdXml)) {
+                val u = unescapeXml(m.groupValues[1].trim())
+                if (u.contains("://") || u.startsWith("file:") || u.startsWith("content:")) out += u
+            }
+            return out.toList()
+        }
+
+        private fun unescapeXml(s: String): String = s
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
 
         fun detectDirectStreamType(url: String, mimeHint: String?): DirectStreamType {
             val mime = mimeHint?.lowercase(Locale.ROOT)?.trim()
@@ -654,10 +990,6 @@ class PlaybackMediaSourceFactory(
     }
 }
 
-/**
- * Result of resolving or refreshing a playback session, carrying the resolved
- * [PlaybackPlan] (and optionally a built Media3 source) plus resume position.
- */
 data class ResolvedPlaybackSession(
     val info: PlaybackInfo,
     val plan: PlaybackPlan,
@@ -667,19 +999,19 @@ data class ResolvedPlaybackSession(
 )
 
 /**
- * Manages playback URL expiration (`expiresAt`), automatic re-fetching on
- * expiry or CDN 403/410 failure, and quality/audio switching (including locked
- * quality guards per protocol §3).
+ * Manages playback URL expiration (`expiresAt` with §11.2 60-second lead time
+ * and short-TTL non-looping guard), automatic re-fetching on expiry or HTTP
+ * 401/403/410 failure, and quality/audio switching.
  */
 class PlaybackSessionController(
     private val fetchPlayback: suspend (itemId: String, quality: String?, audio: String?) -> PlaybackInfo,
-    private val factory: PlaybackMediaSourceFactory = PlaybackMediaSourceFactory(),
+    private val factory: PlaybackMediaSourceFactory,
     private val clockMs: () -> Long = System::currentTimeMillis,
     private val refreshLeadMs: Long = DEFAULT_REFRESH_LEAD_MS,
 ) {
     constructor(
         source: PluginMediaSource,
-        factory: PlaybackMediaSourceFactory = PlaybackMediaSourceFactory(),
+        factory: PlaybackMediaSourceFactory = source.createPlaybackFactory(),
         clockMs: () -> Long = System::currentTimeMillis,
         refreshLeadMs: Long = DEFAULT_REFRESH_LEAD_MS,
     ) : this(
@@ -697,21 +1029,20 @@ class PlaybackSessionController(
     private var currentAudio: String? = null
     @Volatile
     private var currentInfo: PlaybackInfo? = null
+    @Volatile
+    private var nextRefreshAtMs: Long? = null
 
     fun isExpired(nowMs: Long = clockMs()): Boolean {
-        val exp = currentInfo?.expiresAtMs ?: return false
-        return nowMs >= exp - refreshLeadMs
+        val threshold = nextRefreshAtMs ?: return false
+        return nowMs >= threshold
     }
 
-    /**
-     * Loads playback info for [itemId], or reuses the cached one if it belongs
-     * to the same item/quality/audio and has not expired.
-     */
     suspend fun load(
         itemId: String,
         quality: String? = null,
         audio: String? = null,
         resumePositionMs: Long? = null,
+        fallbackDurationMs: Long? = null,
         forceRefresh: Boolean = false,
     ): ResolvedPlaybackSession {
         val sameRequest = !forceRefresh &&
@@ -724,15 +1055,27 @@ class PlaybackSessionController(
         val info = if (sameRequest) {
             currentInfo!!
         } else {
+            val now = clockMs()
             val fresh = fetchPlayback(itemId, quality, audio)
             currentItemId = itemId
             currentQuality = quality ?: fresh.qualities.firstOrNull { it.selected && it.locked == null }?.id
             currentAudio = audio
             currentInfo = fresh
+            // §11.2: refresh 60s before expiry; if freshly returned URL is ALREADY < 60s
+            // from expiry, use it directly until actual expiresAt instead of loop-refetching.
+            nextRefreshAtMs = fresh.expiresAtMs?.let { exp ->
+                val remaining = exp - now
+                if (remaining <= refreshLeadMs) exp else exp - refreshLeadMs
+            }
             fresh
         }
 
-        val plan = factory.plan(info, selectedQualityId = currentQuality)
+        val plan = factory.plan(
+            info = info,
+            selectedQualityId = currentQuality,
+            selectedAudioId = currentAudio,
+            fallbackDurationMs = fallbackDurationMs,
+        )
         return ResolvedPlaybackSession(
             info = info,
             plan = plan,
@@ -742,11 +1085,11 @@ class PlaybackSessionController(
         )
     }
 
-    /**
-     * Switches to [qualityId], rejecting locked qualities with
-     * [SourceForbiddenException] carrying the plugin's `locked` reason.
-     */
-    suspend fun switchQuality(qualityId: String, currentPositionMs: Long): ResolvedPlaybackSession {
+    suspend fun switchQuality(
+        qualityId: String,
+        currentPositionMs: Long,
+        fallbackDurationMs: Long? = null,
+    ): ResolvedPlaybackSession {
         val itemId = currentItemId ?: throw SourceUnsupportedException("当前没有正在播放的内容。")
         val option = currentInfo?.qualities?.firstOrNull { it.id == qualityId }
         if (option?.locked != null) {
@@ -757,17 +1100,15 @@ class PlaybackSessionController(
             quality = qualityId,
             audio = currentAudio,
             resumePositionMs = currentPositionMs,
+            fallbackDurationMs = fallbackDurationMs,
             forceRefresh = true,
         )
     }
 
-    /**
-     * Refreshes an expired URL (or recovers from an HTTP 403/410 CDN expiry
-     * mid-playback) while preserving [currentPositionMs].
-     */
     suspend fun refreshIfExpiredOrFailed(
         currentPositionMs: Long,
         httpStatusCode: Int? = null,
+        fallbackDurationMs: Long? = null,
     ): ResolvedPlaybackSession? {
         val itemId = currentItemId ?: return null
         val shouldRefetch = isExpired() || httpStatusCode == 401 || httpStatusCode == 403 || httpStatusCode == 410
@@ -777,11 +1118,13 @@ class PlaybackSessionController(
             quality = currentQuality,
             audio = currentAudio,
             resumePositionMs = currentPositionMs,
+            fallbackDurationMs = fallbackDurationMs,
             forceRefresh = true,
         )
     }
 
     companion object {
-        const val DEFAULT_REFRESH_LEAD_MS = 30_000L
+        /** §11.2: re-fetch 60 seconds before expiry. */
+        const val DEFAULT_REFRESH_LEAD_MS = 60_000L
     }
 }

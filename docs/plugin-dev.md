@@ -96,9 +96,9 @@ mkdir -p my-media-plugin/locales
 ```
 
 要点说明：
-- `id` 使用反向域名，安装后不可变；
-- `version` 使用 semver，发布更新时必须严格大于旧版本；
-- `permissions.hosts` 支持精确域名与前缀通配 `*.cdn.example.com`；不声明 `lan: true` 时只能用 HTTPS 且禁止访问私有网段；无论如何都禁止访问回环地址（`127.0.0.1` / `localhost` / `::1`）；
+- `id` 使用反向域名，安装后不可变；`author` 可选；
+- `version` 使用 semver，同来源发布更新时必须严格大于旧版本；同 `id` 不同来源视为替换而非更新，需用户确认且不继承原实例数据；
+- `permissions.hosts` 支持精确域名与前缀通配 `*.cdn.example.com`；`lan: true` 仅放开 `hosts` 与 `userHosts` 中位于局域网的主机，不放开整个局域网；用户在 `type: "url"` 配置项填写的主机允许使用 HTTP；无论如何都禁止访问回环、链路本地（`169.254/16`、`fe80::/10`）与保留地址（`240/4`、`255.255.255.255` 等）；
 - `permissions.userHosts: true` 允许访问用户在 `type: "url"` 配置项里填写的服务器主机。
 
 ### 第二步：实现 `main.js`
@@ -220,11 +220,11 @@ d3plugin serve ./my-media-plugin --port 8787
 |---|---|
 | `ctx.config` | 只读（已冻结）的用户配置对象 |
 | `ctx.instanceId` | 当前实例的唯一 ID，可用于区分多实例状态 |
-| `ctx.fetch(url, opts)` | 沙箱 HTTP 请求，支持 `method`、`headers`、`body`、`timeoutMs`、`redirect`（`follow`/`manual`/`error`），自动携带实例 Cookie 罐；禁止设置 `Host` 头；响应体上限 16 MB；返回 `{ status, ok, url, headers, text(), json(), bytes() }` |
-| `ctx.storage` | 每实例独立加密存储：`get(k)`、`set(k, v)`、`remove(k)`、`keys()`，值为任意 JSON，总大小上限 1 MB；登录令牌请存这里 |
-| `ctx.cookies` | 每实例独立加密 Cookie 罐：`get(url)` 返回可直接填入 `PlaybackInfo.headers.Cookie` 的字符串，`set(url, cookie)`，`clear()` |
+| `ctx.fetch(url, opts)` | 沙箱 HTTP 请求，支持 `method`、`headers`、`body`、`timeoutMs`、`redirect`（`follow`/`manual`/`error`），显式 `Cookie` 头与实例 Cookie 罐合并（同名显式优先）；禁止设置 `Host` 头与 HTTPS 降级重定向；单响应体上限 8 MB、每实例并发上限 4、在途字节上限 16 MB；返回 `{ status, ok, url, headers, text(), json(), bytes() }`（`bytes()` 返回 `ArrayBuffer`） |
+| `ctx.storage` | **异步**（必须 `await`）每实例独立加密存储：`await ctx.storage.get(k)`、`set(k, v)`、`remove(k)`、`keys()`，值为任意 JSON，总大小上限 1 MB；登录令牌请存这里 |
+| `ctx.cookies` | **异步**（必须 `await`）每实例独立加密 Cookie 罐（上限 256 KB）：`await ctx.cookies.get(url)` 返回可直接填入 `Cookie` 头的字符串，`await ctx.cookies.set(url, cookie)`，`await ctx.cookies.clear()` |
 | `ctx.crypto` | `md5`、`sha1`、`sha256`、`hmac(algo, key, data)`、`aes.encrypt/decrypt(mode, key, iv, data, aad?)`（支持 `CBC` 与 `GCM`）、`rsa.encrypt(publicKeyPem, data, padding?)`、`randomBytes(n)`、`base64.encode/decode`、`hex.encode/decode` |
-| `ctx.parse` | `html(text)` / `xml(text)` 返回只读 DOM，支持 `querySelector` / `querySelectorAll` / `selectFirst` / `select` / `attr` / `attrs` / `text` / `html` / `children` |
+| `ctx.parse` | `html(text)` / `xml(text)` 返回惰性只读 DOM 句柄（单次调用最多 8 个文档、单个上限 4 MB），支持 `querySelector` / `querySelectorAll` / `selectFirst` / `select` / `attr` / `attrs` / `text` / `html` / `outerHtml` / `children` |
 | `ctx.log` | `debug` / `info` / `warn` / `error`，自动加前缀 `depth3d: plugin <id>` 并抹掉常见凭据和密码 |
 | `ctx.device` | `{ appVersion, locale, model, maxWidth, maxHeight, codecs, hdr }`，用于按设备解码能力选流 |
 | `ctx.t(key, vars?)` | 读取 `locales/*.json` 中的翻译文案，支持 `{{name}}` 占位符 |
@@ -235,10 +235,10 @@ d3plugin serve ./my-media-plugin --port 8787
 ## 5. 错误处理与运行时约束
 
 - **不要抛出原始技术异常给用户看**：业务可预期错误请抛出 `new ctx.Error(code, '给用户看的简体中文短句')`，可选的 `code` 为：`NeedsAuth`、`AuthFailed`、`NeedsSetup`、`Unavailable`、`NotFound`、`Forbidden`、`RateLimited`、`Unsupported`、`Internal`。
-- **无状态假设**：宿主随时可能销毁并重建 QuickJS 实例（例如超时或超过 32 MB 内存限制后）。跨调用必须持久化的凭据或会话 ID 请写入 `ctx.storage`。
-- **超时与内存**：普通调用超时 15 秒，`playback` 超时 30 秒，超时后宿主映射为 `Unavailable` 并重建运行时；单实例内存上限 32 MB。
-- **音视频分离流与地址过期**：当片源音视频分离时，在 `PlaybackInfo` 里返回 `dash: { video, audio }`（带 `initRange`/`indexRange` 时 App 自动合成标准 MPD 支持字节范围拖动与 `<BaseURL>` 容灾切换，否则使用 `MergingMediaSource` 合并并自动切换 `backupUrls`）。如果播放链接带过期时间，请填写 `expiresAt`（毫秒时间戳），播放器过期后会自动重新调用 `playback()`。
-- **DRM**：协议 v1 不支持 Widevine 等 DRM，遇到加密流请明确抛出 `new ctx.Error('Unsupported', '该片源受 DRM 保护，暂不支持播放。')`。
+- **无状态假设**：宿主随时可能销毁并重建 QuickJS 实例（例如超时或超过 64 MB 堆内存限制后）。跨调用必须持久化的凭据或会话 ID 请写入 `ctx.storage`。
+- **超时、内存与取消**：普通调用超时 15 秒，`playback` 超时 30 秒，超时后宿主取消在途网络请求、映射为 `Unavailable` 并重建运行时；单实例堆上限 64 MB。调用返回的 Promise 落定时，未完成的定时器和 `fetch` 会立即取消。
+- **音视频分离流、图片与地址过期**：当片源音视频分离时，在 `PlaybackInfo` 里返回 `dash: { video, audio }` 且**必须提供 `durationMs`**（带 `initRange`/`indexRange` 时 App 自动合成带 `dvb:priority` 的标准 MPD 支持字节范围拖动与按顺序容灾切换，否则使用 `MergingMediaSource` 按设备编码与所选音轨合并并自动切换 `backupUrls`）。`live: true` 不可与 `dash` 同时使用（直播请返回 `url` 如 HLS）。播放器拉取的所有流地址、清单内地址、分片、字幕和图片地址均在每次请求与每跳重定向经过网络策略校验，跨源重定向时剥离敏感头。如果播放链接带过期时间，请填写 `expiresAt`（毫秒时间戳），播放器会在过期前 60 秒自动重取。
+- **DRM 与包体积**：协议 v1 不支持 Widevine 等 DRM，遇到加密流请明确抛出 `new ctx.Error('Unsupported', '该片源受 DRM 保护，暂不支持播放。')`。单个 `.d3plugin` 安装包上限 8 MB，仓库地址必须使用 HTTPS。
 
 ---
 

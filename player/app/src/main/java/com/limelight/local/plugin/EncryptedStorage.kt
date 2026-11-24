@@ -6,6 +6,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import java.io.File
+import java.io.IOException
 import java.security.KeyStore
 import java.security.SecureRandom
 import java.util.concurrent.locks.ReentrantReadWriteLock
@@ -135,11 +136,19 @@ class SoftwareAesSecretBox(
 class StorageQuotaExceededException(message: String) : IllegalStateException(message)
 
 /**
+ * Raised when encrypted storage on disk fails decryption or JSON parsing.
+ * The original file on disk is preserved untouched so a transient keystore
+ * error never silently wipes or overwrites credentials.
+ */
+class StorageCorruptedException(message: String, cause: Throwable? = null) : IOException(message, cause)
+
+/**
  * Per-instance encrypted key-value store backing `ctx.storage` (protocol §5):
  * - JSON values
  * - encrypted on disk using [SecretBox]
  * - strictly capped at 1 MB serialized JSON size
- * - isolated per instance directory
+ * - preserves original file and throws [StorageCorruptedException] if
+ *   decryption fails rather than silently clearing and overwriting
  */
 class InstanceStorage(
     private val file: File,
@@ -150,9 +159,10 @@ class InstanceStorage(
     private val lock = ReentrantReadWriteLock()
     private val entries = LinkedHashMap<String, JsonElement>()
     private var loaded = false
+    private var loadFailure: StorageCorruptedException? = null
 
     fun get(key: String): JsonElement? = lock.read {
-        if (loaded) return entries[key]
+        if (loaded && loadFailure == null) return entries[key]
         null
     } ?: lock.write {
         ensureLoadedLocked()
@@ -161,11 +171,12 @@ class InstanceStorage(
 
     fun set(key: String, value: JsonElement) = lock.write {
         ensureLoadedLocked()
+        val prevExisted = entries.containsKey(key)
         val prev = entries[key]
         entries[key] = value
         val serialized = JsonObject(entries).toString().toByteArray(Charsets.UTF_8)
         if (serialized.size > maxBytes) {
-            if (prev == null) entries.remove(key) else entries[key] = prev
+            if (prevExisted && prev != null) entries[key] = prev else entries.remove(key)
             throw StorageQuotaExceededException(
                 "插件存储空间超过上限（${maxBytes / 1024} KB）",
             )
@@ -189,21 +200,38 @@ class InstanceStorage(
     fun clear() = lock.write {
         entries.clear()
         loaded = true
+        loadFailure = null
         if (file.exists()) {
             file.delete()
         }
     }
 
     private fun ensureLoadedLocked() {
+        loadFailure?.let { throw it }
         if (loaded) return
-        loaded = true
-        if (!file.exists()) return
-        val encrypted = file.readBytes()
-        if (encrypted.isEmpty()) return
-        val plain = secretBox.decrypt(encrypted)
-        val obj = json.parseToJsonElement(String(plain, Charsets.UTF_8)) as? JsonObject ?: return
-        entries.clear()
-        entries.putAll(obj)
+        if (!file.exists()) {
+            loaded = true
+            return
+        }
+        try {
+            val encrypted = file.readBytes()
+            if (encrypted.isEmpty()) {
+                throw StorageCorruptedException("加密存储文件为空或已损坏")
+            }
+            val plain = secretBox.decrypt(encrypted)
+            val obj = json.parseToJsonElement(String(plain, Charsets.UTF_8)) as? JsonObject
+                ?: throw StorageCorruptedException("加密存储内容格式无效")
+            entries.clear()
+            entries.putAll(obj)
+            loaded = true
+        } catch (e: StorageCorruptedException) {
+            loadFailure = e
+            throw e
+        } catch (e: Exception) {
+            val ex = StorageCorruptedException("无法解密插件存储，已保留原文件，请重新登录或检查系统密钥。", e)
+            loadFailure = ex
+            throw ex
+        }
     }
 
     private fun writeEncryptedLocked(plainBytes: ByteArray) {

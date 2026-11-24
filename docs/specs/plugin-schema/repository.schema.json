@@ -34,11 +34,11 @@
             "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
           },
           "description": {
-            "type": "string",
+            "type": ["string", "null"],
             "maxLength": 1000
           },
           "icon": {
-            "type": "string",
+            "type": ["string", "null"],
             "pattern": "^https?://.+"
           },
           "url": {
@@ -50,7 +50,7 @@
             "pattern": "^[0-9a-fA-F]{64}$"
           },
           "minApp": {
-            "type": "string",
+            "type": ["string", "null"],
             "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
           }
         }

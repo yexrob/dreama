@@ -1,8 +1,9 @@
-// depth3d Protocol v1 Reference Plugin
+// depth3d Protocol v1 Reference Plugin (updated for protocol §11)
 // Deterministic fixture plugin covering every protocol field, capability,
-// error code, login flow (form / qr / device), and video-platform pattern
-// (separated DASH + Referer, locked quality reason, multi-part episodes,
-// segmented danmaku, and expiring stream URL refresh).
+// error code, async storage/cookies, login flow (form / qr / device), and
+// video-platform pattern (separated DASH + Referer + durationMs, locked
+// quality reason, multi-part episodes, segmented danmaku with hex & integer
+// colors, and expiring stream URL refresh).
 
 const CDN = 'https://media.cdn.reference.invalid';
 const IMG = 'https://img.cdn.reference.invalid';
@@ -217,75 +218,80 @@ function throwIfErrorTrigger(ctx, id) {
   throw new ctx.Error(code, messages[code] || '未知测试错误。');
 }
 
-function withUserState(ctx, item) {
-  const favs = ctx.storage.get('favorites') || {};
-  const played = ctx.storage.get('played') || {};
+async function withUserState(ctx, item) {
+  const favs = (await ctx.storage.get('favorites')) || {};
+  const played = (await ctx.storage.get('played')) || {};
   const copy = Object.assign({}, item);
   if (Object.prototype.hasOwnProperty.call(favs, item.id)) copy.favorite = Boolean(favs[item.id]);
   if (Object.prototype.hasOwnProperty.call(played, item.id)) copy.played = Boolean(played[item.id]);
   return copy;
 }
 
+async function mapWithUserState(ctx, items) {
+  const favs = (await ctx.storage.get('favorites')) || {};
+  const played = (await ctx.storage.get('played')) || {};
+  return items.map((item) => {
+    const copy = Object.assign({}, item);
+    if (Object.prototype.hasOwnProperty.call(favs, item.id)) copy.favorite = Boolean(favs[item.id]);
+    if (Object.prototype.hasOwnProperty.call(played, item.id)) copy.played = Boolean(played[item.id]);
+    return copy;
+  });
+}
+
 export default {
-  init(ctx) {
-    const count = (ctx.storage.get('initCount') || 0) + 1;
-    ctx.storage.set('initCount', count);
+  async init(ctx) {
+    const count = ((await ctx.storage.get('initCount')) || 0) + 1;
+    await ctx.storage.set('initCount', count);
     ctx.log.info(`reference init #${count} for instance ${ctx.instanceId}`);
   },
 
-  dispose(ctx) {
-    const count = (ctx.storage.get('disposeCount') || 0) + 1;
-    ctx.storage.set('disposeCount', count);
+  async dispose(ctx) {
+    const count = ((await ctx.storage.get('disposeCount')) || 0) + 1;
+    await ctx.storage.set('disposeCount', count);
   },
 
-  home(ctx) {
+  async home(ctx) {
     return [
       {
         id: 'shelf-hero',
         title: '今日推荐',
         style: 'hero',
-        items: [withUserState(ctx, CATALOG['movie-full'])],
+        items: await mapWithUserState(ctx, [CATALOG['movie-full']]),
       },
       {
         id: 'shelf-continue',
         title: '继续观看',
         style: 'continue',
-        items: [
-          withUserState(ctx, CATALOG['movie-full']),
-          withUserState(ctx, CATALOG['episode-1']),
-        ],
+        items: await mapWithUserState(ctx, [CATALOG['movie-full'], CATALOG['episode-1']]),
       },
       {
         id: 'shelf-movies',
         title: '电影与剧集',
         style: 'poster',
         more: 'cat-library',
-        items: [
-          withUserState(ctx, CATALOG['movie-full']),
-          withUserState(ctx, CATALOG['series-1']),
-          withUserState(ctx, CATALOG['collection-scifi']),
-        ],
+        items: await mapWithUserState(ctx, [
+          CATALOG['movie-full'],
+          CATALOG['series-1'],
+          CATALOG['collection-scifi'],
+        ]),
       },
       {
         id: 'shelf-videos',
         title: '视频与直播',
         style: 'thumb',
         more: 'cat-videos',
-        items: [
-          withUserState(ctx, CATALOG['multipart-video']),
-          withUserState(ctx, CATALOG['vr-180']),
-          withUserState(ctx, CATALOG['vr-360']),
-          withUserState(ctx, CATALOG['live-1']),
-        ],
+        items: await mapWithUserState(ctx, [
+          CATALOG['multipart-video'],
+          CATALOG['vr-180'],
+          CATALOG['vr-360'],
+          CATALOG['live-1'],
+        ]),
       },
       {
         id: 'shelf-categories',
         title: '目录与人物',
         style: 'category',
-        items: [
-          withUserState(ctx, CATALOG['folder-demos']),
-          withUserState(ctx, CATALOG['person-1']),
-        ],
+        items: await mapWithUserState(ctx, [CATALOG['folder-demos'], CATALOG['person-1']]),
       },
     ];
   },
@@ -298,17 +304,42 @@ export default {
     ];
   },
 
-  browse(ctx, { categoryId = '', cursor = null, sort = null, filters = null } = {}) {
+  async browse(ctx, { categoryId = '', cursor = null, sort = null, filters = null } = {}) {
     throwIfErrorTrigger(ctx, categoryId);
+
+    if (categoryId === 'compat-forward') {
+      // §11.2 forward-compatibility probe: null optional fields, unknown kind dropped, out-of-range numeric ignored
+      return {
+        items: [
+          {
+            id: 'compat-valid',
+            kind: 'movie',
+            title: '向前兼容电影',
+            subtitle: null,
+            overview: null,
+            poster: null,
+            year: 99999,
+            rating: 120,
+            stereo: 'future-hologram-9d',
+          },
+          {
+            id: 'compat-unknown-kind',
+            kind: 'future-audiobook',
+            title: '未知类型应被丢弃',
+          },
+        ],
+        next: null,
+      };
+    }
 
     if (categoryId === '') {
       return {
-        items: [
+        items: await mapWithUserState(ctx, [
           CATALOG['folder-demos'],
-          withUserState(ctx, CATALOG['movie-full']),
-          withUserState(ctx, CATALOG['series-1']),
-          withUserState(ctx, CATALOG['multipart-video']),
-        ],
+          CATALOG['movie-full'],
+          CATALOG['series-1'],
+          CATALOG['multipart-video'],
+        ]),
         next: null,
       };
     }
@@ -340,58 +371,81 @@ export default {
 
     const pageSize = Math.max(1, Number(ctx.config.pageSize) || 2);
     const offset = cursor ? Number(String(cursor).replace(/^offset:/, '')) || 0 : 0;
-    const slice = pool.slice(offset, offset + pageSize).map((it) => withUserState(ctx, it));
+    const slice = await mapWithUserState(ctx, pool.slice(offset, offset + pageSize));
     const next = offset + pageSize < pool.length ? `offset:${offset + pageSize}` : null;
     return { items: slice, next };
   },
 
-  detail(ctx, { itemId }) {
+  async detail(ctx, { itemId }) {
     throwIfErrorTrigger(ctx, itemId);
     const base = CATALOG[itemId];
     if (!base) {
       throw new ctx.Error('NotFound', `未找到条目 ${itemId}`);
     }
-    const item = withUserState(ctx, base);
+    const item = await withUserState(ctx, base);
     if (itemId === 'movie-full') {
-      item.related = [withUserState(ctx, CATALOG['series-1']), withUserState(ctx, CATALOG['vr-180'])];
+      item.related = await mapWithUserState(ctx, [CATALOG['series-1'], CATALOG['vr-180']]);
     } else if (itemId === 'series-1') {
       item.seasons = [
         Object.assign({}, CATALOG['season-1'], {
-          episodes: [withUserState(ctx, CATALOG['episode-1']), withUserState(ctx, CATALOG['episode-2'])],
+          episodes: await mapWithUserState(ctx, [CATALOG['episode-1'], CATALOG['episode-2']]),
         }),
       ];
     } else if (itemId === 'season-1') {
-      item.episodes = [withUserState(ctx, CATALOG['episode-1']), withUserState(ctx, CATALOG['episode-2'])];
+      item.episodes = await mapWithUserState(ctx, [CATALOG['episode-1'], CATALOG['episode-2']]);
     } else if (itemId === 'multipart-video') {
-      item.episodes = [
-        withUserState(ctx, CATALOG['multipart-p1']),
-        withUserState(ctx, CATALOG['multipart-p2']),
-        withUserState(ctx, CATALOG['multipart-p3']),
-      ];
+      item.episodes = await mapWithUserState(ctx, [
+        CATALOG['multipart-p1'],
+        CATALOG['multipart-p2'],
+        CATALOG['multipart-p3'],
+      ]);
     }
     return item;
   },
 
-  playback(ctx, { itemId, quality = null, audio = null }) {
+  async playback(ctx, { itemId, quality = null, audio = null }) {
     throwIfErrorTrigger(ctx, itemId);
 
     if (itemId === 'drm-item') {
       throw new ctx.Error('Unsupported', '该片源受 Widevine DRM 保护，v1 协议不支持播放。');
     }
 
+    if (itemId === 'live-dash-invalid') {
+      return {
+        live: true,
+        durationMs: 60_000,
+        dash: {
+          video: [
+            {
+              id: 'lv1',
+              url: `${CDN}/live/v.m4s`,
+              mime: 'video/mp4',
+              codecs: 'avc1.640028',
+              bandwidth: 2_000_000,
+              initRange: '0-500',
+              indexRange: '501-900',
+            },
+          ],
+          audio: [],
+        },
+      };
+    }
+
     // Track generation counter to demonstrate URL expiry refresh
     const genKey = `pb_gen_${itemId}`;
-    const gen = (ctx.storage.get(genKey) || 0) + 1;
-    ctx.storage.set(genKey, gen);
+    const gen = ((await ctx.storage.get(genKey)) || 0) + 1;
+    await ctx.storage.set(genKey, gen);
 
-    // 1. Separated DASH stream + Referer + Cookie + locked 4K quality + expiring URL
+    // 1. Separated DASH stream + durationMs (§11.2) + Referer + Cookie + locked 4K quality + expiring URL
     if (itemId === 'multipart-video' || itemId === 'multipart-p1' || itemId === 'dash-separated') {
       if (quality === '4k-vip') {
         throw new ctx.Error('Forbidden', '4K 超清画质需要会员账号。');
       }
       const chosen = quality || '1080p';
-      const cookieHeader = ctx.cookies.get('https://api.reference.invalid/') || 'ref_anon=1';
+      const cookieHeader = (await ctx.cookies.get('https://api.reference.invalid/')) || 'ref_anon=1';
       return {
+        title: CATALOG[itemId]?.title || '音画分离测试视频',
+        durationMs: CATALOG[itemId]?.durationMs || 900_000,
         dash: {
           video: [
             {
@@ -473,6 +527,7 @@ export default {
     // 2. Separated progressive video+audio without initRange/indexRange (MergingMediaSource path)
     if (itemId === 'dash-progressive') {
       return {
+        durationMs: 600_000,
         dash: {
           video: [
             {
@@ -546,6 +601,7 @@ export default {
         { id: 'zh', label: '中文配音', lang: 'zh' },
       ],
       startMs: item.progressMs || 0,
+      durationMs: item.durationMs || undefined,
       stereo: item.stereo || '2d',
       expiresAt: Date.now() + 3_600_000,
       next: itemId === 'episode-1' ? 'episode-2' : undefined,
@@ -553,15 +609,15 @@ export default {
     };
   },
 
-  search(ctx, { query = '', cursor = null, kind = null } = {}) {
+  async search(ctx, { query = '', cursor = null, kind = null } = {}) {
     const q = String(query).trim().toLowerCase();
-    let matches = Object.values(CATALOG).filter((it) => {
+    const matches = Object.values(CATALOG).filter((it) => {
       if (kind && it.kind !== kind) return false;
       return !q || it.title.toLowerCase().includes(q) || (it.overview || '').toLowerCase().includes(q);
     });
     const offset = cursor ? Number(cursor) || 0 : 0;
     const limit = 4;
-    const page = matches.slice(offset, offset + limit).map((it) => withUserState(ctx, it));
+    const page = await mapWithUserState(ctx, matches.slice(offset, offset + limit));
     return {
       items: page,
       next: offset + limit < matches.length ? String(offset + limit) : null,
@@ -576,20 +632,20 @@ export default {
       .slice(0, 5);
   },
 
-  reportProgress(ctx, { itemId, positionMs, durationMs, event, session = null }) {
-    ctx.storage.set('lastProgress', { itemId, positionMs, durationMs, event, session });
+  async reportProgress(ctx, { itemId, positionMs, durationMs, event, session = null }) {
+    await ctx.storage.set('lastProgress', { itemId, positionMs, durationMs, event, session });
   },
 
-  setFavorite(ctx, { itemId, favorite }) {
-    const favs = ctx.storage.get('favorites') || {};
+  async setFavorite(ctx, { itemId, favorite }) {
+    const favs = (await ctx.storage.get('favorites')) || {};
     favs[itemId] = Boolean(favorite);
-    ctx.storage.set('favorites', favs);
+    await ctx.storage.set('favorites', favs);
   },
 
-  setPlayed(ctx, { itemId, played }) {
-    const playedMap = ctx.storage.get('played') || {};
+  async setPlayed(ctx, { itemId, played }) {
+    const playedMap = (await ctx.storage.get('played')) || {};
     playedMap[itemId] = Boolean(played);
-    ctx.storage.set('played', playedMap);
+    await ctx.storage.set('played', playedMap);
   },
 
   filters() {
@@ -618,22 +674,22 @@ export default {
   danmaku(ctx, { itemId, fromMs = 0, toMs = 60_000 }) {
     const all = [
       { timeMs: 1_500, text: '前排打卡！3D 效果很立体', color: '#FFFFFF', mode: 'scroll' },
-      { timeMs: 12_000, text: '高能预警', color: '#FF6699', mode: 'top' },
+      { timeMs: 12_000, text: '高能预警', color: 0xFF6699, mode: 'top' },
       { timeMs: 45_000, text: '这里的视差控制刚刚好', color: '#00E5FF', mode: 'bottom' },
       { timeMs: 75_000, text: '第二段弹幕（60s–120s）', color: '#FFD700', mode: 'scroll' },
-      { timeMs: 130_000, text: '第三段弹幕（120s–180s）', color: '#80FF80', mode: 'scroll' },
+      { timeMs: 130_000, text: '第三段弹幕（120s–180s）', color: 0x80FF80, mode: 'scroll' },
     ];
     return all.filter((d) => d.timeMs >= fromMs && d.timeMs < toMs);
   },
 
   // Form login flow
-  login(ctx) {
+  async login(ctx) {
     if (ctx.config.password === 'wrong') {
       throw new ctx.Error('AuthFailed', '密码错误，请核对后再试。');
     }
     const name = ctx.config.username || '参考测试用户';
-    ctx.storage.set('authToken', `form-token-${name}`);
-    ctx.cookies.set('https://api.reference.invalid/', `ref_sess=form_${name}; Path=/; Secure`);
+    await ctx.storage.set('authToken', `form-token-${name}`);
+    await ctx.cookies.set('https://api.reference.invalid/', `ref_sess=form_${name}; Path=/; Secure`);
     return {
       ok: true,
       user: { name, avatar: `${IMG}/avatars/tester.png` },
@@ -641,9 +697,9 @@ export default {
   },
 
   // QR and Device login start
-  loginStart(ctx) {
+  async loginStart(ctx) {
     const state = `state-${ctx.crypto.sha256(`${ctx.instanceId}-${Date.now()}`).slice(0, 12)}`;
-    ctx.storage.set(`poll_${state}`, 0);
+    await ctx.storage.set(`poll_${state}`, 0);
     if (ctx.config.authFlow === 'device') {
       return {
         url: 'https://api.reference.invalid/activate',
@@ -661,25 +717,25 @@ export default {
   },
 
   // QR and Device login poll: pending -> scanned -> done (or expired)
-  loginPoll(ctx, { state }) {
+  async loginPoll(ctx, { state }) {
     if (state === 'expired-state') {
       return { status: 'expired' };
     }
     const key = `poll_${state}`;
-    const step = (ctx.storage.get(key) || 0) + 1;
-    ctx.storage.set(key, step);
+    const step = ((await ctx.storage.get(key)) || 0) + 1;
+    await ctx.storage.set(key, step);
     if (step === 1) return { status: 'pending' };
     if (step === 2) return { status: 'scanned' };
-    ctx.storage.set('authToken', `qr-token-${state}`);
-    ctx.cookies.set('https://api.reference.invalid/', `ref_sess=qr_${state}; Path=/; Secure`);
+    await ctx.storage.set('authToken', `qr-token-${state}`);
+    await ctx.cookies.set('https://api.reference.invalid/', `ref_sess=qr_${state}; Path=/; Secure`);
     return {
       status: 'done',
       user: { name: '扫码用户', avatar: `${IMG}/avatars/qr.png` },
     };
   },
 
-  logout(ctx) {
-    ctx.storage.remove('authToken');
-    ctx.cookies.clear();
+  async logout(ctx) {
+    await ctx.storage.remove('authToken');
+    await ctx.cookies.clear();
   },
 };
