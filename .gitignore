@@ -11,3 +11,14 @@ player/app/build/
 player/.cxx/
 player/app/.cxx/
 proto/samples/
+
+host/.build/
+host/.cache/
+host/build/
+host/Depth3DHost.xcodeproj/
+host/Experiments/depth-offload/.venv/
+host/Experiments/depth-offload/build/
+host/Experiments/depth-offload/*.mlpackage/
+host/Experiments/depth-offload/*.mlmodelc/
+*.xcuserstate
+xcuserdata/

@@ -1,0 +1,798 @@
+import Darwin
+import Foundation
+
+/// A local folder mount exposed under `/<mountName>/` in the unified WebDAV server.
+public struct WebDAVMount: Equatable, Sendable {
+    public let name: String
+    public let rootURL: URL
+
+    public init(name: String, rootURL: URL) {
+        self.name = name
+        self.rootURL = rootURL.standardizedFileURL
+    }
+}
+
+/// Pure, unit-testable handler for read-only WebDAV requests (`OPTIONS`, `PROPFIND`, `HEAD`, `GET` + `Range`).
+/// Handles virtual root listing, local folders (with strict path containment), and optional proxied rclone backends.
+public final class WebDAVHandler: @unchecked Sendable {
+    public enum StreamPlan: Sendable {
+        case immediate(HTTPResponse)
+        case localFileRange(
+            statusCode: Int,
+            headers: [(String, String)],
+            fileURL: URL,
+            offset: UInt64,
+            length: UInt64,
+            includeBody: Bool
+        )
+        case proxyRclone(
+            endpoint: RcloneBackendEndpoint,
+            mountName: String,
+            subpath: String,
+            method: String,
+            headers: [String: String],
+            body: Data
+        )
+    }
+
+    private let lock = NSLock()
+    private var credentials: WebDAVCredentials
+    private var localMounts: [WebDAVMount]
+    private var rcloneManager: RcloneBridgeManager?
+
+    public init(
+        credentials: WebDAVCredentials,
+        localMounts: [WebDAVMount] = [],
+        rcloneManager: RcloneBridgeManager? = nil
+    ) {
+        self.credentials = credentials
+        self.localMounts = localMounts
+        self.rcloneManager = rcloneManager
+    }
+
+    public func updateConfiguration(credentials: WebDAVCredentials? = nil, localMounts: [WebDAVMount]? = nil) {
+        lock.lock()
+        if let credentials { self.credentials = credentials }
+        if let localMounts { self.localMounts = localMounts }
+        lock.unlock()
+    }
+
+    public func route(_ request: HTTPRequest) -> StreamPlan {
+        lock.lock()
+        let creds = credentials
+        let mounts = localMounts
+        let rclone = rcloneManager
+        lock.unlock()
+
+        // Enforce HTTP Basic Auth on every request.
+        guard WebDAVAuth.verify(authorizationHeader: request.header("authorization"), credentials: creds) else {
+            return .immediate(HTTPResponse(
+                statusCode: 401,
+                headers: [
+                    ("WWW-Authenticate", "Basic realm=\"depth3d\""),
+                    ("Content-Type", "text/plain; charset=utf-8")
+                ],
+                body: Data("Unauthorized".utf8)
+            ))
+        }
+
+        switch request.method {
+        case "OPTIONS":
+            return .immediate(HTTPResponse(
+                statusCode: 200,
+                headers: [
+                    ("DAV", "1"),
+                    ("Allow", "OPTIONS, PROPFIND, GET, HEAD"),
+                    ("Accept-Ranges", "bytes")
+                ]
+            ))
+        case "PROPFIND", "GET", "HEAD":
+            break
+        default:
+            return .immediate(HTTPResponse(
+                statusCode: 405,
+                headers: [("Allow", "OPTIONS, PROPFIND, GET, HEAD")],
+                body: Data("Read-only WebDAV server".utf8)
+            ))
+        }
+
+        guard let resolved = WebDAVPathSanitizer.resolve(request.path) else {
+            return .immediate(HTTPResponse(statusCode: 400, body: Data("Invalid path".utf8)))
+        }
+
+        // Virtual root `/`
+        if resolved.isRoot {
+            if request.method == "PROPFIND" {
+                return .immediate(handleVirtualRootPropfind(
+                    depthHeader: request.header("depth"),
+                    localMounts: mounts,
+                    cloudEndpoints: rclone?.activeEndpoints() ?? []
+                ))
+            }
+            if request.method == "HEAD" {
+                return .immediate(HTTPResponse(statusCode: 200, headers: [("Content-Type", "text/plain; charset=utf-8")]))
+            }
+            return .immediate(HTTPResponse(
+                statusCode: 200,
+                headers: [("Content-Type", "text/plain; charset=utf-8")],
+                body: Data("depth3d Media WebDAV\n".utf8)
+            ))
+        }
+
+        guard let mountName = resolved.mountName else {
+            return .immediate(HTTPResponse(statusCode: 404))
+        }
+
+        // 1. Check local folder mounts first
+        if let mount = mounts.first(where: { $0.name == mountName }) {
+            return handleLocalMount(
+                mount: mount,
+                relativeSegments: resolved.relativeSegments,
+                request: request
+            )
+        }
+
+        // 2. Check active rclone cloud remote mounts
+        if let endpoint = rclone?.endpoint(forMountName: mountName) {
+            let encodedSub = resolved.relativeSegments.isEmpty
+                ? "/"
+                : "/" + resolved.relativeSegments.map(WebDAVPathSanitizer.encodeSegment).joined(separator: "/")
+                    + (request.path.hasSuffix("/") ? "/" : "")
+            return .proxyRclone(
+                endpoint: endpoint,
+                mountName: mountName,
+                subpath: encodedSub,
+                method: request.method,
+                headers: request.headers,
+                body: request.body
+            )
+        }
+
+        return .immediate(HTTPResponse(statusCode: 404))
+    }
+
+    private func handleVirtualRootPropfind(
+        depthHeader: String?,
+        localMounts: [WebDAVMount],
+        cloudEndpoints: [RcloneBackendEndpoint]
+    ) -> HTTPResponse {
+        let depth = (depthHeader ?? "1").trimmingCharacters(in: .whitespaces)
+        var entries: [WebDAVEntry] = [
+            WebDAVEntry(href: "/", displayName: "", isDirectory: true, lastModified: Date())
+        ]
+        if depth != "0" {
+            for mount in localMounts {
+                entries.append(WebDAVEntry(
+                    href: WebDAVPathSanitizer.encodeHref(segments: [mount.name], isDirectory: true),
+                    displayName: mount.name,
+                    isDirectory: true,
+                    lastModified: Date()
+                ))
+            }
+            for cloud in cloudEndpoints {
+                entries.append(WebDAVEntry(
+                    href: WebDAVPathSanitizer.encodeHref(segments: [cloud.mountName], isDirectory: true),
+                    displayName: cloud.mountName,
+                    isDirectory: true,
+                    lastModified: Date()
+                ))
+            }
+        }
+        let xml = WebDAVXMLBuilder.buildMultiStatus(entries)
+        return HTTPResponse(
+            statusCode: 207,
+            headers: [("Content-Type", "application/xml; charset=utf-8")],
+            body: xml
+        )
+    }
+
+    private func handleLocalMount(
+        mount: WebDAVMount,
+        relativeSegments: [String],
+        request: HTTPRequest
+    ) -> StreamPlan {
+        let fm = FileManager.default
+        let rootReal = mount.rootURL.resolvingSymlinksInPath()
+        var targetURL = rootReal
+        for seg in relativeSegments {
+            targetURL.appendPathComponent(seg, isDirectory: false)
+        }
+        let resolvedTarget = targetURL.resolvingSymlinksInPath()
+
+        // Strictly prevent escaping the shared root folder via symlinks or traversal.
+        let rootPrefix = rootReal.path.hasSuffix("/") ? rootReal.path : rootReal.path + "/"
+        guard resolvedTarget.path == rootReal.path || resolvedTarget.path.hasPrefix(rootPrefix) else {
+            return .immediate(HTTPResponse(statusCode: 403))
+        }
+
+        var isDirObjC: ObjCBool = false
+        guard fm.fileExists(atPath: resolvedTarget.path, isDirectory: &isDirObjC) else {
+            return .immediate(HTTPResponse(statusCode: 404))
+        }
+        let isDir = isDirObjC.boolValue
+
+        if request.method == "PROPFIND" {
+            return .immediate(handleLocalPropfind(
+                mount: mount,
+                relativeSegments: relativeSegments,
+                targetURL: resolvedTarget,
+                isDirectory: isDir,
+                depthHeader: request.header("depth")
+            ))
+        }
+
+        guard !isDir else {
+            return .immediate(HTTPResponse(statusCode: 405, headers: [("Allow", "OPTIONS, PROPFIND")]))
+        }
+
+        let attrs = (try? fm.attributesOfItem(atPath: resolvedTarget.path)) ?? [:]
+        let fileSize = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+        let contentType = WebDAVXMLBuilder.mimeType(forPath: resolvedTarget.path)
+        let includeBody = (request.method == "GET")
+
+        if let rangeHeader = request.header("range") {
+            switch ByteRangeParser.parse(rangeHeader, fileSize: fileSize) {
+            case .satisfied(let start, let end):
+                let length = (end - start) + 1
+                return .localFileRange(
+                    statusCode: 206,
+                    headers: [
+                        ("Content-Type", contentType),
+                        ("Accept-Ranges", "bytes"),
+                        ("Content-Range", "bytes \(start)-\(end)/\(fileSize)"),
+                        ("Content-Length", String(length))
+                    ],
+                    fileURL: resolvedTarget,
+                    offset: start,
+                    length: length,
+                    includeBody: includeBody
+                )
+            case .unsatisfiable:
+                return .immediate(HTTPResponse(
+                    statusCode: 416,
+                    headers: [
+                        ("Content-Range", "bytes */\(fileSize)"),
+                        ("Accept-Ranges", "bytes")
+                    ]
+                ))
+            case .invalid:
+                // RFC 9110: ignore syntactically invalid Range header and serve full resource.
+                break
+            }
+        }
+
+        return .localFileRange(
+            statusCode: 200,
+            headers: [
+                ("Content-Type", contentType),
+                ("Accept-Ranges", "bytes"),
+                ("Content-Length", String(fileSize))
+            ],
+            fileURL: resolvedTarget,
+            offset: 0,
+            length: fileSize,
+            includeBody: includeBody
+        )
+    }
+
+    private func handleLocalPropfind(
+        mount: WebDAVMount,
+        relativeSegments: [String],
+        targetURL: URL,
+        isDirectory: Bool,
+        depthHeader: String?
+    ) -> HTTPResponse {
+        let fm = FileManager.default
+        let depth = (depthHeader ?? "1").trimmingCharacters(in: .whitespaces)
+        let fullSegments = [mount.name] + relativeSegments
+
+        let selfAttrs = (try? fm.attributesOfItem(atPath: targetURL.path)) ?? [:]
+        let selfSize = (selfAttrs[.size] as? NSNumber)?.uint64Value
+        let selfMod = selfAttrs[.modificationDate] as? Date
+        let selfName = relativeSegments.last ?? mount.name
+
+        var entries: [WebDAVEntry] = [
+            WebDAVEntry(
+                href: WebDAVPathSanitizer.encodeHref(segments: fullSegments, isDirectory: isDirectory),
+                displayName: selfName,
+                isDirectory: isDirectory,
+                contentLength: isDirectory ? nil : selfSize,
+                lastModified: selfMod,
+                contentType: isDirectory ? nil : WebDAVXMLBuilder.mimeType(forPath: targetURL.path)
+            )
+        ]
+
+        if isDirectory && depth != "0" {
+            let children = (try? fm.contentsOfDirectory(
+                at: targetURL,
+                includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .isHiddenKey],
+                options: [.skipsHiddenFiles]
+            )) ?? []
+
+            let sorted = children.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+            for child in sorted {
+                let name = child.lastPathComponent
+                if name.hasPrefix(".") { continue }
+                let vals = try? child.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey])
+                let childIsDir = vals?.isDirectory ?? false
+                let childSize = vals?.fileSize.map { UInt64(max(0, $0)) }
+                let childMod = vals?.contentModificationDate
+                entries.append(WebDAVEntry(
+                    href: WebDAVPathSanitizer.encodeHref(segments: fullSegments + [name], isDirectory: childIsDir),
+                    displayName: name,
+                    isDirectory: childIsDir,
+                    contentLength: childIsDir ? nil : childSize,
+                    lastModified: childMod,
+                    contentType: childIsDir ? nil : WebDAVXMLBuilder.mimeType(forPath: child.path)
+                ))
+            }
+        }
+
+        let xml = WebDAVXMLBuilder.buildMultiStatus(entries)
+        return HTTPResponse(
+            statusCode: 207,
+            headers: [("Content-Type", "application/xml; charset=utf-8")],
+            body: xml
+        )
+    }
+}
+
+/// Embedded read-only HTTP/1.1 WebDAV server with chunked streaming `Range` support
+/// and transparent loopback proxying for user-configured rclone cloud drives.
+public final class WebDAVServer: @unchecked Sendable {
+    public let handler: WebDAVHandler
+    private let lock = NSLock()
+    private var listenFD: Int32 = -1
+    private var boundPort: UInt16 = 0
+    private var running = false
+    private let acceptQueue = DispatchQueue(label: "dev.depth3d.host.webdav.accept", qos: .userInitiated)
+    private let workerQueue = DispatchQueue(label: "dev.depth3d.host.webdav.worker", qos: .userInitiated, attributes: .concurrent)
+
+    public var port: UInt16 {
+        lock.lock()
+        defer { lock.unlock() }
+        return boundPort
+    }
+
+    public var isRunning: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return running
+    }
+
+    public init(handler: WebDAVHandler) {
+        self.handler = handler
+    }
+
+    deinit {
+        stop()
+    }
+
+    /// Starts the WebDAV server on `preferredPort` (default 8890). If `preferredPort` is already
+    /// occupied (e.g., an existing `serve-gdrive.sh` instance), automatically falls back to the
+    /// next available port so Host never fails to start or interferes with external services.
+    @discardableResult
+    public func start(preferredPort: UInt16 = HostPortDefaults.defaultWebDAVPort) throws -> UInt16 {
+        lock.lock()
+        if running {
+            let p = boundPort
+            lock.unlock()
+            return p
+        }
+        lock.unlock()
+
+        var candidates: [UInt16] = [preferredPort]
+        if preferredPort != 0 {
+            for offset: UInt16 in 1...15 {
+                let candidate = preferredPort &+ offset
+                if candidate >= 1024 {
+                    candidates.append(candidate)
+                }
+            }
+            candidates.append(0)
+        }
+
+        var lastError: Error = ControlHTTPSServerError.bindFailed(preferredPort, EADDRINUSE)
+        for candidate in candidates {
+            do {
+                let (fd, actualPort) = try openListeningSocket(port: candidate)
+                lock.lock()
+                self.listenFD = fd
+                self.boundPort = actualPort
+                self.running = true
+                lock.unlock()
+
+                if candidate != preferredPort && preferredPort != 0 {
+                    HostLogger.warning("WebDAV port \(preferredPort) occupied; listening on fallback port \(actualPort)", category: "media")
+                } else {
+                    HostLogger.info("WebDAV media server listening on port \(actualPort)", category: "media")
+                }
+
+                acceptQueue.async { [weak self] in
+                    self?.acceptLoop(listenFD: fd)
+                }
+                return actualPort
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+
+    public func stop() {
+        lock.lock()
+        let fd = listenFD
+        listenFD = -1
+        boundPort = 0
+        running = false
+        lock.unlock()
+
+        if fd >= 0 {
+            Darwin.shutdown(fd, SHUT_RDWR)
+            Darwin.close(fd)
+            HostLogger.info("WebDAV media server stopped", category: "media")
+        }
+    }
+
+    private func openListeningSocket(port: UInt16) throws -> (Int32, UInt16) {
+        var fd = Darwin.socket(AF_INET6, SOCK_STREAM, 0)
+        if fd >= 0 {
+            var one: Int32 = 1
+            var zero: Int32 = 0
+            if port != 0 {
+                setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+            }
+            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, socklen_t(MemoryLayout<Int32>.size))
+            var addr = sockaddr_in6()
+            addr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+            addr.sin6_family = sa_family_t(AF_INET6)
+            addr.sin6_addr = in6addr_any
+            addr.sin6_port = port.bigEndian
+            let res = withUnsafePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+                }
+            }
+            if res == 0, Darwin.listen(fd, 64) == 0 {
+                var bound = sockaddr_in6()
+                var len = socklen_t(MemoryLayout<sockaddr_in6>.size)
+                _ = withUnsafeMutablePointer(to: &bound) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        Darwin.getsockname(fd, $0, &len)
+                    }
+                }
+                return (fd, UInt16(bigEndian: bound.sin6_port))
+            }
+            let err = errno
+            Darwin.close(fd)
+            if err == EADDRINUSE {
+                throw ControlHTTPSServerError.bindFailed(port, err)
+            }
+        }
+
+        fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw ControlHTTPSServerError.socketCreationFailed(errno) }
+        var one: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_addr.s_addr = INADDR_ANY.bigEndian
+        addr.sin_port = port.bigEndian
+        let res = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard res == 0 else {
+            let err = errno
+            Darwin.close(fd)
+            throw ControlHTTPSServerError.bindFailed(port, err)
+        }
+        guard Darwin.listen(fd, 64) == 0 else {
+            let err = errno
+            Darwin.close(fd)
+            throw ControlHTTPSServerError.listenFailed(err)
+        }
+        var bound = sockaddr_in()
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &bound) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.getsockname(fd, $0, &len)
+            }
+        }
+        return (fd, UInt16(bigEndian: bound.sin_port))
+    }
+
+    private func acceptLoop(listenFD: Int32) {
+        while true {
+            var storage = sockaddr_storage()
+            var len = socklen_t(MemoryLayout<sockaddr_storage>.size)
+            let clientFD = withUnsafeMutablePointer(to: &storage) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.accept(listenFD, $0, &len)
+                }
+            }
+            if clientFD < 0 {
+                if errno == EINTR { continue }
+                break
+            }
+            var one: Int32 = 1
+            setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+            var timeout = timeval(tv_sec: 30, tv_usec: 0)
+            setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+            setsockopt(clientFD, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
+            workerQueue.async { [weak self] in
+                self?.handleClient(fd: clientFD)
+            }
+        }
+    }
+
+    private func handleClient(fd: Int32) {
+        defer { Darwin.close(fd) }
+
+        guard let request = readPlainHTTPRequest(fd: fd) else {
+            _ = writeAll(fd: fd, data: HTTPResponse(statusCode: 400).serialize())
+            return
+        }
+
+        switch handler.route(request) {
+        case .immediate(let response):
+            _ = writeAll(fd: fd, data: response.serialize(includeBody: request.method != "HEAD"))
+
+        case .localFileRange(let statusCode, let headers, let fileURL, let offset, let length, let includeBody):
+            streamLocalFile(
+                fd: fd,
+                statusCode: statusCode,
+                headers: headers,
+                fileURL: fileURL,
+                offset: offset,
+                length: length,
+                includeBody: includeBody
+            )
+
+        case .proxyRclone(let endpoint, let mountName, let subpath, let method, let reqHeaders, let body):
+            proxyToRclone(
+                clientFD: fd,
+                endpoint: endpoint,
+                mountName: mountName,
+                subpath: subpath,
+                method: method,
+                headers: reqHeaders,
+                body: body
+            )
+        }
+    }
+
+    private func streamLocalFile(
+        fd: Int32,
+        statusCode: Int,
+        headers: [(String, String)],
+        fileURL: URL,
+        offset: UInt64,
+        length: UInt64,
+        includeBody: Bool
+    ) {
+        guard let handle = try? FileHandle(forReadingFrom: fileURL) else {
+            _ = writeAll(fd: fd, data: HTTPResponse(statusCode: 404).serialize())
+            return
+        }
+        defer { try? handle.close() }
+
+        let headResp = HTTPResponse(statusCode: statusCode, headers: headers)
+        guard writeAll(fd: fd, data: headResp.serialize(includeBody: false)) else { return }
+        guard includeBody && length > 0 else { return }
+
+        do {
+            try handle.seek(toOffset: offset)
+        } catch {
+            return
+        }
+
+        var remaining = length
+        let chunkSize = 64 * 1024
+        while remaining > 0 {
+            let toRead = Int(min(UInt64(chunkSize), remaining))
+            guard let chunk = try? handle.read(upToCount: toRead), !chunk.isEmpty else {
+                break
+            }
+            if !writeAll(fd: fd, data: chunk) {
+                break
+            }
+            remaining -= UInt64(chunk.count)
+        }
+    }
+
+    private func proxyToRclone(
+        clientFD: Int32,
+        endpoint: RcloneBackendEndpoint,
+        mountName: String,
+        subpath: String,
+        method: String,
+        headers: [String: String],
+        body: Data
+    ) {
+        let upFD = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard upFD >= 0 else {
+            _ = writeAll(fd: clientFD, data: HTTPResponse(statusCode: 502).serialize())
+            return
+        }
+        defer { Darwin.close(upFD) }
+
+        var one: Int32 = 1
+        setsockopt(upFD, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+        var timeout = timeval(tv_sec: 30, tv_usec: 0)
+        setsockopt(upFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(upFD, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        addr.sin_port = endpoint.port.bigEndian
+
+        let connected = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(upFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard connected == 0 else {
+            _ = writeAll(fd: clientFD, data: HTTPResponse(statusCode: 502).serialize())
+            return
+        }
+
+        // Forward request with internal loopback auth and `Connection: close`.
+        var reqHead = "\(method) \(subpath) HTTP/1.1\r\n"
+        reqHead += "Host: 127.0.0.1:\(endpoint.port)\r\n"
+        reqHead += "Authorization: \(endpoint.authHeader)\r\n"
+        reqHead += "Connection: close\r\n"
+        for key in ["depth", "range", "content-type", "accept"] {
+            if let val = headers[key] {
+                reqHead += "\(key): \(val)\r\n"
+            }
+        }
+        if !body.isEmpty {
+            reqHead += "Content-Length: \(body.count)\r\n"
+        }
+        reqHead += "\r\n"
+
+        var reqData = Data(reqHead.utf8)
+        reqData.append(body)
+        guard writeAll(fd: upFD, data: reqData) else { return }
+
+        if method == "PROPFIND" {
+            // Buffer XML response (small) and rewrite `<href>` to include `/<mountName>`.
+            var rawResp = Data()
+            var buf = [UInt8](repeating: 0, count: 16384)
+            while true {
+                let n = Darwin.recv(upFD, &buf, buf.count, 0)
+                if n > 0 {
+                    rawResp.append(buf, count: n)
+                    if rawResp.count > 8 * 1024 * 1024 { break }
+                } else {
+                    break
+                }
+            }
+            let delim = Data("\r\n\r\n".utf8)
+            guard let split = rawResp.range(of: delim) else {
+                _ = writeAll(fd: clientFD, data: HTTPResponse(statusCode: 502).serialize())
+                return
+            }
+            let headStr = String(data: rawResp.subdata(in: 0..<split.lowerBound), encoding: .utf8) ?? ""
+            var respBody = rawResp.subdata(in: split.upperBound..<rawResp.count)
+            if headStr.lowercased().contains("transfer-encoding: chunked") {
+                respBody = decodeChunkedBody(respBody)
+            }
+            let rewritten = WebDAVXMLBuilder.rewriteProxiedMultiStatusXML(respBody, mountName: mountName)
+            let statusLine = headStr.components(separatedBy: "\r\n").first ?? "HTTP/1.1 207 Multi-Status"
+            let statusCode = statusLine.split(separator: " ").dropFirst().first.flatMap { Int($0) } ?? 207
+            let resp = HTTPResponse(
+                statusCode: statusCode,
+                headers: [("Content-Type", "application/xml; charset=utf-8")],
+                body: rewritten
+            )
+            _ = writeAll(fd: clientFD, data: resp.serialize())
+        } else {
+            // Stream GET/HEAD directly byte-for-byte without buffering multi-GB video files.
+            var buf = [UInt8](repeating: 0, count: 65536)
+            while true {
+                let n = Darwin.recv(upFD, &buf, buf.count, 0)
+                if n > 0 {
+                    if !writeAll(fd: clientFD, data: Data(bytes: buf, count: n)) {
+                        break
+                    }
+                } else if n == 0 {
+                    break
+                } else if errno == EINTR {
+                    continue
+                } else {
+                    break
+                }
+            }
+        }
+    }
+
+    private func decodeChunkedBody(_ data: Data) -> Data {
+        var out = Data()
+        var idx = 0
+        let crlf = Data("\r\n".utf8)
+        while idx < data.count {
+            guard let lineEnd = data.range(of: crlf, in: idx..<data.count) else { break }
+            let sizeLine = String(data: data.subdata(in: idx..<lineEnd.lowerBound), encoding: .utf8)?
+                .split(separator: ";").first?
+                .trimmingCharacters(in: .whitespaces) ?? ""
+            guard let chunkSize = Int(sizeLine, radix: 16), chunkSize > 0 else { break }
+            let dataStart = lineEnd.upperBound
+            let dataEnd = min(data.count, dataStart + chunkSize)
+            out.append(data.subdata(in: dataStart..<dataEnd))
+            idx = dataEnd + 2
+        }
+        return out
+    }
+
+    private func readPlainHTTPRequest(fd: Int32) -> HTTPRequest? {
+        var buffer = Data()
+        var chunk = [UInt8](repeating: 0, count: 8192)
+        var parsedHead: HTTPParser.ParsedHead?
+
+        while true {
+            if parsedHead == nil {
+                do {
+                    parsedHead = try HTTPParser.parseHead(from: buffer)
+                } catch {
+                    return nil
+                }
+            }
+            if let head = parsedHead {
+                let needed = head.bodyStartIndex + head.contentLength
+                if buffer.count >= needed {
+                    let body = buffer.subdata(in: head.bodyStartIndex..<needed)
+                    return HTTPRequest(
+                        method: head.method,
+                        rawTarget: head.target,
+                        headers: head.headers,
+                        body: body
+                    )
+                }
+            }
+
+            let n = Darwin.recv(fd, &chunk, chunk.count, 0)
+            if n > 0 {
+                buffer.append(chunk, count: n)
+            } else if n == 0 {
+                if let head = parsedHead, buffer.count >= head.bodyStartIndex + head.contentLength {
+                    return HTTPRequest(
+                        method: head.method,
+                        rawTarget: head.target,
+                        headers: head.headers,
+                        body: buffer.subdata(in: head.bodyStartIndex..<(head.bodyStartIndex + head.contentLength))
+                    )
+                }
+                return nil
+            } else if errno == EINTR {
+                continue
+            } else {
+                return nil
+            }
+        }
+    }
+
+    private func writeAll(fd: Int32, data: Data) -> Bool {
+        data.withUnsafeBytes { rawBuf in
+            guard let base = rawBuf.baseAddress else { return true }
+            var offset = 0
+            while offset < data.count {
+                let n = Darwin.send(fd, base.advanced(by: offset), data.count - offset, 0)
+                if n > 0 {
+                    offset += n
+                } else if n < 0 && errno == EINTR {
+                    continue
+                } else {
+                    return false
+                }
+            }
+            return true
+        }
+    }
+}

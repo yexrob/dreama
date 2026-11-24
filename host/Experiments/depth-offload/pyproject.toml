@@ -1,0 +1,14 @@
+[project]
+name = "depth3d-host-depth-offload"
+version = "0.1.0"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "coremltools>=8.0",
+    "numpy>=1.26,<2.0",
+    "pillow>=10.0",
+    "torch>=2.4,<2.7",
+    "zipdepth",
+]
+
+[tool.uv.sources]
+zipdepth = { git = "https://github.com/fabiotosi92/ZipDepth", rev = "91f3fd21e131641f51e8d35736d1958350180e3a" }
