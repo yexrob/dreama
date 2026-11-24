@@ -87,7 +87,7 @@ fun AirPlayTakeover(status: AirPlayState.Status) {
         Centered(
             { Icon(WifiIcon, null, Modifier.size(40.dp), tint = Wall.Danger) },
             stringResource(R.string.cast_no_wifi_title),
-            stringResource(R.string.cast_no_wifi_body),
+            stringResource(R.string.airplay_no_wifi_body),
         ) {
             WallButton(stringResource(R.string.action_open_wifi), { openWifiSettings(context) }, kind = ButtonKind.Primary)
         }

@@ -27,9 +27,14 @@ data class DiscoveredHost(
     val pairMode: String? = null,
     val mediaPort: Int? = null,
     val protocolVersion: Int = HttpHostProtocolClient.PROTOCOL_VERSION,
+    val gsId: String? = null,
 ) {
     val autoPairSupported: Boolean
         get() = pairMode.equals("auto", ignoreCase = true)
+
+    /** Unique key per announced endpoint so a spoofed mDNS id at another IP cannot evict a real Host (#7). */
+    val endpointKey: String
+        get() = "${id.lowercase()}@${RawComputer.normalizeAddress(address)}:$controlPort"
 
     companion object {
         const val SERVICE_TYPE = "_depth3d-host._tcp."
@@ -51,6 +56,7 @@ data class DiscoveredHost(
             val gsPort = txt["gs"]?.trim()?.toIntOrNull()?.takeIf { it in 1..65535 } ?: NvHTTP.DEFAULT_HTTP_PORT
             val pairMode = txt["pair"]?.trim()?.takeIf { it.isNotEmpty() }
             val mediaPort = txt["media"]?.trim()?.toIntOrNull()?.takeIf { it in 1..65535 }
+            val gsId = txt["gsid"]?.trim()?.takeIf { it.isNotEmpty() }
             return DiscoveredHost(
                 id = id,
                 name = name,
@@ -60,6 +66,7 @@ data class DiscoveredHost(
                 pairMode = pairMode,
                 mediaPort = mediaPort,
                 protocolVersion = version,
+                gsId = gsId,
             )
         }
     }
@@ -259,17 +266,22 @@ class HostDiscovery(context: Context) {
     companion object {
         /**
          * The address to dial out of everything mDNS answered with. The system reports addresses
-         * as they arrive, and the first answer is often only the IPv6 link-local one, which cannot
-         * be dialled without a scope. So: IPv4 first, then a routable IPv6, then a link-local one
-         * only when it carries its interface; otherwise null, and the next update is waited for.
+         * as they arrive, and the first answer is often only IPv6 link-local (`fe80::`), which
+         * OkHttp 5 cannot parse or dial even with a `%scope` zone id (#4). So return IPv4 first,
+         * then a routable (non-link-local) IPv6, and otherwise null until a routable address arrives.
          */
         internal fun chooseAddress(addrs: List<InetAddress>): String? {
             val usable = addrs.filter { !it.isLoopbackAddress && !it.isAnyLocalAddress && !it.isMulticastAddress }
             usable.firstOrNull { it is Inet4Address && !it.isLinkLocalAddress }?.let { return it.hostAddress }
-            usable.firstOrNull { it is Inet6Address && !it.isLinkLocalAddress }?.let { return it.hostAddress }
-            return usable.firstOrNull { it is Inet6Address && it.isLinkLocalAddress && (it.scopeId != 0 || it.scopedInterface != null) }
-                ?.hostAddress
+            return usable.firstOrNull { it is Inet6Address && !it.isLinkLocalAddress }?.hostAddress
         }
+
+        /**
+         * Deduplicates announced services by `(id, address, controlPort)` instead of `id` alone so
+         * an imposter copying a real Host's mDNS `id` at another IP cannot evict the real Host (#7).
+         */
+        internal fun deduplicateEndpoints(hosts: Collection<DiscoveredHost>): List<DiscoveredHost> =
+            hosts.distinctBy { it.endpointKey }
     }
 
     private fun removeCallbackLocked(key: String) {
@@ -283,6 +295,6 @@ class HostDiscovery(context: Context) {
     }
 
     private fun publishLocked() {
-        _hosts.value = byServiceName.values.distinctBy { it.id }
+        _hosts.value = deduplicateEndpoints(byServiceName.values)
     }
 }

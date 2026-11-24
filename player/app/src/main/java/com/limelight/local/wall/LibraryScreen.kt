@@ -113,8 +113,9 @@ fun LibraryScreen(model: WallModel, nav: WallNav) {
         Column(Modifier.offset(40.dp, 120.dp).width(392.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             for (s in sources) {
                 val count = (model.shelves[s.source.id] as? Load.Ready)?.value?.firstOrNull()?.category?.count
-                val countSuffix = count?.let { stringResource(R.string.library_count_suffix, it) } ?: ""
-                ListRow(s.source.name, sub = s.source.description + countSuffix,
+                val sub = count?.let { stringResource(R.string.library_label_with_count, s.source.description, it) }
+                    ?: s.source.description
+                ListRow(s.source.name, sub = sub,
                     lead = s.icon(), selected = s == selected) { selectedId = s.source.id }
             }
             if (sources.none { it.source.kind == SourceKind.WEBDAV }) {
@@ -257,8 +258,9 @@ fun GridScreen(model: WallModel, nav: WallNav, page: Page.Grid) {
                 modifier = Modifier.weight(1f, fill = false))
             val n = page.count ?: listing.items.size.takeIf { listing.next == null && it > 0 }
             src?.let {
-                val countSuffix = n?.let { c -> stringResource(R.string.library_count_suffix, c) } ?: ""
-                Text(it.source.name + countSuffix, style = WallType.Caption, color = Wall.Text2)
+                val label = n?.let { c -> stringResource(R.string.library_label_with_count, it.source.name, c) }
+                    ?: it.source.name
+                Text(label, style = WallType.Caption, color = Wall.Text2)
             }
         }
     }

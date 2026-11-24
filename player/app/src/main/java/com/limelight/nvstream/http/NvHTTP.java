@@ -328,6 +328,89 @@ public class NvHTTP {
         }
     }
     
+    /**
+     * Strictly verifies over HTTPS ONLY (no HTTP fallback, no system CA fallback) that the
+     * GameStream server at this address presents the exact pinned {@link #serverCert}, reports
+     * PairStatus == PAIRED, and matches {@code expectedUuid} when provided (#2).
+     */
+    public boolean verifyPinnedPairedServer(String expectedUuid) {
+        if (serverCert == null || cancelled) {
+            return false;
+        }
+        final X509Certificate pinned = serverCert;
+        X509TrustManager exactTrust = new X509TrustManager() {
+            @Override
+            public void checkClientTrusted(X509Certificate[] chain, String authType) {
+                throw new IllegalStateException("Should never be called");
+            }
+
+            @Override
+            public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+                if (chain == null || chain.length == 0 || !pinned.equals(chain[0])) {
+                    throw new CertificateException("Server certificate does not match pinned paired cert");
+                }
+            }
+
+            @Override
+            public X509Certificate[] getAcceptedIssuers() {
+                return new X509Certificate[0];
+            }
+        };
+        HostnameVerifier exactHv = new HostnameVerifier() {
+            @Override
+            public boolean verify(String hostname, SSLSession session) {
+                try {
+                    Certificate[] certs = session.getPeerCertificates();
+                    return certs.length >= 1 && pinned.equals(certs[0]);
+                } catch (SSLPeerUnverifiedException e) {
+                    return false;
+                }
+            }
+        };
+
+        try {
+            HttpUrl httpsUrl = getHttpsUrl(true);
+            SSLContext sc = SSLContext.getInstance("TLS");
+            sc.init(new KeyManager[] { keyManager }, new TrustManager[] { exactTrust }, new SecureRandom());
+            OkHttpClient strictClient = httpClientLongConnectTimeout.newBuilder()
+                    .sslSocketFactory(sc.getSocketFactory(), exactTrust)
+                    .hostnameVerifier(exactHv)
+                    .build();
+
+            HttpUrl completeUrl = getCompleteUrl(httpsUrl, "serverinfo", null);
+            Request request = new Request.Builder().url(completeUrl).get().build();
+            Call call = strictClient.newCall(request);
+            activeCall.set(call);
+            if (cancelled) {
+                call.cancel();
+                activeCall.compareAndSet(call, null);
+                return false;
+            }
+            String resp;
+            try (Response response = call.execute()) {
+                if (!response.isSuccessful() || response.body() == null) {
+                    return false;
+                }
+                resp = response.body().string();
+            } finally {
+                activeCall.compareAndSet(call, null);
+            }
+
+            if (getPairState(resp) != PairingManager.PairState.PAIRED) {
+                return false;
+            }
+            if (expectedUuid != null && !expectedUuid.isEmpty()) {
+                String actualUuid = getXmlString(resp, "uniqueid", false);
+                if (actualUuid == null || !expectedUuid.equalsIgnoreCase(actualUuid)) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     public String getServerInfo(boolean likelyOnline) throws IOException, XmlPullParserException {
         String resp;
 

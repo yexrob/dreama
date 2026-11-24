@@ -367,6 +367,9 @@ fun PcCard(
     val statusText = when {
         !computer.streamReady && computer.streamNotReadyReason != null ->
             stringResource(R.string.stream_status_not_ready, computer.streamNotReadyReason!!)
+        computer.isPairedOffline -> stringResource(R.string.stream_status_paired_offline)
+        computer.needsHostTrustSetup && computer.isOnline ->
+            stringResource(R.string.stream_status_needs_host_setup)
         computer.status == ComputerStatus.ONLINE_STREAMING -> stringResource(R.string.stream_status_streaming)
         computer.status == ComputerStatus.ONLINE_PAIRED -> stringResource(R.string.stream_status_paired)
         computer.status == ComputerStatus.ONLINE_UNPAIRED ->
@@ -377,6 +380,8 @@ fun PcCard(
     }
     val subColor = when {
         !computer.streamReady -> Wall.Danger
+        computer.isPairedOffline -> Wall.Text2
+        computer.needsHostTrustSetup && computer.isOnline -> Wall.Accent
         computer.status == ComputerStatus.ONLINE_STREAMING -> Wall.Accent
         hovered -> Wall.Text
         dimmed -> Wall.Text3
@@ -736,11 +741,17 @@ private fun PcActionSheet(
                     ComputerStatus.ONLINE_STREAMING -> {
                         ListRow(stringResource(R.string.pc_action_resume), lead = WallIcons.Play, onClick = onConnect)
                         ListRow(stringResource(R.string.pc_action_apps), lead = WallIcons.Grid, onClick = onApps)
+                        if (computer.needsHostTrustSetup) {
+                            ListRow(stringResource(R.string.pc_action_complete_host_setup), lead = WallIcons.Computer, onClick = onPair)
+                        }
                         ListRow(stringResource(R.string.pc_action_quit_app), lead = WallIcons.Power, onClick = onQuitApp)
                     }
                     ComputerStatus.ONLINE_PAIRED -> {
                         ListRow(stringResource(R.string.pc_action_connect), lead = WallIcons.Play, onClick = onConnect)
                         ListRow(stringResource(R.string.pc_action_apps), lead = WallIcons.Grid, onClick = onApps)
+                        if (computer.needsHostTrustSetup) {
+                            ListRow(stringResource(R.string.pc_action_complete_host_setup), lead = WallIcons.Computer, onClick = onPair)
+                        }
                     }
                     ComputerStatus.ONLINE_UNPAIRED -> {
                         ListRow(stringResource(R.string.pc_action_pair), lead = WallIcons.Computer, onClick = onPair)

@@ -172,7 +172,7 @@ class ComputerListStateTest {
             pairMode = "auto",
         )
         val hostInfos = mapOf(
-            "host-uuid-1" to HostInfo(
+            host1.endpointKey to HostInfo(
                 version = 1,
                 name = "书房 Mac Pro",
                 id = "host-uuid-1",
@@ -185,7 +185,7 @@ class ComputerListStateTest {
         val merged = ComputerListMerger.merge(
             computers = listOf(gs1, gs2),
             discoveredHosts = listOf(host1, host2, hostOnly),
-            hostInfos = hostInfos,
+            hostInfosByEndpoint = hostInfos,
         )
 
         assertEquals(3, merged.size)
@@ -205,7 +205,7 @@ class ComputerListStateTest {
         assertEquals(ComputerStatus.ONLINE_UNPAIRED, second.status)
         assertTrue(second.autoPairSupported)
 
-        val third = merged.first { it.id == "host:brand-new-host" }
+        val third = merged.first { it.id == "host:${hostOnly.endpointKey}" }
         assertEquals("新发现的电脑", third.name)
         assertEquals(ComputerStatus.ONLINE_UNPAIRED, third.status)
         assertFalse(third.isSaved)
@@ -318,88 +318,187 @@ class ComputerListStateTest {
     }
 
     @Test
-    fun s5_mergesNewLiveHostWithLegacyOfflineDirectPairedServiceOnSameAddressOrId() {
+    fun r4_1_existingPairedComputerWithHostAndNoTrustFlagsNeedsHostTrustSetup() {
+        val host = DiscoveredHost(
+            id = "host-mac-1",
+            name = "书房 MacBook",
+            address = "192.168.1.50",
+            controlPort = 47990,
+            gsPort = 47989,
+            pairMode = "auto",
+            mediaPort = 8088,
+        )
+        // Real-world upgrade scenario: GameStream uuid != host.id, already paired with saved serverCert
+        val pairedGs = rawComputer(
+            uuid = "gs-sunshine-9999",
+            name = "MacBook",
+            state = ComputerDetails.State.ONLINE,
+            pairState = PairingManager.PairState.PAIRED,
+            activeAddress = "192.168.1.50",
+            activePort = 47989,
+        ).copy(serverCertFingerprint = "gs-cert-fp-1")
+
+        // Before HostPairedTrust exists -> merged into 1 row, ONLINE_PAIRED, needsHostTrustSetup = true (#1)
+        val beforeTrust = ComputerListMerger.merge(
+            computers = listOf(pairedGs),
+            discoveredHosts = listOf(host),
+            observedFingerprintsByEndpoint = mapOf(host.endpointKey to "host-fp-1"),
+            pairedTrusts = emptyMap(),
+        )
+        assertEquals(1, beforeTrust.size)
+        val upgradeItem = beforeTrust.single()
+        assertEquals("gs-sunshine-9999", upgradeItem.id)
+        assertEquals(ComputerStatus.ONLINE_PAIRED, upgradeItem.status)
+        assertTrue("#1: Upgraded paired computer without HostPairedTrust must flag needsHostTrustSetup", upgradeItem.needsHostTrustSetup)
+        assertFalse(upgradeItem.isPairedOffline)
+
+        // After HostPairedTrust is saved -> needsHostTrustSetup becomes false!
+        val afterTrust = ComputerListMerger.merge(
+            computers = listOf(pairedGs),
+            discoveredHosts = listOf(host),
+            observedFingerprintsByEndpoint = mapOf(host.endpointKey to "host-fp-1"),
+            pairedTrusts = mapOf(
+                "host-mac-1" to HostPairedTrust("host-fp-1", "gs-sunshine-9999", "gs-cert-fp-1", "书房 MacBook"),
+            ),
+        )
+        assertEquals(1, afterTrust.size)
+        assertFalse("#1: After HostPairedTrust is saved, needsHostTrustSetup must be false", afterTrust.single().needsHostTrustSetup)
+    }
+
+    @Test
+    fun r4_3_pairedComputerWithDifferentUuidShowsPairedOfflineNotUnpairedWhenStreamPollsOffline() {
+        // #3: Real-world case where Host id ("host-mac-1111") != GameStream uuid ("gs-sunshine-9999").
+        // When streaming service restarts / polls OFFLINE while Host mDNS is live, the card MUST show
+        // paired-but-temporarily-unreachable (status=OFFLINE, isPairedOffline=true), NEVER ONLINE_UNPAIRED!
         val liveHost = DiscoveredHost(
-            id = "new-host-uuid",
+            id = "host-mac-1111",
             name = "书房 MacBook",
             address = "192.168.1.50",
             controlPort = 47990,
             gsPort = 47989,
             pairMode = "auto",
         )
-        // Previously directly paired Sunshine service on the same Mac, now offline with an old UUID
-        // (even on a different legacy port 48000!)
-        val oldOfflineDirect = rawComputer(
-            uuid = "legacy-sunshine-uuid",
-            name = "Old Mac Sunshine",
+        val offlinePairedStream = rawComputer(
+            uuid = "gs-sunshine-9999",
+            name = "MacBook",
             state = ComputerDetails.State.OFFLINE,
             pairState = PairingManager.PairState.PAIRED,
             activeAddress = null,
             activePort = 0,
             mac = "11:22:33:44:55:66",
-        ).copy(localAddress = "192.168.1.50", localPort = 48000)
+        ).copy(localAddress = "192.168.1.50", localPort = 47989, serverCertFingerprint = "gs-fp-real")
 
-        val mergedSingle = ComputerListMerger.merge(
-            computers = listOf(oldOfflineDirect),
+        val merged = ComputerListMerger.merge(
+            computers = listOf(offlinePairedStream),
             discoveredHosts = listOf(liveHost),
+            observedFingerprintsByEndpoint = mapOf(liveHost.endpointKey to "host-fp-real"),
+            pairedTrusts = mapOf(
+                "host-mac-1111" to HostPairedTrust("host-fp-real", "gs-sunshine-9999", "gs-fp-real", "书房 MacBook"),
+            ),
         )
-        assertEquals("S5: Legacy offline PC + live Host must merge into 1 row", 1, mergedSingle.size)
-        val item = mergedSingle.single()
-        assertEquals("host:new-host-uuid", item.id)
+        assertEquals("#3: Trusted Host + offline paired stream record must stay 1 row", 1, merged.size)
+        val item = merged.single()
+        assertEquals("gs-sunshine-9999", item.id)
         assertEquals("书房 MacBook", item.name)
-        assertEquals(ComputerStatus.ONLINE_UNPAIRED, item.status)
+        assertEquals("#3: Must NOT downgrade to ONLINE_UNPAIRED", ComputerStatus.OFFLINE, item.status)
+        assertTrue("#3: Must set isPairedOffline=true so UI shows 已配对 · 暂时连不上", item.isPairedOffline)
         assertTrue(item.isDepth3dHost)
-        assertTrue("Should preserve WoL MAC from absorbed record", item.canWake)
+        assertTrue(item.canWake)
+    }
 
-        // When BOTH old offline record AND live online record exist for the same Host -> still 1 row!
-        val newOnlineGs = rawComputer(
-            uuid = "new-host-uuid",
-            name = "MacBook",
+    @Test
+    fun r4_7_imposterCopyingTrustedHostIdCannotEvictOrRenameRealMac() {
+        val realHost = DiscoveredHost(
+            id = "host-real-id",
+            name = "书房 Mac",
+            address = "192.168.1.50",
+            controlPort = 47990,
+            gsPort = 47989,
+            pairMode = "auto",
+        )
+        val imposterHost = DiscoveredHost(
+            id = "host-real-id",
+            name = "恶意名称",
+            address = "192.168.1.99",
+            controlPort = 47990,
+            gsPort = 47989,
+            pairMode = "auto",
+        )
+        val realRaw = rawComputer(
+            uuid = "gs-real-uuid",
+            name = "Mac-GS",
             state = ComputerDetails.State.ONLINE,
             pairState = PairingManager.PairState.PAIRED,
             activeAddress = "192.168.1.50",
             activePort = 47989,
-        )
-        val mergedBoth = ComputerListMerger.merge(
-            computers = listOf(oldOfflineDirect, newOnlineGs),
-            discoveredHosts = listOf(liveHost),
-        )
-        assertEquals("S5: Old offline + new online + Host must collapse into 1 row", 1, mergedBoth.size)
-        assertEquals("new-host-uuid", mergedBoth.single().id)
-        assertEquals(ComputerStatus.ONLINE_PAIRED, mergedBoth.single().status)
-        assertEquals("书房 MacBook", mergedBoth.single().name)
+        ).copy(serverCertFingerprint = "gs-fp-real")
 
-        // Same host.id where GameStream cache is stale OFFLINE while Host mDNS is live -> prioritize Host!
-        val staleSameId = rawComputer(
-            uuid = "new-host-uuid",
-            name = "MacBook",
+        val imposterInfo = HostInfo(1, "被冒充者改掉的名字", "host-real-id", "macos", HostStreamStatus(true, null), null)
+        val realInfo = HostInfo(1, "Mac 新广播名", "host-real-id", "macos", HostStreamStatus(true, null), null)
+
+        // Even when imposter appears FIRST in discoveredHosts, Pass 1 matches ONLY the verified fingerprint!
+        val merged = ComputerListMerger.merge(
+            computers = listOf(realRaw),
+            discoveredHosts = listOf(imposterHost, realHost),
+            hostInfosByEndpoint = mapOf(
+                imposterHost.endpointKey to imposterInfo,
+                realHost.endpointKey to realInfo,
+            ),
+            observedFingerprintsByEndpoint = mapOf(
+                imposterHost.endpointKey to "fp-imposter",
+                realHost.endpointKey to "fp-real",
+            ),
+            pairedTrusts = mapOf(
+                "host-real-id" to HostPairedTrust("fp-real", "gs-real-uuid", "gs-fp-real", savedName = "书房 Mac"),
+            ),
+        )
+
+        val realCard = merged.firstOrNull { it.id == "gs-real-uuid" }
+        assertNotNull("#7: Real Mac must stay in the list and not be evicted by imposter", realCard)
+        assertEquals("#7: Trusted host must keep its saved name", "书房 Mac", realCard!!.name)
+        assertEquals("#7: Trusted host must attach ONLY to the verified endpoint", "192.168.1.50", realCard.host?.address)
+        assertEquals(ComputerStatus.ONLINE_PAIRED, realCard.status)
+
+        // Imposter stays isolated (not merged into gs-real-uuid)
+        val imposterCard = merged.firstOrNull { it.address == "192.168.1.99" }
+        assertNotNull(imposterCard)
+        assertEquals(ComputerStatus.ONLINE_UNPAIRED, imposterCard!!.status)
+        assertNull("#7: Imposter must NOT be merged with the real saved computer", imposterCard.raw)
+    }
+
+    @Test
+    fun r4_10_offlineOtherMachineSharingHostIpIsNeverSwallowedOrHidden() {
+        // #10: Another machine's old OFFLINE record happened to hold DHCP IP 192.168.1.50 yesterday;
+        // today a new Mac Host got 192.168.1.50. Merging must NOT swallow or hide the offline machine!
+        val newMacHost = DiscoveredHost(
+            id = "mac-host-uuid",
+            name = "新 MacBook",
+            address = "192.168.1.50",
+            controlPort = 47990,
+            gsPort = 47989,
+            pairMode = "auto",
+        )
+        val otherOfflinePc = rawComputer(
+            uuid = "windows-pc-uuid",
+            name = "客厅台式机",
             state = ComputerDetails.State.OFFLINE,
             pairState = PairingManager.PairState.PAIRED,
-            activeAddress = "192.168.1.99",
-            activePort = 47989,
-        )
-        val mergedStaleId = ComputerListMerger.merge(
-            computers = listOf(staleSameId),
-            discoveredHosts = listOf(liveHost),
-        )
-        assertEquals(1, mergedStaleId.size)
-        assertEquals(ComputerStatus.ONLINE_PAIRED, mergedStaleId.single().status)
-        assertEquals("192.168.1.50", mergedStaleId.single().address)
+            activeAddress = null,
+            activePort = 0,
+        ).copy(localAddress = "192.168.1.50", localPort = 47989)
 
-        // Distinct ONLINE service on same IP but different port (48000 vs 47989) remains separate!
-        val otherOnlineVm = rawComputer(
-            uuid = "vm-online-uuid",
-            name = "Windows VM",
-            state = ComputerDetails.State.ONLINE,
-            pairState = PairingManager.PairState.PAIRED,
-            activeAddress = "192.168.1.50",
-            activePort = 48000,
+        val merged = ComputerListMerger.merge(
+            computers = listOf(otherOfflinePc),
+            discoveredHosts = listOf(newMacHost),
         )
-        val mergedDistinctVm = ComputerListMerger.merge(
-            computers = listOf(otherOnlineVm),
-            discoveredHosts = listOf(liveHost),
-        )
-        assertEquals(2, mergedDistinctVm.size)
+        assertEquals("#10: Offline other machine at same IP must NOT be swallowed", 2, merged.size)
+        val hostCard = merged.firstOrNull { it.host?.id == "mac-host-uuid" }
+        val offlineCard = merged.firstOrNull { it.id == "windows-pc-uuid" }
+        assertNotNull(hostCard)
+        assertNotNull(offlineCard)
+        assertEquals(ComputerStatus.ONLINE_UNPAIRED, hostCard!!.status)
+        assertEquals(ComputerStatus.OFFLINE, offlineCard!!.status)
+        assertNull(offlineCard.host)
     }
 
     @Test

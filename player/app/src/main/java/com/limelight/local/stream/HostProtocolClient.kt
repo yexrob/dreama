@@ -69,12 +69,14 @@ data class HostPairedTrust(
     val hostFingerprint: String,
     val computerUuid: String,
     val gsCertFingerprint: String,
+    val savedName: String? = null,
 )
 
 /** Persists pinned Host TLS SHA-256 fingerprints and pairing trust per depth3d Host id. */
 interface HostCertPinStore {
     fun getFingerprint(hostId: String): String?
     fun getPairedTrust(hostId: String): HostPairedTrust?
+    fun getAllPairedTrusts(): Map<String, HostPairedTrust>
     fun savePairedTrust(hostId: String, trust: HostPairedTrust)
     fun clearFingerprint(hostId: String)
 }
@@ -87,6 +89,9 @@ class InMemoryHostCertPinStore : HostCertPinStore {
 
     @Synchronized
     override fun getPairedTrust(hostId: String): HostPairedTrust? = trusts[hostId]
+
+    @Synchronized
+    override fun getAllPairedTrusts(): Map<String, HostPairedTrust> = LinkedHashMap(trusts)
 
     @Synchronized
     override fun savePairedTrust(hostId: String, trust: HostPairedTrust) {
@@ -107,22 +112,40 @@ class SharedPrefsHostCertPinStore(context: Context) : HostCertPinStore {
     override fun getPairedTrust(hostId: String): HostPairedTrust? {
         val savedFp = prefs.getString(hostId, null) ?: return null
         val raw = prefs.getString(PAIRED_PREFIX + hostId, null) ?: return null
-        val parts = raw.split('|')
-        if (parts.size != 3) return null
+        val parts = raw.split('|', limit = 4)
+        if (parts.size < 3) return null
         val fp = parts[0]
         val uuid = parts[1]
         val gsFp = parts[2]
+        val savedName = parts.getOrNull(3)?.takeIf { it.isNotBlank() }
         if (fp.isBlank() || uuid.isBlank() || gsFp.isBlank()) return null
         if (!fp.equals(savedFp, ignoreCase = true)) return null
-        return HostPairedTrust(hostFingerprint = fp, computerUuid = uuid, gsCertFingerprint = gsFp)
+        return HostPairedTrust(
+            hostFingerprint = fp,
+            computerUuid = uuid,
+            gsCertFingerprint = gsFp,
+            savedName = savedName,
+        )
+    }
+
+    override fun getAllPairedTrusts(): Map<String, HostPairedTrust> {
+        val out = LinkedHashMap<String, HostPairedTrust>()
+        for (key in prefs.all.keys) {
+            if (!key.startsWith(PAIRED_PREFIX)) continue
+            val hostId = key.removePrefix(PAIRED_PREFIX)
+            val trust = getPairedTrust(hostId) ?: continue
+            out[hostId] = trust
+        }
+        return out
     }
 
     override fun savePairedTrust(hostId: String, trust: HostPairedTrust) {
+        val cleanName = trust.savedName.orEmpty().replace('\n', ' ').trim()
         prefs.edit()
             .putString(hostId, trust.hostFingerprint)
             .putString(
                 PAIRED_PREFIX + hostId,
-                "${trust.hostFingerprint}|${trust.computerUuid}|${trust.gsCertFingerprint}",
+                "${trust.hostFingerprint}|${trust.computerUuid}|${trust.gsCertFingerprint}|$cleanName",
             )
             .apply()
     }

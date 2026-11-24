@@ -465,6 +465,12 @@
     <string name="airplay_failed_title">投屏没有启动</string>
     <string name="airplay_failed_with_reason">投屏没有启动：%1$s</string>
     <string name="airplay_connecting_prefix">正在连接</string>
+    <string name="airplay_no_wifi_body">投屏和串流需要头显和 iPad、手机、电脑在同一个 Wi-Fi 里。</string>
+
+    <string name="stream_status_needs_host_setup">完成设置后可以看这台电脑上的影片</string>
+    <string name="stream_status_paired_offline">已配对 · 暂时连不上</string>
+    <string name="pc_action_complete_host_setup">完成设置（同步电脑影片）</string>
+    <string name="pair_stage_preparing">正在准备连接…</string>
 
     <string name="dlna_body">在同一个 Wi-Fi 里，从手机上的视频 App 选择这个名字。</string>
     <string name="dlna_casting_title">正在播放手机投屏 · %1$s</string>
@@ -475,7 +481,7 @@
     <string name="dlna_untitled">手机投屏</string>
     <string name="dlna_notif_text">手机和头显连同一个 Wi-Fi，在视频 App 里点「投屏」</string>
 
-    <string name="library_count_suffix"> · %1$d 个</string>
+    <string name="library_label_with_count">%1$s · %2$d 个</string>
     <string name="library_add_webdav">添加 WebDAV</string>
     <string name="library_found_webdav">找到 %1$s</string>
     <string name="library_webdav_desc">Google Drive 等网盘</string>

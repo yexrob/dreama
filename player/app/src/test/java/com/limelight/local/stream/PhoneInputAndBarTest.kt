@@ -289,6 +289,18 @@ class PhoneInputAndBarTest {
             com.limelight.local.dlna.ReceiverStatus("我的 depth3d", com.limelight.local.dlna.ReceiverStatus.Phase.WAITING, casting = "测试电影"),
         )
         assertTrue(casting.notice.contains("测试电影"))
+
+        // #5: Full label-with-count format keeps exact space on BOTH sides of '·' (aapt2 cannot strip it)
+        assertEquals(
+            "头显存储 · 12 个",
+            strings.get(com.limelight.R.string.library_label_with_count, "头显存储", 12),
+        )
+
+        // #13: AirPlay no-Wi-Fi body retains "iPad"
+        assertTrue(
+            "#13: airplay_no_wifi_body must mention iPad",
+            strings.get(com.limelight.R.string.airplay_no_wifi_body).contains("iPad"),
+        )
     }
 
     @Test

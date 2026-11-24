@@ -672,7 +672,7 @@ object DecoderCrashRecovery {
     fun checkAndPrepare(
         tombstone: PrefsStore,
         streamingPrefs: PrefsStore,
-        isGen1: Boolean = false,
+        isGen1: Boolean,
     ): CrashRecoveryPrompt? {
         val crashCount = tombstone.getInt(KEY_CRASH_COUNT, 0)
         val lastNotified = tombstone.getInt(KEY_LAST_NOTIFIED, 0)
@@ -695,7 +695,7 @@ object DecoderCrashRecovery {
     fun resetDefaultsAndClear(
         tombstone: PrefsStore,
         streamingPrefs: PrefsStore,
-        isGen1: Boolean = false,
+        isGen1: Boolean,
     ) {
         PreferenceConfiguration.resetStreamingSettings(streamingPrefs.asSharedPreferences(), isGen1)
         tombstone.putInt(KEY_CRASH_COUNT, 0)
