@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>depth3d 视觉稿 — 03 剧集详情页</title>
+<style>
+  :root {
+    --bg-window: rgba(13, 16, 23, 0.90);
+    --bg-surface: rgba(28, 34, 48, 0.84);
+    --bg-surface-hover: rgba(44, 54, 76, 0.94);
+    --border-subtle: rgba(255, 255, 255, 0.14);
+    --border-hover: rgba(255, 255, 255, 0.72);
+    --text-primary: #F4F7FB;
+    --text-secondary: #A7B4C9;
+    --text-muted: #74839B;
+    --accent: #58C4FF;
+    --accent-hover: #84D6FF;
+    --accent-soft: rgba(88, 196, 255, 0.18);
+    --success: #3ED598;
+    --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: var(--font); color: var(--text-primary); min-height: 860px;
+    display: flex; flex-direction: column; align-items: center; padding: 16px 24px 36px;
+    -webkit-font-smoothing: antialiased;
+  }
+  body.env-bright {
+    background:
+      radial-gradient(ellipse 60% 45% at 18% 15%, rgba(255, 241, 218, 0.65), transparent 65%),
+      radial-gradient(ellipse 55% 50% at 85% 22%, rgba(190, 214, 236, 0.52), transparent 65%),
+      linear-gradient(155deg, #c9c3b8 0%, #9fa3a8 42%, #7d756b 100%);
+  }
+  body.env-dim {
+    background:
+      radial-gradient(ellipse 45% 40% at 15% 20%, rgba(235, 168, 95, 0.2), transparent 60%),
+      linear-gradient(160deg, #1b1e28 0%, #12151e 50%, #0b0d12 100%);
+  }
+
+  .review-bar {
+    width: 100%; max-width: 1280px; display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 14px; padding: 8px 14px; border-radius: 14px;
+    background: rgba(10, 12, 18, 0.76); border: 1px solid rgba(255, 255, 255, 0.12);
+    backdrop-filter: blur(14px); font-size: 13px; color: #b7c3d6; flex-wrap: wrap;
+  }
+  .review-links { display: flex; gap: 6px; flex-wrap: wrap; }
+  .review-links a { color: #a7b4c9; text-decoration: none; padding: 4px 10px; border-radius: 8px; }
+  .review-links a:hover { background: rgba(255,255,255,0.1); color: #fff; }
+  .review-links a.active { background: rgba(88, 196, 255, 0.22); color: #84D6FF; font-weight: 600; }
+  .ctrl-group { display: inline-flex; background: rgba(255,255,255,0.06); border-radius: 9px; padding: 2px; gap: 2px; }
+  .ctrl-btn { border: none; background: transparent; color: #a7b4c9; font-family: inherit; font-size: 12px; padding: 4px 10px; border-radius: 7px; cursor: pointer; }
+  .ctrl-btn.active { background: rgba(88, 196, 255, 0.25); color: #fff; font-weight: 600; }
+
+  .vr-window {
+    width: 100%; max-width: 1280px; height: 760px; border-radius: 28px;
+    background: var(--bg-window); border: 1.5px solid rgba(255, 255, 255, 0.16);
+    box-shadow: 0 32px 80px rgba(0, 0, 0, 0.54), inset 0 1px 0 rgba(255, 255, 255, 0.14);
+    backdrop-filter: blur(28px); position: relative; overflow: hidden; display: flex; flex-direction: column;
+  }
+
+  .backdrop {
+    position: absolute; inset: 0 0 46% 0; z-index: 0;
+    background:
+      radial-gradient(circle at 80% 30%, rgba(255, 182, 72, 0.42), transparent 36%),
+      radial-gradient(circle at 60% 60%, rgba(62, 114, 158, 0.42), transparent 48%),
+      linear-gradient(125deg, #111824 0%, #24364a 58%, #121b26 100%);
+  }
+  .backdrop::after {
+    content: ""; position: absolute; inset: 0;
+    background:
+      linear-gradient(180deg, rgba(13,16,23,0.22) 0%, rgba(13,16,23,0.78) 72%, rgba(13,16,23,1) 100%),
+      linear-gradient(90deg, rgba(13,16,23,0.92) 0%, rgba(13,16,23,0.5) 55%, rgba(13,16,23,0.22) 100%);
+  }
+
+  .detail-topbar {
+    position: relative; z-index: 2; height: 74px; padding: 0 32px;
+    display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+  }
+  .back-btn {
+    height: 52px; padding: 0 20px; border-radius: 14px;
+    background: rgba(14, 18, 28, 0.76); border: 1.5px solid var(--border-subtle);
+    color: var(--text-primary); font-size: 19px; font-weight: 600;
+    display: inline-flex; align-items: center; gap: 10px; text-decoration: none;
+    transition: all 0.15s;
+  }
+  .back-btn:hover { background: var(--bg-surface-hover); border-color: var(--border-hover); transform: scale(1.03); }
+  .source-tag {
+    height: 46px; padding: 0 16px; border-radius: 12px;
+    background: rgba(14, 18, 28, 0.72); border: 1px solid var(--border-subtle);
+    display: inline-flex; align-items: center; gap: 8px; font-size: 16px; color: var(--text-secondary);
+  }
+
+  .scroll-body {
+    position: relative; z-index: 2; flex: 1; overflow-y: auto;
+    padding: 4px 36px 36px; display: flex; flex-direction: column; gap: 24px;
+  }
+  .scroll-body::-webkit-scrollbar { width: 8px; }
+  .scroll-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.16); border-radius: 999px; }
+
+  /* 剧集头部概览 */
+  .series-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 28px; }
+  .series-left { flex: 1; display: flex; flex-direction: column; gap: 12px; max-width: 780px; }
+  .series-title { font-size: 38px; font-weight: 700; line-height: 1.15; }
+  .meta-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .meta-chip {
+    padding: 4px 12px; border-radius: 8px; font-size: 15px; font-weight: 600;
+    background: rgba(255, 255, 255, 0.1); color: #e2eaf6;
+  }
+  .meta-chip.score { background: rgba(255, 182, 72, 0.18); color: #FFD07F; }
+  .meta-chip.stereo { background: var(--accent-soft); color: var(--accent-hover); border: 1px solid rgba(88, 196, 255, 0.42); }
+  .series-desc { font-size: 18px; line-height: 1.52; color: #cad5e6; }
+
+  .cta-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 4px; }
+  .btn {
+    height: 60px; padding: 0 26px; border-radius: 15px; font-family: inherit;
+    font-size: 19px; font-weight: 600; border: 1.5px solid transparent;
+    display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+    cursor: pointer; text-decoration: none; transition: all 0.15s;
+  }
+  .btn-primary { background: var(--accent); color: #06141F; box-shadow: 0 10px 26px rgba(88, 196, 255, 0.28); }
+  .btn-primary:hover { background: var(--accent-hover); transform: scale(1.03); border-color: #fff; }
+  .btn-secondary { background: rgba(255, 255, 255, 0.1); color: var(--text-primary); border-color: rgba(255, 255, 255, 0.18); }
+  .btn-secondary:hover { background: rgba(255, 255, 255, 0.2); border-color: var(--border-hover); transform: scale(1.03); }
+
+  .quick-prefs {
+    display: flex; flex-direction: column; gap: 10px; width: 320px; flex-shrink: 0;
+    background: rgba(20, 25, 37, 0.8); border: 1px solid var(--border-subtle);
+    border-radius: 18px; padding: 14px 16px;
+  }
+  .qp-row { display: flex; justify-content: space-between; align-items: center; font-size: 16px; }
+  .qp-k { color: var(--text-secondary); }
+  .qp-v { font-weight: 600; color: var(--text-primary); }
+  .qp-v.accent { color: var(--accent-hover); }
+
+  /* 季选择器 */
+  .season-bar {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding-top: 6px; border-top: 1px solid rgba(255,255,255,0.08);
+  }
+  .season-tabs { display: flex; gap: 12px; flex-wrap: wrap; }
+  .season-tab {
+    height: 52px; padding: 0 22px; border-radius: 14px;
+    background: var(--bg-surface); border: 1.5px solid var(--border-subtle);
+    color: var(--text-secondary); font-family: inherit; font-size: 18px; font-weight: 600;
+    cursor: pointer; transition: all 0.15s;
+  }
+  .season-tab:hover { background: var(--bg-surface-hover); color: #fff; border-color: rgba(255,255,255,0.36); }
+  .season-tab.active {
+    background: var(--accent-soft); border-color: var(--accent); color: var(--accent-hover);
+  }
+  .season-summary { font-size: 16px; color: var(--text-secondary); }
+
+  /* 剧集卡片网格（3 列大号可点卡片，避免细密单行列表） */
+  .ep-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  .ep-card {
+    border-radius: 18px; background: var(--bg-surface); border: 2px solid transparent;
+    overflow: hidden; text-decoration: none; color: inherit; display: flex; flex-direction: column;
+    transition: all 0.16s cubic-bezier(0.2, 0.8, 0.2, 1); cursor: pointer;
+  }
+  .ep-card:hover {
+    transform: scale(1.03); border-color: var(--border-hover);
+    box-shadow: 0 16px 34px rgba(0, 0, 0, 0.48);
+  }
+  .ep-card.current { border-color: rgba(88, 196, 255, 0.65); background: rgba(34, 46, 68, 0.9); }
+
+  .ep-thumb {
+    height: 144px; position: relative; padding: 12px;
+    display: flex; flex-direction: column; justify-content: space-between;
+  }
+  .ep-top { display: flex; justify-content: space-between; align-items: center; }
+  .ep-num {
+    padding: 4px 10px; border-radius: 8px; font-size: 14px; font-weight: 700;
+    background: rgba(10, 14, 22, 0.76); border: 1px solid rgba(255,255,255,0.16);
+  }
+  .ep-done {
+    padding: 4px 10px; border-radius: 8px; font-size: 13px; font-weight: 700;
+    background: rgba(62, 213, 152, 0.22); color: #7af0be; border: 1px solid rgba(62, 213, 152, 0.45);
+  }
+  .ep-watching {
+    padding: 4px 10px; border-radius: 8px; font-size: 13px; font-weight: 700;
+    background: rgba(88, 196, 255, 0.26); color: #9be0ff; border: 1px solid rgba(88, 196, 255, 0.55);
+  }
+  .ep-dur {
+    align-self: flex-end; padding: 3px 9px; border-radius: 6px; font-size: 14px; font-weight: 600;
+    background: rgba(10, 14, 22, 0.78); font-variant-numeric: tabular-nums;
+  }
+  .ep-prog {
+    position: absolute; left: 0; right: 0; bottom: 0; height: 5px; background: rgba(255,255,255,0.22);
+  }
+  .ep-prog-fill { height: 100%; background: var(--accent); }
+
+  .ep-body { padding: 14px 16px 16px; display: flex; flex-direction: column; gap: 6px; }
+  .ep-title { font-size: 19px; font-weight: 600; }
+  .ep-desc {
+    font-size: 16px; color: var(--text-secondary); line-height: 1.45;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+
+  .hint-footer { margin-top: 12px; font-size: 13px; color: rgba(255,255,255,0.68); text-shadow: 0 1px 4px rgba(0,0,0,0.6); }
+</style>
+</head>
+<body class="env-bright">
+
+  <div class="review-bar">
+    <div class="review-links">
+      <a href="index.html">总览</a>
+      <a href="01-home.html">01 首页播放墙</a>
+      <a href="02-detail-movie.html">02 电影详情</a>
+      <a href="03-detail-series.html" class="active">03 剧集详情</a>
+      <a href="04-sources-plugins.html">04 播放源与插件</a>
+      <a href="05-cast-stream.html">05 投屏与串流</a>
+      <a href="06-onboarding.html">06 首次引导</a>
+      <a href="07-settings.html">07 设置</a>
+      <a href="08-vr-playback.html">08 VR 播放中</a>
+    </div>
+    <div class="ctrl-group" id="envGroup">
+      <button class="ctrl-btn active" onclick="setEnv('bright', this)">亮透视房</button>
+      <button class="ctrl-btn" onclick="setEnv('dim', this)">暗透视房</button>
+    </div>
+  </div>
+
+  <div class="vr-window">
+    <div class="backdrop"></div>
+
+    <header class="detail-topbar">
+      <a class="back-btn" href="01-home.html">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M15 18l-6-6 6-6"/></svg>
+        返回首页
+      </a>
+      <span class="source-tag">来自：我的 Jellyfin · 剧集库</span>
+    </header>
+
+    <div class="scroll-body">
+      <section class="series-head">
+        <div class="series-left">
+          <h1 class="series-title">雾港档案</h1>
+          <div class="meta-row">
+            <span class="meta-chip score">★ 8.8</span>
+            <span class="meta-chip">2024–2025 · 2 季 · 共 18 集</span>
+            <span class="meta-chip">4K HDR · 杜比 5.1</span>
+            <span class="meta-chip stereo">✦ 实时 3D · 均衡</span>
+          </div>
+          <p class="series-desc">
+            浓雾终年不散的北方旧港，一艘三十年前失踪的货轮悄然漂回防波堤。海事调查员沈砚与声呐工程师联手追查尘封的航行日志，却发现整座港口都藏着被抹去的记忆。
+          </p>
+          <div class="cta-row">
+            <a class="btn btn-primary" href="08-vr-playback.html" id="mainPlayBtn">
+              <svg width="21" height="21" viewBox="0 0 24 24" fill="currentColor"><polygon points="6,4 20,12 6,20"/></svg>
+              继续播放 · S2 E04 潮汐密码（剩 16 分）
+            </a>
+            <button class="btn btn-secondary" onclick="alert('已开启：本剧每集播完自动连播下一集')">自动连播：开</button>
+          </div>
+        </div>
+
+        <div class="quick-prefs">
+          <div class="qp-row"><span class="qp-k">本剧默认音轨</span><span class="qp-v">国语 · 5.1</span></div>
+          <div class="qp-row"><span class="qp-k">本剧默认字幕</span><span class="qp-v">简体中文 · ASS</span></div>
+          <div class="qp-row"><span class="qp-k">本剧 3D 记忆</span><span class="qp-v accent">实时 3D · 0.6%</span></div>
+          <div class="qp-row"><span class="qp-k">已看进度</span><span class="qp-v">13 / 18 集</span></div>
+        </div>
+      </section>
+
+      <!-- 季切换栏 -->
+      <section class="season-bar">
+        <div class="season-tabs" id="seasonTabs">
+          <button class="season-tab active" onclick="renderSeason(2, this)">第 2 季（8 集）</button>
+          <button class="season-tab" onclick="renderSeason(1, this)">第 1 季（10 集）</button>
+          <button class="season-tab" onclick="renderSeason(0, this)">特别篇（2 集）</button>
+        </div>
+        <div class="season-summary" id="seasonSummary">第 2 季 · 观看至第 4 集 · 点击任意剧集立即 3D 播放</div>
+      </section>
+
+      <!-- 剧集网格 -->
+      <section class="ep-grid" id="epGrid"></section>
+    </div>
+  </div>
+
+  <div class="hint-footer">点击上方季标签可交互切换「第 2 季 / 第 1 季 / 特别篇」剧集卡片列表</div>
+
+<script>
+  const SEASONS = {
+    2: {
+      summary: '第 2 季 · 观看至第 4 集 · 点击任意剧集立即 3D 播放',
+      episodes: [
+        { num: 'S2 E01', title: '防波堤的雾笛', dur: '52:10', prog: 100, status: 'done', desc: '暴风雨夜过后，三号灯塔自动发射出早已废弃的摩斯频段信号。', bg: 'radial-gradient(circle at 75% 28%, #FFB648, transparent 48%), linear-gradient(150deg,#1a2433,#30455e)' },
+        { num: 'S2 E02', title: '冰冷的船舱日志', dur: '49:44', prog: 100, status: 'done', desc: '声呐测绘显示旧码头下方存在未被记录的沉船隔舱。', bg: 'radial-gradient(circle at 32% 30%, #58C4FF, transparent 50%), linear-gradient(150deg,#132136,#274463)' },
+        { num: 'S2 E03', title: '灰港证人', dur: '51:20', prog: 100, status: 'done', desc: '退休老领航员终于开口，提及当年的双份航线图与匿名发报机。', bg: 'radial-gradient(circle at 70% 35%, #E08E6D, transparent 50%), linear-gradient(150deg,#1f232c,#463b42)' },
+        { num: 'S2 E04', title: '潮汐密码', dur: '50:00', prog: 68, status: 'watching', desc: '沈砚在旧海关档案室破译了潮汐表里的坐标，直指外海孤岛。', bg: 'radial-gradient(circle at 65% 28%, #63D2FF, transparent 46%), linear-gradient(150deg,#14283d,#295272)' },
+        { num: 'S2 E05', title: '无声信号塔', dur: '48:35', prog: 0, status: 'new', desc: '夜雾中登上外海孤岛，无线电接收器突然捕捉到同一段人声。', bg: 'radial-gradient(circle at 40% 25%, #3ED598, transparent 48%), linear-gradient(150deg,#0f2328,#22494d)' },
+        { num: 'S2 E06', title: '白昼幻影', dur: '54:12', prog: 0, status: 'new', desc: '真相浮出水面之前，海事局内部突然下达封港指令。', bg: 'radial-gradient(circle at 78% 35%, #9B8CFF, transparent 48%), linear-gradient(150deg,#181933,#373869)' }
+      ]
+    },
+    1: {
+      summary: '第 1 季 · 10 集已全部看完',
+      episodes: [
+        { num: 'S1 E01', title: '浓雾归航', dur: '54:00', prog: 100, status: 'done', desc: '无主货轮在浓雾中撞上防波堤，拉开了整个雾港谜案的序幕。', bg: 'radial-gradient(circle at 70% 30%, #FFAE52, transparent 48%), linear-gradient(150deg,#1b212e,#3b3e52)' },
+        { num: 'S1 E02', title: '失踪的声呐图', dur: '47:18', prog: 100, status: 'done', desc: '海底地形图与十年前的测绘记录出现长达三公里的盲区。', bg: 'radial-gradient(circle at 38% 30%, #4FB3E8, transparent 48%), linear-gradient(150deg,#102030,#264661)' },
+        { num: 'S1 E03', title: '守灯人笔记', dur: '48:50', prog: 100, status: 'done', desc: '一页撕碎的日志牵出当年海难唯一的幸存者去向。', bg: 'radial-gradient(circle at 66% 32%, #E58C65, transparent 48%), linear-gradient(150deg,#251d24,#51373c)' },
+        { num: 'S1 E04', title: '铁锈与盐', dur: '50:05', prog: 100, status: 'done', desc: '在废弃修船厂发现与货轮同批次的特殊合金铭牌。', bg: 'radial-gradient(circle at 48% 28%, #9AC5D8, transparent 48%), linear-gradient(150deg,#18242e,#384e5e)' },
+        { num: 'S1 E05', title: '双倍潮差', dur: '49:30', prog: 100, status: 'done', desc: '大潮退去的短短两小时，团队冒险潜入沉没的旧栈桥。', bg: 'radial-gradient(circle at 74% 30%, #3ED598, transparent 48%), linear-gradient(150deg,#0f2529,#1d4c50)' },
+        { num: 'S1 E06', title: '深海回响', dur: '55:22', prog: 100, status: 'done', desc: '第一季高潮：水下遗迹现身，而真正的委托人一直在暗处注视。', bg: 'radial-gradient(circle at 50% 25%, #58C4FF, transparent 48%), linear-gradient(150deg,#0d1b36,#223e73)' }
+      ]
+    },
+    0: {
+      summary: '特别篇 · 幕后纪录片与导演加长番外',
+      episodes: [
+        { num: 'SP 01', title: '番外：灯塔守夜人', dur: '34:15', prog: 0, status: 'new', desc: '以老领航员视角回望三十年前那个改变所有人的雾夜。', bg: 'radial-gradient(circle at 68% 30%, #FFD27D, transparent 48%), linear-gradient(150deg,#202330,#49475c)' },
+        { num: 'SP 02', title: '制作特辑：北方实景拍摄记', dur: '28:40', prog: 0, status: 'new', desc: '走进冬季海港外景地，了解实景雾效与水下摄影幕后。', bg: 'radial-gradient(circle at 38% 30%, #7FD4FF, transparent 48%), linear-gradient(150deg,#142536,#2a4a66)' }
+      ]
+    }
+  };
+
+  function renderSeason(seasonKey, btn) {
+    if (btn) {
+      document.querySelectorAll('#seasonTabs .season-tab').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+    }
+    const data = SEASONS[seasonKey];
+    document.getElementById('seasonSummary').textContent = data.summary;
+    const grid = document.getElementById('epGrid');
+    grid.innerHTML = data.episodes.map(ep => `
+      <a class="ep-card ${ep.status === 'watching' ? 'current' : ''}" href="08-vr-playback.html">
+        <div class="ep-thumb" style="background:${ep.bg}">
+          <div class="ep-top">
+            <span class="ep-num">${ep.num}</span>
+            ${ep.status === 'done' ? '<span class="ep-done">✓ 已看完</span>' : ''}
+            ${ep.status === 'watching' ? '<span class="ep-watching">● 观看中</span>' : ''}
+          </div>
+          <span class="ep-dur">${ep.dur}</span>
+          ${ep.prog > 0 && ep.prog < 100 ? `<div class="ep-prog"><div class="ep-prog-fill" style="width:${ep.prog}%"></div></div>` : ''}
+        </div>
+        <div class="ep-body">
+          <div class="ep-title">${ep.title}</div>
+          <div class="ep-desc">${ep.desc}</div>
+        </div>
+      </a>
+    `).join('');
+  }
+
+  function setEnv(mode, btn) {
+    document.body.className = mode === 'bright' ? 'env-bright' : 'env-dim';
+    document.querySelectorAll('#envGroup .ctrl-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  }
+
+  renderSeason(2);
+</script>
+</body>
+</html>

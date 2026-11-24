@@ -1,0 +1,987 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>depth3d 视觉稿 — 08 VR 播放中界面（OpenXR 合成层）</title>
+<style>
+  :root {
+    --panel-bg: rgba(13, 17, 25, 0.88);
+    --panel-elev: rgba(16, 21, 32, 0.93);
+    --surface: rgba(34, 42, 60, 0.82);
+    --surface-hover: rgba(54, 66, 92, 0.94);
+    --border: rgba(255, 255, 255, 0.16);
+    --text-primary: #F4F7FB;
+    --text-secondary: #A9B7CD;
+    --text-muted: #76859D;
+    --accent: #58C4FF;
+    --accent-hover: #84D6FF;
+    --accent-soft: rgba(88, 196, 255, 0.22);
+    --success: #3ED598;
+    --warning: #FFB648;
+    --danger: #FF6470;
+    --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: var(--font); color: var(--text-primary); min-height: 860px;
+    display: flex; flex-direction: column; align-items: center; padding: 14px 20px 30px;
+    background: #0c0e14; -webkit-font-smoothing: antialiased;
+  }
+
+  /* 外部审稿控制条 */
+  .review-bar {
+    width: 100%; max-width: 1340px; display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; margin-bottom: 12px; padding: 8px 14px; border-radius: 14px;
+    background: rgba(16, 20, 30, 0.86); border: 1px solid rgba(255, 255, 255, 0.12);
+    font-size: 13px; color: #b7c3d6; flex-wrap: wrap;
+  }
+  .review-links { display: flex; gap: 5px; flex-wrap: wrap; }
+  .review-links a { color: #a7b4c9; text-decoration: none; padding: 4px 9px; border-radius: 8px; }
+  .review-links a:hover { background: rgba(255,255,255,0.1); color: #fff; }
+  .review-links a.active { background: rgba(88, 196, 255, 0.22); color: #84D6FF; font-weight: 600; }
+  .review-tools { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .ctrl-group { display: inline-flex; background: rgba(255,255,255,0.06); border-radius: 9px; padding: 2px; gap: 2px; }
+  .ctrl-btn { border: none; background: transparent; color: #a7b4c9; font-family: inherit; font-size: 12px; padding: 4px 10px; border-radius: 7px; cursor: pointer; }
+  .ctrl-btn.active { background: rgba(88, 196, 255, 0.28); color: #fff; font-weight: 600; }
+
+  /* OpenXR 头显视野画布（模拟 PICO 4 双眼所见空间） */
+  .xr-viewport {
+    width: 100%; max-width: 1340px; height: 760px; border-radius: 26px;
+    position: relative; overflow: hidden;
+    border: 1.5px solid rgba(255, 255, 255, 0.16);
+    box-shadow: 0 36px 90px rgba(0, 0, 0, 0.72);
+    user-select: none;
+    transition: background 0.35s ease;
+  }
+
+  /* 5 种真实环境背景 */
+  .xr-viewport.room-passthrough {
+    background:
+      radial-gradient(ellipse 52% 45% at 15% 18%, rgba(255, 236, 206, 0.56), transparent 65%),
+      radial-gradient(ellipse 46% 42% at 88% 24%, rgba(176, 204, 230, 0.44), transparent 65%),
+      linear-gradient(180deg, #b8b1a6 0%, #8e8b86 48%, #6d6257 52%, #554a40 100%);
+  }
+  .xr-viewport.room-void { background: radial-gradient(circle at 50% 45%, #10141f 0%, #050609 75%); }
+  .xr-viewport.room-theater {
+    background:
+      radial-gradient(ellipse 68% 45% at 50% 10%, rgba(120, 74, 44, 0.25), transparent 65%),
+      linear-gradient(180deg, #1d1514 0%, #120d0e 58%, #211615 100%);
+  }
+  .xr-viewport.room-cinema {
+    background:
+      radial-gradient(ellipse 75% 42% at 50% 0%, rgba(48, 86, 148, 0.22), transparent 65%),
+      linear-gradient(180deg, #0d121c 0%, #080b12 62%, #1a1114 100%);
+  }
+  .xr-viewport.room-synthwave {
+    background:
+      radial-gradient(circle at 50% 58%, rgba(224, 68, 178, 0.3), transparent 48%),
+      linear-gradient(180deg, #120926 0%, #241046 56%, #130b2a 100%);
+  }
+
+  /* 透视房间装饰剪影（模拟沙发/窗户柔和景深虚化） */
+  .room-decor {
+    position: absolute; inset: 0; pointer-events: none; transition: opacity 0.3s;
+  }
+  .xr-viewport:not(.room-passthrough) .room-decor { opacity: 0; }
+  .synth-grid {
+    position: absolute; left: -10%; right: -10%; bottom: 0; height: 42%; pointer-events: none; opacity: 0;
+    background:
+      repeating-linear-gradient(90deg, rgba(88,196,255,0.22) 0 1px, transparent 1px 64px),
+      repeating-linear-gradient(0deg, rgba(224,68,178,0.28) 0 1px, transparent 1px 36px);
+    transform: perspective(360px) rotateX(62deg); transform-origin: bottom;
+    transition: opacity 0.3s;
+  }
+  .xr-viewport.room-synthwave .synth-grid { opacity: 1; }
+
+  /* 顶部空间 Toast 合成层 */
+  .xr-toast {
+    position: absolute; top: 24px; left: 50%; transform: translateX(-50%);
+    z-index: 30; padding: 12px 24px; border-radius: 999px;
+    background: rgba(12, 16, 24, 0.88); border: 1.5px solid rgba(255, 255, 255, 0.2);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+    display: flex; align-items: center; gap: 11px; font-size: 17px; font-weight: 600;
+    transition: opacity 0.25s, transform 0.25s;
+  }
+  .toast-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+
+  /* 6DoF 悬浮虚拟影幕容器 */
+  .screen-stage {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    padding-bottom: 58px;
+  }
+
+  /* 氛围光层（Ambilight Glow Layer） */
+  .ambilight {
+    position: absolute; width: 1030px; height: 540px; border-radius: 40px;
+    background: radial-gradient(ellipse 68% 60% at 50% 48%, rgba(88, 196, 255, 0.44), rgba(114, 72, 232, 0.24) 55%, transparent 76%);
+    filter: blur(42px); transition: opacity 0.3s, transform 0.25s; pointer-events: none;
+  }
+  .ambilight.off { opacity: 0; }
+
+  /* 虚拟大屏本体（双目立体 Video Layer L + R） */
+  .video-screen {
+    width: 960px; height: 486px; border-radius: 14px; position: relative;
+    box-shadow: 0 30px 80px rgba(0, 0, 0, 0.68), 0 0 0 1px rgba(255,255,255,0.12);
+    overflow: visible; transition: transform 0.22s ease;
+  }
+  .video-frame {
+    position: absolute; inset: 0; border-radius: 14px; overflow: hidden;
+    background:
+      radial-gradient(circle at 64% 34%, rgba(120, 214, 255, 0.72), transparent 30%),
+      radial-gradient(circle at 38% 66%, rgba(92, 62, 220, 0.48), transparent 44%),
+      linear-gradient(175deg, #060b19 0%, #102042 46%, #18365e 70%, #091324 100%);
+  }
+  /* 示意科幻电影画面（纯 SVG 矢量，无版权图） */
+  .scene-svg { width: 100%; height: 100%; display: block; }
+  /* 3D 视差红青/立体微边提示（仅在 3D 开启时极轻微体现立体深度质感） */
+  .stereo-sheen {
+    position: absolute; top: 14px; left: 16px; z-index: 4;
+    padding: 5px 12px; border-radius: 999px; font-size: 13px; font-weight: 700;
+    background: rgba(10, 14, 22, 0.64); border: 1px solid rgba(88, 196, 255, 0.45);
+    color: var(--accent-hover); backdrop-filter: blur(6px);
+    display: inline-flex; align-items: center; gap: 6px; transition: opacity 0.2s;
+  }
+
+  /* 空间立体字幕合成层（位于画面前方匹配深度） */
+  .subtitle-layer {
+    position: absolute; left: 46%; bottom: 26px; transform: translateX(-50%);
+    z-index: 6; text-align: center; pointer-events: none; transition: transform 0.2s, font-size 0.2s;
+  }
+  .sub-text {
+    display: inline-block; padding: 8px 20px; border-radius: 10px; white-space: nowrap;
+    background: rgba(6, 9, 15, 0.66); font-size: 21px; font-weight: 600;
+    letter-spacing: 0.4px; color: #F7FAFF;
+    text-shadow: 0 2px 8px rgba(0, 0, 0, 0.9);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  }
+  .sub-depth-tag {
+    display: block; margin-top: 4px; font-size: 12px; color: var(--accent-hover);
+    opacity: 0; transition: opacity 0.2s;
+  }
+  .show-layers .sub-depth-tag, .show-sub-depth .sub-depth-tag { opacity: 1; }
+
+  /* 6DoF 底边拖拽手柄（快捷菜单关闭时可见） */
+  .move-handle {
+    position: absolute; left: 50%; bottom: -26px; transform: translateX(-50%);
+    width: 148px; height: 10px; border-radius: 999px;
+    background: rgba(255, 255, 255, 0.52); box-shadow: 0 2px 10px rgba(0,0,0,0.5);
+    transition: opacity 0.2s;
+  }
+  .menu-open .move-handle { opacity: 0.16; }
+
+  /* 四角缩放括号 */
+  .corner-br {
+    position: absolute; right: -16px; bottom: -16px; width: 26px; height: 26px;
+    border-right: 4px solid rgba(255,255,255,0.55); border-bottom: 4px solid rgba(255,255,255,0.55);
+    border-radius: 0 0 8px 0; pointer-events: none;
+  }
+
+  /* =========================================================
+     升级版底部播放控制条（合批为 1 个 OpenXR Quad 合成层）
+     ========================================================= */
+  .transport-wrap {
+    position: absolute; left: 50%; bottom: 26px; transform: translateX(-50%);
+    z-index: 20; width: 1060px; display: flex; flex-direction: column; gap: 8px;
+    transition: width 0.25s ease;
+  }
+  .transport-wrap.stream-mode { width: 700px; }
+
+  .transport-meta {
+    display: flex; justify-content: space-between; align-items: center; padding: 0 18px;
+    font-size: 15px; color: rgba(244, 247, 251, 0.9);
+    text-shadow: 0 2px 8px rgba(0,0,0,0.75);
+  }
+  .tm-left { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+  .tm-chip {
+    padding: 3px 9px; border-radius: 7px; font-size: 13px; font-weight: 700;
+    background: rgba(14, 17, 24, 0.72); border: 1px solid rgba(255,255,255,0.18);
+  }
+  .tm-right { display: flex; align-items: center; gap: 14px; font-variant-numeric: tabular-nums; }
+
+  .transport-bar {
+    height: 76px; padding: 0 16px; border-radius: 999px;
+    background: var(--panel-bg); border: 1.5px solid rgba(255, 255, 255, 0.2);
+    box-shadow: 0 18px 46px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255,255,255,0.12);
+    backdrop-filter: blur(22px);
+    display: flex; align-items: center; gap: 12px;
+  }
+
+  .t-btn {
+    width: 52px; height: 52px; border-radius: 50%; border: 1.5px solid transparent;
+    background: transparent; color: var(--text-primary); display: grid; place-items: center;
+    cursor: pointer; transition: all 0.14s; flex-shrink: 0; position: relative; font-family: inherit;
+  }
+  .t-btn:hover { background: rgba(255,255,255,0.14); border-color: rgba(255,255,255,0.45); transform: scale(1.08); }
+  .t-btn.play-main {
+    width: 56px; height: 56px; background: rgba(255,255,255,0.14); border-color: rgba(255,255,255,0.28);
+  }
+  .t-btn.play-main:hover { background: var(--accent); color: #06141F; border-color: #fff; }
+  .t-btn.active {
+    background: var(--accent-soft); border-color: var(--accent); color: var(--accent-hover);
+  }
+  .t-btn.exit:hover { background: rgba(255, 100, 112, 0.24); border-color: var(--danger); color: #ff99a2; }
+
+  .t-btn .tip {
+    position: absolute; bottom: 62px; left: 50%; transform: translateX(-50%);
+    white-space: nowrap; padding: 5px 10px; border-radius: 8px; font-size: 13px; font-weight: 600;
+    background: rgba(10, 13, 20, 0.92); border: 1px solid rgba(255,255,255,0.18); color: #fff;
+    opacity: 0; pointer-events: none; transition: opacity 0.14s;
+  }
+  .t-btn:hover .tip { opacity: 1; }
+
+  .time-lbl {
+    font-size: 17px; font-weight: 700; font-variant-numeric: tabular-nums;
+    color: var(--text-primary); min-width: 74px; text-align: center;
+  }
+  .time-lbl.total { color: var(--text-secondary); }
+
+  /* 进度轨道（支持悬停预览时间气泡） */
+  .scrub-zone {
+    flex: 1; height: 48px; display: flex; align-items: center; position: relative; cursor: pointer;
+  }
+  .scrub-track {
+    width: 100%; height: 8px; border-radius: 999px; background: rgba(255,255,255,0.22); position: relative;
+  }
+  .scrub-buf { position: absolute; left: 0; top: 0; bottom: 0; width: 62%; background: rgba(255,255,255,0.2); border-radius: 999px; }
+  .scrub-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 34%; background: var(--accent); border-radius: 999px; }
+  .scrub-thumb {
+    position: absolute; top: 50%; left: 34%; transform: translate(-50%, -50%);
+    width: 20px; height: 20px; border-radius: 50%; background: var(--accent-hover);
+    border: 2.5px solid #fff; box-shadow: 0 0 12px rgba(88,196,255,0.7);
+  }
+  .scrub-hover-line {
+    position: absolute; top: 50%; transform: translateY(-50%); width: 3px; height: 24px;
+    background: #fff; border-radius: 2px; opacity: 0; pointer-events: none;
+  }
+  .scrub-bubble {
+    position: absolute; bottom: 42px; transform: translateX(-50%);
+    padding: 5px 12px; border-radius: 9px; background: rgba(10, 14, 22, 0.94);
+    border: 1.5px solid var(--accent); color: var(--accent-hover);
+    font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums;
+    opacity: 0; pointer-events: none; white-space: nowrap;
+  }
+  .scrub-zone:hover .scrub-hover-line, .scrub-zone:hover .scrub-bubble { opacity: 1; }
+
+  .bar-divider { width: 1px; height: 34px; background: rgba(255,255,255,0.16); margin: 0 2px; flex-shrink: 0; }
+  .stream-info {
+    flex: 1; display: none; align-items: center; gap: 12px; padding: 0 8px;
+    font-size: 17px; font-weight: 600;
+  }
+  .transport-wrap.stream-mode .media-only { display: none; }
+  .transport-wrap.stream-mode .stream-info { display: flex; }
+
+  /* =========================================================
+     悬浮快捷菜单（合批 1-2 个 OpenXR Quad 合成层，打开后冻结位姿）
+     ========================================================= */
+  .quick-menu {
+    position: absolute; right: 48px; bottom: 152px; z-index: 24;
+    width: 458px; border-radius: 24px;
+    background: var(--panel-elev); border: 1.5px solid rgba(255, 255, 255, 0.22);
+    box-shadow: 0 26px 68px rgba(0, 0, 0, 0.65), inset 0 1px 0 rgba(255,255,255,0.14);
+    backdrop-filter: blur(26px);
+    display: flex; flex-direction: column; overflow: hidden;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+  }
+  .quick-menu.hidden { opacity: 0; pointer-events: none; transform: translateY(10px) scale(0.97); }
+
+  .qm-tabs {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
+    padding: 12px 12px 10px; background: rgba(255,255,255,0.03);
+    border-bottom: 1px solid rgba(255,255,255,0.09);
+  }
+  .qm-tab {
+    height: 46px; border-radius: 12px; border: 1.5px solid transparent;
+    background: transparent; color: var(--text-secondary); font-family: inherit;
+    font-size: 16px; font-weight: 600; cursor: pointer; transition: all 0.14s;
+  }
+  .qm-tab:hover { background: rgba(255,255,255,0.08); color: #fff; }
+  .qm-tab.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-hover); }
+
+  .qm-body { padding: 18px 20px 20px; min-height: 332px; }
+  .qm-pane { display: none; flex-direction: column; gap: 16px; }
+  .qm-pane.active { display: flex; }
+
+  .qm-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+  .qm-lbl { font-size: 17px; font-weight: 600; }
+  .qm-sub { font-size: 13px; color: var(--text-secondary); margin-top: 2px; }
+  .qm-val { font-size: 17px; font-weight: 700; color: var(--accent-hover); font-variant-numeric: tabular-nums; }
+
+  .qm-seg { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .qm-seg.c4 { grid-template-columns: repeat(4, 1fr); }
+  .qm-seg.c5 { grid-template-columns: repeat(5, 1fr); }
+  .qm-seg button {
+    height: 46px; border-radius: 11px; border: 1.5px solid rgba(255,255,255,0.12);
+    background: var(--surface); color: var(--text-primary); font-family: inherit;
+    font-size: 15px; font-weight: 600; cursor: pointer; transition: all 0.14s;
+  }
+  .qm-seg button:hover { background: var(--surface-hover); border-color: rgba(255,255,255,0.4); }
+  .qm-seg button.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-hover); }
+
+  .qm-slider { display: flex; flex-direction: column; gap: 7px; }
+  .qm-slider input[type=range] { width: 100%; height: 9px; accent-color: var(--accent); cursor: pointer; }
+  .warn-scale { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-muted); }
+
+  .switch {
+    width: 56px; height: 32px; border-radius: 999px; background: rgba(255,255,255,0.2);
+    border: none; position: relative; cursor: pointer; transition: background 0.15s;
+  }
+  .switch::after {
+    content: ""; position: absolute; left: 4px; top: 4px; width: 24px; height: 24px;
+    border-radius: 50%; background: #fff; transition: transform 0.15s;
+  }
+  .switch.on { background: var(--accent); }
+  .switch.on::after { transform: translateX(24px); }
+
+  /* 5 环境缩略图 */
+  .env-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
+  .env-cell {
+    border-radius: 12px; border: 2px solid rgba(255,255,255,0.14); padding: 6px;
+    background: rgba(255,255,255,0.04); cursor: pointer; display: flex; flex-direction: column; gap: 6px;
+    align-items: center; color: var(--text-secondary); font-family: inherit; font-size: 13px; font-weight: 600;
+    transition: all 0.14s;
+  }
+  .env-cell:hover { border-color: rgba(255,255,255,0.5); color: #fff; }
+  .env-cell.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-hover); }
+  .env-swatch { width: 100%; height: 38px; border-radius: 7px; }
+
+  .track-list { display: flex; flex-direction: column; gap: 8px; }
+  .track-item {
+    height: 46px; padding: 0 14px; border-radius: 11px; border: 1.5px solid rgba(255,255,255,0.1);
+    background: var(--surface); color: var(--text-primary); font-family: inherit; font-size: 16px;
+    display: flex; align-items: center; justify-content: space-between; cursor: pointer;
+  }
+  .track-item.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-hover); font-weight: 600; }
+
+  /* 手柄射线与光标点示意 */
+  .xr-ray {
+    position: absolute; right: 56px; bottom: -10px; width: 320px; height: 420px;
+    pointer-events: none; z-index: 28;
+  }
+
+  /* =========================================================
+     OpenXR 16 层合成预算调试透视叠加层（仅审稿调试用）
+     ========================================================= */
+  .layer-badge {
+    display: none; position: absolute; z-index: 40;
+    padding: 3px 9px; border-radius: 6px; font-size: 12px; font-weight: 700;
+    background: rgba(255, 182, 72, 0.92); color: #160e02;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.45); pointer-events: none; white-space: nowrap;
+  }
+  .show-layers .layer-badge { display: inline-block; }
+  .show-layers .video-screen { outline: 2px dashed #FFB648; outline-offset: 3px; }
+  .show-layers .transport-bar { outline: 2px dashed #3ED598; outline-offset: 3px; }
+  .show-layers .quick-menu:not(.hidden) { outline: 2px dashed #58C4FF; outline-offset: 3px; }
+  .show-layers .xr-toast { outline: 2px dashed #E066FF; outline-offset: 3px; }
+  .show-layers .subtitle-layer { outline: 2px dashed #FFD27D; outline-offset: 4px; border-radius: 10px; }
+
+  .budget-hud {
+    display: none; position: absolute; left: 22px; top: 22px; z-index: 42;
+    padding: 12px 16px; border-radius: 14px; background: rgba(8, 11, 18, 0.92);
+    border: 1.5px solid rgba(255, 182, 72, 0.55); font-size: 13px; line-height: 1.65;
+    font-variant-numeric: tabular-nums;
+  }
+  .show-layers .budget-hud { display: block; }
+
+  .hint-footer { margin-top: 12px; font-size: 13px; color: #9aa8be; text-align: center; }
+</style>
+</head>
+<body>
+
+  <div class="review-bar">
+    <div class="review-links">
+      <a href="index.html">总览</a>
+      <a href="01-home.html">01 首页播放墙</a>
+      <a href="02-detail-movie.html">02 电影详情</a>
+      <a href="03-detail-series.html">03 剧集详情</a>
+      <a href="04-sources-plugins.html">04 播放源与插件</a>
+      <a href="05-cast-stream.html">05 投屏与串流</a>
+      <a href="06-onboarding.html">06 首次引导</a>
+      <a href="07-settings.html">07 设置</a>
+      <a href="08-vr-playback.html" class="active">08 VR 播放中</a>
+    </div>
+    <div class="review-tools">
+      <div class="ctrl-group" id="modeGroup">
+        <button class="ctrl-btn active" onclick="setPlayMode('media', this)">本地/网盘点播</button>
+        <button class="ctrl-btn" onclick="setPlayMode('stream', this)">投屏/串流精简条</button>
+      </div>
+      <div class="ctrl-group">
+        <button class="ctrl-btn active" id="btnToggleMenu" onclick="toggleQuickMenu()">快捷菜单：开</button>
+        <button class="ctrl-btn" id="btnToggleLayers" onclick="toggleLayerDebug(this)">OpenXR 层预算透视</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- VR 播放场景视口 -->
+  <div class="xr-viewport room-passthrough menu-open" id="xrViewport">
+
+    <!-- 透视客厅柔和空间剪影 -->
+    <svg class="room-decor" viewBox="0 0 1340 760" preserveAspectRatio="none">
+      <!-- 远景窗框柔光 -->
+      <rect x="60" y="60" width="220" height="310" rx="14" fill="rgba(255,248,232,0.26)"/>
+      <rect x="1060" y="75" width="210" height="290" rx="14" fill="rgba(220,236,252,0.2)"/>
+      <!-- 室内踢脚线与墙面层次 -->
+      <line x1="0" y1="435" x2="1340" y2="435" stroke="rgba(45,38,32,0.22)" stroke-width="2"/>
+      <!-- 客厅电视柜/茶几柔和轮廓 -->
+      <rect x="260" y="555" width="820" height="120" rx="18" fill="rgba(56,46,38,0.34)"/>
+      <ellipse cx="180" cy="610" rx="120" ry="70" fill="rgba(64,86,66,0.25)"/>
+    </svg>
+    <div class="synth-grid"></div>
+
+    <!-- 调试用 OpenXR 层预算 HUD -->
+    <div class="budget-hud" id="budgetHud">
+      <div style="color:#FFB648;font-weight:700;margin-bottom:4px;">OpenXR 合成层预算（PICO 4 硬上限 16 层）</div>
+      <div id="budgetDetail"></div>
+    </div>
+
+    <!-- 顶部 Toast 合成层 -->
+    <div class="xr-toast" id="xrToast">
+      <span class="toast-dot"></span>
+      <span id="toastMsg">实时 3D 已开启 · 均衡（0.6%）</span>
+      <span class="layer-badge" style="right:-106px;top:6px;">Toast · 1 层</span>
+    </div>
+
+    <!-- 6DoF 悬浮虚拟屏舞台 -->
+    <div class="screen-stage">
+      <div class="ambilight" id="ambilight"></div>
+
+      <div class="video-screen" id="videoScreen">
+        <span class="layer-badge" style="left:10px;top:-26px;">Video L + R · 2 层（2D 时 1 层）+ Ambilight · 1 层</span>
+
+        <div class="video-frame">
+          <div class="stereo-sheen" id="stereoBadge">✦ 实时 3D · 均衡 0.6% · 72 Hz</div>
+
+          <!-- 纯矢量科幻电影示意画面 -->
+          <svg class="scene-svg" viewBox="0 0 960 486" preserveAspectRatio="xMidYMid slice">
+            <defs>
+              <radialGradient id="planet" cx="35%" cy="32%" r="68%">
+                <stop offset="0%" stop-color="#B9ECFF"/>
+                <stop offset="38%" stop-color="#3F92F5"/>
+                <stop offset="78%" stop-color="#19336D"/>
+                <stop offset="100%" stop-color="#081027"/>
+              </radialGradient>
+              <linearGradient id="ground" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#152642"/>
+                <stop offset="100%" stop-color="#060B16"/>
+              </linearGradient>
+              <linearGradient id="beam" x1="0" y1="0" x2="1" y2="0">
+                <stop offset="0%" stop-color="rgba(132,214,255,0)"/>
+                <stop offset="50%" stop-color="rgba(132,214,255,0.65)"/>
+                <stop offset="100%" stop-color="rgba(132,214,255,0)"/>
+              </linearGradient>
+            </defs>
+            <!-- 星空 -->
+            <circle cx="110" cy="72" r="1.8" fill="#fff" opacity="0.8"/>
+            <circle cx="240" cy="118" r="1.4" fill="#9be0ff" opacity="0.7"/>
+            <circle cx="385" cy="54" r="2" fill="#fff" opacity="0.9"/>
+            <circle cx="760" cy="88" r="1.7" fill="#fff" opacity="0.75"/>
+            <circle cx="845" cy="148" r="2.2" fill="#9be0ff" opacity="0.85"/>
+            <circle cx="170" cy="195" r="1.2" fill="#fff" opacity="0.5"/>
+            <circle cx="890" cy="64" r="1.5" fill="#fff" opacity="0.65"/>
+
+            <!-- 巨型行星与星环 -->
+            <ellipse cx="590" cy="198" rx="280" ry="52" fill="none" stroke="rgba(132,214,255,0.34)" stroke-width="10" transform="rotate(-11 590 198)"/>
+            <circle cx="590" cy="192" r="126" fill="url(#planet)"/>
+            <path d="M320,248 Q590,285 860,148" fill="none" stroke="url(#beam)" stroke-width="6"/>
+
+            <!-- 远景山脊与前景色深层次（营造强立体纵深感） -->
+            <path d="M0,368 L130,312 L270,350 L435,296 L615,358 L770,318 L960,364 L960,486 L0,486 Z" fill="#0d1a32" opacity="0.92"/>
+            <path d="M0,418 L180,365 L350,410 L560,378 L755,422 L960,382 L960,486 L0,486 Z" fill="url(#ground)"/>
+
+            <!-- 前景轨道穿梭艇剪影 -->
+            <g transform="translate(228, 224)">
+              <polygon points="0,18 68,4 94,16 64,28" fill="#17243d" stroke="#84D6FF" stroke-width="1.5"/>
+              <ellipse cx="-14" cy="18" rx="22" ry="4" fill="#58C4FF" opacity="0.75"/>
+              <circle cx="52" cy="14" r="3.5" fill="#B9ECFF"/>
+            </g>
+          </svg>
+
+          <!-- 立体字幕层 -->
+          <div class="subtitle-layer" id="subtitleLayer">
+            <span class="sub-text">—— 轨道信号恢复，前方即将进入星环主带。</span>
+            <span class="sub-depth-tag" id="subDepthTag">字幕合成层 · 1 层（前置深度：适中 +4 cm，防视差重影）</span>
+          </div>
+        </div>
+
+        <!-- 6DoF 底边拖拽条与角标 -->
+        <div class="move-handle"></div>
+        <div class="corner-br"></div>
+      </div>
+    </div>
+
+    <!-- 悬浮快捷菜单（合批 1-2 层，位于播控条上方偏右，不完全挡住电影主体） -->
+    <aside class="quick-menu" id="quickMenu">
+      <span class="layer-badge" style="right:10px;top:6px;">Quick Menu · 1 层</span>
+      <div class="qm-tabs" id="qmTabs">
+        <button class="qm-tab active" onclick="switchQmTab('3d', this)">3D 深度</button>
+        <button class="qm-tab" onclick="switchQmTab('env', this)">屏幕与环境</button>
+        <button class="qm-tab" onclick="switchQmTab('sub', this)">字幕音轨</button>
+        <button class="qm-tab" onclick="switchQmTab('more', this)">播放辅助</button>
+      </div>
+
+      <div class="qm-body">
+        <!-- Tab 1: 3D 深度 -->
+        <div class="qm-pane active" id="qm-3d">
+          <div class="qm-row">
+            <div>
+              <div class="qm-lbl">实时 3D 立体转换</div>
+              <div class="qm-sub">ZipDepth GPU · 20 帧深度/秒</div>
+            </div>
+            <button class="switch on" id="sw3d" onclick="toggle3D()"></button>
+          </div>
+
+          <div>
+            <div class="qm-sub" style="margin-bottom:8px;">3D 强度预设</div>
+            <div class="qm-seg" id="qmPresets">
+              <button onclick="setPreset3D(0.4, '舒适', this)">舒适 0.4%</button>
+              <button class="active" onclick="setPreset3D(0.6, '均衡', this)">均衡 0.6%</button>
+              <button onclick="setPreset3D(0.9, '强烈', this)">强烈 0.9%</button>
+            </div>
+          </div>
+
+          <div class="qm-slider">
+            <div class="qm-row">
+              <span class="qm-lbl">视差分离度</span>
+              <span class="qm-val" id="qmSepVal">0.6%</span>
+            </div>
+            <input type="range" id="qmSep" min="0" max="1.5" step="0.1" value="0.6" oninput="onSepChange(this.value)">
+            <div class="warn-scale"><span>0.0% 平面</span><span>推荐 0.5–0.7%</span><span style="color:var(--warning)">>1.0% 易疲劳</span></div>
+          </div>
+
+          <div class="qm-slider">
+            <div class="qm-row">
+              <span class="qm-lbl">汇聚距离（出屏感）</span>
+              <span class="qm-val" id="qmConvVal">0.35</span>
+            </div>
+            <input type="range" id="qmConv" min="0" max="1" step="0.05" value="0.35" oninput="document.getElementById('qmConvVal').textContent=parseFloat(this.value).toFixed(2)">
+          </div>
+
+          <div class="qm-row" style="padding-top:4px;">
+            <span class="qm-sub">已自动记住本片参数</span>
+            <button class="qm-tab" style="height:38px;padding:0 14px;background:rgba(255,255,255,0.08);color:#fff;" onclick="setPreset3D(0.6, '均衡', document.querySelectorAll('#qmPresets button')[1])">恢复默认</button>
+          </div>
+        </div>
+
+        <!-- Tab 2: 屏幕与环境 -->
+        <div class="qm-pane" id="qm-env">
+          <div>
+            <div class="qm-sub" style="margin-bottom:8px;">观影环境（默认彩色透视）</div>
+            <div class="env-grid" id="envGrid">
+              <button class="env-cell active" onclick="setRoom('passthrough', '透视房间', this)">
+                <div class="env-swatch" style="background:linear-gradient(135deg,#cfc8bc,#7b7369);"></div>透视
+              </button>
+              <button class="env-cell" onclick="setRoom('void', '纯黑影院', this)">
+                <div class="env-swatch" style="background:#080a10;"></div>纯黑
+              </button>
+              <button class="env-cell" onclick="setRoom('theater', '家庭影院', this)">
+                <div class="env-swatch" style="background:linear-gradient(135deg,#472b20,#170f0f);"></div>家庭厅
+              </button>
+              <button class="env-cell" onclick="setRoom('cinema', '巨幕影厅', this)">
+                <div class="env-swatch" style="background:linear-gradient(135deg,#1d355e,#090d16);"></div>巨幕厅
+              </button>
+              <button class="env-cell" onclick="setRoom('synthwave', '霓虹赛博', this)">
+                <div class="env-swatch" style="background:linear-gradient(135deg,#b5389c,#1a0c38);"></div>霓虹
+              </button>
+            </div>
+          </div>
+
+          <div class="qm-slider">
+            <div class="qm-row">
+              <span class="qm-lbl">屏幕大小</span>
+              <span class="qm-val" id="sizeVal">3.0 m（100%）</span>
+            </div>
+            <input type="range" min="0.78" max="1.14" step="0.02" value="1.0" oninput="setScreenScale(this.value)">
+          </div>
+
+          <div class="qm-slider">
+            <div class="qm-row">
+              <span class="qm-lbl">观看距离</span>
+              <span class="qm-val" id="distVal">3.0 m</span>
+            </div>
+            <input type="range" min="1.2" max="6.0" step="0.2" value="3.0" oninput="document.getElementById('distVal').textContent=parseFloat(this.value).toFixed(1)+' m'">
+          </div>
+
+          <div class="qm-row">
+            <div>
+              <div class="qm-lbl">屏幕背后氛围光（Ambilight）</div>
+              <div class="qm-sub">提取画面边缘色彩柔和照亮空间</div>
+            </div>
+            <button class="switch on" id="swGlow" onclick="toggleGlow(this)"></button>
+          </div>
+
+          <div class="qm-row">
+            <span class="qm-lbl">视角锚定</span>
+            <div class="qm-seg" style="grid-template-columns:1fr 1fr;width:230px;" onclick="segOnly(event)">
+              <button class="active">6DoF 固定</button>
+              <button>躺看跟随</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 3: 字幕与音轨 -->
+        <div class="qm-pane" id="qm-sub">
+          <div>
+            <div class="qm-sub" style="margin-bottom:7px;">音轨选择</div>
+            <div class="track-list" onclick="pickTrack(event)">
+              <button class="track-item active"><span>国语 · Dolby 5.1</span><span>✓</span></button>
+              <button class="track-item"><span>英语原声 · Atmos 7.1</span><span></span></button>
+            </div>
+          </div>
+
+          <div>
+            <div class="qm-sub" style="margin-bottom:7px;">字幕选择</div>
+            <div class="track-list" onclick="pickTrack(event)">
+              <button class="track-item active"><span>简体中文 · 特效 ASS</span><span>✓</span></button>
+              <button class="track-item"><span>中英双语 · SRT</span><span></span></button>
+              <button class="track-item"><span>关闭字幕</span><span></span></button>
+            </div>
+          </div>
+
+          <div class="qm-slider">
+            <div class="qm-row">
+              <span class="qm-lbl">字幕空间深度（防立体打架）</span>
+              <span class="qm-val" id="subDepthVal">适中前置 +4 cm</span>
+            </div>
+            <input type="range" min="0" max="10" step="1" value="4" oninput="setSubDepth(this.value)">
+          </div>
+        </div>
+
+        <!-- Tab 4: 播放辅助 -->
+        <div class="qm-pane" id="qm-more">
+          <div>
+            <div class="qm-sub" style="margin-bottom:8px;">播放倍速</div>
+            <div class="qm-seg c5" onclick="segOnly(event)">
+              <button>0.75x</button>
+              <button class="active">1.0x</button>
+              <button>1.25x</button>
+              <button>1.5x</button>
+              <button>2.0x</button>
+            </div>
+          </div>
+
+          <div>
+            <div class="qm-sub" style="margin-bottom:8px;">睡眠定时</div>
+            <div class="qm-seg c4" onclick="segOnly(event)">
+              <button class="active">关闭</button>
+              <button>15 分</button>
+              <button>30 分</button>
+              <button>60 分</button>
+            </div>
+          </div>
+
+          <div class="qm-row">
+            <div>
+              <div class="qm-lbl">A-B 区间重复</div>
+              <div class="qm-sub">适合语言学习或反复欣赏精彩片段</div>
+            </div>
+            <button class="qm-tab" style="height:40px;padding:0 16px;background:var(--surface);color:#fff;" onclick="showToast('已标记起点 A：00:46:12')">设起点 A</button>
+          </div>
+
+          <div class="qm-row">
+            <div>
+              <div class="qm-lbl">性能诊断 HUD</div>
+              <div class="qm-sub">画面左上角显示帧率、深度耗时与延迟</div>
+            </div>
+            <button class="switch" onclick="this.classList.toggle('on');showToast('已切换性能诊断 HUD')"></button>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 底部播放控制条（1 个 OpenXR Quad 层） -->
+    <div class="transport-wrap" id="transportWrap">
+      <div class="transport-meta">
+        <div class="tm-left">
+          <span id="metaTitle">星尘摆渡人</span>
+          <span class="tm-chip" id="metaSrc">我的 Jellyfin · 4K HDR</span>
+        </div>
+        <div class="tm-right">
+          <span class="tm-chip" style="color:var(--accent-hover);border-color:rgba(88,196,255,0.42);" id="meta3d">✦ 实时 3D · 均衡</span>
+          <span>21:42</span>
+          <span>电量 78%</span>
+        </div>
+      </div>
+
+      <div class="transport-bar" style="position:relative;">
+        <span class="layer-badge" style="left:16px;top:-26px;">Transport Bar · 合批 1 层</span>
+
+        <!-- 点播播放控制 -->
+        <button class="t-btn media-only" onclick="seekBy(-10)" title="快退 10 秒">
+          <span class="tip">快退 10 秒</span>
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><text x="8.2" y="15.5" font-size="7.5" fill="currentColor" stroke="none" font-weight="700">10</text></svg>
+        </button>
+
+        <button class="t-btn play-main media-only" id="playPauseBtn" onclick="togglePlay()">
+          <span class="tip" id="playTip">暂停</span>
+          <svg id="playSvg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4.5" width="4.2" height="15" rx="1.2"/><rect x="13.8" y="4.5" width="4.2" height="15" rx="1.2"/></svg>
+        </button>
+
+        <button class="t-btn media-only" onclick="seekBy(10)" title="快进 10 秒">
+          <span class="tip">快进 10 秒</span>
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/><text x="8.2" y="15.5" font-size="7.5" fill="currentColor" stroke="none" font-weight="700">10</text></svg>
+        </button>
+
+        <span class="time-lbl media-only" id="curTime">00:46:12</span>
+
+        <div class="scrub-zone media-only" id="scrubZone" onmousemove="hoverScrub(event)" onclick="clickScrub(event)">
+          <div class="scrub-track">
+            <div class="scrub-buf"></div>
+            <div class="scrub-fill" id="scrubFill"></div>
+            <div class="scrub-thumb" id="scrubThumb"></div>
+          </div>
+          <div class="scrub-hover-line" id="scrubHoverLine"></div>
+          <div class="scrub-bubble" id="scrubBubble">01:12:40</div>
+        </div>
+
+        <span class="time-lbl total media-only">02:18:30</span>
+
+        <!-- 串流/投屏态精简信息 -->
+        <div class="stream-info">
+          <span style="width:10px;height:10px;border-radius:50%;background:var(--success);box-shadow:0 0 8px var(--success);"></span>
+          <span>MacBook Pro · 串流中</span>
+          <span class="tm-chip" style="color:#a9b7cd;">1440p · 72Hz · 延迟 9ms</span>
+        </div>
+
+        <div class="bar-divider"></div>
+
+        <!-- 右侧快捷工具图标（合批在同一张贴图内） -->
+        <button class="t-btn active" id="bar3dBtn" onclick="toggle3D()">
+          <span class="tip">开关实时 3D</span>
+          <span style="font-size:16px;font-weight:800;letter-spacing:-0.5px;">3D</span>
+        </button>
+
+        <button class="t-btn media-only" onclick="openQmTo('sub')">
+          <span class="tip">字幕与音轨</span>
+          <svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2.5"/><line x1="7" y1="13" x2="11" y2="13"/><line x1="13" y1="13" x2="17" y2="13"/><line x1="7" y1="16" x2="14" y2="16"/></svg>
+        </button>
+
+        <button class="t-btn" onclick="openQmTo('env')">
+          <span class="tip">屏幕与环境</span>
+          <svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2.5" y="4.5" width="19" height="13" rx="2.5"/><path d="M8 20.5h8"/></svg>
+        </button>
+
+        <button class="t-btn active" id="barMenuBtn" onclick="toggleQuickMenu()">
+          <span class="tip">快捷菜单</span>
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></svg>
+        </button>
+
+        <a class="t-btn exit" href="02-detail-movie.html">
+          <span class="tip">退出播放</span>
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </a>
+      </div>
+    </div>
+
+    <!-- 空间射线光束示意（2 层：Beam + Dot） -->
+    <svg class="xr-ray" viewBox="0 0 320 420">
+      <defs>
+        <linearGradient id="rayGrad" x1="1" y1="1" x2="0" y2="0">
+          <stop offset="0%" stop-color="rgba(132,214,255,0.65)"/>
+          <stop offset="100%" stop-color="rgba(132,214,255,0.1)"/>
+        </linearGradient>
+      </defs>
+      <line x1="295" y1="415" x2="96" y2="122" stroke="url(#rayGrad)" stroke-width="2.8" stroke-linecap="round"/>
+      <circle cx="96" cy="122" r="7" fill="#fff" stroke="#58C4FF" stroke-width="2.5"/>
+    </svg>
+  </div>
+
+  <div class="hint-footer">可交互体验：悬停/点击进度条预览时间、切换 3D 开关与滑块、在「屏幕与环境」实时切换透视/影厅背景与大小、或开启「OpenXR 层预算透视」查看 16 层合成预算</div>
+
+<script>
+  const TOTAL_SEC = 2 * 3600 + 18 * 60 + 30;
+  let curSec = 46 * 60 + 12;
+  let isPlaying = true;
+  let is3D = true;
+  let menuOpen = true;
+  let glowOn = true;
+  let curRoom = 'passthrough';
+  let toastTimer = null;
+
+  function fmt(sec) {
+    sec = Math.max(0, Math.min(TOTAL_SEC, Math.round(sec)));
+    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  }
+  function updateProgressUI() {
+    const pct = (curSec / TOTAL_SEC) * 100;
+    document.getElementById('scrubFill').style.width = pct + '%';
+    document.getElementById('scrubThumb').style.left = pct + '%';
+    document.getElementById('curTime').textContent = fmt(curSec);
+  }
+  function hoverScrub(e) {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const x = frac * rect.width;
+    document.getElementById('scrubHoverLine').style.left = x + 'px';
+    const b = document.getElementById('scrubBubble');
+    b.style.left = x + 'px';
+    b.textContent = fmt(frac * TOTAL_SEC);
+  }
+  function clickScrub(e) {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    curSec = Math.round(frac * TOTAL_SEC);
+    updateProgressUI();
+    showToast('已跳转至 ' + fmt(curSec));
+  }
+  function seekBy(delta) {
+    curSec = Math.max(0, Math.min(TOTAL_SEC, curSec + delta));
+    updateProgressUI();
+    showToast(delta > 0 ? '快进 10 秒' : '快退 10 秒');
+  }
+  function togglePlay() {
+    isPlaying = !isPlaying;
+    document.getElementById('playSvg').innerHTML = isPlaying
+      ? '<rect x="6" y="4.5" width="4.2" height="15" rx="1.2"/><rect x="13.8" y="4.5" width="4.2" height="15" rx="1.2"/>'
+      : '<polygon points="7,4.5 20,12 7,19.5"/>';
+    document.getElementById('playTip').textContent = isPlaying ? '暂停' : '继续播放';
+    showToast(isPlaying ? '继续播放' : '已暂停（控制条保持常驻）');
+  }
+
+  function showToast(msg) {
+    const t = document.getElementById('xrToast');
+    document.getElementById('toastMsg').textContent = msg;
+    t.style.opacity = '1';
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { t.style.opacity = '0.92'; }, 2500);
+  }
+
+  function toggle3D() {
+    is3D = !is3D;
+    document.getElementById('sw3d').classList.toggle('on', is3D);
+    document.getElementById('bar3dBtn').classList.toggle('active', is3D);
+    const badge = document.getElementById('stereoBadge');
+    const sep = document.getElementById('qmSepVal').textContent;
+    badge.textContent = is3D ? `✦ 实时 3D · ${sep} · 72 Hz` : '2D 原始画面 · 72 Hz';
+    badge.style.color = is3D ? 'var(--accent-hover)' : '#cbd5e6';
+    document.getElementById('meta3d').textContent = is3D ? `✦ 实时 3D · ${sep}` : '2D 模式';
+    showToast(is3D ? `实时 3D 已开启（${sep}）` : '已切换为 2D 画面（省 1 个合成层）');
+    updateBudget();
+  }
+  function setPreset3D(val, label, btn) {
+    document.querySelectorAll('#qmPresets button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('qmSep').value = val;
+    onSepChange(val, label);
+  }
+  function onSepChange(val, label) {
+    const s = parseFloat(val).toFixed(1) + '%';
+    document.getElementById('qmSepVal').textContent = s;
+    if (!is3D) toggle3D();
+    else {
+      document.getElementById('stereoBadge').textContent = `✦ 实时 3D · ${label ? label + ' ' : ''}${s} · 72 Hz`;
+      document.getElementById('meta3d').textContent = `✦ 实时 3D · ${label || s}`;
+      showToast(`3D 分离度已调整为 ${s}`);
+    }
+  }
+
+  function toggleQuickMenu() {
+    menuOpen = !menuOpen;
+    document.getElementById('quickMenu').classList.toggle('hidden', !menuOpen);
+    document.getElementById('xrViewport').classList.toggle('menu-open', menuOpen);
+    document.getElementById('barMenuBtn').classList.toggle('active', menuOpen);
+    document.getElementById('btnToggleMenu').textContent = menuOpen ? '快捷菜单：开' : '快捷菜单：关';
+    document.getElementById('btnToggleMenu').classList.toggle('active', menuOpen);
+    updateBudget();
+  }
+  function openQmTo(tab) {
+    if (!menuOpen) toggleQuickMenu();
+    const idxMap = { '3d': 0, 'env': 1, 'sub': 2, 'more': 3 };
+    const btns = document.querySelectorAll('#qmTabs .qm-tab');
+    switchQmTab(tab, btns[idxMap[tab]]);
+  }
+  function switchQmTab(tab, btn) {
+    document.querySelectorAll('#qmTabs .qm-tab').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    document.querySelectorAll('.qm-pane').forEach(p => p.classList.remove('active'));
+    document.getElementById('qm-' + tab).classList.add('active');
+  }
+
+  function setRoom(room, name, btn) {
+    curRoom = room;
+    const vp = document.getElementById('xrViewport');
+    vp.className = vp.className.replace(/room-\w+/g, '') + ' room-' + room;
+    document.querySelectorAll('#envGrid .env-cell').forEach(c => c.classList.remove('active'));
+    btn.classList.add('active');
+    showToast('已切换观影环境：' + name);
+    updateBudget();
+  }
+  function setScreenScale(v) {
+    const s = parseFloat(v);
+    document.getElementById('videoScreen').style.transform = `scale(${s})`;
+    document.getElementById('ambilight').style.transform = `scale(${s})`;
+    document.getElementById('sizeVal').textContent = `${(3.0 * s).toFixed(1)} m（${Math.round(s * 100)}%）`;
+  }
+  function toggleGlow(btn) {
+    glowOn = !glowOn;
+    btn.classList.toggle('on', glowOn);
+    document.getElementById('ambilight').classList.toggle('off', !glowOn);
+    showToast(glowOn ? '已开启屏幕氛围光' : '已关闭屏幕氛围光');
+    updateBudget();
+  }
+  function setSubDepth(v) {
+    const n = parseInt(v, 10);
+    const label = n === 0 ? '紧贴屏幕 0 cm' : n <= 5 ? `适中前置 +${n} cm` : `更靠前 +${n} cm`;
+    document.getElementById('subDepthVal').textContent = label;
+    document.getElementById('subDepthTag').textContent = `字幕合成层 · 1 层（前置深度：${label}）`;
+    document.getElementById('subtitleLayer').style.transform = `translateX(-50%) scale(${1 + n * 0.014})`;
+    document.getElementById('xrViewport').classList.add('show-sub-depth');
+  }
+  function pickTrack(e) {
+    const btn = e.target.closest('.track-item');
+    if (!btn) return;
+    e.currentTarget.querySelectorAll('.track-item').forEach(b => {
+      b.classList.remove('active');
+      b.lastElementChild.textContent = '';
+    });
+    btn.classList.add('active');
+    btn.lastElementChild.textContent = '✓';
+    showToast('已切换：' + btn.firstElementChild.textContent);
+  }
+  function segOnly(e) {
+    if (e.target.tagName !== 'BUTTON') return;
+    e.currentTarget.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+    e.target.classList.add('active');
+  }
+  function setPlayMode(mode, btn) {
+    const wrap = document.getElementById('transportWrap');
+    const isStream = mode === 'stream';
+    wrap.classList.toggle('stream-mode', isStream);
+    document.getElementById('metaTitle').textContent = isStream ? 'MacBook Pro · 桌面串流' : '星尘摆渡人';
+    document.getElementById('metaSrc').textContent = isStream ? 'depth3d Host · 实时 3D' : '我的 Jellyfin · 4K HDR';
+    document.getElementById('subtitleLayer').style.display = isStream ? 'none' : 'block';
+    document.querySelectorAll('#modeGroup .ctrl-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    updateBudget();
+  }
+  function toggleLayerDebug(btn) {
+    const on = document.getElementById('xrViewport').classList.toggle('show-layers');
+    btn.classList.toggle('active', on);
+    updateBudget();
+  }
+  function updateBudget() {
+    const roomLayers = (curRoom === 'passthrough' || curRoom === 'void') ? 0 : 1;
+    const glowLayers = glowOn ? 1 : 0;
+    const videoLayers = is3D ? 2 : 1;
+    const subLayers = document.getElementById('transportWrap').classList.contains('stream-mode') ? 0 : 1;
+    const barLayers = 1;
+    const menuLayers = menuOpen ? 1 : 0;
+    const rayLayers = 2;
+    const toastLayers = 1;
+    const total = roomLayers + glowLayers + videoLayers + subLayers + barLayers + menuLayers + rayLayers + toastLayers;
+    document.getElementById('budgetDetail').innerHTML = `
+      • 虚拟影厅 Room：${roomLayers} 层<br>
+      • 氛围光 Ambilight：${glowLayers} 层<br>
+      • 视频画面（${is3D ? '左+右双目 3D' : '单层 2D'}）：${videoLayers} 层<br>
+      • 空间立体字幕：${subLayers} 层<br>
+      • 底部播控条（合批贴图）：${barLayers} 层<br>
+      • 快捷菜单（合批贴图）：${menuLayers} 层<br>
+      • 射线光束 + 光标点：${rayLayers} 层<br>
+      • 顶部 Toast：${toastLayers} 层<br>
+      <strong style="color:#3ED598;">当前总计：${total} / 16 层（安全余量 ${16 - total} 层）</strong>
+    `;
+  }
+  updateBudget();
+</script>
+</body>
+</html>

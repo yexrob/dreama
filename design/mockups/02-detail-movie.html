@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>depth3d 视觉稿 — 02 电影详情页</title>
+<style>
+  :root {
+    --bg-window: rgba(13, 16, 23, 0.90);
+    --bg-surface: rgba(28, 34, 48, 0.84);
+    --bg-surface-hover: rgba(44, 54, 76, 0.94);
+    --bg-elevated: rgba(18, 22, 33, 0.96);
+    --border-subtle: rgba(255, 255, 255, 0.14);
+    --border-hover: rgba(255, 255, 255, 0.72);
+    --text-primary: #F4F7FB;
+    --text-secondary: #A7B4C9;
+    --text-muted: #74839B;
+    --accent: #58C4FF;
+    --accent-hover: #84D6FF;
+    --accent-soft: rgba(88, 196, 255, 0.18);
+    --success: #3ED598;
+    --warning: #FFB648;
+    --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: var(--font);
+    color: var(--text-primary);
+    min-height: 860px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 16px 24px 36px;
+    -webkit-font-smoothing: antialiased;
+  }
+  body.env-bright {
+    background:
+      radial-gradient(ellipse 60% 45% at 18% 15%, rgba(255, 241, 218, 0.65), transparent 65%),
+      radial-gradient(ellipse 55% 50% at 85% 22%, rgba(190, 214, 236, 0.52), transparent 65%),
+      linear-gradient(155deg, #c9c3b8 0%, #9fa3a8 42%, #7d756b 100%);
+  }
+  body.env-dim {
+    background:
+      radial-gradient(ellipse 45% 40% at 15% 20%, rgba(235, 168, 95, 0.2), transparent 60%),
+      linear-gradient(160deg, #1b1e28 0%, #12151e 50%, #0b0d12 100%);
+  }
+
+  .review-bar {
+    width: 100%; max-width: 1280px; display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 14px; padding: 8px 14px; border-radius: 14px;
+    background: rgba(10, 12, 18, 0.76); border: 1px solid rgba(255, 255, 255, 0.12);
+    backdrop-filter: blur(14px); font-size: 13px; color: #b7c3d6; flex-wrap: wrap;
+  }
+  .review-links { display: flex; gap: 6px; flex-wrap: wrap; }
+  .review-links a { color: #a7b4c9; text-decoration: none; padding: 4px 10px; border-radius: 8px; }
+  .review-links a:hover { background: rgba(255,255,255,0.1); color: #fff; }
+  .review-links a.active { background: rgba(88, 196, 255, 0.22); color: #84D6FF; font-weight: 600; }
+  .ctrl-group { display: inline-flex; background: rgba(255,255,255,0.06); border-radius: 9px; padding: 2px; gap: 2px; }
+  .ctrl-btn { border: none; background: transparent; color: #a7b4c9; font-family: inherit; font-size: 12px; padding: 4px 10px; border-radius: 7px; cursor: pointer; }
+  .ctrl-btn.active { background: rgba(88, 196, 255, 0.25); color: #fff; font-weight: 600; }
+
+  .vr-window {
+    width: 100%; max-width: 1280px; height: 760px; border-radius: 28px;
+    background: var(--bg-window); border: 1.5px solid rgba(255, 255, 255, 0.16);
+    box-shadow: 0 32px 80px rgba(0, 0, 0, 0.54), inset 0 1px 0 rgba(255, 255, 255, 0.14);
+    backdrop-filter: blur(28px); position: relative; overflow: hidden; display: flex; flex-direction: column;
+  }
+
+  /* 全幅剧照背景渐变 */
+  .backdrop {
+    position: absolute; inset: 0 0 38% 0; z-index: 0;
+    background:
+      radial-gradient(circle at 78% 34%, rgba(88, 196, 255, 0.45), transparent 36%),
+      radial-gradient(circle at 60% 62%, rgba(92, 62, 210, 0.38), transparent 46%),
+      linear-gradient(125deg, #0d1428 0%, #173056 54%, #101f3b 100%);
+  }
+  .backdrop::after {
+    content: ""; position: absolute; inset: 0;
+    background:
+      linear-gradient(180deg, rgba(13,16,23,0.28) 0%, rgba(13,16,23,0.72) 68%, rgba(13,16,23,1) 100%),
+      linear-gradient(90deg, rgba(13,16,23,0.92) 0%, rgba(13,16,23,0.52) 50%, rgba(13,16,23,0.25) 100%);
+  }
+  .backdrop-svg { position: absolute; right: 48px; top: 24px; width: 520px; height: 320px; opacity: 0.72; pointer-events: none; }
+
+  /* 顶部返回栏 */
+  .detail-topbar {
+    position: relative; z-index: 2; height: 76px; padding: 0 32px;
+    display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+  }
+  .back-btn {
+    height: 52px; padding: 0 20px; border-radius: 14px;
+    background: rgba(14, 18, 28, 0.76); border: 1.5px solid var(--border-subtle);
+    color: var(--text-primary); font-size: 19px; font-weight: 600;
+    display: inline-flex; align-items: center; gap: 10px; text-decoration: none; cursor: pointer;
+    transition: all 0.15s;
+  }
+  .back-btn:hover { background: var(--bg-surface-hover); border-color: var(--border-hover); transform: scale(1.03); }
+  .top-right { display: flex; align-items: center; gap: 12px; }
+  .source-tag {
+    height: 46px; padding: 0 16px; border-radius: 12px;
+    background: rgba(14, 18, 28, 0.72); border: 1px solid var(--border-subtle);
+    display: inline-flex; align-items: center; gap: 8px; font-size: 16px; color: var(--text-secondary);
+  }
+  .icon-btn {
+    width: 52px; height: 52px; border-radius: 14px;
+    background: rgba(14, 18, 28, 0.76); border: 1.5px solid var(--border-subtle);
+    color: var(--text-primary); display: grid; place-items: center; cursor: pointer; transition: all 0.15s;
+  }
+  .icon-btn:hover { border-color: var(--border-hover); background: var(--bg-surface-hover); transform: scale(1.05); }
+  .icon-btn.fav { color: #FF6B8A; border-color: rgba(255, 107, 138, 0.55); background: rgba(255, 107, 138, 0.14); }
+
+  /* 主体 */
+  .scroll-body {
+    position: relative; z-index: 2; flex: 1; overflow-y: auto;
+    padding: 8px 36px 36px; display: flex; flex-direction: column; gap: 28px;
+  }
+  .scroll-body::-webkit-scrollbar { width: 8px; }
+  .scroll-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.16); border-radius: 999px; }
+
+  .hero-layout { display: flex; gap: 34px; align-items: flex-start; }
+
+  .poster-big {
+    width: 232px; height: 344px; flex-shrink: 0; border-radius: 20px;
+    background: radial-gradient(circle at 72% 28%, #58C4FF 0%, transparent 45%), linear-gradient(155deg, #102042 0%, #1c3a6e 52%, #0a1024 100%);
+    border: 1.5px solid rgba(255, 255, 255, 0.22);
+    box-shadow: 0 22px 48px rgba(0, 0, 0, 0.55);
+    padding: 18px; display: flex; flex-direction: column; justify-content: space-between;
+  }
+  .poster-big .p-badge {
+    align-self: flex-start; padding: 4px 10px; border-radius: 8px;
+    background: rgba(88, 196, 255, 0.25); color: #9be0ff; border: 1px solid rgba(88, 196, 255, 0.5);
+    font-size: 14px; font-weight: 700;
+  }
+  .poster-big .p-name { font-size: 30px; font-weight: 800; line-height: 1.18; text-shadow: 0 4px 18px rgba(0,0,0,0.55); }
+  .poster-big .p-en { font-size: 13px; letter-spacing: 2.5px; opacity: 0.75; margin-top: 6px; }
+
+  .info-col { flex: 1; display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  .movie-title { font-size: 40px; font-weight: 700; line-height: 1.15; }
+  .movie-orig { font-size: 18px; color: var(--text-secondary); margin-top: 4px; }
+
+  .meta-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .meta-chip {
+    padding: 5px 12px; border-radius: 8px; font-size: 16px; font-weight: 600;
+    background: rgba(255, 255, 255, 0.1); color: #e2eaf6;
+  }
+  .meta-chip.score { background: rgba(255, 182, 72, 0.18); color: #FFD07F; }
+  .meta-chip.stereo { background: var(--accent-soft); color: var(--accent-hover); border: 1px solid rgba(88, 196, 255, 0.42); }
+
+  /* 续播进度条 */
+  .resume-bar {
+    display: flex; align-items: center; gap: 14px; font-size: 16px; color: var(--text-secondary);
+  }
+  .resume-track { width: 220px; height: 7px; border-radius: 999px; background: rgba(255,255,255,0.18); overflow: hidden; }
+  .resume-fill { width: 34%; height: 100%; background: var(--accent); border-radius: 999px; }
+
+  /* 主操作按钮行 */
+  .cta-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .btn {
+    height: 62px; padding: 0 28px; border-radius: 16px; font-family: inherit;
+    font-size: 20px; font-weight: 600; border: 1.5px solid transparent;
+    display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+    cursor: pointer; text-decoration: none; transition: all 0.15s;
+  }
+  .btn-primary {
+    background: var(--accent); color: #06141F;
+    box-shadow: 0 10px 26px rgba(88, 196, 255, 0.32);
+    min-width: 260px;
+  }
+  .btn-primary:hover { background: var(--accent-hover); transform: scale(1.03); border-color: #fff; }
+  .btn-secondary {
+    background: rgba(255, 255, 255, 0.1); color: var(--text-primary);
+    border-color: rgba(255, 255, 255, 0.18);
+  }
+  .btn-secondary:hover { background: rgba(255, 255, 255, 0.2); border-color: var(--border-hover); transform: scale(1.03); }
+
+  /* 内联可点播放选项卡（版本 / 音轨 / 字幕 / 本片 3D） */
+  .spec-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+  }
+  .spec-pill {
+    padding: 12px 14px; border-radius: 14px;
+    background: var(--bg-surface); border: 1.5px solid var(--border-subtle);
+    cursor: pointer; transition: all 0.15s; text-align: left; color: inherit; font-family: inherit;
+  }
+  .spec-pill:hover { background: var(--bg-surface-hover); border-color: var(--border-hover); transform: scale(1.02); }
+  .spec-pill.highlight { border-color: rgba(88, 196, 255, 0.48); background: rgba(88, 196, 255, 0.12); }
+  .spec-k { font-size: 14px; color: var(--text-secondary); margin-bottom: 4px; display: flex; justify-content: space-between; }
+  .spec-v { font-size: 17px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* 简介 */
+  .synopsis {
+    font-size: 19px; line-height: 1.6; color: #cbd5e6; max-width: 880px;
+  }
+
+  /* 底部两栏：影片信息 + 相关推荐 */
+  .bottom-grid { display: grid; grid-template-columns: 360px 1fr; gap: 26px; }
+  .panel-box {
+    background: rgba(24, 30, 42, 0.72); border: 1px solid var(--border-subtle);
+    border-radius: 18px; padding: 18px 20px;
+  }
+  .panel-box h3 { font-size: 20px; font-weight: 600; margin-bottom: 12px; }
+  .kv-list { display: flex; flex-direction: column; gap: 10px; font-size: 17px; }
+  .kv-row { display: flex; justify-content: space-between; gap: 12px; }
+  .kv-row span:first-child { color: var(--text-secondary); }
+  .kv-row span:last-child { font-weight: 500; text-align: right; }
+
+  .rec-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  .rec-card {
+    border-radius: 14px; padding: 12px; height: 152px; display: flex; flex-direction: column; justify-content: flex-end;
+    border: 1.5px solid rgba(255,255,255,0.12); text-decoration: none; color: #fff; transition: all 0.15s;
+  }
+  .rec-card:hover { border-color: var(--border-hover); transform: scale(1.04); }
+  .rec-card .r-t { font-size: 17px; font-weight: 700; }
+  .rec-card .r-m { font-size: 14px; opacity: 0.8; margin-top: 2px; }
+
+  /* 本片 3D 参数浮层弹窗 */
+  .modal-mask {
+    position: absolute; inset: 0; z-index: 10; background: rgba(6, 8, 14, 0.68);
+    backdrop-filter: blur(8px); display: none; align-items: center; justify-content: center;
+  }
+  .modal-mask.open { display: flex; }
+  .modal {
+    width: 640px; border-radius: 24px; background: var(--bg-elevated);
+    border: 1.5px solid rgba(255, 255, 255, 0.18); padding: 26px 28px;
+    box-shadow: 0 28px 64px rgba(0, 0, 0, 0.62); display: flex; flex-direction: column; gap: 20px;
+  }
+  .modal-head { display: flex; justify-content: space-between; align-items: center; }
+  .modal-head h3 { font-size: 24px; font-weight: 700; }
+  .modal-sub { font-size: 16px; color: var(--text-secondary); margin-top: 4px; }
+
+  .seg-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .seg-btn {
+    height: 54px; border-radius: 13px; border: 1.5px solid var(--border-subtle);
+    background: var(--bg-surface); color: var(--text-primary); font-family: inherit;
+    font-size: 18px; font-weight: 600; cursor: pointer; transition: all 0.14s;
+  }
+  .seg-btn.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-hover); }
+
+  .slider-row { display: flex; flex-direction: column; gap: 8px; }
+  .slider-label { display: flex; justify-content: space-between; font-size: 18px; }
+  .slider-val { color: var(--accent-hover); font-weight: 700; font-variant-numeric: tabular-nums; }
+  input[type=range] {
+    width: 100%; height: 10px; accent-color: var(--accent); cursor: pointer;
+  }
+  .modal-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 6px; }
+
+  .hint-footer { margin-top: 12px; font-size: 13px; color: rgba(255,255,255,0.68); text-shadow: 0 1px 4px rgba(0,0,0,0.6); }
+</style>
+</head>
+<body class="env-bright">
+
+  <div class="review-bar">
+    <div class="review-links">
+      <a href="index.html">总览</a>
+      <a href="01-home.html">01 首页播放墙</a>
+      <a href="02-detail-movie.html" class="active">02 电影详情</a>
+      <a href="03-detail-series.html">03 剧集详情</a>
+      <a href="04-sources-plugins.html">04 播放源与插件</a>
+      <a href="05-cast-stream.html">05 投屏与串流</a>
+      <a href="06-onboarding.html">06 首次引导</a>
+      <a href="07-settings.html">07 设置</a>
+      <a href="08-vr-playback.html">08 VR 播放中</a>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <div class="ctrl-group">
+        <button class="ctrl-btn" onclick="toggleModal(true)">打开「本片 3D 参数」浮层</button>
+      </div>
+      <div class="ctrl-group" id="envGroup">
+        <button class="ctrl-btn active" onclick="setEnv('bright', this)">亮透视房</button>
+        <button class="ctrl-btn" onclick="setEnv('dim', this)">暗透视房</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="vr-window">
+    <div class="backdrop">
+      <svg class="backdrop-svg" viewBox="0 0 520 320" fill="none">
+        <circle cx="330" cy="145" r="118" stroke="rgba(132,214,255,0.22)" stroke-width="1.5"/>
+        <circle cx="330" cy="145" r="76" fill="url(#mg1)" opacity="0.82"/>
+        <ellipse cx="330" cy="162" rx="188" ry="38" stroke="rgba(132,214,255,0.52)" stroke-width="2.5" transform="rotate(-12 330 162)"/>
+        <defs>
+          <radialGradient id="mg1" cx="35%" cy="30%" r="70%">
+            <stop offset="0%" stop-color="#9BE0FF"/>
+            <stop offset="55%" stop-color="#2F7DF6"/>
+            <stop offset="100%" stop-color="#0E1A3B"/>
+          </radialGradient>
+        </defs>
+      </svg>
+    </div>
+
+    <header class="detail-topbar">
+      <a class="back-btn" href="01-home.html">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M15 18l-6-6 6-6"/></svg>
+        返回首页
+      </a>
+      <div class="top-right">
+        <span class="source-tag">来自：我的 Jellyfin · 电影库</span>
+        <button class="icon-btn fav" id="favBtn" onclick="this.classList.toggle('fav')" title="收藏">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M12 21s-7-4.5-9.2-8.4C1.1 9.5 2.7 5.5 6.4 5.1c2-.2 3.8.8 5.6 2.8 1.8-2 3.6-3 5.6-2.8 3.7.4 5.3 4.4 3.6 7.5C19 16.5 12 21 12 21z"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="scroll-body">
+      <section class="hero-layout">
+        <div class="poster-big">
+          <span class="p-badge">✦ 实时 3D</span>
+          <div>
+            <div class="p-name">星尘<br>摆渡人</div>
+            <div class="p-en">STARDUST FERRYMAN</div>
+          </div>
+        </div>
+
+        <div class="info-col">
+          <div>
+            <h1 class="movie-title">星尘摆渡人</h1>
+            <div class="movie-orig">Stardust Ferryman · 2025 · 科幻 / 冒险</div>
+          </div>
+
+          <div class="meta-row">
+            <span class="meta-chip score">★ 9.0</span>
+            <span class="meta-chip">2 小时 18 分</span>
+            <span class="meta-chip">4K HEVC HDR10</span>
+            <span class="meta-chip">24 fps → 72 Hz 无抖动</span>
+            <span class="meta-chip stereo">✦ 本片已记忆 3D 参数</span>
+          </div>
+
+          <div class="resume-bar">
+            <div class="resume-track"><div class="resume-fill"></div></div>
+            <span>已观看 00:46:12 · 剩余 1 小时 32 分</span>
+          </div>
+
+          <div class="cta-row">
+            <a class="btn btn-primary" href="08-vr-playback.html">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><polygon points="6,4 20,12 6,20"/></svg>
+              继续 3D 播放
+            </a>
+            <a class="btn btn-secondary" href="08-vr-playback.html">从头播放</a>
+            <button class="btn btn-secondary" onclick="toggleModal(true)">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2.5" y="6" width="19" height="12" rx="4"/><circle cx="8.5" cy="12" r="2"/><circle cx="15.5" cy="12" r="2"/></svg>
+              本片 3D 参数
+            </button>
+          </div>
+
+          <!-- 内联选项条 -->
+          <div class="spec-grid">
+            <button class="spec-pill" onclick="cycleOption(this, ['4K HDR · 24.6 Mbps', '1080p 高码 · 9.2 Mbps'])">
+              <div class="spec-k"><span>视频版本</span><span>切换 ▾</span></div>
+              <div class="spec-v">4K HDR · 24.6 Mbps</div>
+            </button>
+            <button class="spec-pill" onclick="cycleOption(this, ['国语 · Dolby 5.1', '英语原声 · Atmos', '日语 · AAC 2.0'])">
+              <div class="spec-k"><span>音轨</span><span>切换 ▾</span></div>
+              <div class="spec-v">国语 · Dolby 5.1</div>
+            </button>
+            <button class="spec-pill" onclick="cycleOption(this, ['简体中文 · 特效 ASS', '中英双语 · SRT', '关闭字幕'])">
+              <div class="spec-k"><span>字幕</span><span>切换 ▾</span></div>
+              <div class="spec-v">简体中文 · 特效 ASS</div>
+            </button>
+            <button class="spec-pill highlight" onclick="toggleModal(true)">
+              <div class="spec-k"><span>3D 模式（本片记忆）</span><span>调节 ▾</span></div>
+              <div class="spec-v" id="summary3d">自动实时 3D · 均衡 0.6%</div>
+            </button>
+          </div>
+
+          <p class="synopsis">
+            公元 2146 年，深空货运轨道站因太阳风暴与地球失联。负责星环航道维护的摆渡员林远驾驶老旧穿梭艇穿越残骸带，在微弱的脉冲信标指引下，逐一拼凑出空间站撤离前留下的最后秘密。画面充满辽阔景深，非常适合以均衡 3D 强度在巨幕下观看。
+          </p>
+        </div>
+      </section>
+
+      <section class="bottom-grid">
+        <div class="panel-box">
+          <h3>媒体与演职信息</h3>
+          <div class="kv-list">
+            <div class="kv-row"><span>导演</span><span>陈沐风</span></div>
+            <div class="kv-row"><span>主演</span><span>陆知行 / 苏晚 / 顾城</span></div>
+            <div class="kv-row"><span>片源格式</span><span>2D（实时深度转换 20fps）</span></div>
+            <div class="kv-row"><span>文件大小</span><span>24.8 GB · MKV</span></div>
+          </div>
+        </div>
+
+        <div class="panel-box">
+          <h3>更多同类型影片</h3>
+          <div class="rec-row">
+            <a class="rec-card" href="02-detail-movie.html" style="background: radial-gradient(circle at 70% 25%, #FF7866, transparent 50%), linear-gradient(155deg,#2e172c,#5e2a45);">
+              <div class="r-t">苍穹之下</div><div class="r-m">2024 · 4K</div>
+            </a>
+            <a class="rec-card" href="02-detail-movie.html" style="background: radial-gradient(circle at 60% 30%, #F2B84B, transparent 48%), linear-gradient(155deg,#24190d,#5c3d18);">
+              <div class="r-t">时隙行者</div><div class="r-m">2025 · 4K</div>
+            </a>
+            <a class="rec-card" href="03-detail-series.html" style="background: radial-gradient(circle at 50% 22%, #3ED598, transparent 50%), linear-gradient(155deg,#0b1c26,#17464b);">
+              <div class="r-t">极光边界</div><div class="r-m">剧集 · 12 集</div>
+            </a>
+            <a class="rec-card" href="02-detail-movie.html" style="background: radial-gradient(circle at 40% 30%, #2CE4C3, transparent 50%), linear-gradient(155deg,#062534,#0d4b5e);">
+              <div class="r-t">深海回声</div><div class="r-m">原生 SBS 3D</div>
+            </a>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- 本片专属 3D 参数调节浮层 -->
+    <div class="modal-mask" id="modal3d" onclick="if(event.target===this) toggleModal(false)">
+      <div class="modal">
+        <div class="modal-head">
+          <div>
+            <h3>本片 3D 转换参数</h3>
+            <div class="modal-sub">单独为《星尘摆渡人》保存，不影响其他影片默认值</div>
+          </div>
+          <button class="icon-btn" onclick="toggleModal(false)">✕</button>
+        </div>
+
+        <div>
+          <div style="font-size:17px;color:var(--text-secondary);margin-bottom:10px;">片源立体模式</div>
+          <div class="seg-row" id="modeRow">
+            <button class="seg-btn active" onclick="pickSeg(this,'modeRow')">自动实时 3D</button>
+            <button class="seg-btn" onclick="pickSeg(this,'modeRow')">原生左右 SBS</button>
+            <button class="seg-btn" onclick="pickSeg(this,'modeRow')">仅 2D 播放</button>
+          </div>
+        </div>
+
+        <div>
+          <div style="font-size:17px;color:var(--text-secondary);margin-bottom:10px;">3D 强度预设</div>
+          <div class="seg-row" id="presetRow">
+            <button class="seg-btn" onclick="applyPreset(0.4, 0.30, '舒适', this)">舒适 · 0.4%</button>
+            <button class="seg-btn active" onclick="applyPreset(0.6, 0.35, '均衡', this)">均衡 · 0.6%</button>
+            <button class="seg-btn" onclick="applyPreset(0.9, 0.42, '强烈', this)">强烈 · 0.9%</button>
+          </div>
+        </div>
+
+        <div class="slider-row">
+          <div class="slider-label">
+            <span>视差分离度（Separation）</span>
+            <span class="slider-val" id="sepVal">0.6%</span>
+          </div>
+          <input type="range" id="sepRange" min="0" max="1.5" step="0.1" value="0.6" oninput="updateSliders()">
+          <div style="font-size:14px;color:var(--text-muted);display:flex;justify-content:space-between;">
+            <span>0.0% 平面</span><span>推荐 0.5%–0.7%</span><span style="color:var(--warning)">>1.0% 易疲劳</span>
+          </div>
+        </div>
+
+        <div class="slider-row">
+          <div class="slider-label">
+            <span>汇聚距离（Convergence · 出屏感）</span>
+            <span class="slider-val" id="convVal">0.35</span>
+          </div>
+          <input type="range" id="convRange" min="0" max="1" step="0.05" value="0.35" oninput="updateSliders()">
+        </div>
+
+        <div class="modal-foot">
+          <button class="btn btn-secondary" style="height:52px;font-size:18px;padding:0 20px;" onclick="applyPreset(0.6, 0.35, '均衡', document.querySelectorAll('#presetRow .seg-btn')[1])">恢复全局默认</button>
+          <button class="btn btn-primary" style="height:52px;font-size:18px;min-width:160px;" onclick="toggleModal(false)">保存记忆</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="hint-footer">点击版本/音轨/字幕胶囊或「本片 3D 参数」可交互体验详情页微调</div>
+
+<script>
+  function setEnv(mode, btn) {
+    document.body.className = mode === 'bright' ? 'env-bright' : 'env-dim';
+    document.querySelectorAll('#envGroup .ctrl-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  }
+  function cycleOption(el, opts) {
+    const v = el.querySelector('.spec-v');
+    const idx = opts.indexOf(v.textContent);
+    v.textContent = opts[(idx + 1) % opts.length];
+  }
+  function toggleModal(open) {
+    document.getElementById('modal3d').classList.toggle('open', open);
+  }
+  function pickSeg(btn, rowId) {
+    document.querySelectorAll('#' + rowId + ' .seg-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  }
+  function applyPreset(sep, conv, label, btn) {
+    pickSeg(btn, 'presetRow');
+    document.getElementById('sepRange').value = sep;
+    document.getElementById('convRange').value = conv;
+    updateSliders(label);
+  }
+  function updateSliders(presetName) {
+    const sep = parseFloat(document.getElementById('sepRange').value).toFixed(1);
+    const conv = parseFloat(document.getElementById('convRange').value).toFixed(2);
+    document.getElementById('sepVal').textContent = sep + '%';
+    document.getElementById('convVal').textContent = conv;
+    const tag = presetName || (sep == '0.4' ? '舒适' : sep == '0.6' ? '均衡' : sep == '0.9' ? '强烈' : '自定义');
+    document.getElementById('summary3d').textContent = '自动实时 3D · ' + tag + ' ' + sep + '%';
+  }
+</script>
+</body>
+</html>

@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>depth3d 头显端 UI/UX 视觉稿总览</title>
+<style>
+  :root {
+    --bg: #0b0e15;
+    --surface: #141925;
+    --surface-hover: #1d2436;
+    --border: rgba(255,255,255,0.12);
+    --text: #F4F7FB;
+    --muted: #98A6BE;
+    --accent: #58C4FF;
+    --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: var(--font); color: var(--text);
+    background:
+      radial-gradient(ellipse 60% 40% at 50% 0%, rgba(88, 196, 255, 0.14), transparent 65%),
+      var(--bg);
+    min-height: 860px; padding: 40px 28px 64px; -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; display: flex; flex-direction: column; gap: 32px; }
+  header { display: flex; justify-content: space-between; align-items: flex-end; gap: 20px; flex-wrap: wrap; }
+  .brand { display: flex; align-items: center; gap: 14px; margin-bottom: 10px; }
+  .mark {
+    width: 44px; height: 44px; border-radius: 13px;
+    background: linear-gradient(135deg, #58C4FF 0%, #246BFD 60%, #162B5C 100%);
+    display: grid; place-items: center;
+  }
+  h1 { font-size: 34px; font-weight: 800; letter-spacing: -0.5px; }
+  .lead { font-size: 17px; color: var(--muted); max-width: 720px; line-height: 1.6; }
+  .chips { display: flex; gap: 10px; flex-wrap: wrap; }
+  .chip {
+    padding: 6px 14px; border-radius: 999px; font-size: 13px; font-weight: 600;
+    background: rgba(255,255,255,0.06); border: 1px solid var(--border); color: #cdd8ea;
+  }
+  .chip.accent { background: rgba(88,196,255,0.16); border-color: rgba(88,196,255,0.45); color: #84D6FF; }
+
+  .sec-title { font-size: 20px; font-weight: 700; color: #dbe5f5; margin-bottom: 14px; display: flex; align-items: center; gap: 10px; }
+  .sec-sub { font-size: 14px; font-weight: 400; color: var(--muted); }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 18px; }
+  .card {
+    background: var(--surface); border: 1.5px solid var(--border); border-radius: 20px;
+    padding: 22px; text-decoration: none; color: inherit; display: flex; flex-direction: column; gap: 12px;
+    transition: all 0.16s ease;
+  }
+  .card:hover {
+    background: var(--surface-hover); border-color: var(--accent);
+    transform: translateY(-3px); box-shadow: 0 18px 40px rgba(0,0,0,0.42);
+  }
+  .card-top { display: flex; justify-content: space-between; align-items: center; }
+  .num { font-size: 13px; font-weight: 700; color: #84D6FF; background: rgba(88,196,255,0.16); padding: 4px 10px; border-radius: 8px; }
+  .kind { font-size: 12px; color: var(--muted); }
+  .card h3 { font-size: 20px; font-weight: 700; }
+  .card p { font-size: 15px; color: var(--muted); line-height: 1.55; flex: 1; }
+  .open-tip { font-size: 14px; font-weight: 600; color: #84D6FF; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <div class="brand">
+          <div class="mark">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2"><rect x="2.5" y="6" width="19" height="12" rx="4"/><circle cx="8.5" cy="12" r="2.2"/><circle cx="15.5" cy="12" r="2.2"/></svg>
+          </div>
+          <h1>depth3d 头显端 UI/UX 视觉稿</h1>
+        </div>
+        <p class="lead">面向 PICO 4（OpenXR，2160×2160/眼，彩色透视）的 2D 悬浮面板与 VR 播放场景设计稿。全部文件离线自包含，可直接在浏览器交互体验多状态切换、透视明暗对比及 OpenXR 16 层预算透视。</p>
+      </div>
+      <div class="chips">
+        <span class="chip accent">PICO 4 · 20.6 PPD</span>
+        <span class="chip">1280×720 dp 2D 窗口</span>
+        <span class="chip">≤ 16 OpenXR 合成层</span>
+        <span class="chip">简体中文 · 离线自包含</span>
+      </div>
+    </header>
+
+    <section>
+      <div class="sec-title">2D 悬浮面板（Jetpack Compose） <span class="sec-sub">模拟真实透视背景下的深色半透明空间窗口</span></div>
+      <div class="grid">
+        <a class="card" href="01-home.html">
+          <div class="card-top"><span class="num">01</span><span class="kind">首页 · 多状态</span></div>
+          <h3>首页播放墙</h3>
+          <p>左侧空间导航轨 + Hero 焦点横幅 + 跨源「继续观看」+「最近添加」+ 各播放源海报分区。支持切换「正常 / 部分源离线无权限 / 无播放源空态」。</p>
+          <span class="open-tip">打开视觉稿 →</span>
+        </a>
+
+        <a class="card" href="02-detail-movie.html">
+          <div class="card-top"><span class="num">02</span><span class="kind">详情页 · 电影</span></div>
+          <h3>电影详情页</h3>
+          <p>全幅剧照渐变底图、大号 3D 续播主按钮、内联版本/音轨/字幕切换，以及可交互打开的「本片专属 3D 参数记忆」浮层。</p>
+          <span class="open-tip">打开视觉稿 →</span>
+        </a>
+
+        <a class="card" href="03-detail-series.html">
+          <div class="card-top"><span class="num">03</span><span class="kind">详情页 · 剧集</span></div>
+          <h3>剧集详情页</h3>
+          <p>支持点击切换「第 2 季 / 第 1 季 / 特别篇」，3 列宽幅剧集卡片带进度条、已看完与观看中徽章，避免 VR 中细密列表扫读疲劳。</p>
+          <span class="open-tip">打开视觉稿 →</span>
+        </a>
+
+        <a class="card" href="04-sources-plugins.html">
+          <div class="card-top"><span class="num">04</span><span class="kind">扩展生态 · QuickJS</span></div>
+          <h3>播放源与插件管理</h3>
+          <p>涵盖「我的播放源（含 TMDB 刮削与局域网发现）」「插件管理（权限白名单徽章）」「插件仓库」，以及由 manifest 自动生成并附带「手机扫码免打字」的配置表单。</p>
+          <span class="open-tip">打开视觉稿 →</span>
+        </a>
+
+        <a class="card" href="05-cast-stream.html">
+          <div class="card-top"><span class="num">05</span><span class="kind">即时画面输入</span></div>
+          <h3>投屏接收与电脑串流</h3>
+          <p>醒目展示本机设备名 depth3d-PICO4、等待脉冲态、AirPlay 镜像 / DLNA App 投屏 / 安卓镜像分步引导、手机网页遥控二维码，以及电脑串流主机发现页。</p>
+          <span class="open-tip">打开视觉稿 →</span>
+        </a>
+
+        <a class="card" href="06-onboarding.html">
+          <div class="card-top"><span class="num">06</span><span class="kind">3 步引导</span></div>
+          <h3>首次使用引导</h3>
+          <p>3 步轻量化流程：欢迎与透视交互 → 并行扫描本机与局域网 Mac Host 快速接入内容 → 选择默认 3D 舒适度（舒适/均衡/强烈）。</p>
+          <span class="open-tip">打开视觉稿 →</span>
+        </a>
+
+        <a class="card" href="07-settings.html">
+          <div class="card-top"><span class="num">07</span><span class="kind">全局配置</span></div>
+          <h3>全局设置</h3>
+          <p>双栏结构，涵盖 3D 与画面引擎、默认字幕空间深度、空间屏幕场景记忆、后台静默投屏待命、隐私崩溃上报（默认关）与 GPLv3 开源声明。</p>
+          <span class="open-tip">打开视觉稿 →</span>
+        </a>
+      </div>
+    </section>
+
+    <section>
+      <div class="sec-title">VR 播放场景内界面（OpenXR 合成层） <span class="sec-sub">严格控制在 PICO 4 16 层硬限制内</span></div>
+      <div class="grid">
+        <a class="card" href="08-vr-playback.html" style="border-color: rgba(88,196,255,0.42);">
+          <div class="card-top"><span class="num">08</span><span class="kind">OpenXR 场景 · 高交互</span></div>
+          <h3>VR 播放中界面（播控条 + 快捷菜单 + Toast）</h3>
+          <p>悬浮在透视客厅中的 6DoF 影幕、合批单层升级版播控条（悬停预览时间 + 快捷键）、四 Tab 悬浮快捷菜单（实时切换 5 种影院环境、屏幕缩放、3D 强度、字幕深度）、串流精简模式，以及内置的「OpenXR 16 层合成预算透视」。</p>
+          <span class="open-tip">打开交互演示 →</span>
+        </a>
+      </div>
+    </section>
+  </div>
+</body>
+</html>

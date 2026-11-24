@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>depth3d 视觉稿 — 07 全局设置</title>
+<style>
+  :root {
+    --bg-window: rgba(13, 16, 23, 0.89);
+    --bg-sidebar: rgba(9, 12, 18, 0.72);
+    --bg-surface: rgba(28, 34, 48, 0.84);
+    --bg-surface-hover: rgba(44, 54, 76, 0.94);
+    --border-subtle: rgba(255, 255, 255, 0.13);
+    --border-hover: rgba(255, 255, 255, 0.72);
+    --text-primary: #F4F7FB;
+    --text-secondary: #A7B4C9;
+    --text-muted: #74839B;
+    --accent: #58C4FF;
+    --accent-hover: #84D6FF;
+    --accent-soft: rgba(88, 196, 255, 0.18);
+    --success: #3ED598;
+    --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: var(--font); color: var(--text-primary); min-height: 860px;
+    display: flex; flex-direction: column; align-items: center; padding: 16px 24px 36px;
+    -webkit-font-smoothing: antialiased;
+  }
+  body.env-bright {
+    background:
+      radial-gradient(ellipse 60% 45% at 18% 15%, rgba(255, 241, 218, 0.65), transparent 65%),
+      radial-gradient(ellipse 55% 50% at 85% 22%, rgba(190, 214, 236, 0.52), transparent 65%),
+      linear-gradient(155deg, #c9c3b8 0%, #9fa3a8 42%, #7d756b 100%);
+  }
+  body.env-dim {
+    background:
+      radial-gradient(ellipse 45% 40% at 15% 20%, rgba(235, 168, 95, 0.2), transparent 60%),
+      linear-gradient(160deg, #1b1e28 0%, #12151e 50%, #0b0d12 100%);
+  }
+
+  .review-bar {
+    width: 100%; max-width: 1280px; display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 14px; padding: 8px 14px; border-radius: 14px;
+    background: rgba(10, 12, 18, 0.76); border: 1px solid rgba(255, 255, 255, 0.12);
+    backdrop-filter: blur(14px); font-size: 13px; color: #b7c3d6; flex-wrap: wrap;
+  }
+  .review-links { display: flex; gap: 6px; flex-wrap: wrap; }
+  .review-links a { color: #a7b4c9; text-decoration: none; padding: 4px 10px; border-radius: 8px; }
+  .review-links a:hover { background: rgba(255,255,255,0.1); color: #fff; }
+  .review-links a.active { background: rgba(88, 196, 255, 0.22); color: #84D6FF; font-weight: 600; }
+  .ctrl-group { display: inline-flex; background: rgba(255,255,255,0.06); border-radius: 9px; padding: 2px; gap: 2px; }
+  .ctrl-btn { border: none; background: transparent; color: #a7b4c9; font-family: inherit; font-size: 12px; padding: 4px 10px; border-radius: 7px; cursor: pointer; }
+  .ctrl-btn.active { background: rgba(88, 196, 255, 0.25); color: #fff; font-weight: 600; }
+
+  .vr-window {
+    width: 100%; max-width: 1280px; height: 760px; border-radius: 28px;
+    background: var(--bg-window); border: 1.5px solid rgba(255, 255, 255, 0.16);
+    box-shadow: 0 32px 80px rgba(0, 0, 0, 0.54), inset 0 1px 0 rgba(255, 255, 255, 0.14);
+    backdrop-filter: blur(28px); display: flex; overflow: hidden;
+  }
+
+  .sidebar {
+    width: 224px; flex-shrink: 0; background: var(--bg-sidebar);
+    border-right: 1px solid var(--border-subtle); display: flex; flex-direction: column; padding: 24px 16px 20px;
+  }
+  .brand { display: flex; align-items: center; gap: 12px; padding: 6px 12px 24px; }
+  .brand-mark {
+    width: 38px; height: 38px; border-radius: 11px;
+    background: linear-gradient(135deg, #58C4FF 0%, #246BFD 55%, #162B5C 100%);
+    display: grid; place-items: center; flex-shrink: 0;
+  }
+  .brand-name { font-size: 22px; font-weight: 700; }
+  .brand-tag { font-size: 12px; color: var(--accent); font-weight: 600; }
+  .nav-group { display: flex; flex-direction: column; gap: 8px; }
+  .nav-spacer { flex: 1; }
+  .nav-divider { height: 1px; background: var(--border-subtle); margin: 14px 8px; }
+  .nav-item {
+    height: 56px; padding: 0 16px; border-radius: 14px; display: flex; align-items: center; gap: 14px;
+    text-decoration: none; color: var(--text-secondary); font-size: 19px; font-weight: 500;
+    border: 1.5px solid transparent; transition: all 0.15s; position: relative;
+  }
+  .nav-item:hover { background: rgba(255,255,255,0.09); border-color: rgba(255,255,255,0.26); color: #fff; }
+  .nav-item.active { background: var(--accent-soft); border-color: rgba(88, 196, 255, 0.5); color: #fff; font-weight: 600; }
+  .nav-item.active::before { content: ""; position: absolute; left: 0; top: 14px; bottom: 14px; width: 4px; border-radius: 0 4px 4px 0; background: var(--accent); }
+  .nav-item svg { width: 22px; height: 22px; flex-shrink: 0; }
+
+  /* 设置内部分栏：分类列 + 内容列 */
+  .settings-shell { flex: 1; display: flex; min-width: 0; }
+  .cat-col {
+    width: 248px; flex-shrink: 0; border-right: 1px solid rgba(255,255,255,0.08);
+    padding: 26px 16px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .cat-title { font-size: 24px; font-weight: 700; padding: 0 14px 14px; }
+  .cat-btn {
+    height: 54px; padding: 0 16px; border-radius: 14px; border: 1.5px solid transparent;
+    background: transparent; color: var(--text-secondary); font-family: inherit;
+    font-size: 18px; font-weight: 500; text-align: left; cursor: pointer; transition: all 0.14s;
+  }
+  .cat-btn:hover { background: rgba(255,255,255,0.08); color: #fff; }
+  .cat-btn.active { background: var(--bg-surface); border-color: rgba(88,196,255,0.48); color: var(--accent-hover); font-weight: 600; }
+
+  .detail-col {
+    flex: 1; overflow-y: auto; padding: 28px 34px 36px; display: flex; flex-direction: column; gap: 22px;
+  }
+  .detail-col::-webkit-scrollbar { width: 8px; }
+  .detail-col::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.16); border-radius: 999px; }
+
+  .sec-pane { display: none; flex-direction: column; gap: 18px; }
+  .sec-pane.active { display: flex; }
+  .sec-h { font-size: 26px; font-weight: 700; margin-bottom: 2px; }
+
+  .group-card {
+    border-radius: 20px; background: var(--bg-surface); border: 1px solid var(--border-subtle);
+    overflow: hidden;
+  }
+  .row {
+    min-height: 76px; padding: 16px 22px; display: flex; align-items: center; justify-content: space-between;
+    gap: 20px; border-bottom: 1px solid rgba(255,255,255,0.07);
+  }
+  .row:last-child { border-bottom: none; }
+  .row-l { flex: 1; }
+  .row-t { font-size: 19px; font-weight: 600; }
+  .row-d { font-size: 16px; color: var(--text-secondary); margin-top: 4px; line-height: 1.45; }
+
+  .switch {
+    width: 60px; height: 34px; border-radius: 999px; background: rgba(255,255,255,0.18);
+    border: none; position: relative; cursor: pointer; transition: background 0.16s; flex-shrink: 0;
+  }
+  .switch::after {
+    content: ""; position: absolute; left: 4px; top: 4px; width: 26px; height: 26px;
+    border-radius: 50%; background: #fff; transition: transform 0.16s;
+  }
+  .switch.on { background: var(--accent); }
+  .switch.on::after { transform: translateX(26px); }
+
+  .seg { display: inline-flex; background: rgba(10,14,22,0.58); padding: 4px; border-radius: 12px; gap: 4px; flex-shrink: 0; }
+  .seg button {
+    height: 42px; padding: 0 16px; border-radius: 9px; border: none; background: transparent;
+    color: var(--text-secondary); font-family: inherit; font-size: 16px; font-weight: 600; cursor: pointer;
+  }
+  .seg button.active { background: var(--accent); color: #06141F; }
+
+  .btn-pill {
+    height: 46px; padding: 0 18px; border-radius: 12px; border: 1.5px solid var(--border-subtle);
+    background: rgba(255,255,255,0.08); color: #fff; font-family: inherit; font-size: 16px; font-weight: 600;
+    cursor: pointer; flex-shrink: 0;
+  }
+  .btn-pill:hover { background: rgba(255,255,255,0.18); border-color: var(--border-hover); }
+
+  .hint-footer { margin-top: 12px; font-size: 13px; color: rgba(255,255,255,0.68); text-shadow: 0 1px 4px rgba(0,0,0,0.6); }
+</style>
+</head>
+<body class="env-bright">
+
+  <div class="review-bar">
+    <div class="review-links">
+      <a href="index.html">总览</a>
+      <a href="01-home.html">01 首页播放墙</a>
+      <a href="02-detail-movie.html">02 电影详情</a>
+      <a href="03-detail-series.html">03 剧集详情</a>
+      <a href="04-sources-plugins.html">04 播放源与插件</a>
+      <a href="05-cast-stream.html">05 投屏与串流</a>
+      <a href="06-onboarding.html">06 首次引导</a>
+      <a href="07-settings.html" class="active">07 设置</a>
+      <a href="08-vr-playback.html">08 VR 播放中</a>
+    </div>
+    <div class="ctrl-group" id="envGroup">
+      <button class="ctrl-btn active" onclick="setEnv('bright', this)">亮透视房</button>
+      <button class="ctrl-btn" onclick="setEnv('dim', this)">暗透视房</button>
+    </div>
+  </div>
+
+  <div class="vr-window">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2"><rect x="2.5" y="6" width="19" height="12" rx="4"/><circle cx="8.5" cy="12" r="2.2"/><circle cx="15.5" cy="12" r="2.2"/></svg>
+        </div>
+        <div><div class="brand-name">depth3d</div><div class="brand-tag">实时 3D 影院</div></div>
+      </div>
+      <nav class="nav-group">
+        <a class="nav-item" href="01-home.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 10.5L12 3l9 7.5V20a1 1 0 0 1-1 1h-5.5v-6.5h-5V21H4a1 1 0 0 1-1-1z"/></svg>首页</a>
+        <a class="nav-item" href="03-detail-series.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="7" height="7" rx="1.5"/><rect x="14" y="4" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>片库</a>
+        <a class="nav-item" href="05-cast-stream.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 16.1A5 5 0 0 1 5.9 20M2 12.05A9 9 0 0 1 9.95 20M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/><line x1="2" y1="20" x2="2.01" y2="20"/></svg>投屏与串流</a>
+        <a class="nav-item" href="01-home.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="20" y1="20" x2="16.2" y2="16.2"/></svg>搜索</a>
+      </nav>
+      <div class="nav-spacer"></div>
+      <div class="nav-divider"></div>
+      <nav class="nav-group">
+        <a class="nav-item" href="04-sources-plugins.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>播放源与插件</a>
+        <a class="nav-item active" href="07-settings.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 1 1 0 4h-.09c-.66 0-1.25.4-1.51 1z"/></svg>设置</a>
+      </nav>
+    </aside>
+
+    <div class="settings-shell">
+      <div class="cat-col" id="catCol">
+        <div class="cat-title">设置</div>
+        <button class="cat-btn active" onclick="showSec('3d', this)">3D 与画面引擎</button>
+        <button class="cat-btn" onclick="showSec('play', this)">播放与字幕</button>
+        <button class="cat-btn" onclick="showSec('space', this)">空间屏幕与环境</button>
+        <button class="cat-btn" onclick="showSec('cast', this)">投屏与遥控服务</button>
+        <button class="cat-btn" onclick="showSec('about', this)">关于与开源许可</button>
+      </div>
+
+      <div class="detail-col">
+        <!-- 3D 与画面引擎 -->
+        <section class="sec-pane active" id="sec-3d">
+          <h2 class="sec-h">3D 与画面引擎</h2>
+          <div class="group-card">
+            <div class="row">
+              <div class="row-l">
+                <div class="row-t">默认实时 3D 强度</div>
+                <div class="row-d">新建播放的全局起点；单部影片在详情页或播放中调整后将独立记忆</div>
+              </div>
+              <div class="seg" onclick="segClick(event)">
+                <button>舒适 0.4%</button>
+                <button class="active">均衡 0.6%</button>
+                <button>强烈 0.9%</button>
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-l">
+                <div class="row-t">自动识别原生 3D 与空间视频</div>
+                <div class="row-d">检测到左右 SBS、上下 OU、iPhone 空间视频（MV-HEVC）或 180°/360° 时直接按原生格式播放，不额外跑深度模型</div>
+              </div>
+              <button class="switch on" onclick="this.classList.toggle('on')"></button>
+            </div>
+            <div class="row">
+              <div class="row-l">
+                <div class="row-t">深度推理模型策略</div>
+                <div class="row-d">PICO 4 实测 GPU fp16 可稳定输出每秒 20 张深度图，零丢帧</div>
+              </div>
+              <div class="seg" onclick="segClick(event)">
+                <button class="active">自动推荐（GPU 20fps）</button>
+                <button>省电（CPU 12fps）</button>
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-l">
+                <div class="row-t">合成层锐化与超采样</div>
+                <div class="row-d">利用头显合成器硬件提升文字与 4K 缩屏清晰度，几乎无额外耗电</div>
+              </div>
+              <button class="switch on" onclick="this.classList.toggle('on')"></button>
+            </div>
+          </div>
+        </section>
+
+        <!-- 播放与字幕 -->
+        <section class="sec-pane" id="sec-play">
+          <h2 class="sec-h">播放与字幕</h2>
+          <div class="group-card">
+            <div class="row">
+              <div class="row-l">
+                <div class="row-t">默认字幕空间深度</div>
+                <div class="row-d">将字幕置于立体画面主景平面前方，避免与前景人物发生深度打架和重影</div>
+              </div>
+              <div class="seg" onclick="segClick(event)">
+                <button>紧贴屏幕</button>
+                <button class="active">适中前置（推荐）</button>
+                <button>更靠前</button>
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-l">
+                <div class="row-t">优先语言（音轨 / 字幕）</div>
+                <div class="row-d">自动匹配简体中文与原声音轨</div>
+              </div>
+              <button class="btn-pill" onclick="alert('已选：简体中文优先')">简体中文 ▾</button>
+            </div>
+            <div class="row">
+              <div class="row-l">
+                <div class="row-t">剧集片尾自动连播下一集</div>
+                <div class="row-d">当前剧集播放完毕后倒计时 5 秒自动续播</div>
+              </div>
+              <button class="switch on" onclick="this.classList.toggle('on')"></button>
+            </div>
+          </div>
+        </section>
+
+        <!-- 空间屏幕与环境 -->
+        <section class="sec-pane" id="sec-space">
+          <h2 class="sec-h">空间屏幕与环境</h2>
+          <div class="group-card">
+            <div class="row">
+              <div class="row-l">
+                <div class="row-t">默认观影环境</div>
+                <div class="row-d">默认在彩色透视的真实房间里悬浮 6DoF 巨幕，播放中可一键切换</div>
+              </div>
+              <div class="seg" onclick="segClick(event)">
+                <button class="active">透视房间</button>
+                <button>纯黑</button>
+                <button>家庭影院</button>
+                <button>巨幕厅</button>
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-l">
+                <div class="row-t">按使用场景分别记忆屏幕位置与曲率</div>
+                <div class="row-d">分别记住观影、电脑串流与躺看模式下的屏幕大小、距离和仰角</div>
+              </div>
+              <button class="switch on" onclick="this.classList.toggle('on')"></button>
+            </div>
+            <div class="row">
+              <div class="row-l">
+                <div class="row-t">射线悬停与点击微音效</div>
+                <div class="row-d">指向播控与面板按钮时播放轻柔短音，提升无物理触感的确认感</div>
+              </div>
+              <button class="switch on" onclick="this.classList.toggle('on')"></button>
+            </div>
+          </div>
+        </section>
+
+        <!-- 投屏与遥控服务 -->
+        <section class="sec-pane" id="sec-cast">
+          <h2 class="sec-h">投屏与遥控服务</h2>
+          <div class="group-card">
+            <div class="row">
+              <div class="row-l">
+                <div class="row-t">头显投屏设备名称</div>
+                <div class="row-d">手机 AirPlay / DLNA 列表中显示的本机名称</div>
+              </div>
+              <button class="btn-pill" onclick="alert('支持手机扫码或语音改名')">depth3d-PICO4 · 改名</button>
+            </div>
+            <div class="row">
+              <div class="row-l">
+                <div class="row-t">应用启动后后台静默待命接收投屏</div>
+                <div class="row-d">在首页选片时也可直接收到 iPad 镜像或手机 DLNA 推送提示</div>
+              </div>
+              <button class="switch on" onclick="this.classList.toggle('on')"></button>
+            </div>
+            <div class="row">
+              <div class="row-l">
+                <div class="row-t">局域网手机网页遥控器</div>
+                <div class="row-d">允许同一 Wi-Fi 下的手机通过浏览器帮你选片、填入播放源地址与控进度</div>
+              </div>
+              <button class="switch on" onclick="this.classList.toggle('on')"></button>
+            </div>
+          </div>
+        </section>
+
+        <!-- 关于与开源许可 -->
+        <section class="sec-pane" id="sec-about">
+          <h2 class="sec-h">关于与开源许可</h2>
+          <div class="group-card">
+            <div class="row">
+              <div class="row-l">
+                <div class="row-t">depth3d 头显端 · v0.4.0-design</div>
+                <div class="row-d">基于 GPLv3 开源协议发布；深度转换核心参照 ZipDepth 与 MoonlightXR</div>
+              </div>
+              <button class="btn-pill" onclick="alert('已是最新版本')">检查更新</button>
+            </div>
+            <div class="row">
+              <div class="row-l">
+                <div class="row-t">匿名崩溃日志上报</div>
+                <div class="row-d">默认关闭；仅在你主动开启后，于应用异常退出时发送不含片名与隐私的技术堆栈</div>
+              </div>
+              <button class="switch" onclick="this.classList.toggle('on')"></button>
+            </div>
+            <div class="row">
+              <div class="row-l">
+                <div class="row-t">开源组件与 GPLv3 声明</div>
+                <div class="row-d">含 MoonlightXR 渲染底座、UxPlay、Media3 ExoPlayer、QuickJS 等开源项目授权信息</div>
+              </div>
+              <button class="btn-pill" onclick="alert('展示 GPLv3 许可证摘要与源码仓库二维码')">查看详情</button>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <div class="hint-footer">点击左侧设置分类（3D 与画面引擎 / 播放与字幕 / 空间屏幕 / 投屏与遥控 / 关于与开源）可切换查看全部设置项</div>
+
+<script>
+  function showSec(id, btn) {
+    document.querySelectorAll('#catCol .cat-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    document.querySelectorAll('.sec-pane').forEach(p => p.classList.remove('active'));
+    document.getElementById('sec-' + id).classList.add('active');
+  }
+  function segClick(e) {
+    if (e.target.tagName !== 'BUTTON') return;
+    e.currentTarget.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+    e.target.classList.add('active');
+  }
+  function setEnv(mode, btn) {
+    document.body.className = mode === 'bright' ? 'env-bright' : 'env-dim';
+    document.querySelectorAll('#envGroup .ctrl-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  }
+</script>
+</body>
+</html>
