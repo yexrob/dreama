@@ -9,13 +9,15 @@ public struct HTTPRequest: Equatable, Sendable {
     public let headers: [String: String] // lowercase keys
     public let body: Data
     public let peerCertificateDER: Data?
+    public let remoteAddress: String
 
     public init(
         method: String,
         rawTarget: String,
         headers: [String: String] = [:],
         body: Data = Data(),
-        peerCertificateDER: Data? = nil
+        peerCertificateDER: Data? = nil,
+        remoteAddress: String = "127.0.0.1"
     ) {
         self.method = method.uppercased()
         self.rawTarget = rawTarget
@@ -33,6 +35,7 @@ public struct HTTPRequest: Equatable, Sendable {
         self.headers = lower
         self.body = body
         self.peerCertificateDER = peerCertificateDER
+        self.remoteAddress = IPAddressNormalizer.normalize(remoteAddress)
     }
 
     public func header(_ name: String) -> String? {
@@ -76,11 +79,11 @@ public struct HTTPResponse: Equatable, Sendable {
         return true
     }
 
-    public static func json(_ statusCode: Int, object: Any) -> HTTPResponse {
+    public static func json(_ statusCode: Int, object: Any, extraHeaders: [(String, String)] = []) -> HTTPResponse {
         let data = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data("{}".utf8)
         return HTTPResponse(
             statusCode: statusCode,
-            headers: [("Content-Type", "application/json; charset=utf-8")],
+            headers: [("Content-Type", "application/json; charset=utf-8")] + extraHeaders,
             body: data
         )
     }
@@ -134,6 +137,7 @@ public struct HTTPResponse: Equatable, Sendable {
         case 413: return "Payload Too Large"
         case 416: return "Range Not Satisfiable"
         case 426: return "Upgrade Required"
+        case 429: return "Too Many Requests"
         case 500: return "Internal Server Error"
         case 502: return "Bad Gateway"
         case 503: return "Service Unavailable"
@@ -160,7 +164,6 @@ public enum HTTPParser {
 
     public static let maxHeaderBytes = 32 * 1024
 
-    /// Attempts to parse request head from `buffer`. Returns nil if `\r\n\r\n` has not arrived yet.
     public static func parseHead(from buffer: Data, maxBodyBytes: Int = 256 * 1024) throws -> ParsedHead? {
         let delimiter = Data("\r\n\r\n".utf8)
         guard let range = buffer.range(of: delimiter) else {
@@ -313,7 +316,13 @@ public struct ControlProtocolSnapshot: Sendable {
 public protocol ControlProtocolDelegate: Sendable {
     func currentSnapshot() async -> ControlProtocolSnapshot
     func authorizeMediaClient(deviceId: String, peerCertFingerprintSHA256: String) async -> Bool
-    func handleApprovedPairing(deviceName: String, deviceId: String, pin: String, autoAllowFuture: Bool) async -> Bool
+    func handleApprovedPairing(
+        deviceName: String,
+        deviceId: String,
+        pin: String,
+        clientAddress: String,
+        autoAllowFuture: Bool
+    ) async -> Bool
 }
 
 /// Pure, unit-testable HTTP router implementing `docs/specs/host-protocol.md` (v1).
@@ -329,7 +338,6 @@ public final class ControlProtocolRouter: Sendable {
     }
 
     public func handle(_ request: HTTPRequest) async -> HTTPResponse {
-        // 1. Check explicit protocol version header or versioned path segment.
         if let headerVersion = request.header("x-depth3d-protocol-version"),
            headerVersion != String(Self.supportedVersion)
         {
@@ -367,6 +375,7 @@ public final class ControlProtocolRouter: Sendable {
 
     private func handleInfo() async -> HTTPResponse {
         let snap = await delegate.currentSnapshot()
+        let fallbackReason = HostStrings.string("protocol.stream.unavailable")
         let response = HostInfoResponse(
             v: Self.supportedVersion,
             name: snap.hostName,
@@ -374,7 +383,7 @@ public final class ControlProtocolRouter: Sendable {
             os: snap.osDescription,
             stream: .init(
                 ready: snap.streamReady,
-                reason: snap.streamReady ? nil : (snap.streamNotReadyReason ?? "串流服务暂时不可用")
+                reason: snap.streamReady ? nil : (snap.streamNotReadyReason ?? fallbackReason)
             ),
             media: snap.mediaPort.map { .init(port: Int($0)) }
         )
@@ -393,13 +402,31 @@ public final class ControlProtocolRouter: Sendable {
             return HTTPResponse.json(400, object: ["ok": false, "error": "invalid_fields"])
         }
 
-        let decision = await pairingCoordinator.requestApproval(deviceName: device, deviceId: deviceId)
+        // Reject immediately with 503 when the streaming engine is not ready (port conflict,
+        // paused, crashed, missing permission) — never prompt the user for an uncompletable pair.
+        let preflight = await delegate.currentSnapshot()
+        guard preflight.streamReady else {
+            return HTTPResponse.json(503, object: [
+                "ok": false,
+                "error": "engine_unavailable",
+                "reason": preflight.streamNotReadyReason ?? HostStrings.string("protocol.stream.unavailable")
+            ])
+        }
+
+        let decision = await pairingCoordinator.requestApproval(
+            deviceName: device,
+            deviceId: deviceId,
+            clientAddress: request.remoteAddress,
+            peerCertFingerprintSHA256: request.peerCertificateFingerprintSHA256
+        )
+
         switch decision {
         case .approved(let rememberAutoAllow):
             let submitted = await delegate.handleApprovedPairing(
                 deviceName: device,
                 deviceId: deviceId,
                 pin: pin,
+                clientAddress: request.remoteAddress,
                 autoAllowFuture: rememberAutoAllow
             )
             if submitted {
@@ -413,6 +440,7 @@ public final class ControlProtocolRouter: Sendable {
                 deviceName: device,
                 deviceId: deviceId,
                 pin: pin,
+                clientAddress: request.remoteAddress,
                 autoAllowFuture: true
             )
             if submitted {
@@ -426,6 +454,20 @@ public final class ControlProtocolRouter: Sendable {
 
         case .timedOut:
             return HTTPResponse.json(408, object: ["ok": false, "error": "timeout"])
+
+        case .busy:
+            return HTTPResponse.json(
+                429,
+                object: ["ok": false, "error": "pairing_busy"],
+                extraHeaders: [("Retry-After", "5")]
+            )
+
+        case .rateLimited:
+            return HTTPResponse.json(
+                429,
+                object: ["ok": false, "error": "cooldown"],
+                extraHeaders: [("Retry-After", "30")]
+            )
 
         case .cancelled:
             return HTTPResponse.json(403, object: ["ok": false, "error": "cancelled"])
@@ -460,12 +502,10 @@ public final class ControlProtocolRouter: Sendable {
         HTTPResponse.json(426, object: [
             "error": "version_incompatible",
             "supportedVersion": Self.supportedVersion,
-            "message": "请更新电脑上的 depth3d Host"
+            "message": HostStrings.string("protocol.version_incompatible")
         ])
     }
 
-    /// Ensures `"reason": null` and `"media": null` are explicitly emitted as JSON `null`
-    /// matching `docs/specs/host-protocol.md` verbatim.
     private func encodeJSONPreservingNulls(statusCode: Int, _ info: HostInfoResponse) -> HTTPResponse {
         let streamDict: [String: Any] = [
             "ready": info.stream.ready,

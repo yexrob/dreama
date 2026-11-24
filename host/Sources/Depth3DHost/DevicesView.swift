@@ -6,6 +6,7 @@ struct DevicesView: View {
 
     @State private var manualPIN: String = ""
     @State private var manualDeviceName: String = ""
+    @State private var selectedPendingPairingId: String = ""
     @State private var isSubmittingPIN: Bool = false
     @State private var pinFeedbackMessage: String? = nil
     @State private var pinFeedbackIsError: Bool = false
@@ -22,6 +23,7 @@ struct DevicesView: View {
                     Spacer()
                     Button(L10n.string("action.refresh")) {
                         runtime.refreshPairedClientsFromEngine()
+                        runtime.refreshPendingEnginePairings()
                     }
                     .buttonStyle(HostSecondaryButtonStyle())
                     .disabled(runtime.isRefreshingDevices)
@@ -40,7 +42,7 @@ struct DevicesView: View {
                     )
                 }
 
-                // Active incoming pairing requests
+                // Active incoming pairing request (at most one at a time)
                 if !runtime.pendingPairings.isEmpty {
                     VStack(alignment: .leading, spacing: 10) {
                         Text(L10n.string("devices.pending.title"))
@@ -53,6 +55,9 @@ struct DevicesView: View {
                                         Text(L10n.format("pair.prompt.title", prompt.deviceName))
                                             .font(.system(size: 14, weight: .semibold))
                                             .foregroundColor(HostTheme.text)
+                                        Text(L10n.format("pair.prompt.source_ip", prompt.clientAddress))
+                                            .font(.system(size: 11.5).monospacedDigit())
+                                            .foregroundColor(HostTheme.accent)
                                         Text(L10n.string("pair.prompt.subtitle"))
                                             .font(.system(size: 12))
                                             .foregroundColor(HostTheme.text2)
@@ -63,7 +68,8 @@ struct DevicesView: View {
                                     }
                                     .buttonStyle(HostSecondaryButtonStyle())
                                     Button(L10n.string("pair.prompt.allow")) {
-                                        runtime.approvePairing(promptId: prompt.id, rememberAutoAllow: true)
+                                        // Default rememberAutoAllow=false to match safe confirmation rules.
+                                        runtime.approvePairing(promptId: prompt.id, rememberAutoAllow: false)
                                     }
                                     .buttonStyle(HostPrimaryButtonStyle())
                                 }
@@ -83,6 +89,7 @@ struct DevicesView: View {
         .background(HostTheme.bg)
         .onAppear {
             runtime.refreshPairedClientsFromEngine()
+            runtime.refreshPendingEnginePairings()
         }
         .alert(
             L10n.string("devices.remove.confirm_title"),
@@ -146,6 +153,7 @@ struct DevicesView: View {
                                 .toggleStyle(.switch)
                                 .tint(HostTheme.accent)
                                 .labelsHidden()
+                                .disabled(device.certFingerprint == nil)
                                 Text(L10n.string("devices.auto_allow"))
                                     .font(.system(size: 12))
                                     .foregroundColor(HostTheme.text2)
@@ -197,6 +205,19 @@ struct DevicesView: View {
                         .font(.system(size: 12))
                         .foregroundColor(HostTheme.text2)
 
+                    if runtime.pendingEnginePairings.count > 1 {
+                        Picker(L10n.string("devices.manual_pin.select_device"), selection: $selectedPendingPairingId) {
+                            Text(L10n.string("devices.manual_pin.select_device")).tag("")
+                            ForEach(runtime.pendingEnginePairings) { pending in
+                                let label = pending.name ?? L10n.string("device.default_name")
+                                let source = pending.normalizedAddress ?? String(pending.id.prefix(8))
+                                Text("\(label) (\(source))")
+                                    .tag(pending.id)
+                            }
+                        }
+                        .frame(maxWidth: 340)
+                    }
+
                     HStack(spacing: 10) {
                         TextField(L10n.string("devices.manual_pin.pin_placeholder"), text: $manualPIN)
                             .textFieldStyle(.roundedBorder)
@@ -246,15 +267,21 @@ struct DevicesView: View {
         isSubmittingPIN = true
         let pinToSend = manualPIN
         let nameToSend = manualDeviceName
+        let pairingIdToSend = selectedPendingPairingId.isEmpty ? nil : selectedPendingPairingId
 
         pinTask = Task {
-            let result = await runtime.submitManualPIN(pin: pinToSend, deviceName: nameToSend)
+            let result = await runtime.submitManualPIN(
+                pin: pinToSend,
+                deviceName: nameToSend,
+                pairingId: pairingIdToSend
+            )
             guard !Task.isCancelled else { return }
             isSubmittingPIN = false
             switch result {
             case .success:
                 manualPIN = ""
                 manualDeviceName = ""
+                selectedPendingPairingId = ""
                 pinFeedbackIsError = false
                 pinFeedbackMessage = L10n.string("devices.manual_pin.success")
             case .failure(let err):
@@ -266,6 +293,8 @@ struct DevicesView: View {
                     pinFeedbackMessage = L10n.string("devices.manual_pin.error.not_ready")
                 case .noPendingHeadset:
                     pinFeedbackMessage = L10n.string("devices.manual_pin.error.no_pending")
+                case .multiplePendingHeadsets:
+                    pinFeedbackMessage = L10n.string("devices.manual_pin.error.multiple_pending")
                 case .pinRejected:
                     pinFeedbackMessage = L10n.string("devices.manual_pin.error.rejected")
                 case .unexpected:

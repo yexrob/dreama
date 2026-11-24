@@ -50,7 +50,6 @@ public struct CoreAudioHALBackend: AudioHALBackend {
         var value: UInt32 = muted ? 1 : 0
         let size = UInt32(MemoryLayout<UInt32>.size)
 
-        // Prefer master channel (element 0); fall back to stereo channels (1 & 2).
         var master = muteAddress(element: kAudioObjectPropertyElementMain)
         if AudioObjectHasProperty(deviceID, &master) {
             var settable: DarwinBoolean = false
@@ -83,25 +82,34 @@ public struct CoreAudioHALBackend: AudioHALBackend {
     }
 }
 
-/// Manages host-side "串流时静音本机" cleanly alongside the engine's native Core Audio Process Tap.
-///
-/// The bundled streaming engine captures system audio natively via macOS 14.2+ Core Audio Process Tap
-/// (`AudioHardwareCreateProcessTap`), which taps process audio streams prior to the hardware output
-/// mute switch. When the user enables "串流时静音本机", this controller ensures the Mac's speakers
-/// stay silent during streaming (even if a client requests local audio) and always restores the exact
-/// prior mute state when streaming ends, the toggle changes, or the app quits.
+private struct AudioMuteRecoveryMarker: Codable {
+    let deviceID: UInt32
+    let priorMuted: Bool
+}
+
+/// Manages host-side "串流时静音本机" alongside the engine's native Core Audio Process Tap:
+/// - Tracks exact concurrent session count and ONLY restores speakers when the LAST session ends
+/// - Persists a recovery marker before muting so if Host crashes or is `SIGKILL`ed while muted,
+///   the next startup automatically restores the Mac's previous speaker mute state
 public final class SystemAudioController: @unchecked Sendable {
     private let backend: AudioHALBackend
+    private let recoveryFileURL: URL?
     private let lock = NSLock()
 
     private var muteWhileStreaming: Bool
-    private var isStreamingActive: Bool = false
+    private var activeSessionCount: Int = 0
     private var savedDeviceID: AudioDeviceID?
     private var savedPriorMuteState: Bool?
 
-    public init(backend: AudioHALBackend = CoreAudioHALBackend(), muteWhileStreaming: Bool = true) {
+    public init(
+        backend: AudioHALBackend = CoreAudioHALBackend(),
+        muteWhileStreaming: Bool = true,
+        recoveryFileURL: URL? = nil
+    ) {
         self.backend = backend
+        self.recoveryFileURL = recoveryFileURL
         self.muteWhileStreaming = muteWhileStreaming
+        recoverFromPreviousCrashIfNeeded()
     }
 
     deinit {
@@ -114,13 +122,19 @@ public final class SystemAudioController: @unchecked Sendable {
         return savedDeviceID != nil
     }
 
+    public var currentActiveSessionCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeSessionCount
+    }
+
     public func setMuteWhileStreaming(_ enabled: Bool) {
         lock.lock()
         muteWhileStreaming = enabled
-        let active = isStreamingActive
+        let hasSessions = activeSessionCount > 0
         lock.unlock()
 
-        if active {
+        if hasSessions {
             if enabled {
                 applyMuteIfNeeded()
             } else {
@@ -129,20 +143,27 @@ public final class SystemAudioController: @unchecked Sendable {
         }
     }
 
-    public func setStreamingActive(_ active: Bool) {
+    /// Updates the count of concurrently streaming clients.
+    /// Mutes when moving `0 -> >0` (if enabled), stays muted while `>0`, and ONLY unmutes on `0`.
+    public func setActiveSessionCount(_ count: Int) {
+        let clamped = max(0, count)
         lock.lock()
-        let wasActive = isStreamingActive
-        isStreamingActive = active
+        let prev = activeSessionCount
+        activeSessionCount = clamped
         let shouldMute = muteWhileStreaming
         lock.unlock()
 
-        if active && !wasActive {
+        if clamped > 0 && prev == 0 {
             if shouldMute {
                 applyMuteIfNeeded()
             }
-        } else if !active && wasActive {
+        } else if clamped == 0 && prev > 0 {
             restoreIfNeeded()
         }
+    }
+
+    public func setStreamingActive(_ active: Bool) {
+        setActiveSessionCount(active ? max(1, currentActiveSessionCount) : 0)
     }
 
     public func restoreIfNeeded() {
@@ -152,6 +173,8 @@ public final class SystemAudioController: @unchecked Sendable {
         savedDeviceID = nil
         savedPriorMuteState = nil
         lock.unlock()
+
+        clearRecoveryMarker()
 
         guard let deviceID, let priorMuted else { return }
         _ = backend.setDeviceMuted(deviceID, muted: priorMuted)
@@ -171,13 +194,42 @@ public final class SystemAudioController: @unchecked Sendable {
         }
 
         if !priorMuted {
+            // Persist recovery marker BEFORE muting so a sudden crash/SIGKILL can be undone on next launch.
+            writeRecoveryMarker(AudioMuteRecoveryMarker(deviceID: deviceID, priorMuted: priorMuted))
             if backend.setDeviceMuted(deviceID, muted: true) {
                 lock.lock()
                 savedDeviceID = deviceID
                 savedPriorMuteState = priorMuted
                 lock.unlock()
-                HostLogger.info("Muted Mac speakers while streaming (will restore on stop)", category: "audio")
+                HostLogger.info("Muted Mac speakers while streaming (will restore when last session ends)", category: "audio")
+            } else {
+                clearRecoveryMarker()
             }
         }
+    }
+
+    private func recoverFromPreviousCrashIfNeeded() {
+        guard let url = recoveryFileURL,
+              let data = try? Data(contentsOf: url),
+              let marker = try? JSONDecoder().decode(AudioMuteRecoveryMarker.self, from: data)
+        else {
+            return
+        }
+        _ = backend.setDeviceMuted(AudioDeviceID(marker.deviceID), muted: marker.priorMuted)
+        clearRecoveryMarker()
+        HostLogger.warning("Recovered Mac speaker mute state from previous unclean shutdown", category: "audio")
+    }
+
+    private func writeRecoveryMarker(_ marker: AudioMuteRecoveryMarker) {
+        guard let url = recoveryFileURL else { return }
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let data = try? JSONEncoder().encode(marker) {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    private func clearRecoveryMarker() {
+        guard let url = recoveryFileURL else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 }

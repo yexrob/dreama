@@ -13,22 +13,26 @@ public struct PermissionSnapshot: Equatable, Sendable {
     public var screenRecording: PermissionState
     public var accessibility: PermissionState
     public var localNetwork: PermissionState
+    /// Non-permission Bonjour publication error (e.g. name collision/timeout), kept distinct
+    /// from Local Network privacy denial so we never mislead the user into Privacy Settings.
+    public var bonjourPublishFailed: Bool
 
     public init(
         screenRecording: PermissionState = .checking,
         accessibility: PermissionState = .checking,
-        localNetwork: PermissionState = .checking
+        localNetwork: PermissionState = .checking,
+        bonjourPublishFailed: Bool = false
     ) {
         self.screenRecording = screenRecording
         self.accessibility = accessibility
         self.localNetwork = localNetwork
+        self.bonjourPublishFailed = bonjourPublishFailed
     }
 
     public var allGranted: Bool {
         screenRecording == .granted && accessibility == .granted && localNetwork == .granted
     }
 
-    /// Screen recording and local network are mandatory for streaming discovery + video capture.
     public var streamingCoreGranted: Bool {
         screenRecording == .granted && localNetwork != .denied
     }
@@ -83,13 +87,12 @@ public struct MacOSSystemPermissionProvider: SystemPermissionProvider {
 }
 
 /// Continuously monitors Screen Recording, Accessibility, and Local Network permissions.
-/// Automatically detects newly granted permissions so onboarding advances and the
-/// streaming engine restarts without asking the user to quit and relaunch the app.
 public final class PermissionMonitor: @unchecked Sendable {
     private let provider: SystemPermissionProvider
     private let lock = NSLock()
     private var snapshot = PermissionSnapshot()
     private var localNetworkState: PermissionState = .checking
+    private var bonjourFailed: Bool = false
     private var timer: DispatchSourceTimer?
     private var onChange: (@Sendable (PermissionSnapshot, PermissionSnapshot) -> Void)?
 
@@ -139,19 +142,26 @@ public final class PermissionMonitor: @unchecked Sendable {
 
     public func updateLocalNetworkState(from bonjourState: BonjourPublicationState) {
         let mapped: PermissionState
+        let failed: Bool
         switch bonjourState {
         case .published:
             mapped = .granted
+            failed = false
         case .permissionDenied:
             mapped = .denied
+            failed = false
         case .publishing, .stopped:
             mapped = .checking
+            failed = false
         case .failed:
-            mapped = .denied
+            // Non-permission mDNS error: do NOT falsely mark Local Network permission as denied!
+            mapped = .checking
+            failed = true
         }
 
         lock.lock()
         localNetworkState = mapped
+        bonjourFailed = failed
         lock.unlock()
         refreshNow()
     }
@@ -166,7 +176,8 @@ public final class PermissionMonitor: @unchecked Sendable {
         let next = PermissionSnapshot(
             screenRecording: screen,
             accessibility: ax,
-            localNetwork: localNetworkState
+            localNetwork: localNetworkState,
+            bonjourPublishFailed: bonjourFailed
         )
         let changed = (old != next)
         snapshot = next
@@ -175,7 +186,7 @@ public final class PermissionMonitor: @unchecked Sendable {
 
         if changed {
             HostLogger.info(
-                "Permissions updated: screen=\(next.screenRecording.rawValue), ax=\(next.accessibility.rawValue), localNet=\(next.localNetwork.rawValue)",
+                "Permissions updated: screen=\(next.screenRecording.rawValue), ax=\(next.accessibility.rawValue), localNet=\(next.localNetwork.rawValue), mdnsFailed=\(next.bonjourPublishFailed)",
                 category: "permissions"
             )
             cb?(old, next)

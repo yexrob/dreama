@@ -14,7 +14,6 @@ public enum ByteRangeParser {
             return .invalid
         }
         let spec = String(trimmed.dropFirst("bytes=".count)).trimmingCharacters(in: .whitespaces)
-        // Multiple ranges are not required for video seeking; take the first range if comma-separated.
         let firstRange = spec.split(separator: ",", maxSplits: 1).first.map(String.init) ?? spec
         guard let dash = firstRange.firstIndex(of: "-") else {
             return .invalid
@@ -28,7 +27,6 @@ public enum ByteRangeParser {
         }
 
         if startStr.isEmpty {
-            // Suffix range: bytes=-N (last N bytes)
             guard let suffixLen = UInt64(endStr), suffixLen > 0 else {
                 return .invalid
             }
@@ -46,7 +44,6 @@ public enum ByteRangeParser {
         }
 
         if endStr.isEmpty {
-            // Open-ended range: bytes=start-
             return .satisfied(start: start, end: fileSize - 1)
         }
 
@@ -165,6 +162,259 @@ public struct WebDAVEntry: Equatable, Sendable {
     }
 }
 
+/// Incremental, zero-truncation O(N) streaming rewriter for `<href>` / `<D:href>` / `<d:href>`
+/// tags inside proxied `207 Multi-Status` XML responses of arbitrary size (> 8 MB).
+public final class WebDAVHrefStreamRewriter {
+    private let prefixBytes: [UInt8]
+    private var pending = Data()
+    private let maxBufferedHrefBytes = 64 * 1024
+
+    public init(mountName: String) {
+        let prefix = "/" + WebDAVPathSanitizer.encodeSegment(mountName)
+        self.prefixBytes = Array(prefix.utf8)
+    }
+
+    /// Feeds the next raw UTF-8 XML chunk and returns rewritten bytes ready to stream downstream.
+    public func push(_ chunk: Data) -> Data {
+        guard !chunk.isEmpty else { return Data() }
+        pending.append(chunk)
+        return drain(isFinal: false)
+    }
+
+    /// Flushes any trailing buffered bytes at EOF.
+    public func finish() -> Data {
+        drain(isFinal: true)
+    }
+
+    private func drain(isFinal: Bool) -> Data {
+        guard !pending.isEmpty else { return Data() }
+        let bytes = [UInt8](pending)
+        var out = [UInt8]()
+        out.reserveCapacity(bytes.count + 128)
+        var i = 0
+        let count = bytes.count
+
+        while i < count {
+            // Find next '<' (0x3C)
+            guard let ltOffset = bytes[i..<count].firstIndex(of: 0x3C) else {
+                out.append(contentsOf: bytes[i..<count])
+                i = count
+                break
+            }
+
+            if ltOffset > i {
+                out.append(contentsOf: bytes[i..<ltOffset])
+            }
+
+            // Find matching '>' (0x3E) for this tag
+            guard let gtOffset = bytes[ltOffset..<count].firstIndex(of: 0x3E) else {
+                if isFinal || (count - ltOffset) > maxBufferedHrefBytes {
+                    out.append(contentsOf: bytes[ltOffset..<count])
+                    i = count
+                } else {
+                    i = ltOffset
+                }
+                break
+            }
+
+            // Check whether bytes[(ltOffset + 1)..<gtOffset] is an opening `<...:href...>` tag.
+            if isOpeningHrefTag(bytes, start: ltOffset + 1, end: gtOffset) {
+                let valueStart = gtOffset + 1
+                // Search for closing `<` starting `</...:href>`
+                guard let closeLT = bytes[valueStart..<count].firstIndex(of: 0x3C) else {
+                    if isFinal || (count - ltOffset) > maxBufferedHrefBytes {
+                        out.append(contentsOf: bytes[ltOffset..<count])
+                        i = count
+                    } else {
+                        i = ltOffset
+                    }
+                    break
+                }
+                guard let closeGT = bytes[closeLT..<count].firstIndex(of: 0x3E) else {
+                    if isFinal || (count - ltOffset) > maxBufferedHrefBytes {
+                        out.append(contentsOf: bytes[ltOffset..<count])
+                        i = count
+                    } else {
+                        i = ltOffset
+                    }
+                    break
+                }
+
+                if isClosingHrefTag(bytes, start: closeLT + 1, end: closeGT) {
+                    // Emit opening tag
+                    out.append(contentsOf: bytes[ltOffset...gtOffset])
+                    // Rewrite inner href text
+                    let rawHref = String(decoding: bytes[valueStart..<closeLT], as: UTF8.self)
+                    let rewritten = rewriteHrefValue(rawHref)
+                    out.append(contentsOf: rewritten.utf8)
+                    // Emit closing tag
+                    out.append(contentsOf: bytes[closeLT...closeGT])
+                    i = closeGT + 1
+                    continue
+                }
+            }
+
+            // Not a `<href>...</href>` element: copy opening tag verbatim and advance past '>'.
+            out.append(contentsOf: bytes[ltOffset...gtOffset])
+            i = gtOffset + 1
+        }
+
+        if i >= count {
+            pending.removeAll(keepingCapacity: true)
+        } else {
+            pending = Data(bytes[i..<count])
+        }
+        return Data(out)
+    }
+
+    private func rewriteHrefValue(_ rawHref: String) -> String {
+        let prefix = String(decoding: prefixBytes, as: UTF8.self)
+        let pathOnly: String
+        if let schemeRange = rawHref.range(of: "://") {
+            if let slashIdx = rawHref[schemeRange.upperBound...].firstIndex(of: "/") {
+                pathOnly = String(rawHref[slashIdx...])
+            } else {
+                pathOnly = "/"
+            }
+        } else {
+            pathOnly = rawHref.hasPrefix("/") ? rawHref : ("/" + rawHref)
+        }
+        return (pathOnly == "/") ? (prefix + "/") : (prefix + pathOnly)
+    }
+
+    /// Matches `href` or `<prefix>:href` (case-insensitive) optionally followed by whitespace/attributes,
+    /// rejecting closing tags (`/href`) or self-closing tags (`href/`).
+    private func isOpeningHrefTag(_ bytes: [UInt8], start: Int, end: Int) -> Bool {
+        guard start < end else { return false }
+        if bytes[start] == 0x2F || bytes[start] == 0x3F || bytes[start] == 0x21 { return false } // '/', '?', '!'
+        if bytes[end - 1] == 0x2F { return false } // self-closing `<href/>`
+
+        // Tag name runs until first whitespace or end
+        var nameEnd = start
+        while nameEnd < end {
+            let b = bytes[nameEnd]
+            if b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D { break }
+            nameEnd += 1
+        }
+        return matchesHrefName(bytes, start: start, end: nameEnd)
+    }
+
+    private func isClosingHrefTag(_ bytes: [UInt8], start: Int, end: Int) -> Bool {
+        guard start + 1 < end, bytes[start] == 0x2F else { return false } // starts with '/'
+        var nameEnd = end
+        while nameEnd > start + 1 {
+            let b = bytes[nameEnd - 1]
+            if b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D {
+                nameEnd -= 1
+            } else {
+                break
+            }
+        }
+        return matchesHrefName(bytes, start: start + 1, end: nameEnd)
+    }
+
+    private func matchesHrefName(_ bytes: [UInt8], start: Int, end: Int) -> Bool {
+        let len = end - start
+        guard len >= 4 else { return false }
+        // Find optional namespace prefix `:`
+        var localStart = start
+        for idx in start..<end {
+            let b = bytes[idx]
+            if b == 0x3A { // ':'
+                localStart = idx + 1
+            } else if !isXMLNameChar(b) {
+                return false
+            }
+        }
+        guard end - localStart == 4 else { return false }
+        // Case-insensitive "href"
+        return (bytes[localStart] | 0x20) == 0x68     // h
+            && (bytes[localStart + 1] | 0x20) == 0x72 // r
+            && (bytes[localStart + 2] | 0x20) == 0x65 // e
+            && (bytes[localStart + 3] | 0x20) == 0x66 // f
+    }
+
+    private func isXMLNameChar(_ b: UInt8) -> Bool {
+        (b >= 0x41 && b <= 0x5A) // A-Z
+            || (b >= 0x61 && b <= 0x7A) // a-z
+            || (b >= 0x30 && b <= 0x39) // 0-9
+            || b == 0x2D || b == 0x5F || b == 0x2E // '-', '_', '.'
+    }
+}
+
+/// Incremental HTTP/1.1 `Transfer-Encoding: chunked` body decoder for streaming proxy responses.
+public final class HTTPChunkedStreamDecoder {
+    private enum State {
+        case readingSizeLine
+        case readingData(remaining: Int)
+        case readingTrailingCRLF
+        case done
+    }
+
+    private var state: State = .readingSizeLine
+    private var buffer = Data()
+
+    public var isDone: Bool {
+        if case .done = state { return true }
+        return false
+    }
+
+    public init() {}
+
+    public func push(_ incoming: Data) -> Data {
+        guard !incoming.isEmpty, !isDone else { return Data() }
+        buffer.append(incoming)
+        var out = Data()
+        let crlf = Data("\r\n".utf8)
+
+        loop: while !buffer.isEmpty {
+            switch state {
+            case .readingSizeLine:
+                guard let lineEnd = buffer.range(of: crlf) else { break loop }
+                let sizeStr = String(decoding: buffer[buffer.startIndex..<lineEnd.lowerBound], as: UTF8.self)
+                    .split(separator: ";").first?
+                    .trimmingCharacters(in: .whitespaces) ?? ""
+                buffer.removeSubrange(buffer.startIndex..<lineEnd.upperBound)
+                guard let size = Int(sizeStr, radix: 16), size >= 0 else {
+                    state = .done
+                    break loop
+                }
+                if size == 0 {
+                    state = .done
+                    buffer.removeAll()
+                    break loop
+                }
+                state = .readingData(remaining: size)
+
+            case .readingData(let remaining):
+                let take = min(remaining, buffer.count)
+                if take > 0 {
+                    out.append(buffer[buffer.startIndex..<(buffer.startIndex + take)])
+                    buffer.removeSubrange(buffer.startIndex..<(buffer.startIndex + take))
+                }
+                let left = remaining - take
+                if left == 0 {
+                    state = .readingTrailingCRLF
+                } else {
+                    state = .readingData(remaining: left)
+                    break loop
+                }
+
+            case .readingTrailingCRLF:
+                guard buffer.count >= 2 else { break loop }
+                if buffer[buffer.startIndex] == 0x0D && buffer[buffer.startIndex + 1] == 0x0A {
+                    buffer.removeSubrange(buffer.startIndex..<(buffer.startIndex + 2))
+                }
+                state = .readingSizeLine
+
+            case .done:
+                break loop
+            }
+        }
+        return out
+    }
+}
+
 /// Generates RFC 4918 `207 Multi-Status` XML compatible with `player/.../WebDav.java`.
 public enum WebDAVXMLBuilder {
     public static func buildMultiStatus(_ entries: [WebDAVEntry]) -> Data {
@@ -205,36 +455,12 @@ public enum WebDAVXMLBuilder {
     }
 
     /// Rewrites `<href>` / `<D:href>` / `<d:href>` paths in an upstream rclone WebDAV XML
-    /// response so all paths are prefixed with `/<encodedMountName>`.
+    /// response in linear O(N) time without any 8 MB size cap.
     public static func rewriteProxiedMultiStatusXML(_ xmlData: Data, mountName: String) -> Data {
-        guard let xml = String(data: xmlData, encoding: .utf8) else { return xmlData }
-        let prefix = "/" + WebDAVPathSanitizer.encodeSegment(mountName)
-        let pattern = "(<[a-zA-Z0-9_-]*:?href>)([^<]*)(</[a-zA-Z0-9_-]*:?href>)"
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
-            return xmlData
-        }
-        let ns = xml as NSString
-        let matches = regex.matches(in: xml, range: NSRange(location: 0, length: ns.length))
-        var result = xml
-        for match in matches.reversed() {
-            let hrefRange = match.range(at: 2)
-            let rawHref = ns.substring(with: hrefRange)
-            let pathOnly: String
-            if let schemeRange = rawHref.range(of: "://") {
-                if let slashIdx = rawHref[schemeRange.upperBound...].firstIndex(of: "/") {
-                    pathOnly = String(rawHref[slashIdx...])
-                } else {
-                    pathOnly = "/"
-                }
-            } else {
-                pathOnly = rawHref.hasPrefix("/") ? rawHref : ("/" + rawHref)
-            }
-            let rewritten = (pathOnly == "/") ? (prefix + "/") : (prefix + pathOnly)
-            if let swiftRange = Range(hrefRange, in: result) {
-                result.replaceSubrange(swiftRange, with: rewritten)
-            }
-        }
-        return Data(result.utf8)
+        let rewriter = WebDAVHrefStreamRewriter(mountName: mountName)
+        var out = rewriter.push(xmlData)
+        out.append(rewriter.finish())
+        return out
     }
 
     public static func escapeXML(_ text: String) -> String {

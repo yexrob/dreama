@@ -23,14 +23,20 @@ public final class HostRuntime: ObservableObject {
     @Published public private(set) var identity: HostIdentity = HostIdentity()
     @Published public var settings: HostSettings = HostSettings()
     @Published public private(set) var permissions: PermissionSnapshot = PermissionSnapshot()
-    @Published public private(set) var network: NetworkSnapshot = NetworkSnapshot(isConnected: true, interfaceSummary: "Wi-Fi", localIPv4: nil)
+    @Published public private(set) var network: NetworkSnapshot = NetworkSnapshot(
+        isConnected: true,
+        interfaceSummary: HostStrings.string("network.wifi"),
+        localIPv4: nil
+    )
     @Published public private(set) var engineState: EngineSupervisorState = .stopped
     @Published public private(set) var engineLogState: EngineLogState = EngineLogState()
     @Published public private(set) var displays: [DisplayInfo] = []
     @Published public private(set) var pairedDevices: [PairedDeviceRecord] = []
     @Published public private(set) var engineClients: [EngineClientRecord] = []
     @Published public private(set) var pendingPairings: [PendingPairingPrompt] = []
+    @Published public private(set) var pendingEnginePairings: [EnginePendingPairing] = []
     @Published public private(set) var rcloneAvailability: RcloneAvailability = RcloneAvailability(executablePath: nil, availableRemotes: [])
+    @Published public private(set) var rcloneStatuses: [String: RcloneRemoteStatus] = [:]
     @Published public private(set) var controlPort: UInt16 = 0
     @Published public private(set) var webDAVPort: UInt16? = nil
     @Published public private(set) var webDAVError: String? = nil
@@ -43,7 +49,9 @@ public final class HostRuntime: ObservableObject {
     public let overrides: RuntimeOverrides
 
     private var store: HostStateStore?
+    private var childLedger: ChildProcessLedger?
     private var webDAVCredentials: WebDAVCredentials?
+    private var mediaCredentialRevision: Int = 0
     private var adminCredentials: EngineAdminCredentials?
     private var pairingCoordinator: PairingCoordinator?
     private var controlRouter: ControlProtocolRouter?
@@ -59,6 +67,9 @@ public final class HostRuntime: ObservableObject {
     private var webDAVServer: WebDAVServer?
     private var workspaceObservers: [NSObjectProtocol] = []
     private var hasStarted = false
+
+    internal var currentWebDAVCredentials: WebDAVCredentials? { webDAVCredentials }
+    internal var currentMediaCredentialRevision: Int { mediaCredentialRevision }
 
     public var activeEngineBasePort: UInt16 {
         if let override = overrides.engineBasePort {
@@ -86,7 +97,7 @@ public final class HostRuntime: ObservableObject {
             return .portConflict(ports: ports)
         }
         if case .missingBinary = engineState {
-            return .error(message: "应用包缺少内置串流组件，请重新安装 depth3d Host。")
+            return .error(message: HostStrings.string("runtime.error.missing_binary"))
         }
         if !permissions.streamingCoreGranted || engineState == .needsScreenRecording {
             return .needsPermissions(missingCount: max(1, permissions.missingCount))
@@ -105,27 +116,27 @@ public final class HostRuntime: ObservableObject {
 
     public var streamReadyInfo: (ready: Bool, reason: String?) {
         if !network.isConnected {
-            return (false, "这台电脑还没有连上局域网")
+            return (false, HostStrings.string("protocol.stream.no_network"))
         }
         if permissions.screenRecording == .denied || engineState == .needsScreenRecording {
-            return (false, "还没有允许屏幕录制")
+            return (false, HostStrings.string("protocol.stream.no_screen_recording"))
         }
         if permissions.localNetwork == .denied {
-            return (false, "还没有允许本地网络")
+            return (false, HostStrings.string("protocol.stream.no_local_network"))
         }
         switch engineState {
         case .ready, .streaming:
             return (true, nil)
         case .paused:
-            return (false, "电脑端已暂停串流")
+            return (false, HostStrings.string("protocol.stream.paused"))
         case .portConflict:
-            return (false, "串流端口被本机其他程序占用")
+            return (false, HostStrings.string("protocol.stream.port_conflict"))
         case .starting, .stopped:
-            return (false, "串流服务正在启动")
+            return (false, HostStrings.string("protocol.stream.starting"))
         case .needsScreenRecording:
-            return (false, "还没有允许屏幕录制")
+            return (false, HostStrings.string("protocol.stream.no_screen_recording"))
         case .missingBinary:
-            return (false, "内置串流组件缺失")
+            return (false, HostStrings.string("protocol.stream.missing_binary"))
         case .failed(let reason):
             return (false, reason)
         }
@@ -133,6 +144,36 @@ public final class HostRuntime: ObservableObject {
 
     public init(overrides: RuntimeOverrides = .fromProcess()) {
         self.overrides = overrides
+    }
+
+    /// Configures real runtime dependencies for unit tests without mocking `ControlProtocolDelegate`
+    /// or launching the full Bonjour / real streaming binary stack.
+    internal func configureForTesting(
+        store: HostStateStore,
+        engineAPIClient: EngineAPIClient,
+        engineState: EngineSupervisorState,
+        pairingCoordinator: PairingCoordinator,
+        webDAVHandler: WebDAVHandler? = nil,
+        webDAVCredentials: WebDAVCredentials? = nil,
+        webDAVPort: UInt16? = 8890
+    ) {
+        self.store = store
+        self.identity = (try? store.loadOrCreateIdentity()) ?? HostIdentity()
+        self.settings = store.loadSettings()
+        self.pairedDevices = store.loadPairedDevices()
+        self.engineAPIClient = engineAPIClient
+        self.engineState = engineState
+        self.pairingCoordinator = pairingCoordinator
+        self.webDAVHandler = webDAVHandler
+        self.webDAVCredentials = webDAVCredentials ?? (try? store.loadOrCreateWebDAVCredentials())
+        self.webDAVPort = webDAVPort
+        self.permissions = PermissionSnapshot(screenRecording: .granted, accessibility: .granted, localNetwork: .granted)
+        self.network = NetworkSnapshot(isConnected: true, interfaceSummary: HostStrings.string("network.wifi"), localIPv4: "127.0.0.1")
+        self.isInitialized = true
+    }
+
+    internal func makeProtocolDelegateForTesting() -> ControlProtocolDelegate {
+        RuntimeControlProtocolAdapter(runtime: self)
     }
 
     public func start() {
@@ -145,6 +186,14 @@ public final class HostRuntime: ObservableObject {
             let paths = HostPaths(rootDirectory: overrides.dataDirectory)
             let store = try HostStateStore(paths: paths)
             self.store = store
+
+            // 0. Clean up any orphaned engine / rclone / child-guard processes left by an earlier crash.
+            let ledger = ChildProcessLedger(ledgerURL: paths.childLedgerFile)
+            self.childLedger = ledger
+            let cleaned = ledger.cleanupStaleChildren()
+            if cleaned > 0 {
+                HostLogger.warning("Cleaned up \(cleaned) orphaned child process(es) from previous run", category: "runtime")
+            }
 
             let identity = try store.loadOrCreateIdentity()
             var loadedSettings = store.loadSettings()
@@ -163,9 +212,19 @@ public final class HostRuntime: ObservableObject {
             let tlsId = try tlsManager.loadOrCreateIdentity(commonName: loadedSettings.computerName)
             self.tlsFingerprint = tlsId.fingerprintSHA256
 
-            // 2. Pairing coordinator & control protocol HTTPS server.
-            let autoIds = Set(pairedDevices.filter(\.autoAllow).map(\.deviceId))
-            let coordinator = PairingCoordinator(timeout: 60.0, autoAllowedDeviceIds: autoIds)
+            // 2. Certificate-bound pairing coordinator & control protocol HTTPS server.
+            let autoCertMap = Dictionary(
+                pairedDevices.compactMap { dev -> (String, String)? in
+                    guard dev.autoAllow, let fp = dev.certFingerprint, !fp.isEmpty else { return nil }
+                    return (dev.deviceId, fp)
+                },
+                uniquingKeysWith: { first, _ in first }
+            )
+            let coordinator = PairingCoordinator(
+                timeout: 60.0,
+                cooldownDuration: 30.0,
+                autoAllowedCertByDeviceId: autoCertMap
+            )
             self.pairingCoordinator = coordinator
             Task { [weak self] in
                 await coordinator.setPendingChangeHandler { [weak self] prompts in
@@ -185,14 +244,22 @@ public final class HostRuntime: ObservableObject {
             self.controlServer = controlServer
             self.controlPort = boundControlPort
 
-            // 3. System audio mute controller & display enumeration.
-            let audioCtrl = SystemAudioController(muteWhileStreaming: loadedSettings.muteMacWhileStreaming)
+            // 3. System audio mute controller (automatically recovers Mac speaker mute from any crash) & displays.
+            let audioCtrl = SystemAudioController(
+                muteWhileStreaming: loadedSettings.muteMacWhileStreaming,
+                recoveryFileURL: paths.audioMuteRecoveryFile
+            )
             self.audioController = audioCtrl
             self.displays = DisplayEnumerator.currentDisplays()
 
             // 4. Media service (Swift read-only WebDAV + optional rclone bridge).
-            let rclone = RcloneBridgeManager()
+            let rclone = RcloneBridgeManager(ledger: ledger)
             self.rcloneManager = rclone
+            rclone.setStatusesChangedHandler { [weak self] statuses in
+                Task { @MainActor [weak self] in
+                    self?.rcloneStatuses = statuses
+                }
+            }
             let mounts = Self.makeLocalMounts(from: loadedSettings.mediaFolders)
             let davHandler = WebDAVHandler(credentials: webdavCreds, localMounts: mounts, rcloneManager: rclone)
             let davServer = WebDAVServer(handler: davHandler)
@@ -200,7 +267,8 @@ public final class HostRuntime: ObservableObject {
             self.webDAVServer = davServer
             reconcileMediaService()
 
-            // 5. Bonjour mDNS advertiser.
+            // 5. Bonjour mDNS advertiser (`_depth3d-host._tcp` ONLY; no `_webdav._tcp` LAN broadcast).
+            //    `gs` is omitted initially until engine reports `.ready` / `.streaming`.
             let advertiser = HostBonjourAdvertiser()
             self.bonjourAdvertiser = advertiser
             let permMonitor = PermissionMonitor()
@@ -213,10 +281,10 @@ public final class HostRuntime: ObservableObject {
                 name: loadedSettings.computerName,
                 hostId: identity.id,
                 controlPort: boundControlPort,
-                gsPort: activeEngineBasePort,
-                mediaPort: self.webDAVPort
+                gsPort: nil,
+                mediaPort: self.webDAVPort,
+                mediaRevision: self.mediaCredentialRevision
             )
-            advertiser.publishWebDAV(computerName: loadedSettings.computerName, port: self.webDAVPort)
 
             // 6. Streaming engine API client & supervisor.
             let apiPort = HostPortDefaults.engineAPIPort(basePort: activeEngineBasePort)
@@ -226,22 +294,27 @@ public final class HostRuntime: ObservableObject {
             let supervisor = EngineSupervisor(
                 paths: paths,
                 adminCredentials: adminCreds,
-                engineExecutableOverride: overrides.engineExecutableURL
+                engineExecutableOverride: overrides.engineExecutableURL,
+                ledger: ledger
             )
             self.engineSupervisor = supervisor
             supervisor.setHandlers(
                 onStateChanged: { [weak self] newState, logState in
                     Task { @MainActor in
                         guard let self else { return }
+                        let wasReady = self.engineState.isReadyForClients
                         self.engineState = newState
                         self.engineLogState = logState
+                        if wasReady != newState.isReadyForClients {
+                            self.updateBonjourTXT()
+                        }
                         if case .ready = newState {
                             self.refreshPairedClientsFromEngine()
                         }
                     }
                 },
-                onStreamingActivityChanged: { [weak audioCtrl] active in
-                    audioCtrl?.setStreamingActive(active)
+                onActiveSessionCountChanged: { [weak audioCtrl] count in
+                    audioCtrl?.setActiveSessionCount(count)
                 }
             )
 
@@ -286,7 +359,7 @@ public final class HostRuntime: ObservableObject {
             self.isInitialized = true
         } catch {
             HostLogger.error("Runtime startup failed: \(error.localizedDescription)", category: "runtime")
-            self.fatalStartupError = "服务启动失败，请退出后重新打开 depth3d Host。"
+            self.fatalStartupError = HostStrings.string("runtime.error.startup")
             self.isInitialized = true
         }
     }
@@ -328,7 +401,23 @@ public final class HostRuntime: ObservableObject {
         }
     }
 
-    public func submitManualPIN(pin: String, deviceName: String) async -> Result<Void, ManualPINError> {
+    public func refreshPendingEnginePairings() {
+        guard let api = engineAPIClient, engineState.isReadyForClients else {
+            pendingEnginePairings = []
+            return
+        }
+        Task {
+            if let list = try? await api.fetchPendingPairings() {
+                self.pendingEnginePairings = list
+            }
+        }
+    }
+
+    public func submitManualPIN(
+        pin: String,
+        deviceName: String,
+        pairingId: String? = nil
+    ) async -> Result<Void, ManualPINError> {
         let trimmedPIN = pin.trimmingCharacters(in: .whitespacesAndNewlines)
         guard ControlProtocolRouter.isValidPIN(trimmedPIN) else {
             return .failure(.invalidFormat)
@@ -337,13 +426,18 @@ public final class HostRuntime: ObservableObject {
             return .failure(.engineNotReady)
         }
         let cleanName = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let label = cleanName.isEmpty ? "头显设备" : cleanName
+        let label = cleanName.isEmpty ? HostStrings.string("device.default_name") : cleanName
         do {
-            try await api.submitManualPIN(pin: trimmedPIN, deviceName: label)
+            try await api.submitManualPIN(pin: trimmedPIN, deviceName: label, pairingId: pairingId)
+            pendingEnginePairings = []
             refreshPairedClientsFromEngine()
             return .success(())
         } catch EngineAPIError.noPendingPairing {
+            pendingEnginePairings = []
             return .failure(.noPendingHeadset)
+        } catch EngineAPIError.multiplePendingPairings(let list) {
+            pendingEnginePairings = list
+            return .failure(.multiplePendingHeadsets)
         } catch EngineAPIError.pinRejected {
             return .failure(.pinRejected)
         } catch {
@@ -355,6 +449,7 @@ public final class HostRuntime: ObservableObject {
         case invalidFormat
         case engineNotReady
         case noPendingHeadset
+        case multiplePendingHeadsets
         case pinRejected
         case unexpected
     }
@@ -367,12 +462,11 @@ public final class HostRuntime: ObservableObject {
             do {
                 let clients = try await api.listPairedClients()
                 self.engineClients = clients
-                self.syncPairedRecordsWithEngineClients(clients)
                 self.isRefreshingDevices = false
             } catch {
                 self.isRefreshingDevices = false
                 if self.engineState.isReadyForClients {
-                    self.devicesError = "暂时无法读取已配对设备，请稍后重试。"
+                    self.devicesError = HostStrings.string("runtime.error.devices_load")
                 }
             }
         }
@@ -380,14 +474,18 @@ public final class HostRuntime: ObservableObject {
 
     public func setAutoAllow(_ enabled: Bool, for deviceId: String) {
         guard let store else { return }
+        var boundCertFP: String?
         if var existing = pairedDevices.first(where: { $0.deviceId == deviceId }) {
-            existing.autoAllow = enabled
+            // Only cert-bound devices can enable auto-allow.
+            let effective = enabled && (existing.certFingerprint?.isEmpty == false)
+            existing.autoAllow = effective
+            boundCertFP = effective ? existing.certFingerprint : nil
             if let updated = try? store.upsertPairedDevice(existing) {
                 pairedDevices = updated
             }
         }
         if let coordinator = pairingCoordinator {
-            Task { await coordinator.setAutoAllowed(enabled, for: deviceId) }
+            Task { await coordinator.setAutoAllowed(deviceId: deviceId, certFingerprintSHA256: boundCertFP) }
         }
     }
 
@@ -397,8 +495,12 @@ public final class HostRuntime: ObservableObject {
             pairedDevices = updated
         }
         if let coordinator = pairingCoordinator {
-            Task { await coordinator.setAutoAllowed(false, for: device.deviceId) }
+            Task { await coordinator.setAutoAllowed(deviceId: device.deviceId, certFingerprintSHA256: nil) }
         }
+        // Immediately rotate WebDAV credentials and bump Bonjour TXT revision so the removed
+        // device loses media access right away while remaining paired headsets re-fetch `/media`.
+        rotateWebDAVCredentialsAndNotify()
+
         if let uuid = device.engineUUID, let api = engineAPIClient {
             Task {
                 _ = try? await api.unpairClient(uuid: uuid)
@@ -409,6 +511,7 @@ public final class HostRuntime: ObservableObject {
 
     public func removeEngineOnlyClient(_ client: EngineClientRecord) {
         guard let api = engineAPIClient else { return }
+        rotateWebDAVCredentialsAndNotify()
         Task {
             _ = try? await api.unpairClient(uuid: client.uuid)
             self.refreshPairedClientsFromEngine()
@@ -435,6 +538,10 @@ public final class HostRuntime: ObservableObject {
 
     public func retryEngine() {
         restartEngineWithCurrentSettings()
+    }
+
+    public func retryBonjourPublish() {
+        republishBonjour()
     }
 
     public func switchToAlternateEnginePorts() {
@@ -489,7 +596,9 @@ public final class HostRuntime: ObservableObject {
     public func addMediaFolder(url: URL) {
         let cleanURL = url.standardizedFileURL
         guard !settings.mediaFolders.contains(where: { $0.path == cleanURL.path }) else { return }
-        let baseName = cleanURL.lastPathComponent.isEmpty ? "共享文件夹" : cleanURL.lastPathComponent
+        let baseName = cleanURL.lastPathComponent.isEmpty
+            ? HostStrings.string("runtime.default_folder_name")
+            : cleanURL.lastPathComponent
         let uniqueName = makeUniqueMountName(baseName)
         let bookmark = try? cleanURL.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
         settings.mediaFolders.append(MediaFolderEntry(name: uniqueName, path: cleanURL.path, bookmarkData: bookmark))
@@ -537,6 +646,10 @@ public final class HostRuntime: ObservableObject {
         republishBonjour()
     }
 
+    public func retryCloudRemote(_ entry: CloudRemoteEntry) {
+        rcloneManager?.retryRemote(displayName: entry.displayName)
+    }
+
     // MARK: - Settings Updates
 
     public func setMuteMacWhileStreaming(_ enabled: Bool) {
@@ -554,7 +667,7 @@ public final class HostRuntime: ObservableObject {
         } catch {
             HostLogger.warning("Launch at login update failed: \(error.localizedDescription)", category: "settings")
             settings.launchAtLogin = LaunchAtLoginManager.isEnabled
-            launchAtLoginError = "未能更改开机启动设置，请在“系统设置 › 通用 › 登录项”中手动开启。"
+            launchAtLoginError = HostStrings.string("runtime.error.login_item")
         }
     }
 
@@ -596,9 +709,9 @@ public final class HostRuntime: ObservableObject {
         displays = DisplayEnumerator.currentDisplays()
     }
 
-    // MARK: - Internal Helpers for Protocol Adapter
+    // MARK: - Protocol Adapter Operations (Internal for direct non-mock testing)
 
-    fileprivate func snapshotForProtocol() -> ControlProtocolSnapshot {
+    internal func snapshotForProtocol() -> ControlProtocolSnapshot {
         let osVer = ProcessInfo.processInfo.operatingSystemVersion
         let osStr = "macOS \(osVer.majorVersion).\(osVer.minorVersion).\(osVer.patchVersion)"
         let streamInfo = streamReadyInfo
@@ -613,76 +726,151 @@ public final class HostRuntime: ObservableObject {
         )
     }
 
-    fileprivate func authorizeMediaClient(deviceId: String, peerCertFingerprintSHA256: String) -> Bool {
+    /// Strict certificate-bound media authorization:
+    /// - Requires `deviceId` to exist in `pairedDevices` with a bound `certFingerprint`
+    /// - Requires `peerCertFingerprintSHA256` to match that bound fingerprint exactly
+    /// - Requires that certificate to still be present in the streaming engine's `state.json`
+    /// Never matches by display name and never binds an arbitrary cert on first `/media` use.
+    internal func authorizeMediaClient(deviceId: String, peerCertFingerprintSHA256: String) -> Bool {
         guard let store else { return false }
         guard let idx = pairedDevices.firstIndex(where: { $0.deviceId == deviceId }) else {
             return false
         }
         var record = pairedDevices[idx]
-
-        // 1. If device already bound a certificate fingerprint, require exact match.
-        if let boundFP = record.certFingerprint {
-            return boundFP.caseInsensitiveCompare(peerCertFingerprintSHA256) == .orderedSame
+        guard let boundFP = record.certFingerprint, !boundFP.isEmpty else {
+            return false
+        }
+        guard boundFP.caseInsensitiveCompare(peerCertFingerprintSHA256) == .orderedSame else {
+            return false
         }
 
-        // 2. Otherwise check the engine's paired client certificates (`state.json`) and bind on first verified use.
+        // Verify the certificate has not been unpaired from the streaming engine.
         let engineCerts = EngineConfigGenerator.loadPairedCerts(at: store.paths.engineStateFile)
-        if let matched = engineCerts.first(where: {
-            $0.fingerprintSHA256?.caseInsensitiveCompare(peerCertFingerprintSHA256) == .orderedSame
-        }) {
-            record.certFingerprint = peerCertFingerprintSHA256.uppercased()
-            record.engineUUID = matched.uuid
-            record.lastSeenAt = Date()
-            if let updated = try? store.upsertPairedDevice(record) {
-                pairedDevices = updated
-            }
-            return true
+        guard engineCerts.contains(where: {
+            $0.fingerprintSHA256?.caseInsensitiveCompare(boundFP) == .orderedSame
+        }) else {
+            return false
         }
-        return false
+
+        record.lastSeenAt = Date()
+        if let updated = try? store.upsertPairedDevice(record) {
+            pairedDevices = updated
+        }
+        return true
     }
 
-    fileprivate func handleApprovedPairing(
+    /// Completes an approved `/depth3d/v1/pair` request:
+    /// - Fails immediately (`false` -> HTTP `503`) if the streaming engine is not ready or unreachable
+    /// - Submits the PIN ONLY to the single GameStream pending pairing matching `clientAddress`
+    /// - Saves `PairedDeviceRecord` ONLY AFTER GameStream pairing truly succeeds and binds the
+    ///   exact client certificate produced by that pairing session
+    internal func handleApprovedPairing(
         deviceName: String,
         deviceId: String,
         pin: String,
-        autoAllowFuture: Bool
+        clientAddress: String,
+        autoAllowFuture: Bool,
+        backgroundWaitSeconds: TimeInterval = 25.0
     ) async -> Bool {
-        guard let store, let api = engineAPIClient else { return false }
+        guard let store, let api = engineAPIClient, engineState.isReadyForClients else {
+            return false
+        }
+
+        // Ensure the engine management API is actually reachable right now.
+        guard let pending = try? await api.fetchPendingPairings() else {
+            HostLogger.warning("Engine API unreachable while handling approved pairing", category: "pair")
+            return false
+        }
+
+        let targetIP = IPAddressNormalizer.normalize(clientAddress)
+        let matching = pending.filter { $0.normalizedAddress == targetIP }
         let existing = pairedDevices.first(where: { $0.deviceId == deviceId })
-        let updatedRecord = PairedDeviceRecord(
-            deviceId: deviceId,
-            name: deviceName,
-            engineUUID: existing?.engineUUID,
-            certFingerprint: existing?.certFingerprint,
-            autoAllow: autoAllowFuture || (existing?.autoAllow ?? false),
-            pairedAt: existing?.pairedAt ?? Date(),
-            lastSeenAt: Date()
-        )
-        if let saved = try? store.upsertPairedDevice(updatedRecord) {
-            self.pairedDevices = saved
+        let existingFP = existing?.certFingerprint
+        let stateFileURL = store.paths.engineStateFile
+
+        if matching.count > 1 {
+            HostLogger.warning("Refusing ambiguous pairing: \(matching.count) pending sessions from \(targetIP)", category: "pair")
+            return false
         }
 
-        // If a GameStream pairing session is already pending in the engine, submit immediately.
-        // Otherwise arm a background waiter so returning 200 allows the headset to initiate
-        // GameStream `/pair` right away and be paired seamlessly.
-        if let pending = try? await api.fetchPendingPairings(), let first = pending.first {
-            let ok = (try? await api.submitPIN(pairingId: first.id, pin: pin, deviceName: deviceName)) ?? false
-            if ok {
-                HostLogger.info("Immediately paired pending GameStream session for \(deviceName)", category: "pair")
-                self.refreshPairedClientsFromEngine()
-                return true
+        // Case A: Headset already initiated GameStream `/pair` before/concurrently with `/depth3d/v1/pair`.
+        // Complete synchronously and bind the exact certificate before returning `200 OK`.
+        if matching.count == 1 {
+            guard let verified = await api.completeMatchedPairing(
+                pin: pin,
+                deviceName: deviceName,
+                clientAddress: targetIP,
+                stateFileURL: stateFileURL,
+                existingBoundFingerprint: existingFP,
+                maxWait: 5.0
+            ) else {
+                return false
             }
+            persistVerifiedPairing(
+                deviceName: deviceName,
+                deviceId: deviceId,
+                verified: verified,
+                autoAllowFuture: autoAllowFuture
+            )
+            refreshPairedClientsFromEngine()
+            return true
         }
 
+        // Case B: Headset waits for `200 {"ok":true}` from `/depth3d/v1/pair` and immediately starts
+        // GameStream `/pair`. Do NOT save `PairedDeviceRecord` yet — wait in background strictly for
+        // `targetIP` and persist ONLY once the GameStream pairing truly succeeds and yields its cert.
         Task.detached { [weak self, api] in
-            let ok = await api.submitPINWhenReady(pin: pin, deviceName: deviceName, maxWait: 30.0)
-            if ok {
-                await MainActor.run { [weak self] in
-                    self?.refreshPairedClientsFromEngine()
-                }
+            guard let verified = await api.completeMatchedPairing(
+                pin: pin,
+                deviceName: deviceName,
+                clientAddress: targetIP,
+                stateFileURL: stateFileURL,
+                existingBoundFingerprint: existingFP,
+                maxWait: backgroundWaitSeconds
+            ) else {
+                return
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.persistVerifiedPairing(
+                    deviceName: deviceName,
+                    deviceId: deviceId,
+                    verified: verified,
+                    autoAllowFuture: autoAllowFuture
+                )
+                self.refreshPairedClientsFromEngine()
             }
         }
         return true
+    }
+
+    private func persistVerifiedPairing(
+        deviceName: String,
+        deviceId: String,
+        verified: VerifiedEnginePairing,
+        autoAllowFuture: Bool
+    ) {
+        guard let store else { return }
+        let existing = pairedDevices.first(where: { $0.deviceId == deviceId })
+        let shouldAutoAllow = autoAllowFuture || (existing?.autoAllow ?? false)
+        let record = PairedDeviceRecord(
+            deviceId: deviceId,
+            name: deviceName,
+            engineUUID: verified.engineUUID,
+            certFingerprint: verified.certFingerprintSHA256,
+            autoAllow: shouldAutoAllow,
+            pairedAt: existing?.pairedAt ?? Date(),
+            lastSeenAt: Date()
+        )
+        if let saved = try? store.upsertPairedDevice(record) {
+            self.pairedDevices = saved
+        }
+        if let coordinator = pairingCoordinator {
+            let fpForAutoAllow: String? = shouldAutoAllow ? verified.certFingerprintSHA256 : nil
+            Task {
+                await coordinator.setAutoAllowed(deviceId: deviceId, certFingerprintSHA256: fpForAutoAllow)
+            }
+        }
     }
 
     // MARK: - Private Coordination
@@ -748,7 +936,7 @@ public final class HostRuntime: ObservableObject {
                 } catch {
                     HostLogger.error("Failed to start WebDAV media server: \(error.localizedDescription)", category: "media")
                     self.webDAVPort = nil
-                    self.webDAVError = "媒体服务启动失败，请稍后重新开启。"
+                    self.webDAVError = HostStrings.string("runtime.error.webdav_start")
                 }
             } else {
                 self.webDAVPort = davServer.port
@@ -760,38 +948,43 @@ public final class HostRuntime: ObservableObject {
         }
     }
 
+    private func rotateWebDAVCredentialsAndNotify() {
+        guard let store else { return }
+        do {
+            let rotated = try store.rotateWebDAVCredentials()
+            self.webDAVCredentials = rotated
+            self.webDAVHandler?.updateConfiguration(credentials: rotated)
+            self.mediaCredentialRevision += 1
+            HostLogger.info("Rotated WebDAV credentials after device removal (mrev=\(mediaCredentialRevision))", category: "media")
+            updateBonjourTXT()
+        } catch {
+            HostLogger.error("Failed to rotate WebDAV credentials: \(error.localizedDescription)", category: "media")
+        }
+    }
+
     private func republishBonjour() {
         guard controlPort > 0 else { return }
+        let gsPort: UInt16? = engineState.isReadyForClients ? activeEngineBasePort : nil
         bonjourAdvertiser?.publishHost(
             name: settings.computerName,
             hostId: identity.id,
             controlPort: controlPort,
-            gsPort: activeEngineBasePort,
-            mediaPort: webDAVPort
+            gsPort: gsPort,
+            mediaPort: webDAVPort,
+            mediaRevision: mediaCredentialRevision
         )
-        bonjourAdvertiser?.publishWebDAV(computerName: settings.computerName, port: webDAVPort)
     }
 
-    private func syncPairedRecordsWithEngineClients(_ clients: [EngineClientRecord]) {
-        guard let store else { return }
-        let engineCerts = EngineConfigGenerator.loadPairedCerts(at: store.paths.engineStateFile)
-        var changed = false
-        var updated = pairedDevices
-        for idx in updated.indices {
-            if updated[idx].engineUUID == nil {
-                if let match = clients.first(where: { $0.name == updated[idx].name }) {
-                    updated[idx].engineUUID = match.uuid
-                    if let cert = engineCerts.first(where: { $0.uuid == match.uuid }) {
-                        updated[idx].certFingerprint = cert.fingerprintSHA256
-                    }
-                    changed = true
-                }
-            }
-        }
-        if changed, let saved = try? store.savePairedDevices(updated) {
-            _ = saved
-            pairedDevices = updated
-        }
+    private func updateBonjourTXT() {
+        guard controlPort > 0 else { return }
+        let gsPort: UInt16? = engineState.isReadyForClients ? activeEngineBasePort : nil
+        bonjourAdvertiser?.updateHostTXT(
+            name: settings.computerName,
+            hostId: identity.id,
+            gsPort: gsPort,
+            mediaPort: webDAVPort,
+            mediaRevision: mediaCredentialRevision
+        )
     }
 
     private func persistSettings() {
@@ -803,7 +996,7 @@ public final class HostRuntime: ObservableObject {
             .replacingOccurrences(of: "/", with: "-")
             .replacingOccurrences(of: ":", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let base = cleaned.isEmpty ? "媒体文件夹" : cleaned
+        let base = cleaned.isEmpty ? HostStrings.string("runtime.default_media_name") : cleaned
         let existing = Set(settings.mediaFolders.map(\.name) + settings.cloudRemotes.map(\.displayName))
         if !existing.contains(base) { return base }
         var idx = 2
@@ -869,7 +1062,7 @@ private final class RuntimeControlProtocolAdapter: ControlProtocolDelegate, @unc
                 hostId: "",
                 osDescription: "macOS",
                 streamReady: false,
-                streamNotReadyReason: "服务尚未初始化",
+                streamNotReadyReason: HostStrings.string("protocol.stream.not_initialized"),
                 mediaPort: nil,
                 webDAVCredentials: nil
             )
@@ -882,12 +1075,19 @@ private final class RuntimeControlProtocolAdapter: ControlProtocolDelegate, @unc
         }
     }
 
-    func handleApprovedPairing(deviceName: String, deviceId: String, pin: String, autoAllowFuture: Bool) async -> Bool {
+    func handleApprovedPairing(
+        deviceName: String,
+        deviceId: String,
+        pin: String,
+        clientAddress: String,
+        autoAllowFuture: Bool
+    ) async -> Bool {
         guard let runtime else { return false }
         return await runtime.handleApprovedPairing(
             deviceName: deviceName,
             deviceId: deviceId,
             pin: pin,
+            clientAddress: clientAddress,
             autoAllowFuture: autoAllowFuture
         )
     }

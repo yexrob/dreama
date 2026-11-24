@@ -4,12 +4,18 @@ import Depth3DHostCore
 import SwiftUI
 
 /// Floating always-on-top confirmation window for incoming headset auto-pairing requests.
+///
+/// Safety design against accidental approval:
+/// - "以后自动允许这台设备" is UNCHECKED by default
+/// - No default action shortcut (pressing Return/Enter CANNOT approve)
+/// - Displays the requester's IP address clearly
+/// - Non-activating floating panel that NEVER steals keyboard focus from the user's active app
 struct PairingPromptView: View {
     let prompt: PendingPairingPrompt
     let onApprove: (Bool) -> Void
     let onReject: () -> Void
 
-    @State private var rememberAutoAllow: Bool = true
+    @State private var rememberAutoAllow: Bool = false
     @State private var remainingSeconds: Int = 60
 
     private let timer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
@@ -22,6 +28,9 @@ struct PairingPromptView: View {
                     Text(L10n.format("pair.prompt.title", prompt.deviceName))
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundColor(HostTheme.text)
+                    Text(L10n.format("pair.prompt.source_ip", prompt.clientAddress))
+                        .font(.system(size: 11.5).monospacedDigit())
+                        .foregroundColor(HostTheme.accent)
                     Text(L10n.string("pair.prompt.subtitle"))
                         .font(.system(size: 12))
                         .foregroundColor(HostTheme.text2)
@@ -47,15 +56,15 @@ struct PairingPromptView: View {
                 .buttonStyle(HostSecondaryButtonStyle())
                 .keyboardShortcut(.cancelAction)
 
+                // Intentionally NO `.keyboardShortcut(.defaultAction)`: pressing Return must never approve.
                 Button(L10n.string("pair.prompt.allow")) {
                     onApprove(rememberAutoAllow)
                 }
                 .buttonStyle(HostPrimaryButtonStyle())
-                .keyboardShortcut(.defaultAction)
             }
         }
         .padding(20)
-        .frame(width: 400)
+        .frame(width: 420)
         .background(HostTheme.sheet)
         .preferredColorScheme(.dark)
         .onAppear {
@@ -71,8 +80,8 @@ struct PairingPromptView: View {
     }
 }
 
-/// Manages a standalone floating `NSPanel` for incoming pairing prompts so the user sees them
-/// immediately even when the main window is closed.
+/// Manages a standalone non-activating floating `NSPanel` for incoming pairing prompts so the user
+/// sees them immediately even when the main window is closed, WITHOUT stealing keyboard focus.
 @MainActor
 final class PairingPanelController {
     private var panel: NSPanel?
@@ -105,13 +114,15 @@ final class PairingPanelController {
         newPanel.title = L10n.string("pair.panel.window_title")
         newPanel.styleMask = [.titled, .closable, .nonactivatingPanel]
         newPanel.isFloatingPanel = true
+        newPanel.becomesKeyOnlyIfNeeded = true
+        newPanel.hidesOnDeactivate = false
         newPanel.level = .floating
         newPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         newPanel.isReleasedWhenClosed = false
         newPanel.backgroundColor = NSColor(HostTheme.sheet)
         newPanel.center()
-        newPanel.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        // Never call `makeKeyAndOrderFront` or `NSApp.activate` so keyboard focus stays in the user's app.
+        newPanel.orderFrontRegardless()
 
         self.panel = newPanel
     }

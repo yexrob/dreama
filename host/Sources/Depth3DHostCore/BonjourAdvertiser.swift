@@ -11,32 +11,53 @@ public enum BonjourPublicationState: Equatable, Sendable {
 
 /// Pure TXT record builder for `_depth3d-host._tcp` matching `docs/specs/host-protocol.md`.
 public enum HostBonjourTXTRecord {
+    /// Builds TXT entries.
+    /// - `gsPort`: omitted when streaming engine is not ready (port conflict, paused, crashed).
+    /// - `mediaPort`: omitted when media service is disabled or not running.
+    /// - `mediaRevision`: incremented when WebDAV credentials rotate after device unpair so
+    ///   still-paired headsets observing Bonjour TXT know to re-fetch `/depth3d/v1/media`.
     public static func makeDictionary(
         name: String,
         id: String,
-        gsPort: UInt16,
-        mediaPort: UInt16?
+        gsPort: UInt16?,
+        mediaPort: UInt16?,
+        mediaRevision: Int = 0
     ) -> [String: Data] {
         var dict: [String: Data] = [
             "v": Data("1".utf8),
             "name": Data(name.utf8),
             "id": Data(id.utf8),
-            "pair": Data("auto".utf8),
-            "gs": Data(String(gsPort).utf8)
+            "pair": Data("auto".utf8)
         ]
+        if let gsPort {
+            dict["gs"] = Data(String(gsPort).utf8)
+        }
         if let mediaPort {
             dict["media"] = Data(String(mediaPort).utf8)
+            if mediaRevision > 0 {
+                dict["mrev"] = Data(String(mediaRevision).utf8)
+            }
         }
         return dict
     }
+
+    /// Maps `NetService` error codes accurately: ONLY Local Network policy denial
+    /// (`kDNSServiceErr_PolicyDenied` = -65570, `NSNetServicesErrorCode` -72008) reports
+    /// `.permissionDenied`; other errors (collision, timeout, invalid args) report `.failed(code)`.
+    public static func classifyPublishError(code: Int) -> BonjourPublicationState {
+        if code == -65570 || code == -72008 {
+            return .permissionDenied
+        }
+        return .failed(code)
+    }
 }
 
-/// Advertises `_depth3d-host._tcp` (and optionally `_webdav._tcp` when media service is active)
-/// through macOS's system mDNSResponder via `NetService`.
+/// Advertises ONLY `_depth3d-host._tcp` through macOS's system mDNSResponder via `NetService`.
+/// Does NOT broadcast `_webdav._tcp` LAN-wide; paired headsets obtain WebDAV credentials via
+/// mTLS `/depth3d/v1/media`.
 public final class HostBonjourAdvertiser: NSObject, NetServiceDelegate, @unchecked Sendable {
     private let lock = NSLock()
     private var hostService: NetService?
-    private var webDAVService: NetService?
     private var stateHandler: (@Sendable (BonjourPublicationState) -> Void)?
     private var currentState: BonjourPublicationState = .stopped
 
@@ -58,8 +79,9 @@ public final class HostBonjourAdvertiser: NSObject, NetServiceDelegate, @uncheck
         name: String,
         hostId: String,
         controlPort: UInt16,
-        gsPort: UInt16,
-        mediaPort: UInt16?
+        gsPort: UInt16?,
+        mediaPort: UInt16?,
+        mediaRevision: Int = 0
     ) {
         let work = { [weak self] in
             guard let self else { return }
@@ -69,7 +91,8 @@ public final class HostBonjourAdvertiser: NSObject, NetServiceDelegate, @uncheck
                 name: name,
                 id: hostId,
                 gsPort: gsPort,
-                mediaPort: mediaPort
+                mediaPort: mediaPort,
+                mediaRevision: mediaRevision
             )
             service.setTXTRecord(NetService.data(fromTXTRecord: txtDict))
             service.delegate = self
@@ -80,7 +103,10 @@ public final class HostBonjourAdvertiser: NSObject, NetServiceDelegate, @uncheck
             self.lock.unlock()
             cb?(.publishing)
             service.publish()
-            HostLogger.info("Publishing mDNS _depth3d-host._tcp on port \(controlPort) (gs=\(gsPort), media=\(mediaPort.map(String.init) ?? "none"))", category: "mdns")
+            HostLogger.info(
+                "Publishing mDNS _depth3d-host._tcp on port \(controlPort) (gs=\(gsPort.map(String.init) ?? "none"), media=\(mediaPort.map(String.init) ?? "none"))",
+                category: "mdns"
+            )
         }
         if Thread.isMainThread {
             work()
@@ -92,8 +118,9 @@ public final class HostBonjourAdvertiser: NSObject, NetServiceDelegate, @uncheck
     public func updateHostTXT(
         name: String,
         hostId: String,
-        gsPort: UInt16,
-        mediaPort: UInt16?
+        gsPort: UInt16?,
+        mediaPort: UInt16?,
+        mediaRevision: Int = 0
     ) {
         let work = { [weak self] in
             guard let self else { return }
@@ -105,29 +132,10 @@ public final class HostBonjourAdvertiser: NSObject, NetServiceDelegate, @uncheck
                 name: name,
                 id: hostId,
                 gsPort: gsPort,
-                mediaPort: mediaPort
+                mediaPort: mediaPort,
+                mediaRevision: mediaRevision
             )
             service.setTXTRecord(NetService.data(fromTXTRecord: txtDict))
-        }
-        if Thread.isMainThread {
-            work()
-        } else {
-            DispatchQueue.main.async(execute: work)
-        }
-    }
-
-    public func publishWebDAV(computerName: String, port: UInt16?) {
-        let work = { [weak self] in
-            guard let self else { return }
-            self.stopWebDAVOnMain()
-            guard let port else { return }
-            let service = NetService(domain: "local.", type: "_webdav._tcp.", name: "depth3d \(computerName)", port: Int32(port))
-            service.setTXTRecord(NetService.data(fromTXTRecord: ["path": Data("/".utf8)]))
-            self.lock.lock()
-            self.webDAVService = service
-            self.lock.unlock()
-            service.publish()
-            HostLogger.info("Publishing mDNS _webdav._tcp on port \(port)", category: "mdns")
         }
         if Thread.isMainThread {
             work()
@@ -140,7 +148,6 @@ public final class HostBonjourAdvertiser: NSObject, NetServiceDelegate, @uncheck
         let work = { [weak self] in
             guard let self else { return }
             self.stopHostOnMain()
-            self.stopWebDAVOnMain()
             self.updateState(.stopped)
         }
         if Thread.isMainThread {
@@ -156,14 +163,6 @@ public final class HostBonjourAdvertiser: NSObject, NetServiceDelegate, @uncheck
         hostService = nil
         lock.unlock()
         service?.delegate = nil
-        service?.stop()
-    }
-
-    private func stopWebDAVOnMain() {
-        lock.lock()
-        let service = webDAVService
-        webDAVService = nil
-        lock.unlock()
         service?.stop()
     }
 
@@ -192,13 +191,13 @@ public final class HostBonjourAdvertiser: NSObject, NetServiceDelegate, @uncheck
         lock.unlock()
         guard isHost else { return }
         let code = errorDict[NetService.errorCode]?.intValue ?? -1
-        // -72008 / kDNSServiceErr_PolicyDenied (-65570) indicates Local Network permission denied.
-        if code == -65570 || code == -72008 {
+        let classified = HostBonjourTXTRecord.classifyPublishError(code: code)
+        switch classified {
+        case .permissionDenied:
             HostLogger.warning("mDNS publish blocked by Local Network permission (\(code))", category: "mdns")
-            updateState(.permissionDenied)
-        } else {
-            HostLogger.error("mDNS publish failed with code \(code)", category: "mdns")
-            updateState(.failed(code))
+        default:
+            HostLogger.error("mDNS publish failed with non-permission error (\(code))", category: "mdns")
         }
+        updateState(classified)
     }
 }

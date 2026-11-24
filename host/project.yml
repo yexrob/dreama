@@ -41,6 +41,16 @@ targets:
       - sdk: SystemConfiguration.framework
       - sdk: ServiceManagement.framework
       - sdk: ScreenCaptureKit.framework
+  Depth3DChildGuard:
+    type: tool
+    platform: macOS
+    sources:
+      - path: Sources/Depth3DChildGuard
+    settings:
+      base:
+        PRODUCT_NAME: depth3d-child-guard
+        PRODUCT_BUNDLE_IDENTIFIER: dev.depth3d.host.child-guard
+        SKIP_INSTALL: YES
   Depth3DHost:
     type: application
     platform: macOS
@@ -48,8 +58,6 @@ targets:
       - path: Sources/Depth3DHost
         excludes:
           - Resources/Info.plist
-    info:
-      path: Sources/Depth3DHost/Resources/Info.plist
     settings:
       base:
         PRODUCT_NAME: "depth3d Host"
@@ -60,6 +68,9 @@ targets:
         COMBINE_HIDPI_IMAGES: YES
     dependencies:
       - target: Depth3DHostCore
+      - target: Depth3DChildGuard
+        embed: false
+        link: false
   Depth3DHostTests:
     type: bundle.unit-test
     platform: macOS
@@ -77,6 +88,7 @@ schemes:
     build:
       targets:
         Depth3DHost: all
+        Depth3DChildGuard: all
         Depth3DHostTests: [test]
     test:
       targets:

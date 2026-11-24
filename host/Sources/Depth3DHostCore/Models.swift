@@ -1,7 +1,9 @@
 import Foundation
 import SystemConfiguration
 
-/// Video quality presets mapped to VideoToolbox encoder parameters.
+/// Video quality presets mapped to parameters that genuinely affect VideoToolbox encoding
+/// in Sunshine (`src/video.cpp`: `max_bitrate` caps `ctx->bit_rate` in kbps; `vt_coder`
+/// selects H.264 entropy coding; `vt_realtime` controls realtime scheduling).
 public enum StreamQualityPreset: String, Codable, CaseIterable, Identifiable, Sendable {
     case smooth
     case balanced
@@ -9,16 +11,24 @@ public enum StreamQualityPreset: String, Codable, CaseIterable, Identifiable, Se
 
     public var id: String { rawValue }
 
-    /// Quantization parameter (lower = sharper, higher bitrate).
-    public var qp: Int {
+    /// Maximum VideoToolbox bitrate cap in kbps (`0` = unlimited, follows headset request).
+    public var maxBitrateKbps: Int {
         switch self {
-        case .smooth: return 30
-        case .balanced: return 24
-        case .high: return 18
+        case .smooth: return 20_000   // 20 Mbps ceiling for weaker Wi-Fi / low latency
+        case .balanced: return 50_000 // 50 Mbps ceiling (good for 1440p72 HEVC)
+        case .high: return 0          // Unlimited (follows client-requested bitrate, e.g. 80-150 Mbps)
         }
     }
 
-    /// VideoToolbox realtime hint.
+    /// VideoToolbox entropy coder option (`auto`, `cabac`, `cavlc`).
+    public var vtCoder: String {
+        switch self {
+        case .smooth: return "auto"
+        case .balanced, .high: return "cabac"
+        }
+    }
+
+    /// VideoToolbox realtime encoding flag.
     public var realtimeEncoding: Bool { true }
 }
 
@@ -52,7 +62,6 @@ public struct MediaFolderEntry: Codable, Equatable, Identifiable, Sendable {
 public struct CloudRemoteEntry: Codable, Equatable, Identifiable, Sendable {
     public let id: UUID
     public var displayName: String
-    /// rclone remote specification, e.g. "gdrive:" or "gdrive:Movies".
     public var remoteSpec: String
 
     public init(id: UUID = UUID(), displayName: String, remoteSpec: String) {
@@ -62,12 +71,12 @@ public struct CloudRemoteEntry: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
-/// A paired headset record persisted by depth3d Host.
+/// A paired headset record persisted by depth3d Host ONLY after GameStream pairing succeeds.
 public struct PairedDeviceRecord: Codable, Equatable, Identifiable, Sendable {
     public let deviceId: String
     public var name: String
     public var engineUUID: String?
-    /// SHA-256 hex digest (uppercase, no colons) of client X.509 DER certificate.
+    /// Uppercase SHA-256 hex digest of the exact X.509 client certificate bound during pairing.
     public var certFingerprint: String?
     public var autoAllow: Bool
     public let pairedAt: Date
@@ -135,7 +144,9 @@ public struct HostSettings: Codable, Equatable, Sendable {
     }
 
     public static func defaultComputerName() -> String {
-        if let name = SCDynamicStoreCopyComputerName(nil, nil) as String?, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if let name = SCDynamicStoreCopyComputerName(nil, nil) as String?,
+           !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
             return name
         }
         return Host.current().localizedName ?? "Mac"
@@ -149,7 +160,6 @@ public enum HostPortDefaults {
     public static let defaultControlPort: UInt16 = 48090
     public static let defaultWebDAVPort: UInt16 = 8890
 
-    /// All TCP ports bound by the streaming engine relative to `basePort`.
     public static func engineTCPPorts(basePort: UInt16) -> [UInt16] {
         let base = Int(basePort)
         return [base - 5, base, base + 1, base + 21]
@@ -170,8 +180,8 @@ public enum HostPortDefaults {
     }
 }
 
-/// Optional runtime overrides supplied via environment variables or launch arguments
-/// (used for isolated testing with alternate ports and data directory).
+/// Dependency-injected runtime overrides for unit tests and DEBUG builds.
+/// In Release builds, `fromProcess()` ignores all debug environment variables and CLI flags.
 public struct RuntimeOverrides: Equatable, Sendable {
     public var dataDirectory: URL?
     public var engineBasePort: UInt16?
@@ -197,6 +207,7 @@ public struct RuntimeOverrides: Equatable, Sendable {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         arguments: [String] = CommandLine.arguments
     ) -> RuntimeOverrides {
+        #if DEBUG
         var result = RuntimeOverrides()
 
         if let dir = environment["DEPTH3D_HOST_DATA_DIR"], !dir.isEmpty {
@@ -236,6 +247,9 @@ public struct RuntimeOverrides: Equatable, Sendable {
             idx += 1
         }
         return result
+        #else
+        return RuntimeOverrides()
+        #endif
     }
 }
 
@@ -259,11 +273,18 @@ public struct HostPaths: Equatable, Sendable {
     public var pairedDevicesFile: URL { rootDirectory.appendingPathComponent("paired-devices.json") }
     public var webDAVCredentialsFile: URL { rootDirectory.appendingPathComponent("webdav-credentials.json") }
     public var engineAdminCredentialsFile: URL { rootDirectory.appendingPathComponent("engine-admin.json") }
+    public var childLedgerFile: URL { rootDirectory.appendingPathComponent("running-children.json") }
+    public var audioMuteRecoveryFile: URL { rootDirectory.appendingPathComponent("audio-mute-recovery.json") }
 
     public var tlsDirectory: URL { rootDirectory.appendingPathComponent("tls", isDirectory: true) }
     public var engineDirectory: URL { rootDirectory.appendingPathComponent("engine", isDirectory: true) }
+    public var engineHomeDirectory: URL { engineDirectory.appendingPathComponent("home", isDirectory: true) }
+    public var engineIsolatedAppdataDirectory: URL {
+        engineHomeDirectory.appendingPathComponent(".config/sunshine", isDirectory: true)
+    }
     public var engineCredentialsDirectory: URL { engineDirectory.appendingPathComponent("credentials", isDirectory: true) }
     public var engineConfigFile: URL { engineDirectory.appendingPathComponent("engine.conf") }
+    public var engineLogFile: URL { engineDirectory.appendingPathComponent("engine.log") }
     public var engineAppsFile: URL { engineDirectory.appendingPathComponent("apps.json") }
     public var engineStateFile: URL { engineDirectory.appendingPathComponent("state.json") }
     public var engineCredentialsFile: URL { engineDirectory.appendingPathComponent("credentials.json") }
@@ -272,7 +293,14 @@ public struct HostPaths: Equatable, Sendable {
 
     public func ensureDirectoriesExist() throws {
         let fm = FileManager.default
-        for dir in [rootDirectory, tlsDirectory, engineDirectory, engineCredentialsDirectory] {
+        for dir in [
+            rootDirectory,
+            tlsDirectory,
+            engineDirectory,
+            engineHomeDirectory,
+            engineIsolatedAppdataDirectory,
+            engineCredentialsDirectory
+        ] {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: tlsDirectory.path)
@@ -313,5 +341,15 @@ public enum SecureRandom {
             }
         }
         return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func asciiSalt(length: Int = 16) -> String {
+        let alphabet = Array("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        var bytes = [UInt8](repeating: 0, count: length)
+        let status = SecRandomCopyBytes(kSecRandomDefault, length, &bytes)
+        if status != errSecSuccess {
+            for i in 0..<length { bytes[i] = UInt8.random(in: 0...255) }
+        }
+        return String(bytes.map { alphabet[Int($0) % alphabet.count] })
     }
 }

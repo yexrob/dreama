@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import Depth3DHostCore
@@ -5,7 +6,7 @@ import XCTest
 private actor MockControlDelegate: ControlProtocolDelegate {
     var snapshot: ControlProtocolSnapshot
     var authorizedClients: [String: String] = [:] // deviceId -> certFingerprintSHA256
-    var approvedPairings: [(device: String, deviceId: String, pin: String, autoAllow: Bool)] = []
+    var approvedPairings: [(device: String, deviceId: String, pin: String, clientAddress: String, autoAllow: Bool)] = []
     var shouldAcceptEngineSubmit: Bool = true
 
     init(snapshot: ControlProtocolSnapshot) {
@@ -14,6 +15,10 @@ private actor MockControlDelegate: ControlProtocolDelegate {
 
     func setAuthorized(deviceId: String, fingerprint: String) {
         authorizedClients[deviceId] = fingerprint.uppercased()
+    }
+
+    func setSnapshot(_ next: ControlProtocolSnapshot) {
+        snapshot = next
     }
 
     func currentSnapshot() async -> ControlProtocolSnapshot {
@@ -25,8 +30,14 @@ private actor MockControlDelegate: ControlProtocolDelegate {
         return expected == peerCertFingerprintSHA256.uppercased()
     }
 
-    func handleApprovedPairing(deviceName: String, deviceId: String, pin: String, autoAllowFuture: Bool) async -> Bool {
-        approvedPairings.append((deviceName, deviceId, pin, autoAllowFuture))
+    func handleApprovedPairing(
+        deviceName: String,
+        deviceId: String,
+        pin: String,
+        clientAddress: String,
+        autoAllowFuture: Bool
+    ) async -> Bool {
+        approvedPairings.append((deviceName, deviceId, pin, clientAddress, autoAllowFuture))
         return shouldAcceptEngineSubmit
     }
 }
@@ -78,13 +89,13 @@ final class ControlProtocolTests: XCTestCase {
         let media = try XCTUnwrap(json["media"] as? [String: Any])
         XCTAssertEqual(media["port"] as? Int, 8890)
 
-        // Now verify not-ready state with media disabled (null)
+        // Not-ready state with localized reason and media disabled (null)
         let notReadySnap = ControlProtocolSnapshot(
             hostName: "书房 Mac",
             hostId: "11111111-2222-3333-4444-555555555555",
             osDescription: "macOS 15.1",
             streamReady: false,
-            streamNotReadyReason: "还没有允许屏幕录制",
+            streamNotReadyReason: HostStrings.string("protocol.stream.no_screen_recording"),
             mediaPort: nil,
             webDAVCredentials: nil
         )
@@ -98,7 +109,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertTrue(json2["media"] is NSNull)
     }
 
-    func testVersionMismatchReturns426() async {
+    func testVersionMismatchReturns426WithLocalizedMessage() async throws {
         let snap = ControlProtocolSnapshot(
             hostName: "Mac", hostId: "id", osDescription: "macOS 15.0",
             streamReady: true, streamNotReadyReason: nil, mediaPort: nil, webDAVCredentials: nil
@@ -110,6 +121,8 @@ final class ControlProtocolTests: XCTestCase {
 
         let respV2 = await router.handle(HTTPRequest(method: "GET", rawTarget: "/depth3d/v2/info"))
         XCTAssertEqual(respV2.statusCode, 426)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: respV2.body) as? [String: Any])
+        XCTAssertEqual(json["message"] as? String, "请更新电脑上的 depth3d Host")
 
         let respHeader = await router.handle(HTTPRequest(
             method: "GET",
@@ -119,68 +132,132 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(respHeader.statusCode, 426)
     }
 
-    func testPairingApprovalRejectionTimeoutAndAutoAllow() async throws {
+    func testPairReturns503ImmediatelyWhenEngineNotReady() async {
+        let snap = ControlProtocolSnapshot(
+            hostName: "Mac", hostId: "id", osDescription: "macOS 15.0",
+            streamReady: false,
+            streamNotReadyReason: HostStrings.string("protocol.stream.port_conflict"),
+            mediaPort: nil, webDAVCredentials: nil
+        )
+        let coord = PairingCoordinator(timeout: 5.0)
+        let router = ControlProtocolRouter(pairingCoordinator: coord, delegate: MockControlDelegate(snapshot: snap))
+
+        let resp = await router.handle(HTTPRequest(
+            method: "POST",
+            rawTarget: "/depth3d/v1/pair",
+            body: Data("{\"device\":\"PICO 4\",\"deviceId\":\"dev-1\",\"pin\":\"1234\"}".utf8),
+            remoteAddress: "192.168.1.40"
+        ))
+        XCTAssertEqual(resp.statusCode, 503)
+        let prompts = await coord.pendingPrompts()
+        XCTAssertTrue(prompts.isEmpty, "Must not display a pairing prompt when engine is unavailable")
+    }
+
+    /// Verifies cert-bound auto-allow, single active prompt serialization, IP recording,
+    /// rejection/timeout cooldown, and that spoofed `deviceId` without matching TLS cert MUST prompt.
+    func testPairingApprovalRejectionTimeoutCooldownAndCertBoundAutoAllow() async throws {
         let snap = ControlProtocolSnapshot(
             hostName: "Mac", hostId: "id", osDescription: "macOS 15.0",
             streamReady: true, streamNotReadyReason: nil, mediaPort: nil, webDAVCredentials: nil
         )
         let delegate = MockControlDelegate(snapshot: snap)
-        let coordinator = PairingCoordinator(timeout: 0.25)
+        let coordinator = PairingCoordinator(timeout: 0.2, cooldownDuration: 2.0)
         let router = ControlProtocolRouter(pairingCoordinator: coordinator, delegate: delegate)
 
         // 1. Invalid PIN rejected with 400
         let badBody = Data("{\"device\":\"PICO 4\",\"deviceId\":\"dev-1\",\"pin\":\"12ab\"}".utf8)
-        let badResp = await router.handle(HTTPRequest(method: "POST", rawTarget: "/depth3d/v1/pair", body: badBody))
+        let badResp = await router.handle(HTTPRequest(method: "POST", rawTarget: "/depth3d/v1/pair", body: badBody, remoteAddress: "192.168.1.10"))
         XCTAssertEqual(badResp.statusCode, 400)
 
-        // 2. Timeout returns 408
-        let validBody = Data("{\"device\":\"PICO 4\",\"deviceId\":\"dev-timeout\",\"pin\":\"1234\"}".utf8)
-        let timeoutResp = await router.handle(HTTPRequest(method: "POST", rawTarget: "/depth3d/v1/pair", body: validBody))
+        // 2. Timeout returns 408 and starts per-source cooldown (next immediate attempt -> 429)
+        let timeoutBody = Data("{\"device\":\"PICO 4\",\"deviceId\":\"dev-timeout\",\"pin\":\"1234\"}".utf8)
+        let timeoutResp = await router.handle(HTTPRequest(method: "POST", rawTarget: "/depth3d/v1/pair", body: timeoutBody, remoteAddress: "192.168.1.11"))
         XCTAssertEqual(timeoutResp.statusCode, 408)
 
-        // 3. Rejection returns 403
-        let rejectCoord = PairingCoordinator(timeout: 5.0)
-        let rejectRouter = ControlProtocolRouter(pairingCoordinator: rejectCoord, delegate: delegate)
-        let rejectTask = Task {
-            await rejectRouter.handle(HTTPRequest(
+        let cooldownAfterTimeout = await router.handle(HTTPRequest(method: "POST", rawTarget: "/depth3d/v1/pair", body: timeoutBody, remoteAddress: "192.168.1.11"))
+        XCTAssertEqual(cooldownAfterTimeout.statusCode, 429)
+
+        // 3. Single prompt enforcement + rejection cooldown
+        let coord2 = PairingCoordinator(timeout: 5.0, cooldownDuration: 5.0)
+        let router2 = ControlProtocolRouter(pairingCoordinator: coord2, delegate: delegate)
+
+        let firstTask = Task {
+            await router2.handle(HTTPRequest(
                 method: "POST",
                 rawTarget: "/depth3d/v1/pair",
-                body: Data("{\"device\":\"PICO 4\",\"deviceId\":\"dev-rej\",\"pin\":\"4321\"}".utf8)
+                body: Data("{\"device\":\"PICO A\",\"deviceId\":\"dev-rej\",\"pin\":\"4321\"}".utf8),
+                remoteAddress: "::ffff:192.168.1.20"
             ))
         }
         try await Task.sleep(nanoseconds: 50_000_000)
-        let promptsRej = await rejectCoord.pendingPrompts()
-        XCTAssertEqual(promptsRej.count, 1)
-        await rejectCoord.reject(promptId: promptsRej[0].id)
-        let rejResp = await rejectTask.value
-        XCTAssertEqual(rejResp.statusCode, 403)
 
-        // 4. Approval with rememberAutoAllow=true returns 200, then second request auto-approves immediately
-        let approveTask = Task {
-            await rejectRouter.handle(HTTPRequest(
-                method: "POST",
-                rawTarget: "/depth3d/v1/pair",
-                body: Data("{\"device\":\"PICO 4\",\"deviceId\":\"dev-ok\",\"pin\":\"5678\"}".utf8)
-            ))
-        }
-        try await Task.sleep(nanoseconds: 50_000_000)
-        let promptsOk = await rejectCoord.pendingPrompts()
-        XCTAssertEqual(promptsOk.count, 1)
-        await rejectCoord.approve(promptId: promptsOk[0].id, rememberAutoAllow: true)
-        let okResp = await approveTask.value
-        XCTAssertEqual(okResp.statusCode, 200)
+        let activePrompts = await coord2.pendingPrompts()
+        XCTAssertEqual(activePrompts.count, 1)
+        XCTAssertEqual(activePrompts[0].clientAddress, "192.168.1.20")
 
-        let autoResp = await rejectRouter.handle(HTTPRequest(
+        // Second concurrent pairing request from a different IP gets 429 busy (only 1 prompt on screen at a time)
+        let concurrentResp = await router2.handle(HTTPRequest(
             method: "POST",
             rawTarget: "/depth3d/v1/pair",
-            body: Data("{\"device\":\"PICO 4\",\"deviceId\":\"dev-ok\",\"pin\":\"9999\"}".utf8)
+            body: Data("{\"device\":\"PICO B\",\"deviceId\":\"dev-other\",\"pin\":\"1111\"}".utf8),
+            remoteAddress: "192.168.1.21"
         ))
-        XCTAssertEqual(autoResp.statusCode, 200)
+        XCTAssertEqual(concurrentResp.statusCode, 429)
+
+        // Reject first request -> 403, then immediate retry from same IP -> 429 cooldown
+        await coord2.reject(promptId: activePrompts[0].id)
+        let rejResp = await firstTask.value
+        XCTAssertEqual(rejResp.statusCode, 403)
+
+        let spamResp = await router2.handle(HTTPRequest(
+            method: "POST",
+            rawTarget: "/depth3d/v1/pair",
+            body: Data("{\"device\":\"PICO A\",\"deviceId\":\"dev-new\",\"pin\":\"4321\"}".utf8),
+            remoteAddress: "192.168.1.20"
+        ))
+        XCTAssertEqual(spamResp.statusCode, 429)
+
+        // 4. Certificate-bound auto-allow verification
+        let certADer = Data("real-paired-headset-cert-A".utf8)
+        let certAFp = TLSIdentityManager.sha256Hex(certADer)
+        let certBDer = Data("attacker-impersonator-cert-B".utf8)
+
+        let coord3 = PairingCoordinator(timeout: 0.25, cooldownDuration: 0.0)
+        await coord3.setAutoAllowed(deviceId: "dev-ok", certFingerprintSHA256: certAFp)
+        let router3 = ControlProtocolRouter(pairingCoordinator: coord3, delegate: delegate)
+
+        // 4a. Same deviceId WITHOUT client cert MUST NOT auto-approve (prompts and times out -> 408)
+        let spoofNoCert = await router3.handle(HTTPRequest(
+            method: "POST",
+            rawTarget: "/depth3d/v1/pair",
+            body: Data("{\"device\":\"Fake PICO\",\"deviceId\":\"dev-ok\",\"pin\":\"5678\"}".utf8),
+            peerCertificateDER: nil,
+            remoteAddress: "192.168.1.30"
+        ))
+        XCTAssertEqual(spoofNoCert.statusCode, 408, "deviceId alone without TLS client cert must never auto-approve")
+
+        // 4b. Same deviceId WITH wrong client cert MUST NOT auto-approve (prompts and times out -> 408)
+        let spoofWrongCert = await router3.handle(HTTPRequest(
+            method: "POST",
+            rawTarget: "/depth3d/v1/pair",
+            body: Data("{\"device\":\"Fake PICO\",\"deviceId\":\"dev-ok\",\"pin\":\"5678\"}".utf8),
+            peerCertificateDER: certBDer,
+            remoteAddress: "192.168.1.31"
+        ))
+        XCTAssertEqual(spoofWrongCert.statusCode, 408, "Mismatched TLS client cert must never auto-approve")
+
+        // 4c. Same deviceId WITH exact bound TLS client cert auto-approves immediately -> 200
+        let legitimate = await router3.handle(HTTPRequest(
+            method: "POST",
+            rawTarget: "/depth3d/v1/pair",
+            body: Data("{\"device\":\"PICO 4\",\"deviceId\":\"dev-ok\",\"pin\":\"9999\"}".utf8),
+            peerCertificateDER: certADer,
+            remoteAddress: "192.168.1.32"
+        ))
+        XCTAssertEqual(legitimate.statusCode, 200)
         let approved = await delegate.approvedPairings
-        XCTAssertEqual(approved.count, 2)
-        XCTAssertEqual(approved[0].pin, "5678")
-        XCTAssertEqual(approved[1].pin, "9999")
-        XCTAssertTrue(approved[1].autoAllow)
+        XCTAssertEqual(approved.last?.pin, "9999")
+        XCTAssertEqual(approved.last?.clientAddress, "192.168.1.32")
     }
 
     func testMediaEndpointRequiresPairedDeviceAndClientCert() async throws {
@@ -196,11 +273,9 @@ final class ControlProtocolTests: XCTestCase {
 
         let router = ControlProtocolRouter(pairingCoordinator: PairingCoordinator(), delegate: delegate)
 
-        // Missing header & cert -> 401
         let r1 = await router.handle(HTTPRequest(method: "GET", rawTarget: "/depth3d/v1/media"))
         XCTAssertEqual(r1.statusCode, 401)
 
-        // Header without client cert -> 401
         let r2 = await router.handle(HTTPRequest(
             method: "GET",
             rawTarget: "/depth3d/v1/media",
@@ -208,7 +283,6 @@ final class ControlProtocolTests: XCTestCase {
         ))
         XCTAssertEqual(r2.statusCode, 401)
 
-        // Wrong cert -> 401
         let r3 = await router.handle(HTTPRequest(
             method: "GET",
             rawTarget: "/depth3d/v1/media",
@@ -217,7 +291,6 @@ final class ControlProtocolTests: XCTestCase {
         ))
         XCTAssertEqual(r3.statusCode, 401)
 
-        // Valid deviceId + matching client cert -> 200 with WebDAV credentials
         let r4 = await router.handle(HTTPRequest(
             method: "GET",
             rawTarget: "/depth3d/v1/media",
@@ -231,21 +304,34 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(decoded.webdav?.pass, "rndpass99")
     }
 
-    func testBonjourTXTRecordKeys() {
-        let withMedia = HostBonjourTXTRecord.makeDictionary(name: "书房 Mac", id: "UUID-1", gsPort: 47989, mediaPort: 8890)
-        XCTAssertEqual(String(data: withMedia["v"] ?? Data(), encoding: .utf8), "1")
-        XCTAssertEqual(String(data: withMedia["name"] ?? Data(), encoding: .utf8), "书房 Mac")
-        XCTAssertEqual(String(data: withMedia["id"] ?? Data(), encoding: .utf8), "UUID-1")
-        XCTAssertEqual(String(data: withMedia["pair"] ?? Data(), encoding: .utf8), "auto")
-        XCTAssertEqual(String(data: withMedia["gs"] ?? Data(), encoding: .utf8), "47989")
-        XCTAssertEqual(String(data: withMedia["media"] ?? Data(), encoding: .utf8), "8890")
+    func testBonjourTXTRecordAndErrorClassification() {
+        let readyTXT = HostBonjourTXTRecord.makeDictionary(
+            name: "书房 Mac", id: "UUID-1", gsPort: 47989, mediaPort: 8890, mediaRevision: 2
+        )
+        XCTAssertEqual(String(data: readyTXT["v"] ?? Data(), encoding: .utf8), "1")
+        XCTAssertEqual(String(data: readyTXT["name"] ?? Data(), encoding: .utf8), "书房 Mac")
+        XCTAssertEqual(String(data: readyTXT["id"] ?? Data(), encoding: .utf8), "UUID-1")
+        XCTAssertEqual(String(data: readyTXT["pair"] ?? Data(), encoding: .utf8), "auto")
+        XCTAssertEqual(String(data: readyTXT["gs"] ?? Data(), encoding: .utf8), "47989")
+        XCTAssertEqual(String(data: readyTXT["media"] ?? Data(), encoding: .utf8), "8890")
+        XCTAssertEqual(String(data: readyTXT["mrev"] ?? Data(), encoding: .utf8), "2")
 
-        let withoutMedia = HostBonjourTXTRecord.makeDictionary(name: "Mac", id: "UUID-2", gsPort: 57989, mediaPort: nil)
-        XCTAssertNil(withoutMedia["media"])
-        XCTAssertEqual(String(data: withoutMedia["gs"] ?? Data(), encoding: .utf8), "57989")
+        // When engine is NOT ready, `gs` must be omitted from Bonjour TXT
+        let engineDownTXT = HostBonjourTXTRecord.makeDictionary(
+            name: "Mac", id: "UUID-2", gsPort: nil, mediaPort: nil
+        )
+        XCTAssertNil(engineDownTXT["gs"])
+        XCTAssertNil(engineDownTXT["media"])
+        XCTAssertNil(engineDownTXT["mrev"])
+
+        // Error classification: only policy denial codes map to .permissionDenied
+        XCTAssertEqual(HostBonjourTXTRecord.classifyPublishError(code: -65570), .permissionDenied)
+        XCTAssertEqual(HostBonjourTXTRecord.classifyPublishError(code: -72008), .permissionDenied)
+        XCTAssertEqual(HostBonjourTXTRecord.classifyPublishError(code: -72001), .failed(-72001))
+        XCTAssertEqual(HostBonjourTXTRecord.classifyPublishError(code: -72007), .failed(-72007))
     }
 
-    func testControlHTTPSServerLiveWithAndWithoutClientCert() async throws {
+    func testControlHTTPSServerLiveMTLSNonBlockingPairAndRateLimit() async throws {
         let tmpDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("depth3d-tls-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
@@ -254,7 +340,6 @@ final class ControlProtocolTests: XCTestCase {
         let tlsManager = TLSIdentityManager(tlsDirectory: tmpDir.appendingPathComponent("tls"))
         let serverId = try tlsManager.loadOrCreateIdentity(commonName: "depth3d Test Host")
 
-        // Generate a client certificate via /usr/bin/openssl to verify real mTLS.
         let clientKey = tmpDir.appendingPathComponent("client.key")
         let clientCert = tmpDir.appendingPathComponent("client.crt")
         let proc = Process()
@@ -285,18 +370,24 @@ final class ControlProtocolTests: XCTestCase {
         let delegate = MockControlDelegate(snapshot: snap)
         await delegate.setAuthorized(deviceId: "pico-live", fingerprint: clientFP)
 
-        let router = ControlProtocolRouter(pairingCoordinator: PairingCoordinator(), delegate: delegate)
-        let server = ControlHTTPSServer(identity: serverId.secIdentity, router: router)
+        let coord = PairingCoordinator(timeout: 5.0, cooldownDuration: 0.0)
+        let router = ControlProtocolRouter(pairingCoordinator: coord, delegate: delegate)
+        let server = ControlHTTPSServer(
+            identity: serverId.secIdentity,
+            router: router,
+            maxConnections: 16,
+            unauthRateLimitPerWindow: 20
+        )
         let port = try server.start(port: 0, fallbackToEphemeral: false)
         defer { server.stop() }
 
-        // 1. Call GET /depth3d/v1/info WITHOUT client cert
+        // 1. Live /info without client cert
         let (code1, body1) = runCurl(["-sk", "--max-time", "5", "https://127.0.0.1:\(port)/depth3d/v1/info"])
         XCTAssertEqual(code1, 200)
         XCTAssertTrue(body1.contains("\"v\":1"))
         XCTAssertTrue(body1.contains("\"ready\":true"))
 
-        // 2. Call GET /depth3d/v1/media WITHOUT client cert -> 401
+        // 2. Live /media without client cert -> 401
         let (code2, _) = runCurl([
             "-sk", "--max-time", "5",
             "-H", "X-Depth3d-Device: pico-live",
@@ -304,7 +395,7 @@ final class ControlProtocolTests: XCTestCase {
         ])
         XCTAssertEqual(code2, 401)
 
-        // 3. Call GET /depth3d/v1/media WITH paired client cert -> 200 + credentials
+        // 3. Live /media WITH paired client cert -> 200 + credentials
         let (code3, body3) = runCurl([
             "-sk", "--max-time", "5",
             "--cert", clientCert.path,
@@ -315,6 +406,47 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(code3, 200)
         XCTAssertTrue(body3.contains("\"pass\":\"livepass\""))
         XCTAssertTrue(body3.contains("\"port\":8899"))
+
+        // 4. Non-blocking /pair wait: while a /pair waits on user confirmation, concurrent /info
+        //    requests must still complete promptly without blocking worker threads!
+        let pairTask = Task.detached { [self] () -> (Int, String) in
+            self.runCurl([
+                "-sk", "--max-time", "5",
+                "-X", "POST",
+                "-H", "Content-Type: application/json",
+                "-d", "{\"device\":\"PICO 4\",\"deviceId\":\"nonblock\",\"pin\":\"1234\"}",
+                "https://127.0.0.1:\(port)/depth3d/v1/pair"
+            ])
+        }
+        try await Task.sleep(nanoseconds: 250_000_000)
+        let prompts = await coord.pendingPrompts()
+        XCTAssertEqual(prompts.count, 1)
+
+        let (infoWhileWaiting, _) = runCurl(["-sk", "--max-time", "2", "https://127.0.0.1:\(port)/depth3d/v1/info"])
+        XCTAssertEqual(infoWhileWaiting, 200, "/info must stay responsive while /pair waits for user")
+
+        await coord.approve(promptId: prompts[0].id, rememberAutoAllow: false)
+        let (pairCode, _) = await pairTask.value
+        XCTAssertEqual(pairCode, 200)
+
+        // 5. Unauthenticated rate limiting on ControlHTTPSServer
+        let rateLimitedServer = ControlHTTPSServer(
+            identity: serverId.secIdentity,
+            router: router,
+            maxConnections: 8,
+            unauthRateLimitPerWindow: 2,
+            unauthRateWindowSeconds: 60.0
+        )
+        let rlPort = try rateLimitedServer.start(port: 0, fallbackToEphemeral: false)
+        defer { rateLimitedServer.stop() }
+
+        XCTAssertEqual(runCurl(["-sk", "--max-time", "3", "https://127.0.0.1:\(rlPort)/depth3d/v1/info"]).0, 200)
+        XCTAssertEqual(runCurl(["-sk", "--max-time", "3", "https://127.0.0.1:\(rlPort)/depth3d/v1/info"]).0, 200)
+        XCTAssertEqual(
+            runCurl(["-sk", "--max-time", "3", "https://127.0.0.1:\(rlPort)/depth3d/v1/info"]).0,
+            429,
+            "Unauthenticated requests exceeding per-IP limit must receive 429"
+        )
     }
 
     private func runCurl(_ args: [String]) -> (Int, String) {
@@ -325,8 +457,9 @@ final class ControlProtocolTests: XCTestCase {
         p.standardOutput = out
         p.standardError = FileHandle.nullDevice
         try? p.run()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
-        let raw = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let raw = String(data: data, encoding: .utf8) ?? ""
         let lines = raw.components(separatedBy: "\n")
         let code = Int(lines.last ?? "") ?? 0
         let body = lines.dropLast().joined(separator: "\n")

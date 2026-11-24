@@ -1,17 +1,20 @@
 import Foundation
 
-public struct EnginePendingPairing: Codable, Equatable, Sendable {
+/// Pending GameStream pairing request returned by Sunshine `GET /api/pin`
+/// (`src/confighttp.cpp`: `{ id, name, address }`).
+public struct EnginePendingPairing: Codable, Equatable, Identifiable, Sendable {
     public let id: String
-    public let clientAddress: String?
+    public let name: String?
+    public let address: String?
 
-    enum CodingKeys: String, CodingKey {
-        case id
-        case clientAddress = "client_address"
+    public init(id: String, name: String? = nil, address: String? = nil) {
+        self.id = id
+        self.name = name
+        self.address = address
     }
 
-    public init(id: String, clientAddress: String? = nil) {
-        self.id = id
-        self.clientAddress = clientAddress
+    public var normalizedAddress: String? {
+        address.map(IPAddressNormalizer.normalize)
     }
 }
 
@@ -27,11 +30,23 @@ public struct EngineClientRecord: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
-public enum EngineAPIError: Error, LocalizedError {
+/// Cryptographically verified outcome of submitting a PIN to one specific engine pairing session.
+public struct VerifiedEnginePairing: Equatable, Sendable {
+    public let engineUUID: String
+    public let certFingerprintSHA256: String
+
+    public init(engineUUID: String, certFingerprintSHA256: String) {
+        self.engineUUID = engineUUID
+        self.certFingerprintSHA256 = certFingerprintSHA256.uppercased()
+    }
+}
+
+public enum EngineAPIError: Error, LocalizedError, Equatable {
     case invalidResponse
     case unauthorized
     case httpError(Int)
     case noPendingPairing
+    case multiplePendingPairings([EnginePendingPairing])
     case pinRejected
 
     public var errorDescription: String? {
@@ -40,13 +55,37 @@ public enum EngineAPIError: Error, LocalizedError {
         case .unauthorized: return "Local engine authentication failed"
         case .httpError(let code): return "Local engine HTTP \(code)"
         case .noPendingPairing: return "No pending pairing session"
+        case .multiplePendingPairings: return "Multiple pending pairing sessions require explicit selection"
         case .pinRejected: return "Pairing PIN was rejected"
         }
     }
 }
 
-/// Loopback-only URLSession delegate that accepts the local streaming engine's self-signed
-/// HTTPS certificate strictly on `127.0.0.1` / `localhost`.
+/// Serializes PIN submission + `state.json` before/after diffing so two pairings can never
+/// cross-contaminate which client certificate consumed a given PIN.
+private actor PairingCompletionSerializer {
+    private var isBusy = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func runSerialized<T: Sendable>(_ operation: @Sendable () async -> T) async -> T {
+        if isBusy {
+            await withCheckedContinuation { continuation in
+                waiters.append(continuation)
+            }
+        }
+        isBusy = true
+        defer {
+            if !waiters.isEmpty {
+                let next = waiters.removeFirst()
+                next.resume()
+            } else {
+                isBusy = false
+            }
+        }
+        return await operation()
+    }
+}
+
 private final class LoopbackSelfSignedDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
     func urlSession(
         _ session: URLSession,
@@ -66,11 +105,12 @@ private final class LoopbackSelfSignedDelegate: NSObject, URLSessionDelegate, @u
 }
 
 /// Client for the built-in streaming engine's localhost-only management API (`https://127.0.0.1:<port+1>/api/*`).
-/// Never exposes the engine's web UI to the user.
+/// Never exposes the engine's web UI to the user and disables system HTTP proxies on loopback requests.
 public final class EngineAPIClient: @unchecked Sendable {
     private let session: URLSession
     private let delegate: LoopbackSelfSignedDelegate
     private let lock = NSLock()
+    private let serializer = PairingCompletionSerializer()
     private var apiPort: UInt16
     private var credentials: EngineAdminCredentials
 
@@ -80,8 +120,8 @@ public final class EngineAPIClient: @unchecked Sendable {
         let del = LoopbackSelfSignedDelegate()
         self.delegate = del
         let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 5
-        cfg.timeoutIntervalForResource = 10
+        cfg.timeoutIntervalForRequest = 15
+        cfg.timeoutIntervalForResource = 25
         cfg.httpShouldSetCookies = false
         cfg.connectionProxyDictionary = [:]
         self.session = URLSession(configuration: cfg, delegate: del, delegateQueue: nil)
@@ -142,7 +182,8 @@ public final class EngineAPIClient: @unchecked Sendable {
         return try JSONDecoder().decode(PendingResponse.self, from: data).pairings ?? []
     }
 
-    /// Submits a 4-digit PIN for a specific pending pairing session. Never logs the PIN.
+    /// Submits a 4-digit PIN to ONE specific `pairingId`. Sunshine blocks until the full
+    /// GameStream 4-step cryptographic handshake completes and returns `status: true` only on success.
     public func submitPIN(pairingId: String, pin: String, deviceName: String) async throws -> Bool {
         struct PinResponse: Decodable { let status: Bool? }
         let csrf = await fetchCSRFToken()
@@ -161,43 +202,106 @@ public final class EngineAPIClient: @unchecked Sendable {
         return parsed.status == true
     }
 
-    /// Submits a 4-digit PIN to the first currently pending pairing (for manual PIN UI).
-    public func submitManualPIN(pin: String, deviceName: String) async throws {
-        let pairings = try await fetchPendingPairings()
-        guard let first = pairings.first else {
-            throw EngineAPIError.noPendingPairing
+    /// Submits a manual 4-digit PIN. If `pairingId` is nil, succeeds ONLY when there is a single
+    /// unambiguous pending pairing; when multiple headsets are waiting, throws `.multiplePendingPairings`
+    /// so the UI lets the user explicitly choose the matching device/IP.
+    public func submitManualPIN(pin: String, deviceName: String, pairingId: String? = nil) async throws {
+        let targetId: String
+        if let explicit = pairingId, !explicit.isEmpty {
+            targetId = explicit
+        } else {
+            let pairings = try await fetchPendingPairings()
+            if pairings.isEmpty {
+                throw EngineAPIError.noPendingPairing
+            }
+            if pairings.count > 1 {
+                throw EngineAPIError.multiplePendingPairings(pairings)
+            }
+            targetId = pairings[0].id
         }
-        let ok = try await submitPIN(pairingId: first.id, pin: pin, deviceName: deviceName)
+        let ok = try await submitPIN(pairingId: targetId, pin: pin, deviceName: deviceName)
         if !ok {
             throw EngineAPIError.pinRejected
         }
     }
 
-    /// Waits for a pending GameStream pairing session to appear (or uses one already queued)
-    /// and submits the approved PIN. Supports both headset orderings cleanly:
-    /// - Headset started GameStream `/pair` before `/depth3d/v1/pair` was approved
-    /// - Headset starts GameStream `/pair` immediately after `/depth3d/v1/pair` returns 200
-    public func submitPINWhenReady(
+    /// Strictly pairs ONE incoming GameStream pairing session matching `clientAddress`, submits `pin`
+    /// ONLY to that single `pairing_id`, and returns the exact client certificate written to `stateFileURL`
+    /// by that completed pairing handshake.
+    ///
+    /// Never sprays the PIN to unrelated pending pairings or blindly selects `pairings.first`.
+    public func completeMatchedPairing(
         pin: String,
         deviceName: String,
+        clientAddress: String,
+        stateFileURL: URL,
+        existingBoundFingerprint: String? = nil,
         maxWait: TimeInterval = 25.0,
         pollInterval: TimeInterval = 0.15
-    ) async -> Bool {
-        let deadline = Date().addingTimeInterval(maxWait)
-        while Date() < deadline {
-            if let pairings = try? await fetchPendingPairings(), !pairings.isEmpty {
-                for pending in pairings {
-                    if (try? await submitPIN(pairingId: pending.id, pin: pin, deviceName: deviceName)) == true {
-                        HostLogger.info("Submitted approved pairing PIN to streaming engine for \(deviceName)", category: "pair")
-                        return true
+    ) async -> VerifiedEnginePairing? {
+        let targetIP = IPAddressNormalizer.normalize(clientAddress)
+        return await serializer.runSerialized { [self] in
+            let deadline = Date().addingTimeInterval(maxWait)
+            var attemptedIds = Set<String>()
+
+            while Date() < deadline {
+                if let pairings = try? await self.fetchPendingPairings() {
+                    let matching = pairings.filter { pending in
+                        guard !attemptedIds.contains(pending.id) else { return false }
+                        guard let addr = pending.normalizedAddress else { return false }
+                        return addr == targetIP
+                    }
+
+                    // Require an unambiguous single pending pairing from `clientAddress`.
+                    if matching.count == 1, let target = matching.first {
+                        attemptedIds.insert(target.id)
+                        let beforeCerts = EngineConfigGenerator.loadPairedCerts(at: stateFileURL)
+                        let beforeUUIDs = Set(beforeCerts.map(\.uuid))
+
+                        let ok = (try? await self.submitPIN(
+                            pairingId: target.id,
+                            pin: pin,
+                            deviceName: deviceName
+                        )) ?? false
+
+                        guard ok else {
+                            HostLogger.warning("Matched pairing session failed PIN verification for \(targetIP)", category: "pair")
+                            return nil
+                        }
+
+                        // Sunshine persists `state.json` before returning `status: true`.
+                        // Diff `state.json` to bind ONLY the exact cert that consumed this PIN.
+                        let afterCerts = EngineConfigGenerator.loadPairedCerts(at: stateFileURL)
+                        let newlyAdded = afterCerts.filter { !beforeUUIDs.contains($0.uuid) }
+                        if newlyAdded.count == 1, let cert = newlyAdded.first, let fp = cert.fingerprintSHA256 {
+                            HostLogger.info("Bound paired device \(deviceName) (\(targetIP)) to exact client certificate", category: "pair")
+                            return VerifiedEnginePairing(engineUUID: cert.uuid, certFingerprintSHA256: fp)
+                        }
+
+                        // Re-pairing an already-bound device whose existing cert remained in `state.json`.
+                        if newlyAdded.isEmpty,
+                           let existingFP = existingBoundFingerprint,
+                           let matched = afterCerts.first(where: {
+                               $0.fingerprintSHA256?.caseInsensitiveCompare(existingFP) == .orderedSame
+                           }),
+                           let fp = matched.fingerprintSHA256
+                        {
+                            HostLogger.info("Verified re-pairing of existing cert-bound device \(deviceName)", category: "pair")
+                            return VerifiedEnginePairing(engineUUID: matched.uuid, certFingerprintSHA256: fp)
+                        }
+
+                        HostLogger.warning("Pairing succeeded in engine but exact certificate diff was ambiguous (added=\(newlyAdded.count))", category: "pair")
+                        return nil
                     }
                 }
+
+                let sleepNs = UInt64(max(0.05, pollInterval) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: sleepNs)
             }
-            let sleepNs = UInt64(max(0.05, pollInterval) * 1_000_000_000)
-            try? await Task.sleep(nanoseconds: sleepNs)
+
+            HostLogger.warning("Timed out waiting for GameStream pairing from \(targetIP)", category: "pair")
+            return nil
         }
-        HostLogger.warning("No incoming GameStream pairing session arrived before timeout for \(deviceName)", category: "pair")
-        return false
     }
 
     public func cancelPairing(pairingId: String) async throws {

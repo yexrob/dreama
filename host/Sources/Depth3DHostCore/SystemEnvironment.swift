@@ -7,7 +7,7 @@ import ServiceManagement
 
 /// Information about a connected macOS display selectable for streaming.
 public struct DisplayInfo: Identifiable, Equatable, Sendable {
-    public let id: String // CGDirectDisplayID decimal string
+    public let id: String
     public let name: String
     public let width: Int
     public let height: Int
@@ -55,7 +55,9 @@ public enum DisplayEnumerator {
             let width = mode?.pixelWidth ?? CGDisplayPixelsWide(cgID)
             let height = mode?.pixelHeight ?? CGDisplayPixelsHigh(cgID)
             let screenName = screensByNumber[cgID]?.localizedName
-            let fallbackName = CGDisplayIsBuiltin(cgID) != 0 ? "内建显示器" : "外接显示器 \(idx + 1)"
+            let fallbackName = CGDisplayIsBuiltin(cgID) != 0
+                ? HostStrings.string("display.builtin")
+                : HostStrings.format("display.external_numbered", idx + 1)
             return DisplayInfo(
                 id: String(cgID),
                 name: (screenName?.isEmpty == false ? screenName! : fallbackName),
@@ -84,7 +86,11 @@ public final class NetworkMonitor: @unchecked Sendable {
     private let monitor = NWPathMonitor()
     private let queue = DispatchQueue(label: "dev.depth3d.host.network", qos: .utility)
     private let lock = NSLock()
-    private var snapshot = NetworkSnapshot(isConnected: true, interfaceSummary: "Wi-Fi", localIPv4: nil)
+    private var snapshot = NetworkSnapshot(
+        isConnected: true,
+        interfaceSummary: HostStrings.string("network.wifi"),
+        localIPv4: nil
+    )
     private var onChange: (@Sendable (NetworkSnapshot) -> Void)?
 
     public init() {}
@@ -110,13 +116,13 @@ public final class NetworkMonitor: @unchecked Sendable {
             let connected = (path.status == .satisfied) && (ip != nil || path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet))
             let iface: String
             if path.usesInterfaceType(.wiredEthernet) {
-                iface = "以太网"
+                iface = HostStrings.string("network.ethernet")
             } else if path.usesInterfaceType(.wifi) {
-                iface = "Wi-Fi"
+                iface = HostStrings.string("network.wifi")
             } else if connected {
-                iface = "局域网"
+                iface = HostStrings.string("network.lan")
             } else {
-                iface = "未连接"
+                iface = HostStrings.string("network.disconnected")
             }
             let next = NetworkSnapshot(isConnected: connected, interfaceSummary: iface, localIPv4: ip)
             self.lock.lock()
@@ -125,7 +131,7 @@ public final class NetworkMonitor: @unchecked Sendable {
             let cb = self.onChange
             self.lock.unlock()
             if changed {
-                HostLogger.info("Network state changed: connected=\(connected), iface=\(iface)", category: "network")
+                HostLogger.info("Network state changed: connected=\(connected)", category: "network")
                 cb?(next)
             }
         }

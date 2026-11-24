@@ -170,7 +170,7 @@ sh player/app/src/main/jni/airplay/mac/build.sh     # 需要 Xcode 命令行工�
 | llhttp（随 UxPlay） | 9.3.0 | MIT | `jni/airplay/uxplay/lib/llhttp/` |
 | libplist（只取库本身） | 2.6.0，[libimobiledevice/libplist](https://github.com/libimobiledevice/libplist) 2117b8fd | LGPL-2.1+ | `jni/airplay/libplist/` |
 | OpenSSL libcrypto | 4.0.2，仓库里 moonlight-core 已有的预编译库 | Apache-2.0 | `jni/moonlight-core/openssl/` |
-| Sunshine（Mac Host 内置串流引擎及随附 OpenSSL 3 / miniupnpc / ICU4C / Qt 6 动态库） | v2026.914.233613（`63d35f70`），[SunshineStream/Sunshine](https://github.com/SunshineStream/Sunshine) 官方 macOS DMG | GPL-3.0-only（随附库为 Apache-2.0 / BSD-3-Clause / Unicode-3.0 / LGPL-3.0-only） | 构建时由 `host/scripts/fetch-engine.sh` 下载校验并打包进 `depth3d Host.app/Contents/` |
+| Sunshine（Mac Host 内置串流引擎及随附 OpenSSL 3 / miniupnpc / ICU4C / Qt 6 动态库） | v2026.914.233613（`63d35f70`），[SunshineStream/Sunshine](https://github.com/SunshineStream/Sunshine)（原 `LizardByte/Sunshine` 改名后的官方组织，旧地址 301 跳转至此）官方 macOS DMG | GPL-3.0-only（随附库为 Apache-2.0 / BSD-3-Clause / Unicode-3.0 / LGPL-3.0-only） | 构建时由 `host/scripts/fetch-engine.sh` 按固定 SHA-256 校验后打包进 `depth3d Host.app/Contents/` |
 
 都和本项目的 GPLv3 兼容，许可原文在各自目录里。接入方式参考了 [jqssun/android-airplay-server](https://github.com/jqssun/android-airplay-server)；`jni/airplay/android/`、`local/airplay/` 和 `host/` 是本项目自己写的。
 

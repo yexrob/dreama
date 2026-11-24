@@ -26,10 +26,9 @@ public enum EngineSupervisorState: Equatable, Sendable {
     }
 }
 
-/// Checks whether a local TCP port is already bound by another process (e.g., Homebrew Sunshine).
+/// Checks whether a local TCP port is already bound by another process.
 public enum PortProbe {
     public static func isTCPPortOccupied(_ port: UInt16) -> Bool {
-        // Check by attempting a non-reuse bind on IPv4 loopback & wildcard.
         let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }
         defer { Darwin.close(fd) }
@@ -54,43 +53,55 @@ public enum PortProbe {
 }
 
 /// Supervises the built-in streaming engine child process:
-/// - Writes isolated config inside `Application Support/depth3d Host/engine/`
-/// - Checks port conflicts before starting so it never disturbs an existing service
-/// - Initializes internal credentials cleanly without logging secrets
-/// - Parses stdout/stderr logs in real time to drive host state and audio mute hooks
+/// - Writes isolated config & hashed credentials (`0600`) inside `Application Support/depth3d Host/engine/`
+///   (never passes passwords on CLI, never touches `~/.config/sunshine`)
+/// - Sets isolated `HOME` & `log_path` so all engine logs and appdata stay inside `engineDir`
+/// - Wraps child launch with `depth3d-child-guard` (kqueue `NOTE_EXIT`) + `ChildProcessLedger` pidfile cleanup
+/// - Parses logs accurately across multi-device streaming sessions
 /// - Automatically restarts on unexpected crashes with exponential backoff
-/// - Cleanly terminates the child process on `stop()` / app exit
 public final class EngineSupervisor: @unchecked Sendable {
     private let lock = NSLock()
     private let paths: HostPaths
     private let adminCredentials: EngineAdminCredentials
     private let engineExecutableOverride: URL?
+    private let childGuardOverride: URL?
+    private let ledger: ChildProcessLedger
+    private let backoffDelays: [TimeInterval]
+    private let stableRunResetSeconds: TimeInterval
     private let queue = DispatchQueue(label: "dev.depth3d.host.engine.supervisor", qos: .userInitiated)
 
     private var process: Process?
+    private var trackedPID: Int32 = -1
     private var logState = EngineLogState()
     private var currentConfig: EngineConfigGenerator.Input?
     private var shouldBeRunning = false
     private var isPaused = false
     private var consecutiveFailures = 0
+    private var launchCount = 0
     private var lastLaunchDate: Date?
     private var pendingRestartWork: DispatchWorkItem?
     private var state: EngineSupervisorState = .stopped
 
     private var onStateChanged: (@Sendable (EngineSupervisorState, EngineLogState) -> Void)?
-    private var onStreamingActivityChanged: (@Sendable (Bool) -> Void)?
-    private var lastStreamingActive = false
-
-    private static let backoffDelays: [TimeInterval] = [1.0, 2.0, 5.0, 10.0, 15.0]
+    private var onActiveSessionCountChanged: (@Sendable (Int) -> Void)?
+    private var lastReportedSessionCount = 0
 
     public init(
         paths: HostPaths,
         adminCredentials: EngineAdminCredentials,
-        engineExecutableOverride: URL? = nil
+        engineExecutableOverride: URL? = nil,
+        childGuardOverride: URL? = nil,
+        ledger: ChildProcessLedger? = nil,
+        backoffDelays: [TimeInterval] = [1.0, 2.0, 5.0, 10.0, 15.0],
+        stableRunResetSeconds: TimeInterval = 30.0
     ) {
         self.paths = paths
         self.adminCredentials = adminCredentials
         self.engineExecutableOverride = engineExecutableOverride
+        self.childGuardOverride = childGuardOverride
+        self.ledger = ledger ?? ChildProcessLedger(ledgerURL: paths.childLedgerFile)
+        self.backoffDelays = backoffDelays
+        self.stableRunResetSeconds = stableRunResetSeconds
     }
 
     deinit {
@@ -99,11 +110,11 @@ public final class EngineSupervisor: @unchecked Sendable {
 
     public func setHandlers(
         onStateChanged: (@Sendable (EngineSupervisorState, EngineLogState) -> Void)?,
-        onStreamingActivityChanged: (@Sendable (Bool) -> Void)?
+        onActiveSessionCountChanged: (@Sendable (Int) -> Void)?
     ) {
         lock.lock()
         self.onStateChanged = onStateChanged
-        self.onStreamingActivityChanged = onStreamingActivityChanged
+        self.onActiveSessionCountChanged = onActiveSessionCountChanged
         let st = state
         let ls = logState
         lock.unlock()
@@ -114,6 +125,18 @@ public final class EngineSupervisor: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return state
+    }
+
+    public func totalLaunchAttempts() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return launchCount
+    }
+
+    /// Cleans up any orphaned streaming engine left behind by a previous crashed instance.
+    @discardableResult
+    public func cleanupOrphanedEngineProcesses() -> Int {
+        ledger.cleanupStaleChildren(kinds: [.engine, .childGuard])
     }
 
     public func start(config: EngineConfigGenerator.Input) {
@@ -213,7 +236,6 @@ public final class EngineSupervisor: @unchecked Sendable {
             return
         }
 
-        // Pre-flight port check: avoid fighting with another running GameStream service.
         let requiredPorts = HostPortDefaults.engineTCPPorts(basePort: config.basePort)
         let occupied = PortProbe.occupiedTCPPorts(in: requiredPorts)
         if !occupied.isEmpty {
@@ -226,15 +248,21 @@ public final class EngineSupervisor: @unchecked Sendable {
             try EngineConfigGenerator.writeFiles(config)
         } catch {
             HostLogger.error("Failed to write engine configuration: \(error.localizedDescription)", category: "engine")
-            publishState(.failed(reason: "无法写入串流服务配置文件"))
+            publishState(.failed(reason: HostStrings.string("engine.error.write_config")))
             return
         }
 
-        // Initialize engine internal API credentials once if not present yet.
+        // Write `credentials.json` directly with `0600` permissions — NEVER pass credentials via CLI args.
         if !FileManager.default.fileExists(atPath: paths.engineCredentialsFile.path) {
-            if !initializeEngineCredentials(executableURL: executableURL, configURL: paths.engineConfigFile) {
-                HostLogger.error("Failed to initialize internal engine credentials", category: "engine")
-                publishState(.failed(reason: "无法初始化内置串流引擎凭据"))
+            do {
+                try EngineConfigGenerator.writeCredentialsFile(
+                    to: paths.engineCredentialsFile,
+                    credentials: adminCredentials
+                )
+                HostLogger.info("Initialized internal streaming engine credentials file", category: "engine")
+            } catch {
+                HostLogger.error("Failed to write internal engine credentials: \(error.localizedDescription)", category: "engine")
+                publishState(.failed(reason: HostStrings.string("engine.error.write_creds")))
                 return
             }
         }
@@ -242,13 +270,26 @@ public final class EngineSupervisor: @unchecked Sendable {
         lock.lock()
         self.logState = EngineLogState()
         self.lastLaunchDate = Date()
+        self.launchCount += 1
         lock.unlock()
         publishState(.starting)
 
         let proc = Process()
-        proc.executableURL = executableURL
-        proc.arguments = [paths.engineConfigFile.path]
+        let guardURL = childGuardOverride ?? ChildProcessLedger.locateChildGuard()
+        let usedGuard = ChildProcessLedger.configureLaunch(
+            process: proc,
+            executableURL: executableURL,
+            arguments: [paths.engineConfigFile.path],
+            guardURL: guardURL
+        )
         proc.currentDirectoryURL = paths.engineDirectory
+
+        // Isolate `HOME` & `XDG_CONFIG_HOME` into `Application Support/depth3d Host/engine/home`
+        // so the engine NEVER reads, writes, or rotates files in the user's `~/.config/sunshine`.
+        var env = ProcessInfo.processInfo.environment
+        env["HOME"] = paths.engineHomeDirectory.path
+        env["XDG_CONFIG_HOME"] = paths.engineHomeDirectory.appendingPathComponent(".config").path
+        proc.environment = env
 
         let outputPipe = Pipe()
         proc.standardOutput = outputPipe
@@ -267,8 +308,8 @@ public final class EngineSupervisor: @unchecked Sendable {
             pendingLineData.append(chunk)
             var lines: [String] = []
             while let nl = pendingLineData.firstIndex(of: 0x0A) {
-                let lineData = pendingLineData.subdata(in: 0..<nl)
-                pendingLineData.removeSubrange(0...nl)
+                let lineData = pendingLineData[pendingLineData.startIndex..<nl]
+                pendingLineData.removeSubrange(pendingLineData.startIndex...nl)
                 if let str = String(data: lineData, encoding: .utf8) {
                     lines.append(str)
                 }
@@ -289,42 +330,24 @@ public final class EngineSupervisor: @unchecked Sendable {
 
         do {
             try proc.run()
+            let pid = proc.processIdentifier
             lock.lock()
             self.process = proc
+            self.trackedPID = pid
             lock.unlock()
-            HostLogger.info("Started built-in streaming engine (pid=\(proc.processIdentifier), port=\(config.basePort))", category: "engine")
+
+            ledger.register(
+                pid: pid,
+                kind: usedGuard ? .childGuard : .engine,
+                executableHint: usedGuard ? (guardURL?.lastPathComponent ?? "depth3d-child-guard") : executableURL.lastPathComponent
+            )
+            HostLogger.info(
+                "Started built-in streaming engine (pid=\(pid), guarded=\(usedGuard), port=\(config.basePort))",
+                category: "engine"
+            )
         } catch {
             HostLogger.error("Failed to launch streaming engine: \(error.localizedDescription)", category: "engine")
-            publishState(.failed(reason: "无法启动内置串流引擎"))
-        }
-    }
-
-    private func initializeEngineCredentials(executableURL: URL, configURL: URL) -> Bool {
-        let proc = Process()
-        proc.executableURL = executableURL
-        proc.arguments = [
-            configURL.path,
-            "--creds",
-            adminCredentials.username,
-            adminCredentials.password
-        ]
-        proc.currentDirectoryURL = paths.engineDirectory
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-            if proc.terminationStatus == 0 {
-                try? FileManager.default.setAttributes(
-                    [.posixPermissions: 0o600],
-                    ofItemAtPath: paths.engineCredentialsFile.path
-                )
-                HostLogger.info("Initialized internal streaming engine credentials", category: "engine")
-                return true
-            }
-            return false
-        } catch {
-            return false
+            publishState(.failed(reason: HostStrings.string("engine.error.launch")))
         }
     }
 
@@ -334,15 +357,15 @@ public final class EngineSupervisor: @unchecked Sendable {
         lock.lock()
         logState.apply(event)
         let ls = logState
-        let activeNow = ls.activeSessions > 0
-        let streamingChanged = (activeNow != lastStreamingActive)
-        lastStreamingActive = activeNow
-        let streamingCB = onStreamingActivityChanged
+        let sessionCount = ls.activeSessions
+        let countChanged = (sessionCount != lastReportedSessionCount)
+        lastReportedSessionCount = sessionCount
+        let sessionCB = onActiveSessionCountChanged
         lock.unlock()
 
-        if streamingChanged {
-            HostLogger.info("Streaming activity changed: active=\(activeNow)", category: "engine")
-            streamingCB?(activeNow)
+        if countChanged {
+            HostLogger.info("Streaming active session count changed: \(sessionCount)", category: "engine")
+            sessionCB?(sessionCount)
         }
 
         let nextState = computeState(from: ls)
@@ -361,7 +384,7 @@ public final class EngineSupervisor: @unchecked Sendable {
         }
         if ls.apiReady {
             if ls.encoderUnavailable {
-                return .failed(reason: "未检测到可用的显示器或硬件编码器")
+                return .failed(reason: HostStrings.string("engine.error.no_encoder"))
             }
             return .ready(encoder: ls.encoderName)
         }
@@ -371,18 +394,23 @@ public final class EngineSupervisor: @unchecked Sendable {
     private func handleProcessTerminated(_ terminated: Process) {
         lock.lock()
         let isCurrent = (process === terminated)
+        let pidToClear = trackedPID
         if isCurrent {
             process = nil
+            trackedPID = -1
         }
         let wantRun = shouldBeRunning
         let launchedAt = lastLaunchDate
-        let wasStreaming = lastStreamingActive
-        lastStreamingActive = false
-        let streamingCB = onStreamingActivityChanged
+        let hadSessions = lastReportedSessionCount > 0
+        lastReportedSessionCount = 0
+        let sessionCB = onActiveSessionCountChanged
         lock.unlock()
 
-        if wasStreaming {
-            streamingCB?(false)
+        if pidToClear > 0 {
+            ledger.unregister(pid: pidToClear)
+        }
+        if hadSessions {
+            sessionCB?(0)
         }
 
         guard isCurrent else { return }
@@ -393,22 +421,21 @@ public final class EngineSupervisor: @unchecked Sendable {
 
         guard wantRun else { return }
 
-        // If engine ran stably for >30s, reset crash counter.
         lock.lock()
-        if let launchedAt, Date().timeIntervalSince(launchedAt) > 30 {
+        if let launchedAt, Date().timeIntervalSince(launchedAt) > stableRunResetSeconds {
             consecutiveFailures = 0
         }
         consecutiveFailures += 1
         let attempt = consecutiveFailures
         lock.unlock()
 
-        if attempt > Self.backoffDelays.count {
+        if attempt > backoffDelays.count {
             HostLogger.error("Streaming engine crashed repeatedly (\(attempt) times); halting auto-restart", category: "engine")
-            publishState(.failed(reason: "串流引擎多次意外退出，请检查权限后点击重试"))
+            publishState(.failed(reason: HostStrings.string("engine.error.crash_loop")))
             return
         }
 
-        let delay = Self.backoffDelays[attempt - 1]
+        let delay = backoffDelays[attempt - 1]
         HostLogger.info("Scheduling streaming engine restart in \(delay)s (attempt \(attempt))", category: "engine")
         publishState(.starting)
 
@@ -424,29 +451,35 @@ public final class EngineSupervisor: @unchecked Sendable {
     private func terminateCurrentProcessSync() {
         lock.lock()
         let proc = process
+        let pidToClear = trackedPID
         process = nil
-        let wasStreaming = lastStreamingActive
-        lastStreamingActive = false
-        let streamingCB = onStreamingActivityChanged
+        trackedPID = -1
+        let hadSessions = lastReportedSessionCount > 0
+        lastReportedSessionCount = 0
+        let sessionCB = onActiveSessionCountChanged
         lock.unlock()
 
-        if wasStreaming {
-            streamingCB?(false)
+        if hadSessions {
+            sessionCB?(0)
         }
 
-        guard let proc, proc.isRunning else { return }
-        let pid = proc.processIdentifier
-        proc.terminate() // SIGTERM
+        if let proc, proc.isRunning {
+            let pid = proc.processIdentifier
+            proc.terminate()
+            let deadline = Date().addingTimeInterval(2.0)
+            while proc.isRunning && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if proc.isRunning {
+                kill(pid, SIGKILL)
+                proc.waitUntilExit()
+            }
+            HostLogger.info("Terminated streaming engine (pid=\(pid))", category: "engine")
+        }
 
-        let deadline = Date().addingTimeInterval(2.0)
-        while proc.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.05)
+        if pidToClear > 0 {
+            ledger.unregister(pid: pidToClear)
         }
-        if proc.isRunning {
-            kill(pid, SIGKILL)
-            proc.waitUntilExit()
-        }
-        HostLogger.info("Terminated streaming engine (pid=\(pid))", category: "engine")
     }
 
     private func publishState(_ next: EngineSupervisorState) {

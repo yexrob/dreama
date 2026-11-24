@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Fetch and extract the pinned built-in streaming engine (Sunshine, GPLv3) for
-# bundling inside depth3d Host.app/Contents/Helpers/stream-engine/.
+# Fetch and extract the pinned built-in streaming engine (Sunshine, GPL-3.0-only)
+# for bundling inside depth3d Host.app.
 #
-# Reproducible and idempotent:
-#   - Pinned upstream tag, git commit, download URL, and SHA-256 checksum.
-#   - Uses host/.cache/ so repeated runs verify the cached DMG without re-downloading.
-#   - Extracts into a plain helper directory (no inner Info.plist, no upstream icon)
-#     so macOS TCC attributes Screen Recording / System Audio / Accessibility / Local
-#     Network permissions directly to depth3d Host.app.
+# Upstream provenance:
+#   LizardByte/Sunshine renamed its GitHub organization to SunshineStream/Sunshine
+#   (https://github.com/LizardByte/Sunshine returns HTTP 301 -> SunshineStream/Sunshine).
+#
+# Strict integrity guarantees:
+#   - Every supported architecture MUST have a hardcoded, pinned SHA-256 digest below.
+#   - Environment overrides to bypass or weaken SHA-256 verification are NOT supported.
+#   - Missing or mismatched checksums always fail with non-zero exit code.
 #
 # Usage:
 #   host/scripts/fetch-engine.sh [--arch arm64|x86_64] [--out <dir>]
@@ -20,12 +22,13 @@ HOST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENGINE_VERSION="v2026.914.233613"
 ENGINE_COMMIT="63d35f702ee9e362e43263742981836ec0710384"
 ENGINE_LICENSE="GPL-3.0-only"
+# SunshineStream is LizardByte's renamed GitHub organization (LizardByte/Sunshine 301-redirects here).
 BASE_URL="https://github.com/SunshineStream/Sunshine/releases/download/${ENGINE_VERSION}"
 
-# Pinned SHA-256 checksums for official Sunshine macOS release DMGs.
-SHA256_ARM64="795f03a389c5726f9a7b15f501dc1ddf204b442cae565859ac83aae027a9e07c"
-# x86_64 SHA-256 verified on first Intel fetch or pinned below once downloaded:
-SHA256_X86_64="${DEPTH3D_SUNSHINE_X86_64_SHA256:-}"
+# Pinned SHA-256 checksums published on the official v2026.914.233613 GitHub release.
+# Never read checksums from environment variables.
+readonly SHA256_ARM64="795f03a389c5726f9a7b15f501dc1ddf204b442cae565859ac83aae027a9e07c"
+readonly SHA256_X86_64="764b11674babac0cd838c2883359207a481c462f355ccbfd1ec91f6d44672101"
 
 ARCH="$(uname -m)"
 OUT_DIR=""
@@ -63,10 +66,15 @@ case "$ARCH" in
     EXPECTED_SHA="$SHA256_X86_64"
     ;;
   *)
-    echo "Unsupported architecture: $ARCH (expected arm64 or x86_64)" >&2
+    echo "depth3d: unsupported architecture '$ARCH' (expected arm64 or x86_64)" >&2
     exit 1
     ;;
 esac
+
+if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "depth3d: missing or invalid pinned SHA-256 for arch '${ARCH}'; refusing unverified fetch" >&2
+  exit 1
+fi
 
 CACHE_DIR="${HOST_DIR}/.cache"
 OUT_DIR="${OUT_DIR:-${HOST_DIR}/build/engine-${ARCH}/stream-engine}"
@@ -78,9 +86,13 @@ mkdir -p "$CACHE_DIR"
 verify_sha256() {
   local file="$1"
   local expected="$2"
+  if [[ -z "$expected" ]]; then
+    echo "depth3d: internal error: empty expected SHA-256" >&2
+    return 1
+  fi
   local actual
   actual="$(shasum -a 256 "$file" | awk '{print $1}')"
-  if [[ -n "$expected" && "$actual" != "$expected" ]]; then
+  if [[ "$actual" != "$expected" ]]; then
     echo "depth3d: SHA-256 mismatch for $file" >&2
     echo "  expected: $expected" >&2
     echo "  actual:   $actual" >&2
@@ -93,7 +105,10 @@ if [[ ! -f "$DMG_PATH" ]]; then
   echo "depth3d: downloading streaming engine ${ENGINE_VERSION} (${ARCH})..."
   TMP_DMG="${DMG_PATH}.tmp.$$"
   trap 'rm -f "$TMP_DMG"' EXIT
-  curl -fL --retry 3 --retry-delay 2 -o "$TMP_DMG" "$DOWNLOAD_URL"
+  if ! curl -fL --retry 3 --retry-delay 2 -o "$TMP_DMG" "$DOWNLOAD_URL"; then
+    echo "depth3d: failed to download ${DOWNLOAD_URL} (${ARCH}); cannot proceed without verified engine binary" >&2
+    exit 1
+  fi
   verify_sha256 "$TMP_DMG" "$EXPECTED_SHA" >/dev/null
   mv "$TMP_DMG" "$DMG_PATH"
   trap - EXIT
@@ -143,6 +158,9 @@ mv "${OUT_DIR}/MacOS/Sunshine" "${OUT_DIR}/MacOS/depth3d-stream-engine"
 chmod 755 "${OUT_DIR}/MacOS/depth3d-stream-engine"
 rm -f "${OUT_DIR}/Resources/sunshine.icns"
 
+# Ad-hoc sign renamed executable so staged engine can also run directly in tests.
+codesign --force --sign - "${OUT_DIR}/MacOS/depth3d-stream-engine" >/dev/null
+
 # Verify zero non-system absolute dylib references remain
 BAD_LINKS="$(otool -L "${OUT_DIR}/MacOS/depth3d-stream-engine" | tail -n +2 | awk '{print $1}' | grep -vE '^(/System/|/usr/lib/|@executable_path/|@loader_path/|@rpath/)' || true)"
 if [[ -n "$BAD_LINKS" ]]; then
@@ -154,6 +172,7 @@ fi
 cat > "$MANIFEST_PATH" <<EOF
 {
   "component": "Sunshine",
+  "organization": "SunshineStream (formerly LizardByte)",
   "version": "${ENGINE_VERSION}",
   "commit": "${ENGINE_COMMIT}",
   "arch": "${ARCH}",

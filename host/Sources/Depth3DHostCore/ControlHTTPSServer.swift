@@ -16,23 +16,63 @@ public enum ControlHTTPSServerError: Error, LocalizedError {
     }
 }
 
+/// Box holding a live SecureTransport SSLContext + client fd so `/depth3d/v1/pair` can suspend
+/// asynchronously in a Swift Task without holding a GCD thread-pool thread during the 60s wait.
+private final class ActiveTLSConnection: @unchecked Sendable {
+    let fd: Int32
+    let ctx: SSLContext
+    private var closed = false
+    private let lock = NSLock()
+
+    init(fd: Int32, ctx: SSLContext) {
+        self.fd = fd
+        self.ctx = ctx
+    }
+
+    @available(macOS, deprecated: 10.15)
+    func close() {
+        lock.lock()
+        guard !closed else {
+            lock.unlock()
+            return
+        }
+        closed = true
+        lock.unlock()
+        _ = SSLClose(ctx)
+        Darwin.close(fd)
+    }
+
+    deinit {
+        lock.lock()
+        let needsClose = !closed
+        closed = true
+        lock.unlock()
+        if needsClose {
+            Darwin.close(fd)
+        }
+    }
+}
+
 /// HTTPS server for `/depth3d/v1/*` with optional TLS client certificate authentication
 /// (SecureTransport `.tryAuthenticate`):
-///   - `/depth3d/v1/info` and `/depth3d/v1/pair` work without a client certificate
-///   - `/depth3d/v1/media` receives the peer's X.509 certificate for mTLS verification
-///
-/// Using system Security.framework avoids third-party TLS dependencies while supporting
-/// optional client certificates on macOS 14+ (where Network.framework's
-/// `sec_protocol_options_set_peer_authentication_optional` is unavailable on macOS).
+///   - Connection cap (`ConnectionGuard`) to prevent socket/memory exhaustion
+///   - Strict handshake & read timeouts (`SO_RCVTIMEO` / `SO_SNDTIMEO`)
+///   - Per-IP rate limiting for unauthenticated connections (`IPRateLimiter`)
+///   - Non-blocking async dispatch so `/depth3d/v1/pair` waits never tie up worker threads
 public final class ControlHTTPSServer: @unchecked Sendable {
     private let identity: SecIdentity
     private let router: ControlProtocolRouter
+    private let connectionGuard: ConnectionGuard
+    private let unauthRateLimiter: IPRateLimiter
+    private let handshakeTimeoutSec: Int
+    private let readTimeoutSec: Int
+
     private let lock = NSLock()
     private var listenFD: Int32 = -1
     private var running = false
     private var boundPort: UInt16 = 0
     private var acceptQueue = DispatchQueue(label: "dev.depth3d.host.control.accept", qos: .userInitiated)
-    private var workerQueue = DispatchQueue(label: "dev.depth3d.host.control.worker", qos: .userInitiated, attributes: .concurrent)
+    private var ioQueue = DispatchQueue(label: "dev.depth3d.host.control.io", qos: .userInitiated, attributes: .concurrent)
 
     public var port: UInt16 {
         lock.lock()
@@ -40,17 +80,30 @@ public final class ControlHTTPSServer: @unchecked Sendable {
         return boundPort
     }
 
-    public init(identity: SecIdentity, router: ControlProtocolRouter) {
+    public init(
+        identity: SecIdentity,
+        router: ControlProtocolRouter,
+        maxConnections: Int = 32,
+        unauthRateLimitPerWindow: Int = 30,
+        unauthRateWindowSeconds: TimeInterval = 10.0,
+        handshakeTimeoutSec: Int = 5,
+        readTimeoutSec: Int = 5
+    ) {
         self.identity = identity
         self.router = router
+        self.connectionGuard = ConnectionGuard(maxConnections: maxConnections)
+        self.unauthRateLimiter = IPRateLimiter(
+            maxEvents: unauthRateLimitPerWindow,
+            windowSeconds: unauthRateWindowSeconds
+        )
+        self.handshakeTimeoutSec = max(1, handshakeTimeoutSec)
+        self.readTimeoutSec = max(1, readTimeoutSec)
     }
 
     deinit {
         stop()
     }
 
-    /// Starts listening on `preferredPort` (pass `0` for an ephemeral OS-assigned port).
-    /// Returns the actual bound TCP port.
     @discardableResult
     public func start(port preferredPort: UInt16 = HostPortDefaults.defaultControlPort, fallbackToEphemeral: Bool = true) throws -> UInt16 {
         lock.lock()
@@ -104,7 +157,6 @@ public final class ControlHTTPSServer: @unchecked Sendable {
     }
 
     private func openListeningSocket(port: UInt16) throws -> (Int32, UInt16) {
-        // Dual-stack IPv6 socket accepting both IPv4 and IPv6 LAN connections.
         var fd = Darwin.socket(AF_INET6, SOCK_STREAM, 0)
         if fd >= 0 {
             var one: Int32 = 1
@@ -142,13 +194,14 @@ public final class ControlHTTPSServer: @unchecked Sendable {
             }
         }
 
-        // Fallback to IPv4-only socket if IPv6 is disabled on the host.
         fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else {
             throw ControlHTTPSServerError.socketCreationFailed(errno)
         }
         var one: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+        if port != 0 {
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+        }
 
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -195,25 +248,42 @@ public final class ControlHTTPSServer: @unchecked Sendable {
                 if errno == EINTR { continue }
                 break
             }
+
+            // Enforce strict connection ceiling before allocating TLS state or threads.
+            guard connectionGuard.tryAcquire() else {
+                Darwin.close(clientFD)
+                continue
+            }
+
+            let peerIP = IPAddressNormalizer.peerAddress(from: &storage)
             var one: Int32 = 1
             setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-            var timeout = timeval(tv_sec: 15, tv_usec: 0)
-            setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-            setsockopt(clientFD, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+            var hsTimeout = timeval(tv_sec: handshakeTimeoutSec, tv_usec: 0)
+            setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &hsTimeout, socklen_t(MemoryLayout<timeval>.size))
+            setsockopt(clientFD, SOL_SOCKET, SO_SNDTIMEO, &hsTimeout, socklen_t(MemoryLayout<timeval>.size))
 
-            workerQueue.async { [weak self] in
-                self?.handleClient(fd: clientFD)
+            ioQueue.async { [weak self] in
+                guard let self else {
+                    Darwin.close(clientFD)
+                    return
+                }
+                self.startTLSAndDispatch(fd: clientFD, peerIP: peerIP)
             }
         }
     }
 
-    @available(macOS, deprecated: 10.15)
-    private func handleClient(fd: Int32) {
-        defer { Darwin.close(fd) }
+    private func startTLSAndDispatch(fd: Int32, peerIP: String) {
+        performTLSRead(fd: fd, peerIP: peerIP)
+    }
 
+    @available(macOS, deprecated: 10.15)
+    private func performTLSRead(fd: Int32, peerIP: String) {
         guard let ctx = SSLCreateContext(kCFAllocatorDefault, .serverSide, .streamType) else {
+            Darwin.close(fd)
+            connectionGuard.release()
             return
         }
+        let conn = ActiveTLSConnection(fd: fd, ctx: ctx)
 
         let readFunc: SSLReadFunc = { connRef, data, dataLength in
             let sock = Int32(Int(bitPattern: connRef))
@@ -276,12 +346,16 @@ public final class ControlHTTPSServer: @unchecked Sendable {
             handshakeStatus = SSLHandshake(ctx)
         }
         guard handshakeStatus == noErr else {
+            conn.close()
+            connectionGuard.release()
             return
         }
 
-        defer { _ = SSLClose(ctx) }
+        // Apply request read timeout.
+        var rTimeout = timeval(tv_sec: readTimeoutSec, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rTimeout, socklen_t(MemoryLayout<timeval>.size))
 
-        // Extract optional peer client certificate for mTLS endpoints (`/depth3d/v1/media`).
+        // Extract optional peer client certificate.
         var peerDER: Data?
         var peerTrust: SecTrust?
         if SSLCopyPeerTrust(ctx, &peerTrust) == noErr,
@@ -292,39 +366,52 @@ public final class ControlHTTPSServer: @unchecked Sendable {
             peerDER = SecCertificateCopyData(leaf) as Data
         }
 
-        // Read full HTTP request.
-        guard let request = readHTTPRequest(ctx: ctx, peerCertDER: peerDER) else {
-            let bad = HTTPResponse.json(400, object: ["error": "bad_request"])
-            writeAll(ctx: ctx, data: bad.serialize())
+        // Rate-limit unauthenticated connections (clients not presenting a client certificate).
+        if peerDER == nil && !unauthRateLimiter.allow(key: peerIP) {
+            let limited = HTTPResponse.json(
+                429,
+                object: ["error": "rate_limited"],
+                extraHeaders: [("Retry-After", "10")]
+            )
+            writeAll(ctx: ctx, data: limited.serialize())
+            conn.close()
+            connectionGuard.release()
             return
         }
 
-        // Extend socket send timeout for `/pair` which can legitimately wait up to 60s for user approval.
-        if request.path == "/depth3d/v1/pair" {
-            var pairTimeout = timeval(tv_sec: 70, tv_usec: 0)
-            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &pairTimeout, socklen_t(MemoryLayout<timeval>.size))
+        guard let request = readHTTPRequest(ctx: ctx, peerCertDER: peerDER, remoteAddress: peerIP) else {
+            let bad = HTTPResponse.json(400, object: ["error": "bad_request"])
+            writeAll(ctx: ctx, data: bad.serialize())
+            conn.close()
+            connectionGuard.release()
+            return
         }
 
-        let semaphore = DispatchSemaphore(value: 0)
-        var responseBox: HTTPResponse?
+        // Hand off routing to an async Swift Task so long-running `/depth3d/v1/pair`
+        // waits (up to 60s) suspend cooperatively without occupying ANY GCD thread-pool thread!
         let router = self.router
+        let ioQueue = self.ioQueue
+        let guardRef = self.connectionGuard
         Task {
-            responseBox = await router.handle(request)
-            semaphore.signal()
+            let response = await router.handle(request)
+            ioQueue.async {
+                var writeTimeout = timeval(tv_sec: 10, tv_usec: 0)
+                setsockopt(conn.fd, SOL_SOCKET, SO_SNDTIMEO, &writeTimeout, socklen_t(MemoryLayout<timeval>.size))
+                Self.writeAllStatic(ctx: conn.ctx, data: response.serialize(includeBody: request.method != "HEAD"))
+                conn.close()
+                guardRef.release()
+            }
         }
-        semaphore.wait()
-
-        let response = responseBox ?? HTTPResponse.json(500, object: ["error": "internal_error"])
-        writeAll(ctx: ctx, data: response.serialize(includeBody: request.method != "HEAD"))
     }
 
     @available(macOS, deprecated: 10.15)
-    private func readHTTPRequest(ctx: SSLContext, peerCertDER: Data?) -> HTTPRequest? {
+    private func readHTTPRequest(ctx: SSLContext, peerCertDER: Data?, remoteAddress: String) -> HTTPRequest? {
         var buffer = Data()
         var chunk = [UInt8](repeating: 0, count: 8192)
         var parsedHead: HTTPParser.ParsedHead?
+        let deadline = Date().addingTimeInterval(Double(readTimeoutSec))
 
-        while true {
+        while Date() < deadline {
             if parsedHead == nil {
                 do {
                     parsedHead = try HTTPParser.parseHead(from: buffer)
@@ -341,7 +428,8 @@ public final class ControlHTTPSServer: @unchecked Sendable {
                         rawTarget: head.target,
                         headers: head.headers,
                         body: body,
-                        peerCertificateDER: peerCertDER
+                        peerCertificateDER: peerCertDER,
+                        remoteAddress: remoteAddress
                     )
                 }
             }
@@ -357,7 +445,6 @@ public final class ControlHTTPSServer: @unchecked Sendable {
                 if bytesRead == 0 { return nil }
                 continue
             } else {
-                // Connection closed before full request arrived; check one last time.
                 if let head = parsedHead, buffer.count >= head.bodyStartIndex + head.contentLength {
                     let body = buffer.subdata(in: head.bodyStartIndex..<(head.bodyStartIndex + head.contentLength))
                     return HTTPRequest(
@@ -365,16 +452,23 @@ public final class ControlHTTPSServer: @unchecked Sendable {
                         rawTarget: head.target,
                         headers: head.headers,
                         body: body,
-                        peerCertificateDER: peerCertDER
+                        peerCertificateDER: peerCertDER,
+                        remoteAddress: remoteAddress
                     )
                 }
                 return nil
             }
         }
+        return nil
     }
 
     @available(macOS, deprecated: 10.15)
     private func writeAll(ctx: SSLContext, data: Data) {
+        Self.writeAllStatic(ctx: ctx, data: data)
+    }
+
+    @available(macOS, deprecated: 10.15)
+    private static func writeAllStatic(ctx: SSLContext, data: Data) {
         data.withUnsafeBytes { rawBuf in
             guard let base = rawBuf.baseAddress else { return }
             var offset = 0

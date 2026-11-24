@@ -13,7 +13,8 @@ public struct WebDAVMount: Equatable, Sendable {
 }
 
 /// Pure, unit-testable handler for read-only WebDAV requests (`OPTIONS`, `PROPFIND`, `HEAD`, `GET` + `Range`).
-/// Handles virtual root listing, local folders (with strict path containment), and optional proxied rclone backends.
+/// Handles virtual root listing, local folders (with strict path containment and hidden-file blocking),
+/// and optional proxied rclone backends.
 public final class WebDAVHandler: @unchecked Sendable {
     public enum StreamPlan: Sendable {
         case immediate(HTTPResponse)
@@ -134,6 +135,10 @@ public final class WebDAVHandler: @unchecked Sendable {
 
         // 2. Check active rclone cloud remote mounts
         if let endpoint = rclone?.endpoint(forMountName: mountName) {
+            // Also block dot-prefixed hidden paths on cloud mounts for consistency.
+            if resolved.relativeSegments.contains(where: { $0.hasPrefix(".") }) {
+                return .immediate(HTTPResponse(statusCode: 404))
+            }
             let encodedSub = resolved.relativeSegments.isEmpty
                 ? "/"
                 : "/" + resolved.relativeSegments.map(WebDAVPathSanitizer.encodeSegment).joined(separator: "/")
@@ -191,6 +196,11 @@ public final class WebDAVHandler: @unchecked Sendable {
         relativeSegments: [String],
         request: HTTPRequest
     ) -> StreamPlan {
+        // Hidden files (`.`-prefixed) are never listed AND must never be readable via GET/HEAD/PROPFIND.
+        if relativeSegments.contains(where: { $0.hasPrefix(".") }) {
+            return .immediate(HTTPResponse(statusCode: 404))
+        }
+
         let fm = FileManager.default
         let rootReal = mount.rootURL.resolvingSymlinksInPath()
         var targetURL = rootReal
@@ -203,6 +213,11 @@ public final class WebDAVHandler: @unchecked Sendable {
         let rootPrefix = rootReal.path.hasSuffix("/") ? rootReal.path : rootReal.path + "/"
         guard resolvedTarget.path == rootReal.path || resolvedTarget.path.hasPrefix(rootPrefix) else {
             return .immediate(HTTPResponse(statusCode: 403))
+        }
+
+        // Also reject symlinks inside the mount that point to a hidden dot-file.
+        if !relativeSegments.isEmpty && resolvedTarget.lastPathComponent.hasPrefix(".") {
+            return .immediate(HTTPResponse(statusCode: 404))
         }
 
         var isDirObjC: ObjCBool = false
@@ -256,7 +271,6 @@ public final class WebDAVHandler: @unchecked Sendable {
                     ]
                 ))
             case .invalid:
-                // RFC 9110: ignore syntactically invalid Range header and serve full resource.
                 break
             }
         }
@@ -337,10 +351,19 @@ public final class WebDAVHandler: @unchecked Sendable {
     }
 }
 
-/// Embedded read-only HTTP/1.1 WebDAV server with chunked streaming `Range` support
-/// and transparent loopback proxying for user-configured rclone cloud drives.
+/// Embedded read-only HTTP/1.1 WebDAV server with:
+/// - Connection concurrency limit (`ConnectionGuard`)
+/// - Header read & socket write timeouts
+/// - Per-IP rate limiting on unauthenticated / failed-auth requests (`429`)
+/// - Streaming `Range` support for local video files
+/// - Zero-truncation streaming `PROPFIND` `<href>` rewriting and byte-for-byte streaming proxy for rclone
 public final class WebDAVServer: @unchecked Sendable {
     public let handler: WebDAVHandler
+    private let connectionGuard: ConnectionGuard
+    private let unauthRateLimiter: IPRateLimiter
+    private let readTimeoutSeconds: Int
+    private let writeTimeoutSeconds: Int
+
     private let lock = NSLock()
     private var listenFD: Int32 = -1
     private var boundPort: UInt16 = 0
@@ -360,8 +383,18 @@ public final class WebDAVServer: @unchecked Sendable {
         return running
     }
 
-    public init(handler: WebDAVHandler) {
+    public init(
+        handler: WebDAVHandler,
+        maxConnections: Int = 64,
+        maxUnauthRequestsPerMinute: Int = 30,
+        readTimeoutSeconds: Int = 10,
+        writeTimeoutSeconds: Int = 30
+    ) {
         self.handler = handler
+        self.connectionGuard = ConnectionGuard(maxConnections: maxConnections)
+        self.unauthRateLimiter = IPRateLimiter(maxEvents: maxUnauthRequestsPerMinute, windowSeconds: 60.0)
+        self.readTimeoutSeconds = max(1, readTimeoutSeconds)
+        self.writeTimeoutSeconds = max(1, writeTimeoutSeconds)
     }
 
     deinit {
@@ -473,7 +506,9 @@ public final class WebDAVServer: @unchecked Sendable {
         fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw ControlHTTPSServerError.socketCreationFailed(errno) }
         var one: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+        if port != 0 {
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+        }
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
@@ -517,28 +552,64 @@ public final class WebDAVServer: @unchecked Sendable {
                 if errno == EINTR { continue }
                 break
             }
+
             var one: Int32 = 1
             setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-            var timeout = timeval(tv_sec: 30, tv_usec: 0)
-            setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-            setsockopt(clientFD, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+            var rcvTimeout = timeval(tv_sec: readTimeoutSeconds, tv_usec: 0)
+            var sndTimeout = timeval(tv_sec: writeTimeoutSeconds, tv_usec: 0)
+            setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeout, socklen_t(MemoryLayout<timeval>.size))
+            setsockopt(clientFD, SOL_SOCKET, SO_SNDTIMEO, &sndTimeout, socklen_t(MemoryLayout<timeval>.size))
+
+            let peerIP = IPAddressNormalizer.peerAddress(from: &storage)
+
+            guard connectionGuard.tryAcquire() else {
+                HostLogger.warning("WebDAV server connection cap reached; rejecting \(peerIP)", category: "media")
+                let busyResp = HTTPResponse(
+                    statusCode: 503,
+                    headers: [("Retry-After", "5")],
+                    body: Data("Server busy".utf8)
+                )
+                _ = writeAll(fd: clientFD, data: busyResp.serialize())
+                Darwin.close(clientFD)
+                continue
+            }
 
             workerQueue.async { [weak self] in
-                self?.handleClient(fd: clientFD)
+                guard let self else {
+                    Darwin.close(clientFD)
+                    return
+                }
+                defer {
+                    Darwin.close(clientFD)
+                    self.connectionGuard.release()
+                }
+                self.handleClient(fd: clientFD, peerIP: peerIP)
             }
         }
     }
 
-    private func handleClient(fd: Int32) {
-        defer { Darwin.close(fd) }
+    private func handleClient(fd: Int32, peerIP: String) {
+        if unauthRateLimiter.isLimited(key: peerIP) {
+            let limited = HTTPResponse(
+                statusCode: 429,
+                headers: [("Retry-After", "60"), ("Content-Type", "text/plain; charset=utf-8")],
+                body: Data("Too Many Requests".utf8)
+            )
+            _ = writeAll(fd: fd, data: limited.serialize())
+            return
+        }
 
-        guard let request = readPlainHTTPRequest(fd: fd) else {
+        guard let request = readPlainHTTPRequest(fd: fd, peerIP: peerIP) else {
+            unauthRateLimiter.recordEvent(key: peerIP)
             _ = writeAll(fd: fd, data: HTTPResponse(statusCode: 400).serialize())
             return
         }
 
         switch handler.route(request) {
         case .immediate(let response):
+            if response.statusCode == 401 {
+                unauthRateLimiter.recordEvent(key: peerIP)
+            }
             _ = writeAll(fd: fd, data: response.serialize(includeBody: request.method != "HEAD"))
 
         case .localFileRange(let statusCode, let headers, let fileURL, let offset, let length, let includeBody):
@@ -622,7 +693,7 @@ public final class WebDAVServer: @unchecked Sendable {
 
         var one: Int32 = 1
         setsockopt(upFD, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-        var timeout = timeval(tv_sec: 30, tv_usec: 0)
+        var timeout = timeval(tv_sec: writeTimeoutSeconds, tv_usec: 0)
         setsockopt(upFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(upFD, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
 
@@ -662,37 +733,7 @@ public final class WebDAVServer: @unchecked Sendable {
         guard writeAll(fd: upFD, data: reqData) else { return }
 
         if method == "PROPFIND" {
-            // Buffer XML response (small) and rewrite `<href>` to include `/<mountName>`.
-            var rawResp = Data()
-            var buf = [UInt8](repeating: 0, count: 16384)
-            while true {
-                let n = Darwin.recv(upFD, &buf, buf.count, 0)
-                if n > 0 {
-                    rawResp.append(buf, count: n)
-                    if rawResp.count > 8 * 1024 * 1024 { break }
-                } else {
-                    break
-                }
-            }
-            let delim = Data("\r\n\r\n".utf8)
-            guard let split = rawResp.range(of: delim) else {
-                _ = writeAll(fd: clientFD, data: HTTPResponse(statusCode: 502).serialize())
-                return
-            }
-            let headStr = String(data: rawResp.subdata(in: 0..<split.lowerBound), encoding: .utf8) ?? ""
-            var respBody = rawResp.subdata(in: split.upperBound..<rawResp.count)
-            if headStr.lowercased().contains("transfer-encoding: chunked") {
-                respBody = decodeChunkedBody(respBody)
-            }
-            let rewritten = WebDAVXMLBuilder.rewriteProxiedMultiStatusXML(respBody, mountName: mountName)
-            let statusLine = headStr.components(separatedBy: "\r\n").first ?? "HTTP/1.1 207 Multi-Status"
-            let statusCode = statusLine.split(separator: " ").dropFirst().first.flatMap { Int($0) } ?? 207
-            let resp = HTTPResponse(
-                statusCode: statusCode,
-                headers: [("Content-Type", "application/xml; charset=utf-8")],
-                body: rewritten
-            )
-            _ = writeAll(fd: clientFD, data: resp.serialize())
+            streamRewrittenPropfind(upFD: upFD, clientFD: clientFD, mountName: mountName)
         } else {
             // Stream GET/HEAD directly byte-for-byte without buffering multi-GB video files.
             var buf = [UInt8](repeating: 0, count: 65536)
@@ -713,30 +754,99 @@ public final class WebDAVServer: @unchecked Sendable {
         }
     }
 
-    private func decodeChunkedBody(_ data: Data) -> Data {
-        var out = Data()
-        var idx = 0
-        let crlf = Data("\r\n".utf8)
-        while idx < data.count {
-            guard let lineEnd = data.range(of: crlf, in: idx..<data.count) else { break }
-            let sizeLine = String(data: data.subdata(in: idx..<lineEnd.lowerBound), encoding: .utf8)?
-                .split(separator: ";").first?
-                .trimmingCharacters(in: .whitespaces) ?? ""
-            guard let chunkSize = Int(sizeLine, radix: 16), chunkSize > 0 else { break }
-            let dataStart = lineEnd.upperBound
-            let dataEnd = min(data.count, dataStart + chunkSize)
-            out.append(data.subdata(in: dataStart..<dataEnd))
-            idx = dataEnd + 2
+    /// Streams an upstream `PROPFIND` response of arbitrary size (no 8 MB cap!) while
+    /// incrementally rewriting `<href>` tags to include `/<mountName>` and forwarding via
+    /// HTTP/1.1 chunked transfer encoding.
+    private func streamRewrittenPropfind(upFD: Int32, clientFD: Int32, mountName: String) {
+        let delim = Data("\r\n\r\n".utf8)
+        var headBuffer = Data()
+        var buf = [UInt8](repeating: 0, count: 32768)
+        var headerEndRange: Range<Data.Index>?
+
+        while headerEndRange == nil {
+            let n = Darwin.recv(upFD, &buf, buf.count, 0)
+            if n > 0 {
+                headBuffer.append(buf, count: n)
+                headerEndRange = headBuffer.range(of: delim)
+                if headerEndRange == nil && headBuffer.count > 64 * 1024 {
+                    _ = writeAll(fd: clientFD, data: HTTPResponse(statusCode: 502).serialize())
+                    return
+                }
+            } else if n < 0 && errno == EINTR {
+                continue
+            } else {
+                break
+            }
         }
-        return out
+
+        guard let split = headerEndRange else {
+            _ = writeAll(fd: clientFD, data: HTTPResponse(statusCode: 502).serialize())
+            return
+        }
+
+        let headStr = String(data: headBuffer.subdata(in: 0..<split.lowerBound), encoding: .utf8) ?? ""
+        let initialBody = headBuffer.subdata(in: split.upperBound..<headBuffer.count)
+        let isChunkedUpstream = headStr.lowercased().contains("transfer-encoding: chunked")
+        let statusLine = headStr.components(separatedBy: "\r\n").first ?? "HTTP/1.1 207 Multi-Status"
+        let statusCode = statusLine.split(separator: " ").dropFirst().first.flatMap { Int($0) } ?? 207
+
+        let responseHead =
+            "HTTP/1.1 \(statusCode) \(HTTPResponse.defaultReason(for: statusCode))\r\n" +
+            "Content-Type: application/xml; charset=utf-8\r\n" +
+            "Transfer-Encoding: chunked\r\n" +
+            "Connection: close\r\n\r\n"
+        guard writeAll(fd: clientFD, data: Data(responseHead.utf8)) else { return }
+
+        let chunkDecoder = isChunkedUpstream ? HTTPChunkedStreamDecoder() : nil
+        let rewriter = WebDAVHrefStreamRewriter(mountName: mountName)
+
+        func forwardRawUpstream(_ data: Data) -> Bool {
+            guard !data.isEmpty else { return true }
+            let xmlPart = chunkDecoder?.push(data) ?? data
+            guard !xmlPart.isEmpty else { return true }
+            let rewritten = rewriter.push(xmlPart)
+            return writeHTTPChunk(fd: clientFD, payload: rewritten)
+        }
+
+        if !forwardRawUpstream(initialBody) { return }
+
+        while !(chunkDecoder?.isDone ?? false) {
+            let n = Darwin.recv(upFD, &buf, buf.count, 0)
+            if n > 0 {
+                if !forwardRawUpstream(Data(bytes: buf, count: n)) {
+                    return
+                }
+            } else if n == 0 {
+                break
+            } else if errno == EINTR {
+                continue
+            } else {
+                break
+            }
+        }
+
+        let tail = rewriter.finish()
+        if !tail.isEmpty {
+            guard writeHTTPChunk(fd: clientFD, payload: tail) else { return }
+        }
+        _ = writeAll(fd: clientFD, data: Data("0\r\n\r\n".utf8))
     }
 
-    private func readPlainHTTPRequest(fd: Int32) -> HTTPRequest? {
+    private func writeHTTPChunk(fd: Int32, payload: Data) -> Bool {
+        guard !payload.isEmpty else { return true }
+        var frame = Data("\(String(payload.count, radix: 16))\r\n".utf8)
+        frame.append(payload)
+        frame.append(contentsOf: [0x0D, 0x0A])
+        return writeAll(fd: fd, data: frame)
+    }
+
+    private func readPlainHTTPRequest(fd: Int32, peerIP: String) -> HTTPRequest? {
         var buffer = Data()
         var chunk = [UInt8](repeating: 0, count: 8192)
         var parsedHead: HTTPParser.ParsedHead?
+        let deadline = Date().addingTimeInterval(TimeInterval(readTimeoutSeconds))
 
-        while true {
+        while Date() < deadline {
             if parsedHead == nil {
                 do {
                     parsedHead = try HTTPParser.parseHead(from: buffer)
@@ -752,7 +862,8 @@ public final class WebDAVServer: @unchecked Sendable {
                         method: head.method,
                         rawTarget: head.target,
                         headers: head.headers,
-                        body: body
+                        body: body,
+                        remoteAddress: peerIP
                     )
                 }
             }
@@ -766,7 +877,8 @@ public final class WebDAVServer: @unchecked Sendable {
                         method: head.method,
                         rawTarget: head.target,
                         headers: head.headers,
-                        body: buffer.subdata(in: head.bodyStartIndex..<(head.bodyStartIndex + head.contentLength))
+                        body: buffer.subdata(in: head.bodyStartIndex..<(head.bodyStartIndex + head.contentLength)),
+                        remoteAddress: peerIP
                     )
                 }
                 return nil
@@ -776,6 +888,7 @@ public final class WebDAVServer: @unchecked Sendable {
                 return nil
             }
         }
+        return nil
     }
 
     private func writeAll(fd: Int32, data: Data) -> Bool {

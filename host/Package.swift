@@ -15,12 +15,19 @@ let package = Package(
         .executable(
             name: "Depth3DHost",
             targets: ["Depth3DHost"]
+        ),
+        .executable(
+            name: "depth3d-child-guard",
+            targets: ["Depth3DChildGuard"]
         )
     ],
     targets: [
         .target(
             name: "Depth3DHostCore",
             path: "Sources/Depth3DHostCore",
+            resources: [
+                .process("Resources/Localizable.xcstrings")
+            ],
             linkerSettings: [
                 .linkedFramework("CoreAudio"),
                 .linkedFramework("AudioToolbox"),
@@ -34,6 +41,10 @@ let package = Package(
             ]
         ),
         .executableTarget(
+            name: "Depth3DChildGuard",
+            path: "Sources/Depth3DChildGuard"
+        ),
+        .executableTarget(
             name: "Depth3DHost",
             dependencies: ["Depth3DHostCore"],
             path: "Sources/Depth3DHost",
@@ -42,7 +53,6 @@ let package = Package(
                 "Resources/Assets.xcassets"
             ],
             resources: [
-                .process("Resources/Localizable.xcstrings"),
                 .copy("Resources/THIRD_PARTY_NOTICES.md")
             ]
         ),

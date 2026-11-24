@@ -1,3 +1,4 @@
+import Depth3DHostCore
 import Foundation
 import SwiftUI
 
@@ -35,11 +36,11 @@ enum L10n {
     }()
 
     static func string(_ key: String) -> String {
-        NSLocalizedString(key, tableName: "Localizable", bundle: resourceBundle, value: key, comment: "")
+        HostStrings.string(key)
     }
 
     static func format(_ key: String, _ args: CVarArg...) -> String {
-        let fmt = string(key)
+        let fmt = HostStrings.string(key)
         return String(format: fmt, locale: Locale(identifier: "zh_Hans_CN"), arguments: args)
     }
 

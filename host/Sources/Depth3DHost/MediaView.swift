@@ -159,28 +159,45 @@ struct MediaView: View {
                     }
                 }
             } else {
-                // Active cloud remotes
+                // Active cloud remotes with live health & actionable error recovery
                 if !runtime.settings.cloudRemotes.isEmpty {
                     VStack(spacing: 8) {
                         ForEach(runtime.settings.cloudRemotes) { remote in
+                            let remoteStatus = runtime.rcloneStatuses[remote.displayName]
                             HostCard {
-                                HStack(spacing: 12) {
-                                    Image(systemName: "cloud.fill")
-                                        .font(.system(size: 17))
-                                        .foregroundColor(HostTheme.accent)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(remote.displayName)
-                                            .font(.system(size: 14, weight: .semibold))
-                                            .foregroundColor(HostTheme.text)
-                                        Text(remote.remoteSpec)
+                                VStack(alignment: .leading, spacing: 8) {
+                                    HStack(spacing: 12) {
+                                        Image(systemName: cloudIconName(for: remoteStatus))
+                                            .font(.system(size: 17))
+                                            .foregroundColor(cloudIconColor(for: remoteStatus))
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(remote.displayName)
+                                                .font(.system(size: 14, weight: .semibold))
+                                                .foregroundColor(HostTheme.text)
+                                            Text(remote.remoteSpec)
+                                                .font(.system(size: 12))
+                                                .foregroundColor(HostTheme.text2)
+                                        }
+                                        Spacer()
+                                        cloudStatusBadge(for: remoteStatus)
+                                        if case .error = remoteStatus {
+                                            Button(L10n.string("action.retry")) {
+                                                runtime.retryCloudRemote(remote)
+                                            }
+                                            .buttonStyle(HostSecondaryButtonStyle())
+                                        }
+                                        Button(L10n.string("action.remove")) {
+                                            runtime.removeCloudRemote(remote)
+                                        }
+                                        .buttonStyle(HostDangerButtonStyle())
+                                    }
+
+                                    if case .error(let message) = remoteStatus {
+                                        Text(message)
                                             .font(.system(size: 12))
-                                            .foregroundColor(HostTheme.text2)
+                                            .foregroundColor(HostTheme.danger)
+                                            .fixedSize(horizontal: false, vertical: true)
                                     }
-                                    Spacer()
-                                    Button(L10n.string("action.remove")) {
-                                        runtime.removeCloudRemote(remote)
-                                    }
-                                    .buttonStyle(HostDangerButtonStyle())
                                 }
                             }
                         }
@@ -219,6 +236,44 @@ struct MediaView: View {
                     )
                 }
             }
+        }
+    }
+
+    private func cloudIconName(for status: RcloneRemoteStatus?) -> String {
+        if case .error = status {
+            return "exclamationmark.icloud.fill"
+        }
+        return "cloud.fill"
+    }
+
+    private func cloudIconColor(for status: RcloneRemoteStatus?) -> Color {
+        if case .error = status {
+            return HostTheme.danger
+        }
+        return HostTheme.accent
+    }
+
+    @ViewBuilder
+    private func cloudStatusBadge(for status: RcloneRemoteStatus?) -> some View {
+        switch status {
+        case .running:
+            Text(L10n.string("media.cloud.status.running"))
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundColor(HostTheme.accent)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(HostTheme.accent.opacity(0.14)))
+        case .starting:
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(HostTheme.accent)
+                Text(L10n.string("media.cloud.status.starting"))
+                    .font(.system(size: 11.5))
+                    .foregroundColor(HostTheme.text2)
+            }
+        case .error, .none:
+            EmptyView()
         }
     }
 

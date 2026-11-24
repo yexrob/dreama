@@ -170,6 +170,7 @@ struct StatusView: View {
 
     @ViewBuilder
     private var actionItemsSection: some View {
+        let hasBonjourError = runtime.permissions.bonjourPublishFailed && runtime.permissions.localNetwork != .denied
         let hasPermissionIssues = !runtime.permissions.allGranted
         let hasPortConflict: Bool = {
             if case .portConflict = runtime.engineState { return true }
@@ -177,7 +178,7 @@ struct StatusView: View {
         }()
         let hasWebDAVError = runtime.webDAVError != nil
 
-        if hasPermissionIssues || hasPortConflict || hasWebDAVError {
+        if hasPermissionIssues || hasBonjourError || hasPortConflict || hasWebDAVError {
             VStack(alignment: .leading, spacing: 10) {
                 Text(L10n.string("status.needs_attention"))
                     .font(.system(size: 14, weight: .semibold))
@@ -189,6 +190,15 @@ struct StatusView: View {
                         message: L10n.string("status.port_conflict.card_desc"),
                         actionTitle: L10n.string("action.retry"),
                         onAction: runtime.retryEngine
+                    )
+                }
+
+                if hasBonjourError {
+                    InlineErrorBanner(
+                        title: L10n.string("status.bonjour_error.title"),
+                        message: L10n.string("status.bonjour_error.desc"),
+                        actionTitle: L10n.string("action.retry"),
+                        onAction: runtime.retryBonjourPublish
                     )
                 }
 
@@ -212,7 +222,7 @@ struct StatusView: View {
                     )
                 }
 
-                if runtime.permissions.localNetwork != .granted {
+                if runtime.permissions.localNetwork != .granted && !hasBonjourError {
                     PermissionRowCard(
                         title: L10n.string("perm.local_network.title"),
                         description: L10n.string("perm.local_network.desc"),

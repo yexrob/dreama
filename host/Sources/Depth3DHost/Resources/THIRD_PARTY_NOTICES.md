@@ -6,7 +6,7 @@ depth3d Host 以 **GNU General Public License v3.0 (GPL-3.0-only)** 开源发布
 
 | 组件 | 版本 | 来源 | 许可 |
 |---|---|---|---|
-| Sunshine（内置串流引擎） | v2026.914.233613（commit `63d35f70`） | https://github.com/LizardByte/Sunshine | GPL-3.0-only |
+| Sunshine（内置串流引擎） | v2026.914.233613（commit `63d35f70`） | https://github.com/SunshineStream/Sunshine（原 `LizardByte/Sunshine` 改名后的官方组织） | GPL-3.0-only |
 | OpenSSL（随内置串流引擎分发） | 3.x | https://github.com/openssl/openssl | Apache-2.0 |
 | miniupnpc（随内置串流引擎分发） | 2.3.x | https://github.com/miniupnp/miniupnp | BSD-3-Clause |
 | ICU4C（随内置串流引擎分发） | 78.x | https://github.com/unicode-org/icu | Unicode-3.0 |

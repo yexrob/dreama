@@ -8,14 +8,21 @@ public enum EngineLogEvent: Equatable, Sendable {
     case encoderSelected(String)
     case encoderUnavailable
     case portBindFailed(UInt16?)
-    case streamingStarted(activeSessions: Int)
-    case streamingStopped
+    /// Logged by RTSP (`New streaming session started [active sessions: N]`) right before ENet connects.
+    case sessionCountReported(Int)
+    /// Logged once per ENet client connection (`CLIENT CONNECTED`).
+    case clientConnected
+    /// Logged once per ENet client disconnect (`CLIENT DISCONNECTED`).
+    case clientDisconnected
     case audioTapActive(hostMuted: Bool?)
     case audioTapFailed
     case pairingExpired
 }
 
 /// Aggregated state derived purely from engine log lines.
+/// Properly tracks concurrent multi-device streaming sessions without double-counting
+/// (`New streaming session started` + `CLIENT CONNECTED`) or double-decrementing
+/// (`CLIENT DISCONNECTED` + debug `Session ended`).
 public struct EngineLogState: Equatable, Sendable {
     public var apiReady: Bool = false
     public var mdnsRegistered: Bool = false
@@ -24,6 +31,7 @@ public struct EngineLogState: Equatable, Sendable {
     public var encoderUnavailable: Bool = false
     public var failedPort: UInt16?
     public var activeSessions: Int = 0
+    private var pendingConnectAcks: Int = 0
     public var systemAudioTapActive: Bool = false
     public var systemAudioTapHostMuted: Bool?
     public var systemAudioTapFailed: Bool = false
@@ -45,10 +53,23 @@ public struct EngineLogState: Equatable, Sendable {
             encoderUnavailable = true
         case .portBindFailed(let port):
             failedPort = port
-        case .streamingStarted(let count):
-            activeSessions = max(1, count)
-        case .streamingStopped:
+        case .sessionCountReported(let count):
+            activeSessions = max(0, count)
+            // RTSP logs `New streaming session started [active sessions: N]` immediately before
+            // ENet logs `CLIENT CONNECTED` for the same session. Record one pending ack so
+            // `CLIENT CONNECTED` does not double-increment `activeSessions`.
+            pendingConnectAcks += 1
+        case .clientConnected:
+            if pendingConnectAcks > 0 {
+                pendingConnectAcks -= 1
+            } else {
+                activeSessions += 1
+            }
+        case .clientDisconnected:
             activeSessions = max(0, activeSessions - 1)
+            if activeSessions == 0 {
+                pendingConnectAcks = 0
+            }
         case .audioTapActive(let muted):
             systemAudioTapActive = true
             systemAudioTapFailed = false
@@ -107,15 +128,18 @@ public enum EngineLogParser {
         if let range = line.range(of: "New streaming session started [active sessions:") {
             let tail = line[range.upperBound...].trimmingCharacters(in: .whitespaces)
             let digits = tail.prefix { $0.isNumber }
-            return .streamingStarted(activeSessions: Int(digits) ?? 1)
+            if let count = Int(digits) {
+                return .sessionCountReported(count)
+            }
         }
 
         if line.contains("CLIENT CONNECTED") {
-            return .streamingStarted(activeSessions: 1)
+            return .clientConnected
         }
 
-        if line.contains("CLIENT DISCONNECTED") || line.contains("Session ended") {
-            return .streamingStopped
+        // Only decrement on `CLIENT DISCONNECTED` (not debug `Session ended`) to prevent double-decrement.
+        if line.contains("CLIENT DISCONNECTED") {
+            return .clientDisconnected
         }
 
         if line.contains("Core Audio tap: Host audio disabled (muted)") {
