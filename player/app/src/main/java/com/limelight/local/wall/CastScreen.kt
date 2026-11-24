@@ -1,7 +1,5 @@
 package com.limelight.local.wall
 
-import android.os.Build
-import android.provider.Settings
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -14,36 +12,34 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import com.limelight.local.dlna.CastReceiver
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 /**
- * 投屏 (design-opus cast.html). AirPlay and DLNA receiving are not built yet,
- * so the top half only says how it will work; 电脑串流 below it is the
- * Moonlight host list, which works today.
+ * 投屏 (design-opus cast.html). Phone video apps cast over DLNA to the name
+ * shown here; AirPlay is not built yet. 电脑串流 below is the Moonlight host
+ * list.
  */
 @Composable
 fun CastScreen(nav: WallNav) {
-    val context = LocalContext.current
-    val name = remember {
-        Settings.Global.getString(context.contentResolver, Settings.Global.DEVICE_NAME) ?: Build.MODEL
-    }
+    val dlna by CastReceiver.status.collectAsState()
+    val copy = dlnaCastCopy(dlna)
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.offset(64.dp, 136.dp).width(1152.dp)) {
-            Notice("投屏 · 即将支持", WallIcons.Cast, danger = false)
-            Text(name, style = WallType.Display, modifier = Modifier.padding(top = 12.dp))
-            Text("做好以后，在同一个 Wi-Fi 里从 iPad、iPhone 或手机 App 选这个名字就能投过来。",
-                style = WallType.Body, color = Wall.Text2, modifier = Modifier.padding(top = 12.dp))
+            Notice(copy.notice, if (copy.danger) WallIcons.Alert else WallIcons.Cast, danger = copy.danger)
+            Text(dlna.name, style = WallType.Display, modifier = Modifier.padding(top = 12.dp))
+            Text(copy.body, style = WallType.Body, color = Wall.Text2, modifier = Modifier.padding(top = 12.dp))
         }
         Row(Modifier.offset(64.dp, 372.dp), horizontalArrangement = Arrangement.spacedBy(48.dp)) {
             HowTo(WallIcons.Tablet, "iPad / iPhone", "即将支持 · 控制中心 › 屏幕镜像")
-            HowTo(WallIcons.Phone, "手机里的视频 App", "即将支持 · 播放时点「投屏」")
+            HowTo(WallIcons.Phone, "手机里的视频 App", copy.phoneHowTo)
         }
         Row(Modifier.offset(64.dp, 520.dp), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(14.dp)) {

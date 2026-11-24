@@ -26,10 +26,12 @@
     <uses-permission android:name="com.android.providers.tv.permission.READ_EPG_DATA"/>
     <uses-permission android:name="com.android.providers.tv.permission.WRITE_EPG_DATA"/>
 
-    <!-- We don't need a MulticastLock on API level 34+ because we use NsdManager for mDNS -->
-    <uses-permission
-        android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"
-        android:maxSdkVersion="33" />
+    <!-- mDNS uses NsdManager on API level 34+, but the DLNA receiver's SSDP
+         discovery needs a MulticastLock on every version -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- The DLNA cast receiver runs as a media playback foreground service -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
 
     <uses-feature
         android:name="android.hardware.touchscreen"
@@ -334,6 +336,12 @@
         <service
             android:name=".binding.input.driver.UsbDriverService"
             android:label="Usb Driver Service" />
+        <!-- depth3d: the DLNA cast receiver, only while the app is open -->
+        <service
+            android:name=".local.dlna.DlnaService"
+            android:label="投屏接收"
+            android:foregroundServiceType="mediaPlayback"
+            android:exported="false" />
 
         <activity
             android:name=".BugReportActivity"

@@ -1,21 +1,40 @@
 package com.limelight.local;
 
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.media.MediaMetadataRetriever;
-import android.media.MediaPlayer;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.WindowManager;
 import android.widget.Toast;
 
+import androidx.annotation.OptIn;
+import androidx.media3.common.AudioAttributes;
+import androidx.media3.common.C;
+import androidx.media3.common.Format;
+import androidx.media3.common.MediaItem;
+import androidx.media3.common.PlaybackException;
+import androidx.media3.common.Player;
+import androidx.media3.common.Tracks;
+import androidx.media3.common.VideoSize;
+import androidx.media3.common.util.UnstableApi;
+import androidx.media3.datasource.DefaultDataSource;
+import androidx.media3.datasource.DefaultHttpDataSource;
+import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
+
 import com.limelight.LimeLog;
 import com.limelight.binding.video.XrRenderer;
 import com.limelight.binding.video.XrStartFailure;
+import com.limelight.local.dlna.CastReceiver;
+import com.limelight.local.dlna.PlayerLink;
+import com.limelight.local.dlna.PlayerState;
 import com.limelight.local.media.WatchHistory;
 import com.limelight.preferences.PreferenceConfiguration;
 
@@ -23,18 +42,26 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
 /**
- * Plays a local video on MoonlightXR's virtual screen. The renderer hands out
- * the Surface its SurfaceTexture is fed from; here MediaPlayer decodes into it
+ * Plays a video on MoonlightXR's virtual screen. The renderer hands out the
+ * Surface its SurfaceTexture is fed from; here ExoPlayer decodes into it
  * instead of the stream decoder, and everything after that — the depth model,
  * the warp per eye, the screen, the pointer — is the renderer's own.
+ *
+ * The video is a local file, one on the WebDAV share, or what a phone casts
+ * over DLNA (MP4, FLV, HLS, DASH). A cast is driven from the phone as well,
+ * through PlayerLink, and a new cast while this is up replaces what plays.
  *
  * Controls: trigger on the screen plays and pauses, the thumbstick seeks ten
  * seconds a click, and the bar's exit button leaves.
  */
+@OptIn(markerClass = UnstableApi.class)
 public class LocalPlayerXR extends Activity
-        implements XrRenderer.InputListener, XrRenderer.SessionListener {
+        implements XrRenderer.InputListener, XrRenderer.SessionListener, PlayerLink.CastPlayer {
 
     private static final int SEEK_STEP_MS = 10_000;
     // An Authorization header for an http source (the WebDAV share)
@@ -44,14 +71,50 @@ public class LocalPlayerXR extends Activity
     public static final String EXTRA_START_MS = "start_ms";
     public static final String EXTRA_SOURCE_ID = "source_id";
     public static final String EXTRA_ITEM_ID = "item_id";
+    // A DLNA cast: which one, so the phone's commands reach only the player
+    // showing it, and the stream type where the url does not say
+    public static final String EXTRA_CAST_ID = "cast_id";
+    public static final String EXTRA_MIME = "mime";
+    // Started again by itself for a picture of another shape, so it does not do so twice
+    public static final String EXTRA_RELAUNCHED = "relaunched";
+
+    // One OpenXR session at a time: a player started again waits for the last one's to be gone
+    private static final Semaphore SESSION = new Semaphore(1);
+    private static final long SESSION_WAIT_S = 5;
+    // How long a cast's own stream gets to say how big its picture is
+    private static final long PROBE_WAIT_MS = 8000;
+    // The session's screen keeps its shape; a picture further off than this starts it again
+    private static final float SHAPE_SLACK = 0.03f;
 
     private Map<String, String> headers = Collections.emptyMap();
 
     private final Handler main = new Handler(Looper.getMainLooper());
+    private final Object life = new Object();
     private volatile XrRenderer renderer;
-    private MediaPlayer player;
-    private boolean prepared;
-    private boolean finishing;
+    // Under life
+    private boolean destroyed;
+    private boolean gated;
+
+    // Main thread
+    private ExoPlayer player;
+    private DefaultHttpDataSource.Factory http;
+    private boolean held;
+    private long castId;
+    private long startMs;
+    // The current item has been ready once; the session's surface is on the player
+    private boolean ready;
+    private boolean surfaceSet;
+    private boolean wantPlay = true;
+    private boolean errored;
+    private boolean checkShape;
+    private int sessionW, sessionH;
+    private Intent relaunch;
+    private String pendingNotice, pendingMore;
+
+    // What a cast's stream says its picture is, for the session's size
+    private final CountDownLatch probed = new CountDownLatch(1);
+    private volatile int probeW, probeH;
+    private volatile float probeFps;
 
     // The transport strip and where the pointer is on the picture. The
     // pointer fields are written on the frame loop thread.
@@ -73,19 +136,86 @@ public class LocalPlayerXR extends Activity
             finish();
             return;
         }
+        // The cast receiver stays up while a film plays, for a phone to cast to
+        CastReceiver.hold(this);
+        held = true;
 
-        String auth = getIntent().getStringExtra(EXTRA_AUTH);
+        // The user agent Android's own MediaPlayer sends, which the WebDAV
+        // share always got and which the phones' CDNs take from TV boxes
+        http = new DefaultHttpDataSource.Factory()
+                .setUserAgent("stagefright/1.2 (Linux;Android " + Build.VERSION.RELEASE + ")")
+                .setAllowCrossProtocolRedirects(true);
+        player = new ExoPlayer.Builder(this)
+                .setMediaSourceFactory(new DefaultMediaSourceFactory(new DefaultDataSource.Factory(this, http)))
+                .build();
+        player.setAudioAttributes(new AudioAttributes.Builder()
+                .setUsage(C.USAGE_MEDIA)
+                .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+                .build(), false);
+        // The display rate is the session's to pick, from the probe below
+        player.setVideoChangeFrameRateStrategy(C.VIDEO_CHANGE_FRAME_RATE_STRATEGY_OFF);
+        player.addListener(events);
+        // Buffers while the session starts
+        load(getIntent());
+        PlayerLink.attach(this, castId);
+        main.post(barTick);
+
+        final boolean cast = castId != 0;
+        new Thread(() -> startSession(uri, cast), "depth3d-start").start();
+    }
+
+    private void load(Intent in) {
+        Uri uri = in.getData();
+        castId = in.getLongExtra(EXTRA_CAST_ID, 0);
+        startMs = in.getLongExtra(EXTRA_START_MS, 0);
+        String auth = in.getStringExtra(EXTRA_AUTH);
+        Map<String, String> h = Collections.emptyMap();
         if (auth != null) {
-            headers = new HashMap<>();
-            headers.put("Authorization", auth);
+            h = new HashMap<>();
+            h.put("Authorization", auth);
         }
-        new Thread(() -> startSession(uri), "depth3d-start").start();
+        headers = h;
+        http.setDefaultRequestProperties(h);
+
+        MediaItem.Builder item = new MediaItem.Builder().setUri(uri);
+        String mime = in.getStringExtra(EXTRA_MIME);
+        if (mime != null) {
+            item.setMimeType(mime);
+        }
+        ready = false;
+        errored = false;
+        wantPlay = true;
+        // A film of its own loops as it always did; a cast ends, for the phone to send the next
+        player.setRepeatMode(castId != 0 ? Player.REPEAT_MODE_OFF : Player.REPEAT_MODE_ONE);
+        player.setWakeMode(isHttp(uri) ? C.WAKE_MODE_NETWORK : C.WAKE_MODE_NONE);
+        player.setPlayWhenReady(false);
+        player.setMediaItem(item.build());
+        player.prepare();
     }
 
     // Off the main thread: start() waits on the OpenXR session's init
-    private void startSession(Uri uri) {
-        int[] size = videoSize(uri);
-        float fps = frameRate(uri);
+    private void startSession(Uri uri, boolean cast) {
+        int[] size;
+        float fps;
+        boolean guessed = false;
+        if (cast) {
+            // A phone's stream may be HLS or FLV, which only the player reads
+            try {
+                probed.await(PROBE_WAIT_MS, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            if (probeW > 0 && probeH > 0) {
+                size = new int[]{probeW, probeH};
+            } else {
+                size = new int[]{1920, 1080};
+                guessed = true;
+            }
+            fps = probeFps > 0 ? probeFps : 30f;
+        } else {
+            size = videoSize(uri);
+            fps = frameRate(uri);
+        }
 
         PreferenceConfiguration prefs = PreferenceConfiguration.readPreferences(this);
         prefs.enableVrMode = true;
@@ -97,63 +227,223 @@ public class LocalPlayerXR extends Activity
         // The Gen 1 profile's 12 maps a second is a stream's budget; a film
         // held 20 on a Pico 4 with no missed refreshes
         prefs.vrDepthRate = Math.max(prefs.vrDepthRate, com.limelight.binding.video.XrShared.DEPTH_RATE_DEFAULT);
-        LimeLog.info(String.format(Locale.US, "depth3d: %s %dx%d @ %.2f", uri, size[0], size[1], fps));
+        LimeLog.info(String.format(Locale.US, "depth3d: %s %dx%d @ %.2f%s", uri, size[0], size[1], fps,
+                guessed ? " (guessed)" : ""));
+
+        synchronized (life) {
+            if (destroyed) {
+                return;
+            }
+        }
+        boolean gate = false;
+        try {
+            gate = SESSION.tryAcquire(SESSION_WAIT_S, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (!gate) {
+            LimeLog.warning("depth3d: the last session is still going; starting anyway");
+        }
+        synchronized (life) {
+            if (destroyed) {
+                if (gate) {
+                    SESSION.release();
+                }
+                return;
+            }
+        }
 
         XrRenderer r = new XrRenderer();
         r.setLocalMedia(true);
         r.setInputListener(this);
         r.setSessionListener(this);
         if (!r.start(this, size[0], size[1], prefs)) {
+            if (gate) {
+                SESSION.release();
+            }
             XrStartFailure failure = r.getStartFailure();
             onVrUnavailable(failure != null ? failure : XrStartFailure.unknown());
             return;
         }
-        renderer = r;
-        bar = new TransportBar(size[0], size[1]);
-        main.post(() -> startPlayback(uri));
+        boolean kept;
+        synchronized (life) {
+            kept = !destroyed;
+            if (kept) {
+                renderer = r;
+                gated = gate;
+            }
+        }
+        if (!kept) {
+            // Gone while the session started: nothing else would stop it
+            r.prepareForStop();
+            r.cleanup();
+            if (gate) {
+                SESSION.release();
+            }
+            return;
+        }
+        final TransportBar b = new TransportBar(size[0], size[1]);
+        final int w = size[0], h = size[1];
+        final boolean check = guessed || cast;
+        main.post(() -> sessionUp(r, b, w, h, check));
     }
 
-    private void startPlayback(Uri uri) {
-        XrRenderer r = renderer;
-        if (r == null || isFinishing() || isDestroyed()) {
+    private void sessionUp(XrRenderer r, TransportBar b, int w, int h, boolean check) {
+        ExoPlayer p = player;
+        if (renderer != r || p == null) {
             return;
         }
-        MediaPlayer mp = new MediaPlayer();
-        try {
-            mp.setDataSource(this, uri, headers);
-            mp.setSurface(r.getInputSurface());
-            mp.setLooping(true);
-            if (isHttp(uri)) {
-                r.showNotice("正在从网盘缓冲…", getIntent().getStringExtra(EXTRA_TITLE));
-                mp.setOnInfoListener((p, what, extra) -> {
-                    if (what == MediaPlayer.MEDIA_INFO_BUFFERING_START) {
-                        r.showNotice("缓冲中…", null);
-                    }
-                    return false;
-                });
+        bar = b;
+        sessionW = w;
+        sessionH = h;
+        checkShape = check;
+        p.setVideoSurface(r.getInputSurface());
+        surfaceSet = true;
+        if (pendingNotice != null) {
+            r.showNotice(pendingNotice, pendingMore);
+            pendingNotice = null;
+            pendingMore = null;
+        } else if (!ready) {
+            if (castId != 0) {
+                r.showNotice("正在打开投屏…", title());
+            } else if (isHttp(getIntent().getData())) {
+                r.showNotice("正在从网盘缓冲…", title());
             }
-            mp.setOnPreparedListener(p -> {
-                prepared = true;
-                long start = getIntent().getLongExtra(EXTRA_START_MS, 0);
+        }
+        if (ready && !errored) {
+            p.setPlayWhenReady(wantPlay);
+        }
+        tickBar();
+    }
+
+    private final Player.Listener events = new Player.Listener() {
+        @Override
+        public void onPlaybackStateChanged(int state) {
+            ExoPlayer p = player;
+            if (p == null) {
+                return;
+            }
+            if (state == Player.STATE_READY && !ready) {
+                ready = true;
+                long d = p.getDuration();
                 // A resume point in the last seconds would only loop round to the start
-                if (start > 0 && start < p.getDuration() - 5000) {
-                    p.seekTo((int) start);
+                boolean nearEnd = castId == 0 && d != C.TIME_UNSET && startMs >= d - 5000;
+                if (startMs > 0 && !nearEnd) {
+                    p.seekTo(startMs);
                 }
-                p.start();
-            });
-            mp.setOnErrorListener((p, what, extra) -> {
-                r.showNotice("播放出错", "what=" + what + " extra=" + extra);
-                return true;
-            });
-            mp.prepareAsync();
-        } catch (Exception e) {
-            LimeLog.warning("depth3d: cannot play " + uri + ": " + e);
-            r.showNotice("无法播放这个视频", e.getMessage());
-            mp.release();
+                if (surfaceSet) {
+                    p.setPlayWhenReady(wantPlay);
+                }
+            } else if (state == Player.STATE_BUFFERING && ready && isHttp(getIntent().getData())) {
+                notice("缓冲中…", null);
+            }
+            tickBar();
+        }
+
+        @Override
+        public void onTracksChanged(Tracks tracks) {
+            if (tracks.isEmpty() || probed.getCount() == 0) {
+                return;
+            }
+            Format f = videoFormat(tracks);
+            if (f != null && f.width > 0 && f.height > 0) {
+                boolean turned = f.rotationDegrees == 90 || f.rotationDegrees == 270;
+                probeW = turned ? f.height : f.width;
+                probeH = turned ? f.width : f.height;
+                probeFps = f.frameRate;
+            }
+            probed.countDown();
+        }
+
+        @Override
+        public void onVideoSizeChanged(VideoSize size) {
+            if (!checkShape || size.width <= 0 || size.height <= 0 || sessionW <= 0 || sessionH <= 0) {
+                return;
+            }
+            checkShape = false;
+            float off = (size.width / (float) size.height) / (sessionW / (float) sessionH);
+            if (Math.abs(off - 1f) > SHAPE_SLACK && !getIntent().getBooleanExtra(EXTRA_RELAUNCHED, false)) {
+                relaunch();
+            }
+        }
+
+        @Override
+        public void onPlayerError(PlaybackException e) {
+            errored = true;
+            LimeLog.warning("depth3d: cannot play " + getIntent().getData() + ": " + e);
+            notice(castId != 0 ? "投屏的视频放不了" : "播放出错", e.getErrorCodeName());
+            probed.countDown();
+            tickBar();
+        }
+    };
+
+    private static Format videoFormat(Tracks tracks) {
+        Format any = null;
+        for (Tracks.Group g : tracks.getGroups()) {
+            if (g.getType() != C.TRACK_TYPE_VIDEO) {
+                continue;
+            }
+            for (int i = 0; i < g.length; i++) {
+                if (g.isTrackSelected(i)) {
+                    return g.getTrackFormat(i);
+                }
+                if (any == null) {
+                    any = g.getTrackFormat(i);
+                }
+            }
+        }
+        return any;
+    }
+
+    // A notice now, or once the session is up to show it
+    private void notice(String text, String more) {
+        XrRenderer r = renderer;
+        if (r != null && surfaceSet) {
+            r.showNotice(text, more);
+        } else {
+            pendingNotice = text;
+            pendingMore = more;
+        }
+    }
+
+    // The session's screen has the shape it started with: a cast of another
+    // shape gets a session of its own, at the same place in the video
+    private void relaunch() {
+        LimeLog.info("depth3d: the picture is another shape, starting the session again");
+        relaunch = new Intent(this, LocalPlayerXR.class)
+                .setData(getIntent().getData())
+                .putExtras(getIntent())
+                .putExtra(EXTRA_RELAUNCHED, true)
+                .putExtra(EXTRA_START_MS, position())
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        finish();
+    }
+
+    // A new film or cast while this is up plays here, in place of the last
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        ExoPlayer p = player;
+        if (intent.getData() == null || p == null || relaunch != null) {
             return;
         }
-        player = mp;
-        main.post(barTick);
+        saveProgress();
+        long old = castId;
+        long next = intent.getLongExtra(EXTRA_CAST_ID, 0);
+        if (old != next) {
+            PlayerLink.detach(this, old, position(), duration(), true);
+        }
+        setIntent(intent);
+        load(intent);
+        if (old != next) {
+            PlayerLink.attach(this, castId);
+        }
+        checkShape = surfaceSet;
+        XrRenderer r = renderer;
+        if (r != null && surfaceSet) {
+            r.showNotice(castId != 0 ? "正在打开投屏…" : "正在打开…", title());
+        }
+        tickBar();
     }
 
     private int[] videoSize(Uri uri) {
@@ -197,7 +487,7 @@ public class LocalPlayerXR extends Activity
     }
 
     private static boolean isHttp(Uri uri) {
-        String s = uri.getScheme();
+        String s = uri != null ? uri.getScheme() : null;
         return "http".equals(s) || "https".equals(s);
     }
 
@@ -209,9 +499,99 @@ public class LocalPlayerXR extends Activity
         }
     }
 
-    private static String clock(int ms) {
-        int s = ms / 1000;
-        return String.format(Locale.US, "%d:%02d", s / 60, s % 60);
+    private String title() {
+        return getIntent().getStringExtra(EXTRA_TITLE);
+    }
+
+    private long position() {
+        ExoPlayer p = player;
+        return p != null ? Math.max(0, p.getCurrentPosition()) : 0;
+    }
+
+    // 0 while not known, as for a live stream
+    private long duration() {
+        ExoPlayer p = player;
+        long d = p != null ? p.getDuration() : C.TIME_UNSET;
+        return d == C.TIME_UNSET ? 0 : Math.max(0, d);
+    }
+
+    private boolean playing() {
+        ExoPlayer p = player;
+        return p != null && p.getPlayWhenReady() && p.getPlaybackState() != Player.STATE_ENDED;
+    }
+
+    private void setPlaying(boolean on) {
+        ExoPlayer p = player;
+        if (p == null) {
+            return;
+        }
+        wantPlay = on;
+        if (on && errored) {
+            // Try again: a phone's play after a failed open, or the trigger
+            errored = false;
+            p.prepare();
+        }
+        if (on && p.getPlaybackState() == Player.STATE_ENDED) {
+            p.seekTo(0);
+        }
+        if (ready && surfaceSet) {
+            p.setPlayWhenReady(on);
+        }
+        if (!on) {
+            saveProgress();
+        }
+    }
+
+    // What the phone sees through GetPositionInfo and its events
+    private void report() {
+        ExoPlayer p = player;
+        if (p == null || castId == 0) {
+            return;
+        }
+        PlayerState st;
+        if (errored) {
+            st = PlayerState.ERROR;
+        } else if (!ready || !surfaceSet) {
+            st = PlayerState.LOADING;
+        } else if (p.getPlaybackState() == Player.STATE_ENDED) {
+            st = PlayerState.ENDED;
+        } else {
+            st = p.getPlayWhenReady() ? PlayerState.PLAYING : PlayerState.PAUSED;
+        }
+        PlayerLink.report(castId, st, position(), duration());
+    }
+
+    // ---- the phone, through PlayerLink, on the main thread ----
+
+    @Override
+    public void castPlay() {
+        setPlaying(true);
+        tickBar();
+    }
+
+    @Override
+    public void castPause() {
+        setPlaying(false);
+        tickBar();
+    }
+
+    @Override
+    public void castSeek(long ms) {
+        ExoPlayer p = player;
+        if (p == null) {
+            return;
+        }
+        if (!ready) {
+            startMs = ms;
+        } else {
+            p.seekTo(Math.max(0, ms));
+        }
+        tickBar();
+    }
+
+    @Override
+    public void castClose() {
+        finish();
     }
 
     // ---- input from the session, on the frame loop thread ----
@@ -223,53 +603,50 @@ public class LocalPlayerXR extends Activity
         }
         final float u = pointerU, v = pointerV;
         main.post(() -> {
-            MediaPlayer mp = player;
+            ExoPlayer p = player;
             TransportBar b = bar;
-            if (mp == null || b == null) {
+            if (p == null || b == null) {
                 return;
             }
             pointerMovedMs = System.currentTimeMillis();
-            try {
-                float x = b.texX(u, v);
-                float f = Float.isNaN(x) || TransportBar.onButton(x)
-                        ? Float.NaN : TransportBar.trackFraction(x);
-                if (!Float.isNaN(f)) {
-                    mp.seekTo((int) (f * mp.getDuration()));
-                } else if (mp.isPlaying()) {
-                    mp.pause();
-                    saveProgress();
-                } else {
-                    mp.start();
+            float x = b.texX(u, v);
+            float f = Float.isNaN(x) || TransportBar.onButton(x)
+                    ? Float.NaN : TransportBar.trackFraction(x);
+            if (!Float.isNaN(f)) {
+                long d = duration();
+                if (d > 0 && p.isCurrentMediaItemSeekable()) {
+                    p.seekTo((long) (f * d));
                 }
-            } catch (IllegalStateException ignored) {
+            } else {
+                setPlaying(!playing());
             }
             tickBar();
         });
     }
 
     // Shown while paused, or for a while after the pointer moves; redrawn a
-    // few times a second while it shows
+    // few times a second while it shows. Each round also tells a casting
+    // phone where the player is.
     private void tickBar() {
         main.removeCallbacks(barTick);
-        MediaPlayer mp = player;
-        XrRenderer r = renderer;
-        TransportBar b = bar;
-        if (mp == null || r == null || b == null) {
+        ExoPlayer p = player;
+        if (p == null) {
             return;
         }
-        try {
-            boolean playing = mp.isPlaying();
+        report();
+        XrRenderer r = renderer;
+        TransportBar b = bar;
+        if (r != null && b != null) {
+            boolean on = playing();
             long since = System.currentTimeMillis() - pointerMovedMs;
-            boolean show = !playing || since < BAR_LINGER_MS;
+            boolean show = !on || since < BAR_LINGER_MS;
             r.setTransportVisible(show);
             if (show) {
                 float x = since < BAR_LINGER_MS ? b.texX(pointerU, pointerV) : Float.NaN;
                 boolean onBtn = !Float.isNaN(x) && TransportBar.onButton(x);
                 float hover = Float.isNaN(x) || onBtn ? Float.NaN : TransportBar.trackFraction(x);
-                r.postTransport(b.draw(playing, mp.getCurrentPosition(), mp.getDuration(),
-                        hover, onBtn, getIntent().getStringExtra(EXTRA_TITLE)));
+                r.postTransport(b.draw(on, (int) position(), (int) duration(), hover, onBtn, title()));
             }
-        } catch (IllegalStateException ignored) {
         }
         main.postDelayed(barTick, BAR_TICK_MS);
     }
@@ -277,19 +654,19 @@ public class LocalPlayerXR extends Activity
     @Override
     public void onVrScroll(int clicks) {
         main.post(() -> {
-            MediaPlayer mp = player;
+            ExoPlayer p = player;
             XrRenderer r = renderer;
-            if (mp == null || r == null) {
+            if (p == null || r == null || !p.isCurrentMediaItemSeekable()) {
                 return;
             }
-            try {
-                int to = Math.max(0, Math.min(mp.getDuration() - 1000,
-                        mp.getCurrentPosition() - clicks * SEEK_STEP_MS));
-                mp.seekTo(to);
-                pointerMovedMs = System.currentTimeMillis();
-                tickBar();
-            } catch (IllegalStateException ignored) {
+            long to = position() - (long) clicks * SEEK_STEP_MS;
+            long d = duration();
+            if (d > 0) {
+                to = Math.min(d - 1000, to);
             }
+            p.seekTo(Math.max(0, to));
+            pointerMovedMs = System.currentTimeMillis();
+            tickBar();
         });
     }
 
@@ -337,28 +714,24 @@ public class LocalPlayerXR extends Activity
     @Override
     public void onVrSessionAway() {
         main.post(() -> {
-            if (player != null && player.isPlaying()) {
-                player.pause();
-                saveProgress();
+            if (playing()) {
+                setPlaying(false);
+                tickBar();
             }
         });
     }
 
     // For 继续观看. Only when the wall said which item this is: an adb launch
-    // with a bare uri has nothing to file it under.
+    // with a bare uri, or a cast, has nothing to file it under.
     private void saveProgress() {
-        MediaPlayer mp = player;
+        ExoPlayer p = player;
         Intent in = getIntent();
         String source = in.getStringExtra(EXTRA_SOURCE_ID);
         String item = in.getStringExtra(EXTRA_ITEM_ID);
-        if (mp == null || !prepared || source == null || item == null) {
+        if (p == null || !ready || source == null || item == null) {
             return;
         }
-        try {
-            WatchHistory.save(this, source, item, in.getStringExtra(EXTRA_TITLE),
-                    mp.getCurrentPosition(), mp.getDuration());
-        } catch (IllegalStateException ignored) {
-        }
+        WatchHistory.save(this, source, item, in.getStringExtra(EXTRA_TITLE), position(), duration());
     }
 
     // ---- lifecycle ----
@@ -378,21 +751,52 @@ public class LocalPlayerXR extends Activity
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        if (finishing) {
-            return;
+        XrRenderer r;
+        boolean gate;
+        synchronized (life) {
+            if (destroyed) {
+                return;
+            }
+            destroyed = true;
+            r = renderer;
+            renderer = null;
+            gate = gated;
+            gated = false;
         }
-        finishing = true;
+        // A start still waiting on the probe goes on, to find it is gone
+        probed.countDown();
         main.removeCallbacks(barTick);
-        if (player != null) {
+        ExoPlayer p = player;
+        long pos = position(), dur = duration();
+        if (p != null) {
             saveProgress();
-            player.release();
+            // Before the renderer lets the surface go, which the codec draws into
+            p.release();
             player = null;
         }
-        XrRenderer r = renderer;
-        renderer = null;
+        // Started again for the same cast: the phone is not told it ended
+        PlayerLink.detach(this, castId, pos, dur, relaunch == null);
         if (r != null) {
             r.prepareForStop();
             r.cleanup();
+        }
+        if (gate) {
+            SESSION.release();
+        }
+        if (held) {
+            held = false;
+            CastReceiver.release(this);
+        }
+        final Intent again = relaunch;
+        if (again != null) {
+            final Context app = getApplicationContext();
+            main.post(() -> {
+                try {
+                    app.startActivity(again);
+                } catch (RuntimeException e) {
+                    LimeLog.warning("depth3d: could not start the player again: " + e);
+                }
+            });
         }
     }
 }

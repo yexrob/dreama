@@ -14,6 +14,7 @@ import com.limelight.LimeLog
 import com.limelight.PcView
 import com.limelight.local.LocalPlayerXR
 import com.limelight.local.WebDav
+import com.limelight.local.dlna.CastReceiver
 import com.limelight.local.media.LocalVideoSource
 import com.limelight.local.media.PlaybackInfo
 import com.limelight.preferences.StreamSettings
@@ -60,6 +61,18 @@ class WallActivity : ComponentActivity(), WallActions {
             LimeLog.info("depth3d: wall window ${v.width}x${v.height} px, density ${resources.displayMetrics.density}, " +
                 "${v.width / DESIGN_WIDTH} px per design unit")
         }
+    }
+
+    // The DLNA cast receiver runs while the wall is in front (and the player
+    // holds it while a film plays), never once the app is closed
+    override fun onStart() {
+        super.onStart()
+        CastReceiver.hold(this)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        CastReceiver.release(this)
     }
 
     override fun onRestart() {
