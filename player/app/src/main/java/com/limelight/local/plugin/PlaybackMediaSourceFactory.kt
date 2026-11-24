@@ -1,6 +1,8 @@
 package com.limelight.local.plugin
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.annotation.OptIn
 import androidx.media3.common.C
@@ -95,16 +97,122 @@ object PluginPlayback {
  * The ONLY public image loading entry point for plugin artwork (`poster`,
  * `thumb`, `backdrop`, `avatar`) (§11.3).
  *
- * Wall UI code MUST load plugin [Artwork] exclusively through [PluginImages]
- * so every image URL and redirect hop is enforced against the instance's
- * [NetworkPolicy] with DNS pinning, HTTPS downgrade blocking, and cross-origin
- * header stripping.
+ * Wall UI code MUST load plugin [Artwork] exclusively through [PluginImages.loadBitmap]
+ * (NEVER via `Artworks.load`, raw `OkHttpClient`, or `MediaMetadataRetriever`).
+ * Every image URL and redirect hop is enforced against the instance's
+ * [NetworkPolicy] with DNS pinning, HTTPS downgrade blocking, cross-origin
+ * header stripping, 16 MB download cap, and `inJustDecodeBounds` pixel-count
+ * limiting BEFORE decoding pixels into memory.
  */
 object PluginImages {
-    suspend fun loadBytes(
+    const val DEFAULT_MAX_EDGE_PX: Int = 1280
+    const val MAX_DECODED_PIXELS: Long = 16_000_000L
+    const val MAX_RAW_EDGE_PX: Int = 16_384
+    const val MAX_RAW_SOURCE_PIXELS: Long = 64_000_000L
+
+    suspend fun loadBitmap(
         source: PluginMediaSource,
         artwork: Artwork,
-    ): ByteArray = source.createImageFetcher().fetchBytes(artwork)
+        maxEdgePx: Int = DEFAULT_MAX_EDGE_PX,
+        maxPixels: Long = MAX_DECODED_PIXELS,
+    ): Bitmap? {
+        if (artwork.isVideoFrame) {
+            throw IllegalArgumentException(
+                "插件图片来源禁止使用 isVideoFrame / MediaMetadataRetriever 路径，请使用普通图片地址或占位图",
+            )
+        }
+        val bytes = source.createImageFetcher().fetchBytes(artwork)
+        return decodeBoundedBitmap(bytes, maxEdgePx = maxEdgePx, maxPixels = maxPixels)
+    }
+
+    internal fun decodeBoundedBitmap(
+        bytes: ByteArray,
+        maxEdgePx: Int = DEFAULT_MAX_EDGE_PX,
+        maxPixels: Long = MAX_DECODED_PIXELS,
+    ): Bitmap? {
+        require(maxEdgePx > 0) { "maxEdgePx must be positive" }
+        require(maxPixels > 0L) { "maxPixels must be positive" }
+        if (bytes.isEmpty()) return null
+
+        // Fast header guard for PNG IHDR bombs before touching platform decoders
+        peekPngDimensions(bytes)?.let { (pngW, pngH) ->
+            val pngPixels = pngW.toLong() * pngH.toLong()
+            if (pngW <= 0 || pngH <= 0 || pngW > MAX_RAW_EDGE_PX || pngH > MAX_RAW_EDGE_PX || pngPixels > MAX_RAW_SOURCE_PIXELS) {
+                throw IOException("图片尺寸过大（${pngW}x${pngH}），已拒绝解码以保护内存")
+            }
+        }
+
+        // Pass 1: inspect dimensions via inJustDecodeBounds BEFORE allocating pixel buffers
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        val rawW = bounds.outWidth
+        val rawH = bounds.outHeight
+        if (rawW <= 0 || rawH <= 0) return null
+        val rawPixels = rawW.toLong() * rawH.toLong()
+        if (rawW > MAX_RAW_EDGE_PX || rawH > MAX_RAW_EDGE_PX || rawPixels > MAX_RAW_SOURCE_PIXELS) {
+            throw IOException("图片尺寸过大（${rawW}x${rawH}），已拒绝解码以保护内存")
+        }
+
+        // Compute power-of-2 inSampleSize so decoded dimensions fit BOTH maxEdgePx and maxPixels
+        var sampleSize = 1
+        while (true) {
+            val estW = (rawW + sampleSize - 1) / sampleSize
+            val estH = (rawH + sampleSize - 1) / sampleSize
+            val estPixels = estW.toLong() * estH.toLong()
+            if (estW <= maxEdgePx && estH <= maxEdgePx && estPixels <= maxPixels) {
+                break
+            }
+            val next = sampleSize * 2
+            if (next <= 0 || next > 64) break
+            sampleSize = next
+        }
+
+        // Pass 2: decode downsampled bitmap with RGB_565 to cap memory footprint
+        val decodeOpts = BitmapFactory.Options().apply {
+            inSampleSize = sampleSize
+            inPreferredConfig = Bitmap.Config.RGB_565
+        }
+        val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts) ?: return null
+        val longEdge = maxOf(decoded.width, decoded.height)
+        val decodedPixels = decoded.width.toLong() * decoded.height.toLong()
+        if (longEdge <= maxEdgePx && decodedPixels <= maxPixels) {
+            return decoded
+        }
+        val edgeScale = maxEdgePx.toDouble() / longEdge.toDouble()
+        val pixelScale = kotlin.math.sqrt(maxPixels.toDouble() / decodedPixels.toDouble())
+        val scale = minOf(edgeScale, pixelScale).coerceAtMost(1.0)
+        val targetW = (decoded.width * scale).toInt().coerceAtLeast(1)
+        val targetH = (decoded.height * scale).toInt().coerceAtLeast(1)
+        val scaled = Bitmap.createScaledBitmap(decoded, targetW, targetH, true)
+        if (scaled !== decoded) {
+            decoded.recycle()
+        }
+        return scaled
+    }
+
+    private fun peekPngDimensions(bytes: ByteArray): Pair<Int, Int>? {
+        // 8-byte PNG signature + 4-byte len + 4-byte "IHDR" + 4-byte width + 4-byte height = 24 bytes
+        if (bytes.size < 24) return null
+        if (bytes[0] != 0x89.toByte() || bytes[1] != 0x50.toByte() || bytes[2] != 0x4E.toByte() || bytes[3] != 0x47.toByte() ||
+            bytes[4] != 0x0D.toByte() || bytes[5] != 0x0A.toByte() || bytes[6] != 0x1A.toByte() || bytes[7] != 0x0A.toByte()
+        ) {
+            return null
+        }
+        if (bytes[12] != 'I'.code.toByte() || bytes[13] != 'H'.code.toByte() ||
+            bytes[14] != 'D'.code.toByte() || bytes[15] != 'R'.code.toByte()
+        ) {
+            return null
+        }
+        val w = ((bytes[16].toInt() and 0xFF) shl 24) or
+            ((bytes[17].toInt() and 0xFF) shl 16) or
+            ((bytes[18].toInt() and 0xFF) shl 8) or
+            (bytes[19].toInt() and 0xFF)
+        val h = ((bytes[20].toInt() and 0xFF) shl 24) or
+            ((bytes[21].toInt() and 0xFF) shl 16) or
+            ((bytes[22].toInt() and 0xFF) shl 8) or
+            (bytes[23].toInt() and 0xFF)
+        return w to h
+    }
 }
 
 internal sealed interface ResolvedStreamPlan {
@@ -771,6 +879,7 @@ internal class FailoverUrlDataSource(
 @OptIn(UnstableApi::class)
 internal class JsonSubtitleVttDataSource(
     private val upstreamFactory: DataSource.Factory,
+    private val maxSubtitleBytes: Int = MAX_SUBTITLE_BYTES,
 ) : BaseDataSource(/* isNetwork = */ true) {
     private var converted: ByteArray? = null
     private var offset: Int = 0
@@ -779,14 +888,25 @@ internal class JsonSubtitleVttDataSource(
     override fun open(dataSpec: DataSpec): Long {
         transferInitializing(dataSpec)
         openedUri = dataSpec.uri
+        if (dataSpec.length != C.LENGTH_UNSET.toLong() && dataSpec.length > maxSubtitleBytes) {
+            throw IOException("字幕文件超过大小上限（${maxSubtitleBytes / (1024 * 1024)} MB）")
+        }
         val delegate = upstreamFactory.createDataSource()
         val raw = try {
-            delegate.open(dataSpec)
+            val contentLen = delegate.open(dataSpec)
+            if (contentLen != C.LENGTH_UNSET.toLong() && contentLen > maxSubtitleBytes) {
+                throw IOException("字幕文件超过大小上限（${maxSubtitleBytes / (1024 * 1024)} MB）")
+            }
             val buf = ByteArray(8192)
             val out = ByteArrayOutputStream()
+            var totalRead = 0L
             while (true) {
                 val n = delegate.read(buf, 0, buf.size)
                 if (n < 0) break
+                totalRead += n
+                if (totalRead > maxSubtitleBytes) {
+                    throw IOException("字幕文件超过大小上限（${maxSubtitleBytes / (1024 * 1024)} MB）")
+                }
                 out.write(buf, 0, n)
             }
             out.toString(Charsets.UTF_8.name())
@@ -798,6 +918,10 @@ internal class JsonSubtitleVttDataSource(
         offset = 0
         transferStarted(dataSpec)
         return vttBytes.size.toLong()
+    }
+
+    companion object {
+        const val MAX_SUBTITLE_BYTES: Int = 4 * 1024 * 1024
     }
 
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {

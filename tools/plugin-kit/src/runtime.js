@@ -5,7 +5,7 @@ import { getQuickJS } from 'quickjs-emscripten';
 import { pluginCrypto } from './crypto.js';
 import { PluginCookieJar } from './cookies.js';
 import { PluginDomParser } from './dom.js';
-import { FetchGateway } from './fetch-gateway.js';
+import { FetchGateway, MAX_FETCH_META_JSON_BYTES } from './fetch-gateway.js';
 import { PluginLocale } from './locale.js';
 import { MAX_LOG_MESSAGE_BYTES, PluginLogger, truncateUtf8 } from './logger.js';
 import { NetworkPolicy, extractUserHosts } from './network-policy.js';
@@ -639,18 +639,42 @@ export class QuickJsPluginHost {
     });
 
     // §11.1 (B2): binary fetchMeta + single-consume fetchReadBytes/fetchReadText
+    // Enforce raw envelope, URL (8 KB), headers (32 KB), body (2 MB), and queue (16)
+    // limits BEFORE decoding body bytes or queuing.
     addAsync('fetchMeta', async (reqJson, gen) => {
-      const req = JSON.parse(reqJson);
-      let body = null;
-      if (req.bodyBase64 !== undefined) body = Buffer.from(req.bodyBase64, 'base64');
-      else if (req.bodyText !== undefined) body = Buffer.from(req.bodyText, 'utf8');
-      const resp = await this.fetchGateway.fetch({
-        url: req.url,
-        method: req.method,
-        headers: req.headers,
-        body,
-        timeoutMs: req.timeoutMs,
-        redirect: req.redirect,
+      const rawStr = String(reqJson ?? '');
+      if (Buffer.byteLength(rawStr, 'utf8') > MAX_FETCH_META_JSON_BYTES) {
+        throw new RangeError('请求内容超过大小限制（请求体上限 2 MB）');
+      }
+      const req = JSON.parse(rawStr);
+      this.fetchGateway.validateRequestLimits(req.url, req.headers, null);
+      if (req.bodyBase64 !== undefined) {
+        const approxBytes = Math.floor((String(req.bodyBase64).length * 3) / 4);
+        if (approxBytes > this.fetchGateway.maxRequestBodyBytes + 3) {
+          throw new RangeError('请求体超过大小限制（上限 2 MB）');
+        }
+      } else if (req.bodyText !== undefined) {
+        if (Buffer.byteLength(String(req.bodyText), 'utf8') > this.fetchGateway.maxRequestBodyBytes) {
+          throw new RangeError('请求体超过大小限制（上限 2 MB）');
+        }
+      }
+      const resp = await this.fetchGateway.withSlot(async (signal) => {
+        let body = null;
+        if (req.bodyBase64 !== undefined) {
+          body = Buffer.from(req.bodyBase64, 'base64');
+          this.fetchGateway.validateRequestLimits(req.url, req.headers, body);
+        } else if (req.bodyText !== undefined) {
+          body = Buffer.from(req.bodyText, 'utf8');
+          this.fetchGateway.validateRequestLimits(req.url, req.headers, body);
+        }
+        return this.fetchGateway._execute({
+          url: req.url,
+          method: req.method,
+          headers: req.headers,
+          body,
+          timeoutMs: req.timeoutMs,
+          redirect: req.redirect,
+        }, this.defaultTimeoutMs, signal);
       });
       if (gen !== this.callGen) {
         throw new Error('请求已取消');

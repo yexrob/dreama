@@ -15,6 +15,16 @@ const SIG_DD = 0x08074b50;
 const SIG_CDH = 0x02014b50;
 const SIG_EOCD = 0x06054b50;
 
+const strictUtf8Decoder = new TextDecoder('utf-8', { fatal: true });
+
+function decodeStrictUtf8(buf, label) {
+  try {
+    return strictUtf8Decoder.decode(buf);
+  } catch {
+    throw new Error(`Invalid UTF-8 bytes in plugin archive (${label})`);
+  }
+}
+
 // Standard IEEE 802.3 CRC-32 table (works identically across all Node versions)
 const CRC32_TABLE = (() => {
   const t = new Uint32Array(256);
@@ -188,7 +198,7 @@ export async function inspectArchiveBuffer(inputBuf) {
     if (nextPos > eocdOffset) throw new Error('Zip Central Directory entry out of bounds');
 
     const rawNameBuf = buf.subarray(nameStart, nameStart + nameLen);
-    const rawName = rawNameBuf.toString('utf8');
+    const rawName = decodeStrictUtf8(rawNameBuf, 'zip entry name');
     const normName = normalizeEntryName(rawName);
     if (seenRaw.has(rawName) || seenNorm.has(normName)) {
       throw new Error(`Archive contains duplicate entry: ${rawName}`);
@@ -300,7 +310,11 @@ export async function inspectArchiveBuffer(inputBuf) {
     if (cd.method === 0) {
       content = compData;
     } else {
-      content = zlib.inflateRawSync(compData, { maxOutputLength: remaining });
+      const inflated = zlib.inflateRawSync(compData, { info: true, maxOutputLength: remaining });
+      if (inflated.engine.bytesWritten !== compData.length) {
+        throw new Error(`Zip deflate stream contains trailing unconsumed bytes: ${cd.rawName}`);
+      }
+      content = inflated.buffer;
     }
     totalUnpacked += content.length;
 
@@ -317,13 +331,13 @@ export async function inspectArchiveBuffer(inputBuf) {
         throw new Error(`Zip CRC-32 verification failed: ${cd.rawName}`);
       }
 
-      if (cd.normName === 'manifest.json') manifestRaw = content.toString('utf8');
-      else if (cd.normName === 'main.js') mainJs = content.toString('utf8');
+      if (cd.normName === 'manifest.json') manifestRaw = decodeStrictUtf8(content, 'manifest.json');
+      else if (cd.normName === 'main.js') mainJs = decodeStrictUtf8(content, 'main.js');
       else if (cd.normName === 'icon.png') iconPng = Buffer.from(content);
       else if (cd.normName.startsWith('locales/') && cd.normName.endsWith('.json')) {
         const tag = cd.normName.slice('locales/'.length, -'.json'.length);
         if (tag && !tag.includes('/')) {
-          locales[tag] = content.toString('utf8');
+          locales[tag] = decodeStrictUtf8(content, cd.normName);
         }
       }
     }

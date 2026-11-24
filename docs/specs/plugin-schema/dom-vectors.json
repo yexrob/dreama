@@ -1,63 +1,98 @@
 {
-  "description": "Shared HTML & XML DOM parsing parity vectors enforced identically by Android PluginDomParser (Jsoup) and tools/plugin-kit PluginDomParser (linkedom DOMParser).",
+  "description": "Shared HTML/XML DOM parity test vectors run identically on Android PluginDomParser (Jsoup) and tools/plugin-kit (linkedom).",
   "cases": [
     {
       "name": "xml_dash_mpd_self_closing_and_case",
       "mode": "xml",
-      "input": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" xmlns:dvb=\"urn:dvb:dash:profile:dvb-dash:2014\" type=\"static\">\n  <Period id=\"0\">\n    <AdaptationSet id=\"0\" contentType=\"video\">\n      <Representation id=\"v1\" mimeType=\"video/mp4\" codecs=\"avc1.640028\">\n        <SegmentBase indexRange=\"821-1020\">\n          <Initialization range=\"0-820\"/>\n        </SegmentBase>\n        <BaseURL dvb:priority=\"1\">  https://primary.example/v.m4s \n  </BaseURL>\n        <BaseURL dvb:priority=\"2\">https://backup.example/v.m4s</BaseURL>\n      </Representation>\n    </AdaptationSet>\n  </Period>\n</MPD>",
+      "input": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><MPD xmlns:dvb=\"urn:dvb:dash:dash-extensions:2014-1\" mediaPresentationDuration=\"PT120S\"><Period><AdaptationSet mimeType=\"video/mp4\"><Representation id=\"v1\" bandwidth=\"4000000\"><BaseURL dvb:priority=\"1\">https://cdn1.example.com/v.mp4</BaseURL><BaseURL dvb:priority=\"2\">https://cdn2.example.com/v.mp4</BaseURL><SegmentBase indexRange=\"700-750\"><Initialization range=\"0-699\"/><RepresentationIndex range=\"700-750\"/></SegmentBase></Representation></AdaptationSet></Period></MPD>",
       "assertions": [
         { "op": "rootTag", "expected": "#document" },
         { "op": "rootChildrenTags", "expected": ["MPD"] },
-        { "op": "firstTag", "selector": "MPD", "expected": "MPD" },
-        { "op": "firstAttr", "selector": "MPD", "attr": "type", "expected": "static" },
-        { "op": "firstAttr", "selector": "MPD", "attr": "missingAttr", "expected": null },
-        { "op": "firstTag", "selector": "SegmentBase > Initialization", "expected": "Initialization" },
-        { "op": "firstAttr", "selector": "SegmentBase > Initialization", "attr": "range", "expected": "0-820" },
-        { "op": "allTexts", "selector": "Representation BaseURL", "expected": ["https://primary.example/v.m4s", "https://backup.example/v.m4s"] },
-        { "op": "allTags", "selector": "Representation BaseURL", "expected": ["BaseURL", "BaseURL"] },
-        { "op": "allAttrs", "selector": "Representation BaseURL", "attr": "dvb:priority", "expected": ["1", "2"] }
+        { "op": "firstTag", "selector": "Representation", "expected": "Representation" },
+        { "op": "firstTag", "selector": "representation", "expected": null },
+        { "op": "firstAttr", "selector": "Representation", "attr": "id", "expected": "v1" },
+        { "op": "firstAttr", "selector": "Representation", "attr": "ID", "expected": null },
+        { "op": "firstAttr", "selector": "Representation", "attr": "missing", "expected": null },
+        { "op": "allTexts", "selector": "BaseURL", "expected": ["https://cdn1.example.com/v.mp4", "https://cdn2.example.com/v.mp4"] },
+        { "op": "allAttrs", "selector": "BaseURL", "attr": "dvb:priority", "expected": ["1", "2"] },
+        { "op": "childrenTags", "selector": "SegmentBase", "expected": ["Initialization", "RepresentationIndex"] },
+        { "op": "firstAttr", "selector": "Initialization", "attr": "range", "expected": "0-699" }
       ]
     },
     {
       "name": "xml_rss_cdata_and_link",
       "mode": "xml",
-      "input": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\">\n  <channel>\n    <title>  Feed   Title  </title>\n    <item>\n      <title><![CDATA[Hello & <World>   2026]]></title>\n      <link>https://example.com/episodes/42</link>\n      <enclosure url=\"https://cdn.example.com/ep42.mp4\" type=\"video/mp4\"/>\n      <guid>ep-42</guid>\n    </item>\n  </channel>\n</rss>",
+      "input": "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><item><title><![CDATA[  Hello & <World>   2026  ]]></title><link>https://feeds.example.com/ep/1</link><description>Plain   text</description></item></channel></rss>",
       "assertions": [
         { "op": "rootTag", "expected": "#document" },
-        { "op": "firstText", "selector": "channel > title", "expected": "Feed Title" },
-        { "op": "firstText", "selector": "item > title", "expected": "Hello & <World> 2026" },
-        { "op": "firstText", "selector": "item > link", "expected": "https://example.com/episodes/42" },
-        { "op": "firstAttr", "selector": "item > enclosure", "attr": "url", "expected": "https://cdn.example.com/ep42.mp4" },
-        { "op": "firstText", "selector": "item > guid", "expected": "ep-42" }
+        { "op": "firstTag", "selector": "rss", "expected": "rss" },
+        { "op": "firstText", "selector": "item title", "expected": "Hello & <World> 2026" },
+        { "op": "firstText", "selector": "item link", "expected": "https://feeds.example.com/ep/1" },
+        { "op": "firstText", "selector": "item description", "expected": "Plain text" },
+        { "op": "firstText", "selector": "item", "expected": "Hello & <World> 2026 https://feeds.example.com/ep/1Plain text" }
       ]
     },
     {
-      "name": "html_full_doc_case_whitespace_and_attrs",
-      "mode": "html",
-      "input": "<!DOCTYPE html><html><head><title>Page</title></head><body><DIV class=\"card\" data-id=\"42\" disabled><A href=\"/watch/42\">  Episode\n   \t One  </A><SPAN class=\"meta\">HD</SPAN></DIV></body></html>",
+      "name": "xml_namespaces_entities_and_case_sensitivity",
+      "mode": "xml",
+      "input": "<?xml version=\"1.0\"?><!DOCTYPE r [<!ENTITY e \"EXP\">]><r xmlns:dvb=\"u\"><dvb:x Attr=\"1\">caf&eacute; &amp; &#233; &e;</dvb:x><item><title>A</title><description>B</description></item><a><b/><c>after</c></a></r>",
       "assertions": [
-        { "op": "rootTag", "expected": "#document" },
-        { "op": "rootChildrenTags", "expected": ["html"] },
-        { "op": "firstTag", "selector": "div.card", "expected": "div" },
-        { "op": "firstAttr", "selector": "div.card", "attr": "data-id", "expected": "42" },
-        { "op": "firstAttr", "selector": "div.card", "attr": "disabled", "expected": "" },
-        { "op": "firstAttr", "selector": "div.card", "attr": "nonexistent", "expected": null },
-        { "op": "firstTag", "selector": "div.card > a", "expected": "a" },
-        { "op": "firstText", "selector": "div.card > a", "expected": "Episode One" },
-        { "op": "firstText", "selector": "div.card", "expected": "Episode One HD" },
-        { "op": "childrenTags", "selector": "div.card", "expected": ["a", "span"] }
+        { "op": "firstText", "selector": "dvb|x", "expected": "caf&eacute; & \u00e9 &e;" },
+        { "op": "firstAttr", "selector": "dvb|x", "attr": "Attr", "expected": "1" },
+        { "op": "firstAttr", "selector": "dvb|x", "attr": "attr", "expected": null },
+        { "op": "firstTag", "selector": "dvb|x[Attr=\"1\"]", "expected": "dvb:x" },
+        { "op": "firstTag", "selector": "dvb|x[attr=\"1\"]", "expected": null },
+        { "op": "firstText", "selector": "item", "expected": "AB" },
+        { "op": "firstText", "selector": "a > c", "expected": "after" }
       ]
     },
     {
-      "name": "html_fragment_unified_root_and_selectors",
+      "name": "html_case_whitespace_and_attrs",
       "mode": "html",
-      "input": "<ul class=\"list\"><li data-idx=\"1\">  Alpha \n Beta </li><li data-idx=\"2\">Gamma</li></ul>",
+      "input": "<!DOCTYPE html><html><head><title>Sample</title></head><body><DIV class=\"Hero\" DATA-X=\"1\" data-id=\"42\" disabled><H1>  Title   One </H1><P>Line  1</P><P>Line\n\t2</P></DIV><div class=\"a\"><div class=\"b\">inner</div></div></body></html>",
       "assertions": [
         { "op": "rootTag", "expected": "#document" },
-        { "op": "rootChildrenTags", "expected": ["html"] },
-        { "op": "allTexts", "selector": "ul.list > li", "expected": ["Alpha Beta", "Gamma"] },
-        { "op": "allAttrs", "selector": "ul.list > li", "attr": "data-idx", "expected": ["1", "2"] },
-        { "op": "firstAttr", "selector": "ul.list", "attr": "id", "expected": null }
+        { "op": "firstTag", "selector": ".Hero", "expected": "div" },
+        { "op": "firstTag", "selector": "H1", "expected": "h1" },
+        { "op": "firstText", "selector": "h1", "expected": "Title One" },
+        { "op": "firstText", "selector": ".Hero", "expected": "Title One Line 1 Line 2" },
+        { "op": "firstAttr", "selector": ".Hero", "attr": "data-id", "expected": "42" },
+        { "op": "firstAttr", "selector": ".Hero", "attr": "data-x", "expected": "1" },
+        { "op": "firstAttr", "selector": ".Hero", "attr": "DATA-X", "expected": "1" },
+        { "op": "firstAttr", "selector": ".Hero", "attr": "disabled", "expected": "" },
+        { "op": "firstAttr", "selector": ".Hero", "attr": "nonexistent", "expected": null },
+        { "op": "allTexts", "selector": "p", "expected": ["Line 1", "Line 2"] },
+        { "op": "subFirstAttr", "parent": "div.a", "selector": "div", "attr": "class", "expected": "b" }
+      ]
+    },
+    {
+      "name": "html_script_style_blocks_unicode_space_and_unsupported_pseudos",
+      "mode": "html",
+      "input": "<!DOCTYPE html><html><head><title>T</title><style>.x{color:red}</style></head><body><div id=\"s\"><script>var x=1;</script><style>body{display:none}</style>Hi</div><div id=\"n\">a&nbsp;&nbsp;b</div><div id=\"br\">a<br>b</div><div id=\"v\"><span>a</span><video>v</video>b</div><div id=\"d\"><details><summary>S</summary>D</details>x</div><select id=\"sel\"><option>o1</option><option>o2</option></select><div id=\"u\">a\u2003\u2003b</div><table id=\"tb\"><tr><td>a</td><td>b</td></tr></table><div id=\"ta\"><textarea>  t  </textarea></div><ul><li>1</li><li>2</li></ul></body></html>",
+      "assertions": [
+        { "op": "firstText", "selector": "#s", "expected": "Hi" },
+        { "op": "firstText", "selector": "#n", "expected": "a b" },
+        { "op": "firstText", "selector": "#br", "expected": "a b" },
+        { "op": "firstText", "selector": "#v", "expected": "a v b" },
+        { "op": "firstText", "selector": "#d", "expected": "SD x" },
+        { "op": "firstText", "selector": "#sel", "expected": "o1 o2" },
+        { "op": "firstText", "selector": "#u", "expected": "a\u2003\u2003b" },
+        { "op": "firstText", "selector": "#tb", "expected": "a b" },
+        { "op": "firstText", "selector": "#ta", "expected": "t" },
+        { "op": "firstText", "selector": "li:nth-child(2)", "expected": "2" },
+        { "op": "selectorThrows", "selector": "li:eq(1)", "expected": true },
+        { "op": "selectorThrows", "selector": "div:contains(Hi)", "expected": true }
+      ]
+    },
+    {
+      "name": "html_fragment_wrapping",
+      "mode": "html",
+      "input": "<title>T</title><p>body</p><ul class=\"list\"><li>First</li><li>Second</li></ul>",
+      "assertions": [
+        { "op": "rootTag", "expected": "#document" },
+        { "op": "rootText", "expected": "T body First Second" },
+        { "op": "allTexts", "selector": "ul.list > li", "expected": ["First", "Second"] },
+        { "op": "allTags", "selector": "ul.list > li", "expected": ["li", "li"] }
       ]
     }
   ]

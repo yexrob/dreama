@@ -187,6 +187,24 @@
   // and strict per-instance active timer limit (256 max, §11.1).
   const MAX_ACTIVE_TIMERS = 256;
   const MAX_RETURN_BYTES = 8 * 1024 * 1024;
+  const MAX_FETCH_URL_BYTES = 8 * 1024;
+  const MAX_FETCH_HEADERS_BYTES = 32 * 1024;
+  const MAX_FETCH_BODY_BYTES = 2 * 1024 * 1024;
+
+  function utf8ByteLength(str) {
+    const s = String(str);
+    let n = 0;
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i);
+      if (c < 0x80) n += 1;
+      else if (c < 0x800) n += 2;
+      else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length) {
+        n += 4;
+        i += 1;
+      } else n += 3;
+    }
+    return n;
+  }
   let currentGen = 0;
   let nextTimerId = 1;
   const activeTimerIds = new Set();
@@ -318,27 +336,57 @@
 
       async fetch(url, opts) {
         const o = opts || {};
+        const urlStr = String(url);
+        if (utf8ByteLength(urlStr) > MAX_FETCH_URL_BYTES) {
+          throw new RangeError('请求 URL 超过大小限制（上限 8 KB）');
+        }
         const req = {
-          url: String(url),
+          url: urlStr,
           method: o.method ? String(o.method) : 'GET',
           headers: {},
           redirect: o.redirect ? String(o.redirect) : 'follow',
         };
         if (o.timeoutMs !== undefined && o.timeoutMs !== null) req.timeoutMs = Number(o.timeoutMs);
+        let headersBytes = 0;
         if (o.headers && typeof o.headers === 'object') {
           for (const [k, v] of Object.entries(o.headers)) {
-            if (v !== undefined && v !== null) req.headers[String(k)] = String(v);
+            if (v !== undefined && v !== null) {
+              const ks = String(k);
+              const vs = String(v);
+              headersBytes += utf8ByteLength(ks) + utf8ByteLength(vs) + 4;
+              if (headersBytes > MAX_FETCH_HEADERS_BYTES) {
+                throw new RangeError('请求头总大小超过限制（上限 32 KB）');
+              }
+              req.headers[ks] = vs;
+            }
           }
         }
         if (o.body !== undefined && o.body !== null) {
           if (o.body instanceof Uint8Array || ArrayBuffer.isView(o.body) || o.body instanceof ArrayBuffer) {
+            const byteLen = o.body instanceof ArrayBuffer ? o.body.byteLength : o.body.byteLength;
+            if (byteLen > MAX_FETCH_BODY_BYTES) {
+              throw new RangeError('请求体超过大小限制（上限 2 MB）');
+            }
             req.bodyBase64 = toInputBase64(o.body);
           } else if (typeof o.body === 'string') {
+            if (utf8ByteLength(o.body) > MAX_FETCH_BODY_BYTES) {
+              throw new RangeError('请求体超过大小限制（上限 2 MB）');
+            }
             req.bodyText = o.body;
           } else {
-            req.bodyText = JSON.stringify(o.body);
+            const serialized = JSON.stringify(o.body);
+            if (utf8ByteLength(serialized) > MAX_FETCH_BODY_BYTES) {
+              throw new RangeError('请求体超过大小限制（上限 2 MB）');
+            }
+            req.bodyText = serialized;
             if (!Object.keys(req.headers).some((k) => k.toLowerCase() === 'content-type')) {
-              req.headers['Content-Type'] = 'application/json; charset=utf-8';
+              const ctKey = 'Content-Type';
+              const ctVal = 'application/json; charset=utf-8';
+              headersBytes += utf8ByteLength(ctKey) + utf8ByteLength(ctVal) + 4;
+              if (headersBytes > MAX_FETCH_HEADERS_BYTES) {
+                throw new RangeError('请求头总大小超过限制（上限 32 KB）');
+              }
+              req.headers[ctKey] = ctVal;
             }
           }
         }

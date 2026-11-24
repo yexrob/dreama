@@ -787,6 +787,7 @@ class CtxApiAndRecoveryTest {
                   const out = [];
                   for (const a of arg.assertions) {
                     if (a.op === 'rootTag') out.push(doc.tag);
+                    else if (a.op === 'rootText') out.push(doc.text);
                     else if (a.op === 'rootChildrenTags') out.push(doc.children.map((c) => c.tag));
                     else if (a.op === 'firstTag') out.push(doc.querySelector(a.selector)?.tag ?? null);
                     else if (a.op === 'firstText') out.push(doc.querySelector(a.selector)?.text ?? null);
@@ -795,6 +796,14 @@ class CtxApiAndRecoveryTest {
                     else if (a.op === 'allTags') out.push(doc.querySelectorAll(a.selector).map((n) => n.tag));
                     else if (a.op === 'allAttrs') out.push(doc.querySelectorAll(a.selector).map((n) => n.attr(a.attr)));
                     else if (a.op === 'childrenTags') out.push(doc.querySelector(a.selector).children.map((c) => c.tag));
+                    else if (a.op === 'subFirstAttr') {
+                      const p = doc.querySelector(a.parent);
+                      out.push(p ? (p.querySelector(a.selector)?.attr(a.attr) ?? null) : null);
+                    } else if (a.op === 'selectorThrows') {
+                      let threw = false;
+                      try { doc.querySelector(a.selector); } catch { threw = true; }
+                      out.push(threw);
+                    }
                   }
                   return out;
                 }
@@ -924,22 +933,39 @@ class CtxApiAndRecoveryTest {
             } catch (_: StorageQuotaExceededException) {
             }
 
-            // 4. Item #3c: Return payload > 8 MB maps to Internal without parsing huge host JSON
-            val usedBeforeReturn = Runtime.getRuntime().let { it.totalMemory() - it.freeMemory() }
+            // 4. Item #3c & Round 4 Item #9: Return payload > 8 MB maps to Internal with bounded host heap
+            fun settledUsedBytes(): Long {
+                System.gc()
+                Thread.sleep(20)
+                val rt = Runtime.getRuntime()
+                return rt.totalMemory() - rt.freeMemory()
+            }
+            val usedBeforeReturn = settledUsedBytes()
             try {
                 runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("return-oversize"))))
                 fail("Oversized return value (> 8 MB) must map to PluginInternalException")
             } catch (_: PluginInternalException) {
             }
+            val returnHeapDelta = settledUsedBytes() - usedBeforeReturn
+            assertTrue(
+                "Host heap growth after rejecting 9 MB return must stay bounded (< 8 MB), got ${returnHeapDelta / (1024 * 1024)} MB",
+                returnHeapDelta < 8L * 1024 * 1024,
+            )
             // Runtime remains healthy after rejecting oversized return
             assertEquals(0, runtime.invoke("home").jsonArray.size)
 
             // 5. Item #3d: ctx.parse > 200k nodes rejected BEFORE building 210k Jsoup nodes
+            val usedBeforeDomFlood = settledUsedBytes()
             try {
                 runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("dom-node-flood"))))
                 fail("DOM with 210k elements must be rejected")
             } catch (_: PluginInternalException) {
             }
+            val domFloodDelta = settledUsedBytes() - usedBeforeDomFlood
+            assertTrue(
+                "Rejected 210k-node DOM flood must not grow host heap by > 16 MB, got ${domFloodDelta / (1024 * 1024)} MB",
+                domFloodDelta < 16L * 1024 * 1024,
+            )
             val directDom = PluginDomParser()
             try {
                 directDom.parseHtml("<a></a>".repeat(210_000))
@@ -954,8 +980,8 @@ class CtxApiAndRecoveryTest {
                 fail("257th concurrent setTimeout must be rejected")
             } catch (_: PluginInternalException) {
             }
+            assertEquals("Active timers must return to 0 after call finishes", 0, runtime.currentActiveTimerCount())
             assertEquals(0, runtime.invoke("home").jsonArray.size)
-            assertTrue(usedBeforeReturn >= 0L)
 
             // 7. Item #8a: Single-consume Response body (second read throws TypeError)
             val baseUrl = "http://192.168.1.50:${server.port}"
@@ -1024,6 +1050,253 @@ class CtxApiAndRecoveryTest {
             runtime.close()
             server.shutdown()
             tmpDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun blocksDomFormattingAmplificationUnderConstrainedHeapAndEnforcesFetchRequestLimitsAndAtomicTimers(): Unit = runBlocking {
+        // 1. Round 4 Item #1 [Blocking]: Exact Amp.java formatting-element amplification payload
+        //    ("<div>" + 100 x <b id=i> + "</div>" + 190,000 x <p>x</p>, 1.52 MB, pre-scan 190,101 < 200k)
+        //    MUST throw DomLimitExceededException / PluginInternalException (NOT OutOfMemoryError!)
+        //    under a constrained -Xmx192m heap AND keep heap growth strictly bounded.
+        val javaBin = File(System.getProperty("java.home"), "bin/java").absolutePath
+        val classpath = System.getProperty("java.class.path")
+        val proc = ProcessBuilder(
+            javaBin,
+            "-Xmx192m",
+            "-cp",
+            classpath,
+            DomAmplificationSubprocessMain::class.java.name,
+        ).redirectErrorStream(true).start()
+        val procOut = proc.inputStream.bufferedReader().readText()
+        val exitCode = proc.waitFor()
+        assertEquals("Constrained -Xmx192m DOM amplification probe must exit cleanly (not OOM):\n$procOut", 0, exitCode)
+        assertTrue("Probe must report DOM_LIMIT_THROWN:\n$procOut", procOut.contains("DOM_LIMIT_THROWN"))
+        val deltaMatch = Regex("""HEAP_DELTA_MB=(-?\d+)""").find(procOut)
+        val peakMatch = Regex("""PEAK_DELTA_MB=(-?\d+)""").find(procOut)
+        assertTrue("Probe must report HEAP_DELTA_MB and PEAK_DELTA_MB:\n$procOut", deltaMatch != null && peakMatch != null)
+        val heapDeltaMb = deltaMatch!!.groupValues[1].toLong()
+        val peakDeltaMb = peakMatch!!.groupValues[1].toLong()
+        assertTrue(
+            "Peak heap growth DURING parsing under -Xmx192m must stay bounded (< 96 MB, vs 388 MB OOM), got $peakDeltaMb MB:\n$procOut",
+            peakDeltaMb < 96L,
+        )
+        assertTrue(
+            "Retained heap growth after abort must stay bounded (< 32 MB), got $heapDeltaMb MB:\n$procOut",
+            heapDeltaMb < 32L,
+        )
+
+        // Also verify through real QuickJS PluginRuntime -> maps cleanly to PluginInternalException
+        val tmpDir = Files.createTempDirectory("d3-r4-limits").toFile()
+        val secretBox = SoftwareAesSecretBox()
+        val logger = PluginLogger("dev.depth3d.r4", "inst-r4", sink = { _, _ -> })
+        val storage = InstanceStorage(File(tmpDir, "storage.enc"), secretBox)
+        val cookieJar = PluginCookieJar(File(tmpDir, "cookies.enc"), secretBox)
+
+        val server = MockWebServer()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                if (request.path.orEmpty().startsWith("/slow")) {
+                    Thread.sleep(250)
+                    return MockResponse().setResponseCode(200).setBody("ok")
+                }
+                return MockResponse().setResponseCode(200).setBody("ok")
+            }
+        }
+        server.start()
+
+        val okHttp = OkHttpClient.Builder()
+            .proxy(Proxy.NO_PROXY)
+            .socketFactory(LocalRedirectSocketFactory("192.168.1.50", server.port))
+            .build()
+        val manifest = PluginManifest(
+            api = 1,
+            id = "dev.depth3d.r4",
+            name = "R4",
+            version = "1.0.0",
+            permissions = PluginPermissions(hosts = emptyList(), userHosts = true, lan = true),
+        )
+        val policy = NetworkPolicy(
+            permissions = manifest.permissions,
+            userConfiguredHosts = setOf("192.168.1.50"),
+            dnsResolver = { listOf(InetAddress.getByName("192.168.1.50")) },
+        )
+        val fetchGw = PluginFetchGateway(policy, cookieJar, baseClient = okHttp)
+        val baseUrl = "http://192.168.1.50:${server.port}"
+
+        val mainJs = """
+            export default {
+              home() { return []; },
+              async browse(ctx, arg) {
+                const mode = arg.categoryId;
+                if (mode === 'dom-amp') {
+                  let s = '<div>';
+                  for (let i = 0; i < 100; i++) s += '<b id=' + i + '>';
+                  s += '</div>';
+                  s += '<p>x</p>'.repeat(190000);
+                  ctx.parse.html(s);
+                  return { ok: true };
+                }
+                if (mode === 'fetch-20mb-post') {
+                  // Unawaited multi-POST with 20 MB body must be rejected immediately before host buffering
+                  const big = 'P'.repeat(20 * 1024 * 1024);
+                  await ctx.fetch(arg.url, { method: 'POST', body: big });
+                  return { ok: true };
+                }
+                if (mode === 'fetch-oversize-url') {
+                  await ctx.fetch(arg.url + '/' + 'u'.repeat(9 * 1024));
+                  return { ok: true };
+                }
+                if (mode === 'fetch-oversize-headers') {
+                  await ctx.fetch(arg.url, { headers: { 'X-Big': 'H'.repeat(35 * 1024) } });
+                  return { ok: true };
+                }
+                if (mode === 'fetch-queue-flood') {
+                  const ps = [];
+                  for (let i = 0; i < 25; i++) {
+                    ps.push(
+                      ctx.fetch(arg.url + '/slow?i=' + i).then(
+                        () => 'ok',
+                        (e) => 'err:' + (e.message || String(e)),
+                      ),
+                    );
+                  }
+                  return { results: await Promise.all(ps) };
+                }
+                return { items: [] };
+              },
+              detail() { return { id: '1', kind: 'video', title: '1' }; },
+              playback() { return { url: 'https://cdn.example.com/a.mp4' }; },
+            };
+        """.trimIndent()
+
+        val runtime = PluginRuntime(
+            manifest = manifest,
+            instanceId = "inst-r4",
+            mainJsSource = mainJs,
+            config = emptyMap(),
+            fetchGateway = fetchGw,
+            storage = storage,
+            cookieJar = cookieJar,
+            logger = logger,
+        )
+
+        try {
+            // Item #1 via QuickJS runtime
+            try {
+                runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("dom-amp"))))
+                fail("Formatting-element amplification bomb must map to PluginInternalException")
+            } catch (_: PluginInternalException) {
+            }
+
+            // Item #2a: 20 MB POST rejected immediately with bounded host heap
+            System.gc()
+            Thread.sleep(20)
+            val beforePost = Runtime.getRuntime().let { it.totalMemory() - it.freeMemory() }
+            try {
+                runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("fetch-20mb-post"), "url" to JsonPrimitive(baseUrl))))
+                fail("20 MB POST body must be rejected")
+            } catch (_: PluginInternalException) {
+            }
+            System.gc()
+            Thread.sleep(20)
+            val postDelta = Runtime.getRuntime().let { it.totalMemory() - it.freeMemory() } - beforePost
+            assertTrue(
+                "Host heap must not retain 20 MB POST payload, delta=${postDelta / (1024 * 1024)} MB",
+                postDelta < 16L * 1024 * 1024,
+            )
+
+            // Item #2b: > 8 KB URL and > 32 KB headers rejected
+            try {
+                runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("fetch-oversize-url"), "url" to JsonPrimitive(baseUrl))))
+                fail("> 8 KB URL must be rejected")
+            } catch (_: PluginInternalException) {
+            }
+            try {
+                runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("fetch-oversize-headers"), "url" to JsonPrimitive(baseUrl))))
+                fail("> 32 KB headers must be rejected")
+            } catch (_: PluginInternalException) {
+            }
+
+            // Item #2c: 25 unawaited fetches -> 4 active + 16 queued = 20 ok, 5 rejected immediately with queue cap
+            val qRes = runtime.invoke(
+                "browse",
+                JsonObject(mapOf("categoryId" to JsonPrimitive("fetch-queue-flood"), "url" to JsonPrimitive(baseUrl))),
+            ).jsonObject["results"]!!.jsonArray.map { it.jsonPrimitive.content }
+            val okCount = qRes.count { it == "ok" }
+            val errList = qRes.filter { it.startsWith("err:") }
+            assertEquals("Expected 4 active + 16 queued = 20 succeeded, got $qRes", 20, okCount)
+            assertEquals("Expected 5 rejected above 16-request queue cap, got $qRes", 5, errList.size)
+            assertTrue("Queue rejections must cite queue limit: $errList", errList.all { it.contains("排队") })
+            assertEquals("Queued count must return to 0 after completion", 0, fetchGw.currentQueuedCount())
+
+            // Item #10: Atomic timer slot reservation under heavy concurrency NEVER exceeds 256
+            val granted = java.util.concurrent.atomic.AtomicInteger(0)
+            val maxObserved = java.util.concurrent.atomic.AtomicInteger(0)
+            val workers = (1..500).map {
+                async(Dispatchers.Default) {
+                    if (runtime.tryReserveTimerSlot()) {
+                        val cur = runtime.currentActiveTimerCount()
+                        maxObserved.accumulateAndGet(cur) { a, b -> maxOf(a, b) }
+                        granted.incrementAndGet()
+                    }
+                }
+            }
+            workers.forEach { it.await() }
+            assertEquals("Exactly 256 timer slots must be granted across 500 concurrent callers", PluginRuntime.MAX_ACTIVE_TIMERS, granted.get())
+            assertTrue("Observed active timer count must never exceed 256, got ${maxObserved.get()}", maxObserved.get() <= PluginRuntime.MAX_ACTIVE_TIMERS)
+            repeat(granted.get()) { runtime.releaseTimerSlot() }
+            assertEquals("Active timer count must return cleanly to 0", 0, runtime.currentActiveTimerCount())
+        } finally {
+            runtime.close()
+            server.shutdown()
+            tmpDir.deleteRecursively()
+        }
+    }
+}
+
+/**
+ * Isolated `-Xmx192m` child JVM entry point invoked by
+ * [CtxApiAndRecoveryTest.blocksDomFormattingAmplificationUnderConstrainedHeapAndEnforcesFetchRequestLimitsAndAtomicTimers]
+ * to prove the exact 1.52 MB HTML5 formatting-element amplification bomb throws
+ * [DomLimitExceededException] rather than [OutOfMemoryError].
+ */
+object DomAmplificationSubprocessMain {
+    @JvmStatic
+    fun main(args: Array<String>) {
+        val sb = StringBuilder("<div>")
+        for (i in 0 until 100) sb.append("<b id=").append(i).append(">")
+        sb.append("</div>")
+        repeat(190_000) { sb.append("<p>x</p>") }
+        val payload = sb.toString()
+
+        val rt = Runtime.getRuntime()
+        System.gc()
+        Thread.sleep(30)
+        val before = rt.totalMemory() - rt.freeMemory()
+        // Reset JVM heap MemoryPool peak counters right before parsing so we measure true peak DURING parse
+        val heapPools = java.lang.management.ManagementFactory.getMemoryPoolMXBeans()
+            .filter { it.type == java.lang.management.MemoryType.HEAP }
+        heapPools.forEach { runCatching { it.resetPeakUsage() } }
+
+        val parser = PluginDomParser()
+        try {
+            parser.parseHtml(payload)
+            System.err.println("UNEXPECTED_SUCCESS nodes=${parser.currentTotalNodes()}")
+            kotlin.system.exitProcess(2)
+        } catch (e: DomLimitExceededException) {
+            val peakHeapBytes = heapPools.sumOf { it.peakUsage?.used ?: 0L }
+            val peakDeltaMb = ((peakHeapBytes - before).coerceAtLeast(0L)) / (1024L * 1024L)
+            System.gc()
+            Thread.sleep(30)
+            val after = rt.totalMemory() - rt.freeMemory()
+            val deltaMb = (after - before) / (1024L * 1024L)
+            if (parser.currentTotalNodes() != 0) {
+                System.err.println("NONZERO_NODES=${parser.currentTotalNodes()}")
+                kotlin.system.exitProcess(3)
+            }
+            println("DOM_LIMIT_THROWN PEAK_DELTA_MB=$peakDeltaMb HEAP_DELTA_MB=$deltaMb MSG=${e.message}")
+            kotlin.system.exitProcess(0)
         }
     }
 }

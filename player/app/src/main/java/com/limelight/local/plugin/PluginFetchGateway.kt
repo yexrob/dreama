@@ -21,6 +21,8 @@ import java.net.SocketTimeoutException
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 data class FetchRequest(
@@ -41,6 +43,8 @@ data class FetchResponse(
 )
 
 class FetchResponseTooLargeException(message: String) : IOException(message)
+class FetchRequestTooLargeException(message: String) : IOException(message)
+class FetchQueueFullException(message: String) : IOException(message)
 
 /**
  * Thread-safe byte budget shared across all concurrent in-flight fetches and
@@ -98,6 +102,10 @@ class PluginFetchGateway(
     private val maxConcurrentFetches: Int = MAX_CONCURRENT_FETCHES,
     val inFlightBudget: InFlightByteBudget = InFlightByteBudget(MAX_INFLIGHT_BYTES.toLong()),
     private val maxRedirects: Int = MAX_REDIRECTS,
+    private val maxQueuedFetches: Int = MAX_QUEUED_FETCHES,
+    private val maxRequestBodyBytes: Int = MAX_REQUEST_BODY_BYTES,
+    private val maxRequestUrlBytes: Int = MAX_REQUEST_URL_BYTES,
+    private val maxRequestHeadersBytes: Int = MAX_REQUEST_HEADERS_BYTES,
 ) {
     private val client: OkHttpClient = baseClient.newBuilder()
         .proxy(Proxy.NO_PROXY)
@@ -106,16 +114,74 @@ class PluginFetchGateway(
         .build()
 
     private val concurrencySemaphore = Semaphore(maxConcurrentFetches)
+    private val queuedFetches = AtomicInteger(0)
     private val callSeq = AtomicLong(1)
     private val activeCalls = ConcurrentHashMap<Long, Call>()
 
+    fun currentQueuedCount(): Int = queuedFetches.get()
+
+    fun validateRequestMetadata(url: String, headers: Map<String, String>) {
+        if (url.toByteArray(Charsets.UTF_8).size > maxRequestUrlBytes) {
+            throw FetchRequestTooLargeException("请求 URL 超过大小限制（上限 ${maxRequestUrlBytes / 1024} KB）")
+        }
+        var headerBytes = 0L
+        for ((k, v) in headers) {
+            headerBytes += k.toByteArray(Charsets.UTF_8).size.toLong() +
+                v.toByteArray(Charsets.UTF_8).size.toLong() + 4L
+            if (headerBytes > maxRequestHeadersBytes) {
+                throw FetchRequestTooLargeException(
+                    "请求头总大小超过限制（上限 ${maxRequestHeadersBytes / 1024} KB）",
+                )
+            }
+        }
+    }
+
+    fun validateRequestBodyBytes(bodyBytes: ByteArray?) {
+        if (bodyBytes != null && bodyBytes.size > maxRequestBodyBytes) {
+            throw FetchRequestTooLargeException(
+                "请求体超过大小限制（上限 ${maxRequestBodyBytes / (1024 * 1024)} MB）",
+            )
+        }
+    }
+
     /**
-     * Suspends respecting the 4-concurrent-fetch limit and runs the HTTP
-     * request on [Dispatchers.IO]. Cancelling the coroutine cancels the live
-     * OkHttp [Call] immediately.
+     * Atomically enforces the queued-request cap ([maxQueuedFetches] = 16)
+     * BEFORE suspending on the 4-permit concurrency semaphore so unawaited
+     * request floods fail immediately without holding request bodies on heap.
+     */
+    suspend fun <T> withSlot(block: suspend () -> T): T {
+        if (!concurrencySemaphore.tryAcquire()) {
+            while (true) {
+                val cur = queuedFetches.get()
+                if (cur >= maxQueuedFetches) {
+                    throw FetchQueueFullException("排队中的请求数超过上限（最多 $maxQueuedFetches 个）")
+                }
+                if (queuedFetches.compareAndSet(cur, cur + 1)) break
+            }
+            val dequeued = AtomicBoolean(false)
+            try {
+                concurrencySemaphore.acquire()
+            } finally {
+                if (dequeued.compareAndSet(false, true)) {
+                    queuedFetches.decrementAndGet()
+                }
+            }
+        }
+        return try {
+            block()
+        } finally {
+            concurrencySemaphore.release()
+        }
+    }
+
+    /**
+     * Enforces URL/header/body/queue limits, suspends respecting the
+     * 4-concurrent-fetch limit, and runs the HTTP request on [Dispatchers.IO].
      */
     suspend fun fetch(req: FetchRequest, defaultTimeoutMs: Long = DEFAULT_TIMEOUT_MS): FetchResponse {
-        return concurrencySemaphore.withPermit {
+        validateRequestMetadata(req.url, req.headers)
+        validateRequestBodyBytes(req.body)
+        return withSlot {
             withContext(Dispatchers.IO) {
                 executeBlocking(req, defaultTimeoutMs)
             }
@@ -123,6 +189,8 @@ class PluginFetchGateway(
     }
 
     fun executeBlocking(req: FetchRequest, defaultTimeoutMs: Long = DEFAULT_TIMEOUT_MS): FetchResponse {
+        validateRequestMetadata(req.url, req.headers)
+        validateRequestBodyBytes(req.body)
         val redirectMode = req.redirect.lowercase(Locale.ROOT)
         require(redirectMode in setOf("follow", "manual", "error")) {
             "Unsupported redirect mode: ${req.redirect}"
@@ -334,8 +402,18 @@ class PluginFetchGateway(
     companion object {
         /** §11.1: single fetch response cap is 8 MB. */
         const val MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+        /** Request body cap is 2 MB. */
+        const val MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
+        /** Request URL length cap is 8 KB. */
+        const val MAX_REQUEST_URL_BYTES = 8 * 1024
+        /** Request headers total byte cap is 32 KB. */
+        const val MAX_REQUEST_HEADERS_BYTES = 32 * 1024
+        /** Raw JSON bridge envelope cap (2 MB base64 + 32 KB headers + 8 KB URL + framing). */
+        const val MAX_FETCH_META_JSON_BYTES = 3 * 1024 * 1024
         /** §11.1: max 4 concurrent fetches per instance. */
         const val MAX_CONCURRENT_FETCHES = 4
+        /** Max queued fetches waiting for a concurrency permit. */
+        const val MAX_QUEUED_FETCHES = 16
         /** §11.1: max 16 MB total in-flight bytes per instance. */
         const val MAX_INFLIGHT_BYTES = 16 * 1024 * 1024
         const val MAX_REDIRECTS = 10

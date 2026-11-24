@@ -1,6 +1,6 @@
 # 插件运行时宿主集成指南（Wall / 播放器 / 设置页）
 
-本文面向负责把 `com.limelight.local.plugin` 接到播放墙（`local/wall/`）、播放器（`LocalPlayerXR.java`）和设置页的界面任务，说明**唯一允许的接入入口**、**明确禁止的做法**、**S7 异常分支改造对照表**，以及**插件安装/权限确认 UI 约束**。
+本文面向负责把 `com.limelight.local.plugin` 接到播放墙（`local/wall/`）、播放器（`LocalPlayerXR.java`）和设置页的界面任务，说明**唯一允许的接入入口**、**现有代码里不能复用到插件源的路径**、**边界约束机制**、**S7 异常分支改造对照表**，以及**插件安装/权限确认 UI 约束**。
 
 底层协议与安全边界以 [plugin-protocol.md](plugin-protocol.md)（特别是 §7 与 §11）为准。
 
@@ -8,7 +8,9 @@
 
 ## 1. 唯一的对外接入入口
 
-插件模块已把底层工厂（`PlaybackMediaSourceFactory`、`SafePluginHttpDataSource`、`SafePluginHttpExecutor`、`PluginImageFetcher`、`FailoverUrlDataSource`）收口为包/模块内部实现，外部界面与播放器只允许调用下面 4 个公开入口：
+> **关于可见性边界的如实说明**：当前 Android 工程为单一 `:app` Gradle 模块，Kotlin 的 `internal` 修饰符在单模块内对整个 `:app` 可见，并不是跨模块的编译期强隔离。因此，下面把底层工厂收口为 `internal` 属于**接口约定**，同时配合自动化架构守卫单测 [`PluginBoundaryGuardTest.kt`](../../player/app/src/test/java/com/limelight/local/plugin/PluginBoundaryGuardTest.kt) 扫描 `local/plugin/` 包之外对 `PlaybackInfo.url`/`headers`、插件内部类及裸 HTTP/解码客户端的越权调用（一旦发现直接让单测失败）。若后续将插件运行时拆为独立 Gradle 子模块（如 `:plugin-runtime`），这些 `internal` 声明即可自然升级为编译期强制隔离。
+
+外部界面与播放器只允许调用下面 4 个公开入口：
 
 ### 1.1 播放流：`PluginPlayback`
 
@@ -44,22 +46,29 @@ if (refreshed != null) {
 }
 ```
 
-### 1.2 图片加载：`PluginImages`
+### 1.2 图片加载：`PluginImages.loadBitmap`
 
-所有来自 `SourceKind.PLUGIN` 的图片（`Item.poster`、`Item.thumb`、`Item.backdrop`、`PersonCredit.image`、`UserProfile.avatar`）必须通过 `PluginImages.loadBytes` 获取字节，再交给解码/缓存层：
+所有来自 `SourceKind.PLUGIN` 的图片（`Item.poster`、`Item.thumb`、`Item.backdrop`、`PersonCredit.image`、`UserProfile.avatar`）**必须**调用 `PluginImages.loadBitmap`，不要拿原始字节自行 `BitmapFactory.decodeByteArray`：
 
 ```kotlin
-val bytes: ByteArray = PluginImages.loadBytes(pluginMediaSource, artwork)
-val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+// maxEdgePx 与现有 Artworks.Size 对齐（CARD = 720，BACKDROP = 1280）
+val bitmap: Bitmap? = PluginImages.loadBitmap(
+    source = pluginMediaSource,
+    artwork = artwork,
+    maxEdgePx = size.px,
+)
 ```
 
-`PluginImages.loadBytes` 内部强制执行 §11.3：每跳校验 `NetworkPolicy`（DNS 解析后拦截回环/链路本地/保留地址与越权私网）、锁定已校验 IP 直连（禁系统代理）、拦截 HTTPS→HTTP 降级重定向、跨源清除 `Authorization`/`Cookie`/自定义头，且限制单图上限 16 MB。
+`PluginImages.loadBitmap` 内部强制完成全部安全与内存防护：
+1. 拒绝 `artwork.isVideoFrame == true`（防止误走 `MediaMetadataRetriever`）。
+2. 每跳校验 `NetworkPolicy`（DNS 解析后拦截回环/链路本地/保留地址与越权私网）、锁定已校验 IP 直连（禁系统代理）、拦截 HTTPS→HTTP 降级重定向、跨源清除 `Authorization`/`Cookie`/自定义头，限制下载体上限 16 MB。
+3. 解码前先通过 `BitmapFactory.Options.inJustDecodeBounds = true` 读取宽高，拦截超大尺寸像素炸弹（原始单边 > 16384 或总像素 > 6400 万直接拒绝），再按 `inSampleSize` + `RGB_565` 降采样缩放至不超过 `maxEdgePx` 与 `maxPixels` 后返回 `Bitmap`。
 
 ### 1.3 插件安装与权限预览：`PluginPackageManager`
 
 1. 弹出安装确认卡片前，**必须**先调用 `packageManager.previewPackage(zipBytes, sourceUrl, repoUrl)` 获取 `PluginInstallPreview`：
    - 展示 `preview.manifest.name` / `version` / `author` / `permissions.hosts` / `permissions.userHosts` / `permissions.lan`。
-   - **局域网通配符告警**：当 `preview.allowsWildcardLanAccess == true`（即 `permissions.lan == true` 且 `permissions.hosts` 含通配符如 `*.local`、`*.lan`）时，确认页必须醒目展示 **`「可访问你局域网里的任意设备」`**（也可直接读取 `preview.permissionWarnings`）。
+   - **局域网通配符告警**：当 `preview.allowsWildcardLanAccess == true`（即 `permissions.lan == true` 且 `permissions.hosts` 含通配符如 `*.home.arpa`、`*.lan.example.com`）时，确认页必须醒目展示 **`「可访问你局域网里的任意设备」`**（也可直接读取 `preview.permissionWarnings`）。
    - **不同来源替换告警**：当 `preview.requiresReplacementConfirmation == true`（不同仓库、不同路径 URL，或**任何本地文件同 ID 安装**）时，必须提示「继续安装将替换原插件并清除所有配置、登录信息和本地数据」，用户明确确认后才传 `confirmReplaceFromDifferentSource = true` 调用 `installFromBytes` / `installFromFile` / `installFromRepository`。
 2. 同来源更新后若 `InstallResult.needsPermissionReconfirm == true`，该插件被暂停加载（调用 `openSource` 后的业务方法会抛出 `SourceNeedsSetupException`），界面需展示新增权限，用户同意后调用 `packageManager.confirmPermissions(pluginId)` 恢复。
 
@@ -70,15 +79,21 @@ val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
 
 ---
 
-## 2. 明确禁止的做法
+## 2. 现有代码不可复用的路径与明确禁止的做法
 
-接入播放器和 Wall 时，**绝对不能**做以下 5 件事：
+界面与播放器任务按下面对照表分流，**绝对不能**把 `SourceKind.PLUGIN` 走入现有本机/WebDAV 路径：
 
-1. **禁止读取 `PlaybackInfo.url` 和 `PlaybackInfo.headers` 自己拼 `DefaultHttpDataSource`**（`LocalPlayerXR.java:145` 当前只针对本机和 WebDAV 这样做）。一旦传给 `DefaultHttpDataSource`，`NetworkPolicy`、DNS 锁定、HTTPS 降级拦截、跨源去头、MPD/HLS 子请求校验、备用源切换和 JSON 字幕转 VTT 会全部失效。
-2. **禁止把插件 `Artwork.url` / `Artwork.headers` 直接交给未受约束的 `OkHttpClient`、`HttpURLConnection`、Glide 或默认 Coil**——这会绕过 §11.3 的图片 SSRF 防护与跨源脱敏。
-3. **禁止对 `PluginSourceMismatchException` 自动传 `confirmReplaceFromDifferentSource = true`**，尤其是本地文件安装同 ID 插件时（本地文件安装同 ID 一律按替换处理，必须由用户显式确认）。
-4. **禁止把 `ctx.config` 里 `type == "password"` 的字段写入明文日志或未加密 SharedPreferences**；配置读写一律走 `PluginPackageManager.createInstance` / `updateInstanceConfig`。
-5. **禁止在界面直接展示异常类名、协议错误码（如 `NeedsAuth`、`Internal`）或英文栈信息**——`PluginErrorMapper` 已为所有异常提供中文用户文案。
+| 现有路径 / 禁区 | 位置 | 为什么对插件源禁止 | 插件源唯一正确入口 |
+| --- | --- | --- | --- |
+| `Artworks.load(...)` | `local/media/Artworks.kt:45-100`（调用点 `local/wall/Components.kt:298` `rememberArt`） | 内部 `fetch()` 使用裸 `OkHttpClient`，不校验 `NetworkPolicy`、不锁 DNS、不拦截降级重定向、不剥离跨源头，且直接 `decodeStream` 无 `inJustDecodeBounds` 像素上限 | `PluginImages.loadBitmap(pluginMediaSource, artwork, maxEdgePx = size.px)` |
+| `isVideoFrame` / `MediaMetadataRetriever.setDataSource(url, headers)` | `local/media/Artworks.kt:68-92` 与 `local/LocalPlayerXR.java:450-475`（含 `MediaExtractor.setDataSource`） | 由系统媒体服务直连网络，完全绕过 `NetworkPolicy`、代理禁用与跨源去头 | 封面图走 `PluginImages.loadBitmap`（无图则显示占位图，禁止用 `MediaMetadataRetriever` 抓帧）；播放分辨率与帧率从 ExoPlayer `Player.Listener.onVideoSizeChanged` / `Format.frameRate` 读取 |
+| `WallActivity.launchPlayer` + `DefaultHttpDataSource` | `local/wall/WallActivity.kt:113-124` 与 `local/LocalPlayerXR.java:145` | 直接把 `PlaybackInfo.url` 塞进 `Intent` 并拼 `DefaultHttpDataSource`，绕过网络策略、DNS 锁定、跨源去头、MPD/HLS 子请求校验、备用源切换与 JSON 字幕转换 | 将 `(sourceId, itemId)` 交给播放器，通过 `PluginPlayback.createSessionController(pluginMediaSource)` 或 `PluginPlayback.createMediaSource(...)` 构建 `MediaSource` |
+| DLNA 投屏或任何包外组件（外部 `Intent`、`DownloadManager`、第三方播放器等） | `local/` 投屏及外部拉起路径 | 包外组件与局域网渲染器不受 `NetworkPolicy` 约束，且可能将内网资源或鉴权令牌泄露给外部设备 | 插件源**禁止**投屏或外发 URL；对 `SourceKind.PLUGIN` 隐藏/禁用 DLNA 投屏入口，仅在应用内用 `PluginPlayback` 播放 |
+
+同时必须遵守以下 3 条红线：
+1. **禁止对 `PluginSourceMismatchException` 自动传 `confirmReplaceFromDifferentSource = true`**，尤其是本地文件安装同 ID 插件时（本地文件安装同 ID 一律按替换处理，必须由用户显式确认）。
+2. **禁止把 `ctx.config` 里 `type == "password"` 的字段写入明文日志或未加密 SharedPreferences**；配置读写一律走 `PluginPackageManager.createInstance` / `updateInstanceConfig`。
+3. **禁止在界面直接展示异常类名、协议错误码（如 `NeedsAuth`、`Internal`）或英文栈信息**——`PluginErrorMapper` 已为所有异常提供中文用户文案。
 
 ---
 

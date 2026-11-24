@@ -55,6 +55,7 @@ import org.robolectric.annotation.Config
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.IOException
 import java.net.InetAddress
 import java.net.Proxy
 import java.nio.file.Files
@@ -310,24 +311,23 @@ class Media3DashAndRoomTest {
         serverB.start()
 
         try {
-            // --- Run Scenario A ---
-            val clientA = OkHttpClient.Builder()
+            // --- Baseline: healthy DASH stream to establish exact reference sample counts (Round 4 Item #8) ---
+            val clientBase = OkHttpClient.Builder()
                 .proxy(Proxy.NO_PROXY)
                 .socketFactory(LocalRedirectSocketFactory("93.184.216.34", serverA.port))
                 .build()
-            val (mgrA, srcA) = openTestPluginSource(File(rootDir, "a"), clientA)
-            try {
-                val baseA = "http://93.184.216.34:${serverA.port}"
-                val infoA = PlaybackInfo(
+            val (mgrBase, srcBase) = openTestPluginSource(File(rootDir, "base"), clientBase)
+            val (baseV, baseA) = try {
+                val baseHost = "http://93.184.216.34:${serverA.port}"
+                val infoBase = PlaybackInfo(
                     url = "",
-                    title = "DASH 404 Failover",
+                    title = "DASH Healthy Baseline",
                     durationMs = 500L,
                     dash = DashStream(
                         video = listOf(
                             MediaTrack(
                                 id = "v1",
-                                url = "$baseA/primary/v.mp4",
-                                backupUrls = listOf("$baseA/backup/v.mp4"),
+                                url = "$baseHost/backup/v.mp4",
                                 mime = "video/mp4",
                                 codecs = "avc1.42c00a",
                                 bandwidth = 80_000,
@@ -340,8 +340,55 @@ class Media3DashAndRoomTest {
                         audio = listOf(
                             MediaTrack(
                                 id = "a1",
-                                url = "$baseA/primary/a.mp4",
-                                backupUrls = listOf("$baseA/backup/a.mp4"),
+                                url = "$baseHost/backup/a.mp4",
+                                mime = "audio/mp4",
+                                codecs = "mp4a.40.2",
+                                bandwidth = 32_000,
+                                initRange = "0-728",
+                                indexRange = "729-780",
+                            ),
+                        ),
+                    ),
+                )
+                runRealExoPlayerToCompletion(context, PluginPlayback.createMediaSource(context, srcBase, infoBase))
+            } finally {
+                runBlocking { mgrBase.shutdownAll() }
+            }
+            assertTrue("Baseline DASH must decode video & audio samples", baseV > 0 && baseA > 0)
+            hits404.clear()
+
+            // --- Run Scenario A ---
+            val clientA = OkHttpClient.Builder()
+                .proxy(Proxy.NO_PROXY)
+                .socketFactory(LocalRedirectSocketFactory("93.184.216.34", serverA.port))
+                .build()
+            val (mgrA, srcA) = openTestPluginSource(File(rootDir, "a"), clientA)
+            try {
+                val baseAUrl = "http://93.184.216.34:${serverA.port}"
+                val infoA = PlaybackInfo(
+                    url = "",
+                    title = "DASH 404 Failover",
+                    durationMs = 500L,
+                    dash = DashStream(
+                        video = listOf(
+                            MediaTrack(
+                                id = "v1",
+                                url = "$baseAUrl/primary/v.mp4",
+                                backupUrls = listOf("$baseAUrl/backup/v.mp4"),
+                                mime = "video/mp4",
+                                codecs = "avc1.42c00a",
+                                bandwidth = 80_000,
+                                width = 64,
+                                height = 64,
+                                initRange = "0-790",
+                                indexRange = "791-842",
+                            ),
+                        ),
+                        audio = listOf(
+                            MediaTrack(
+                                id = "a1",
+                                url = "$baseAUrl/primary/a.mp4",
+                                backupUrls = listOf("$baseAUrl/backup/a.mp4"),
                                 mime = "audio/mp4",
                                 codecs = "mp4a.40.2",
                                 bandwidth = 32_000,
@@ -354,8 +401,8 @@ class Media3DashAndRoomTest {
                 // Use public PluginPlayback facade (Item #4)
                 val mediaSourceA = PluginPlayback.createMediaSource(context, srcA, infoA)
                 val (vSamplesA, aSamplesA) = runRealExoPlayerToCompletion(context, mediaSourceA)
-                assertTrue("Video samples must be decoded via backup BaseURL", vSamplesA > 0)
-                assertTrue("Audio samples must be decoded", aSamplesA > 0)
+                assertEquals("DASH 404 failover must decode exact same video sample count as healthy baseline", baseV, vSamplesA)
+                assertEquals("DASH 404 failover must decode exact same audio sample count as healthy baseline", baseA, aSamplesA)
                 assertTrue("Primary must be attempted first: $hits404", hits404.contains("/primary/v.mp4"))
                 assertTrue("Backup BaseURL must take over after primary 404: $hits404", hits404.contains("/backup/v.mp4"))
             } finally {
@@ -405,8 +452,8 @@ class Media3DashAndRoomTest {
                 )
                 val mediaSourceB = PluginPlayback.createMediaSource(context, srcB, infoB)
                 val (vSamplesB, aSamplesB) = runRealExoPlayerToCompletion(context, mediaSourceB)
-                assertTrue("Video samples must complete after mid-stream disconnect failover", vSamplesB > 0)
-                assertTrue("Audio samples must complete", aSamplesB > 0)
+                assertEquals("DASH mid-stream disconnect failover must match healthy baseline video samples", baseV, vSamplesB)
+                assertEquals("DASH mid-stream disconnect failover must match healthy baseline audio samples", baseA, aSamplesB)
                 assertTrue("Primary init/segment must be tried first: $hitsDisconnect", hitsDisconnect.any { it.startsWith("/primary/v.mp4") })
                 assertTrue("Backup BaseURL must take over after primary disconnect: $hitsDisconnect", hitsDisconnect.any { it.startsWith("/backup/v.mp4") })
             } finally {
@@ -461,6 +508,36 @@ class Media3DashAndRoomTest {
         serverMid.start()
 
         try {
+            // --- Healthy progressive baseline for exact sample count comparison (Round 4 Item #8) ---
+            val clientBase = OkHttpClient.Builder()
+                .proxy(Proxy.NO_PROXY)
+                .socketFactory(LocalRedirectSocketFactory("93.184.216.34", serverOpen.port))
+                .build()
+            val (mgrBase, srcBase) = openTestPluginSource(File(rootDir, "base"), clientBase)
+            val (baseV, baseA) = try {
+                val baseHost = "http://93.184.216.34:${serverOpen.port}"
+                val infoBase = PlaybackInfo(
+                    url = "",
+                    title = "Non-DASH Healthy Baseline",
+                    dash = DashStream(
+                        video = listOf(
+                            MediaTrack(
+                                id = "v1",
+                                url = "$baseHost/backup.mp4",
+                                mime = "video/mp4",
+                                codecs = "avc1.42c00a",
+                                bandwidth = 80_000,
+                            ),
+                        ),
+                    ),
+                )
+                runRealExoPlayerToCompletion(context, PluginPlayback.createMediaSource(context, srcBase, infoBase))
+            } finally {
+                runBlocking { mgrBase.shutdownAll() }
+            }
+            assertTrue("Baseline progressive must decode video & audio samples", baseV > 0 && baseA > 0)
+            hitsOpen.clear()
+
             // --- Scenario A: open-time 503 failover ---
             val clientA = OkHttpClient.Builder()
                 .proxy(Proxy.NO_PROXY)
@@ -468,7 +545,7 @@ class Media3DashAndRoomTest {
                 .build()
             val (mgrA, srcA) = openTestPluginSource(File(rootDir, "open"), clientA)
             try {
-                val baseA = "http://93.184.216.34:${serverOpen.port}"
+                val baseAUrl = "http://93.184.216.34:${serverOpen.port}"
                 // Non-DASH progressive separated tracks (no initRange/indexRange -> MergedProgressiveTracks + FailoverUrlDataSource)
                 val infoA = PlaybackInfo(
                     url = "",
@@ -477,8 +554,8 @@ class Media3DashAndRoomTest {
                         video = listOf(
                             MediaTrack(
                                 id = "v1",
-                                url = "$baseA/primary.mp4",
-                                backupUrls = listOf("$baseA/backup.mp4"),
+                                url = "$baseAUrl/primary.mp4",
+                                backupUrls = listOf("$baseAUrl/backup.mp4"),
                                 mime = "video/mp4",
                                 codecs = "avc1.42c00a",
                                 bandwidth = 80_000,
@@ -490,7 +567,8 @@ class Media3DashAndRoomTest {
                     context,
                     PluginPlayback.createMediaSource(context, srcA, infoA),
                 )
-                assertTrue(vSamples > 0 && aSamples > 0)
+                assertEquals("Non-DASH open failover must decode exact same video sample count as baseline", baseV, vSamples)
+                assertEquals("Non-DASH open failover must decode exact same audio sample count as baseline", baseA, aSamples)
                 assertTrue(hitsOpen.contains("/primary.mp4"))
                 assertTrue(hitsOpen.contains("/backup.mp4"))
             } finally {
@@ -525,8 +603,8 @@ class Media3DashAndRoomTest {
                     context,
                     PluginPlayback.createMediaSource(context, srcB, infoB),
                 )
-                assertTrue("Mid-stream failover must decode complete video", vSamples > 0)
-                assertTrue("Mid-stream failover must decode complete audio", aSamples > 0)
+                assertEquals("Mid-stream failover must match healthy baseline video sample count", baseV, vSamples)
+                assertEquals("Mid-stream failover must match healthy baseline audio sample count", baseA, aSamples)
                 assertTrue("Primary must be attempted first: $hitsMid", hitsMid.any { it.startsWith("/primary.mp4") })
                 assertTrue(
                     "Backup must resume via Range after primary mid-stream disconnect: $hitsMid",
@@ -546,6 +624,15 @@ class Media3DashAndRoomTest {
     @androidx.annotation.OptIn(UnstableApi::class)
     fun realExoPlayerHlsPropagatesAuthHeaderToSubPlaylistAndSegmentsAndPluginImagesFacadeWorks() {
         val tsBytes = loadTestMedia("hls_seg0.ts")
+        val validPngBytes = run {
+            val bmp = android.graphics.Bitmap.createBitmap(160, 120, android.graphics.Bitmap.Config.ARGB_8888)
+            val baos = java.io.ByteArrayOutputStream()
+            bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, baos)
+            bmp.recycle()
+            baos.toByteArray()
+        }
+        // Crafted 20000x20000 PNG IHDR header (67 bytes) to verify inJustDecodeBounds pixel-bomb rejection
+        val pixelBombPngBytes = buildPngHeaderBytes(width = 20_000, height = 20_000)
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val rootDir = Files.createTempDirectory("d3-exo-hls").toFile()
         val expectedAuth = """MediaBrowser Client="depth3d", Device="Headset", DeviceId="d1", Version="1.0.0", Token="hls-tok-99""""
@@ -605,7 +692,10 @@ class Media3DashAndRoomTest {
                         )
                     "/Items/item1/Images/Primary" -> {
                         if (auth != expectedAuth) MockResponse().setResponseCode(401)
-                        else MockResponse().setResponseCode(200).setBody("PNG_OK")
+                        else MockResponse().setResponseCode(200).setHeader("Content-Type", "image/png").setBody(Buffer().write(validPngBytes))
+                    }
+                    "/Items/item1/Images/PixelBomb" -> {
+                        MockResponse().setResponseCode(200).setHeader("Content-Type", "image/png").setBody(Buffer().write(pixelBombPngBytes))
                     }
                     else -> MockResponse().setResponseCode(404)
                 }
@@ -658,23 +748,45 @@ class Media3DashAndRoomTest {
                 assertEquals(expectedAuth, authByPath["/Videos/item1/cross-variant.m3u8"])
                 assertNull("Cross-origin HLS segment must NOT receive Authorization header", authByPath["/cross/seg0.ts"])
 
-                // 3. Item #4: Public PluginImages.loadBytes facade enforces NetworkPolicy & sends auth to trusted origin
-                val imgBytes = runBlocking {
-                    PluginImages.loadBytes(
+                // 3. Round 4 Item #3: Public PluginImages.loadBitmap enforces NetworkPolicy, auth header,
+                // inJustDecodeBounds pixel-bomb protection, downsampling, and rejects isVideoFrame / file:// / unlisted LAN
+                val decodedBmp = runBlocking {
+                    PluginImages.loadBitmap(
                         src,
                         Artwork(
                             url = "$lanBase/Items/item1/Images/Primary",
                             headers = mapOf("Authorization" to expectedAuth),
                         ),
+                        maxEdgePx = 80,
                     )
                 }
-                assertEquals("PNG_OK", String(imgBytes, Charsets.UTF_8))
+                assertNotNull("Valid PNG must decode to Bitmap", decodedBmp)
+                assertTrue("Decoded Bitmap must respect maxEdgePx=80 (got ${decodedBmp!!.width}x${decodedBmp.height})", maxOf(decodedBmp.width, decodedBmp.height) <= 80)
+                decodedBmp.recycle()
+
+                // Pixel-bomb PNG (20000x20000 in 67 bytes) MUST be rejected at inJustDecodeBounds before allocating pixels
+                runBlocking {
+                    try {
+                        PluginImages.loadBitmap(src, Artwork(url = "$lanBase/Items/item1/Images/PixelBomb"))
+                        fail("20000x20000 pixel-bomb PNG must be rejected by PluginImages.loadBitmap")
+                    } catch (_: IOException) {
+                    }
+                }
+
+                // isVideoFrame=true MUST be rejected (MediaMetadataRetriever forbidden for plugin URLs)
+                runBlocking {
+                    try {
+                        PluginImages.loadBitmap(src, Artwork(url = "$lanBase/Items/item1/Images/Primary", isVideoFrame = true))
+                        fail("isVideoFrame=true must be rejected by PluginImages.loadBitmap")
+                    } catch (_: IllegalArgumentException) {
+                    }
+                }
 
                 // PluginImages MUST reject unlisted private IP and file://
                 runBlocking {
                     for (bad in listOf("file:///etc/passwd", "http://192.168.1.99:${server.port}/x.jpg")) {
                         try {
-                            PluginImages.loadBytes(src, Artwork(url = bad))
+                            PluginImages.loadBitmap(src, Artwork(url = bad))
                             fail("PluginImages must reject $bad")
                         } catch (_: Exception) {
                         }
@@ -968,5 +1080,76 @@ class Media3DashAndRoomTest {
         } finally {
             server.shutdown()
         }
+    }
+
+    @Test
+    @androidx.annotation.OptIn(UnstableApi::class)
+    fun jsonSubtitleVttDataSourceRejectsOversizedSubtitleAbove4Mb() {
+        // Round 4 Item #6: JsonSubtitleVttDataSource.open must cap subtitle reads at 4 MB
+        val bytesServed = AtomicInteger(0)
+        val hugeStreamFactory = androidx.media3.datasource.DataSource.Factory {
+            object : androidx.media3.datasource.BaseDataSource(true) {
+                private var remaining = 6 * 1024 * 1024
+                private var uri: Uri? = null
+                override fun open(dataSpec: androidx.media3.datasource.DataSpec): Long {
+                    uri = dataSpec.uri
+                    return androidx.media3.common.C.LENGTH_UNSET.toLong()
+                }
+                override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                    if (remaining <= 0) return androidx.media3.common.C.RESULT_END_OF_INPUT
+                    val n = minOf(length, remaining)
+                    java.util.Arrays.fill(buffer, offset, offset + n, 'a'.code.toByte())
+                    remaining -= n
+                    bytesServed.addAndGet(n)
+                    return n
+                }
+                override fun getUri(): Uri? = uri
+                override fun close() {}
+            }
+        }
+        val ds = JsonSubtitleVttDataSource(hugeStreamFactory)
+        try {
+            ds.open(androidx.media3.datasource.DataSpec(Uri.parse("https://cdn.example.com/huge.bcc.json")))
+            fail("JsonSubtitleVttDataSource must reject subtitles larger than 4 MB")
+        } catch (e: IOException) {
+            assertTrue("Error message must mention size cap: ${e.message}", e.message.orEmpty().contains("4 MB"))
+        } finally {
+            ds.close()
+        }
+        // Must have aborted right after crossing 4 MB rather than buffering all 6 MB
+        assertTrue(
+            "Must stop reading right after 4 MB limit, served ${bytesServed.get()} bytes",
+            bytesServed.get() <= JsonSubtitleVttDataSource.MAX_SUBTITLE_BYTES + 16_384,
+        )
+    }
+
+    private fun buildPngHeaderBytes(width: Int, height: Int): ByteArray {
+        val baos = java.io.ByteArrayOutputStream()
+        // PNG signature
+        baos.write(byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A))
+        fun writeChunk(type: String, data: ByteArray) {
+            val typeBytes = type.toByteArray(Charsets.US_ASCII)
+            val crc = java.util.zip.CRC32().apply {
+                update(typeBytes)
+                update(data)
+            }.value
+            val bb = java.nio.ByteBuffer.allocate(4).putInt(data.size).array()
+            baos.write(bb)
+            baos.write(typeBytes)
+            baos.write(data)
+            baos.write(java.nio.ByteBuffer.allocate(4).putInt(crc.toInt()).array())
+        }
+        val ihdr = java.nio.ByteBuffer.allocate(13)
+            .putInt(width)
+            .putInt(height)
+            .put(8) // bit depth
+            .put(2) // color type RGB
+            .put(0)
+            .put(0)
+            .put(0)
+            .array()
+        writeChunk("IHDR", ihdr)
+        writeChunk("IEND", ByteArray(0))
+        return baos.toByteArray()
     }
 }

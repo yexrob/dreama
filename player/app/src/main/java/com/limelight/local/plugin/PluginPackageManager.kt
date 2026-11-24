@@ -175,13 +175,13 @@ data class PluginPackageArchive(
                     }
                     val norm = cd.normalizedName
                     when {
-                        norm == "manifest.json" -> manifestJson = String(content, Charsets.UTF_8)
-                        norm == "main.js" -> mainJs = String(content, Charsets.UTF_8)
+                        norm == "manifest.json" -> manifestJson = decodeStrictUtf8(content, "manifest.json")
+                        norm == "main.js" -> mainJs = decodeStrictUtf8(content, "main.js")
                         norm == "icon.png" -> iconPng = content
                         norm.startsWith("locales/") && norm.endsWith(".json") -> {
                             val tag = norm.removePrefix("locales/").removeSuffix(".json")
                             if (tag.isNotEmpty() && !tag.contains('/')) {
-                                locales[tag] = String(content, Charsets.UTF_8)
+                                locales[tag] = decodeStrictUtf8(content, norm)
                             }
                         }
                     }
@@ -207,6 +207,17 @@ data class PluginPackageArchive(
                 iconPng = iconPng,
                 locales = locales,
             )
+        }
+
+        private fun decodeStrictUtf8(bytes: ByteArray, label: String): String {
+            val decoder = Charsets.UTF_8.newDecoder()
+                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+            return try {
+                decoder.decode(java.nio.ByteBuffer.wrap(bytes)).toString()
+            } catch (e: java.nio.charset.CharacterCodingException) {
+                throw PackageInstallException("插件包包含非法 UTF-8 字节（$label）", e)
+            }
         }
 
         private fun parseCentralDirectory(bytes: ByteArray): ParsedCentralDirectory {
@@ -280,7 +291,7 @@ data class PluginPackageArchive(
                     throw PackageInstallException("插件包 zip 中央目录越界")
                 }
                 val rawNameBytes = bytes.copyOfRange(nameStart, nameStart + nameLen)
-                val rawName = String(rawNameBytes, Charsets.UTF_8)
+                val rawName = decodeStrictUtf8(rawNameBytes, "zip entry name")
                 val normName = normalizeEntryName(rawName)
                 if (!seenRaw.add(rawName) || !seenNorm.add(normName)) {
                     throw PackageInstallException("插件包包含重复文件名：$rawName")

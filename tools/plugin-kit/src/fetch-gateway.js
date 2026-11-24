@@ -3,9 +3,14 @@ import https from 'node:https';
 import { PluginCookieJar } from './cookies.js';
 import { NetworkPolicyError, originKey } from './network-policy.js';
 
-/** §11.1 (B2): 8 MB single fetch response cap, 4 concurrent fetches, 16 MB in-flight bytes. */
+/** §11.1 (B2): 8 MB single fetch response cap, 4 concurrent fetches, 16 queued, 16 MB in-flight bytes, 2 MB req body, 32 KB req headers, 8 KB URL. */
 export const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+export const MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024;
+export const MAX_REQUEST_URL_BYTES = 8 * 1024;
+export const MAX_REQUEST_HEADERS_BYTES = 32 * 1024;
+export const MAX_FETCH_META_JSON_BYTES = 3 * 1024 * 1024;
 export const MAX_CONCURRENT_FETCHES = 4;
+export const MAX_QUEUED_FETCHES = 16;
 export const MAX_INFLIGHT_BYTES = 16 * 1024 * 1024;
 export const MAX_REDIRECTS = 10;
 
@@ -20,9 +25,24 @@ export class FetchResponseTooLargeError extends Error {
   }
 }
 
+export class FetchRequestTooLargeError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'FetchRequestTooLargeError';
+  }
+}
+
+export class FetchQueueFullError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'FetchQueueFullError';
+  }
+}
+
 class AsyncSemaphore {
-  constructor(permits) {
+  constructor(permits, maxQueued = MAX_QUEUED_FETCHES) {
     this.permits = permits;
+    this.maxQueued = maxQueued;
     this.waiters = [];
   }
 
@@ -33,6 +53,9 @@ class AsyncSemaphore {
     if (this.permits > 0) {
       this.permits -= 1;
       return Promise.resolve();
+    }
+    if (this.waiters.length >= this.maxQueued) {
+      return Promise.reject(new FetchQueueFullError(`排队中的请求数超过上限（最多 ${this.maxQueued} 个）`));
     }
     return new Promise((resolve, reject) => {
       const entry = { resolve, reject };
@@ -87,12 +110,52 @@ export class FetchGateway {
     this.policy = policy;
     this.cookieJar = cookieJar;
     this.maxResponseBytes = opts.maxResponseBytes ?? MAX_RESPONSE_BYTES;
+    this.maxRequestBodyBytes = opts.maxRequestBodyBytes ?? MAX_REQUEST_BODY_BYTES;
+    this.maxRequestUrlBytes = opts.maxRequestUrlBytes ?? MAX_REQUEST_URL_BYTES;
+    this.maxRequestHeadersBytes = opts.maxRequestHeadersBytes ?? MAX_REQUEST_HEADERS_BYTES;
     this.maxConcurrent = opts.maxConcurrent ?? MAX_CONCURRENT_FETCHES;
+    this.maxQueued = opts.maxQueued ?? MAX_QUEUED_FETCHES;
     this.inFlightBudget = opts.inFlightBudget ?? new InFlightByteBudget(opts.maxInFlightBytes ?? MAX_INFLIGHT_BYTES);
     this.maxRedirects = opts.maxRedirects ?? MAX_REDIRECTS;
     this.transportOverride = opts.transportOverride ?? null;
-    this.semaphore = new AsyncSemaphore(this.maxConcurrent);
+    this.semaphore = new AsyncSemaphore(this.maxConcurrent, this.maxQueued);
     this.activeControllers = new Set();
+  }
+
+  validateRequestLimits(url, headers, body) {
+    if (Buffer.byteLength(String(url ?? ''), 'utf8') > this.maxRequestUrlBytes) {
+      throw new FetchRequestTooLargeError(`请求 URL 超过大小限制（上限 ${Math.round(this.maxRequestUrlBytes / 1024)} KB）`);
+    }
+    let headerBytes = 0;
+    for (const [k, v] of Object.entries(headers || {})) {
+      if (v === undefined || v === null) continue;
+      headerBytes += Buffer.byteLength(String(k), 'utf8') + Buffer.byteLength(String(v), 'utf8') + 4;
+      if (headerBytes > this.maxRequestHeadersBytes) {
+        throw new FetchRequestTooLargeError(`请求头总大小超过限制（上限 ${Math.round(this.maxRequestHeadersBytes / 1024)} KB）`);
+      }
+    }
+    if (body !== null && body !== undefined) {
+      const len = Buffer.isBuffer(body) || body instanceof Uint8Array
+        ? body.byteLength
+        : Buffer.byteLength(String(body), 'utf8');
+      if (len > this.maxRequestBodyBytes) {
+        throw new FetchRequestTooLargeError(`请求体超过大小限制（上限 ${Math.round(this.maxRequestBodyBytes / (1024 * 1024))} MB）`);
+      }
+    }
+  }
+
+  async withSlot(fn) {
+    const controller = new AbortController();
+    this.activeControllers.add(controller);
+    let acquired = false;
+    try {
+      await this.semaphore.acquire(controller.signal);
+      acquired = true;
+      return await fn(controller.signal);
+    } finally {
+      if (acquired) this.semaphore.release();
+      this.activeControllers.delete(controller);
+    }
   }
 
   cancelAllActive() {
@@ -107,17 +170,8 @@ export class FetchGateway {
   }
 
   async fetch(req, defaultTimeoutMs = 15_000) {
-    const controller = new AbortController();
-    this.activeControllers.add(controller);
-    let acquired = false;
-    try {
-      await this.semaphore.acquire(controller.signal);
-      acquired = true;
-      return await this._execute(req, defaultTimeoutMs, controller.signal);
-    } finally {
-      if (acquired) this.semaphore.release();
-      this.activeControllers.delete(controller);
-    }
+    this.validateRequestLimits(req.url, req.headers, req.body);
+    return this.withSlot((signal) => this._execute(req, defaultTimeoutMs, signal));
   }
 
   async _execute(req, defaultTimeoutMs, signal) {

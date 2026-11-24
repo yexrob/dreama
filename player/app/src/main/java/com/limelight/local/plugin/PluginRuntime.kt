@@ -171,10 +171,39 @@ class PluginRuntime(
     private var storageCorruptedInCall: Boolean = false
     private val callGeneration = AtomicInteger(0)
 
+    private class ActiveTimerHandle(
+        val job: Job,
+        private val releaseOnce: () -> Unit,
+    ) {
+        fun cancelAndRelease() {
+            releaseOnce()
+            job.cancel()
+        }
+    }
+
     // Per-call live timers and buffered fetch response bodies (all released on settle/timeout)
-    private val activeTimers = ConcurrentHashMap<Int, Job>()
+    private val activeTimers = ConcurrentHashMap<Int, ActiveTimerHandle>()
+    private val activeTimerCount = AtomicInteger(0)
     private val responseHandleSeq = AtomicInteger(1)
     private val responseBodies = ConcurrentHashMap<Int, ByteArray>()
+
+    internal fun currentActiveTimerCount(): Int = activeTimerCount.get()
+
+    internal fun tryReserveTimerSlot(): Boolean {
+        while (true) {
+            val cur = activeTimerCount.get()
+            if (cur >= MAX_ACTIVE_TIMERS) return false
+            if (activeTimerCount.compareAndSet(cur, cur + 1)) return true
+        }
+    }
+
+    internal fun releaseTimerSlot() {
+        while (true) {
+            val cur = activeTimerCount.get()
+            if (cur <= 0) return
+            if (activeTimerCount.compareAndSet(cur, cur - 1)) return
+        }
+    }
 
     /** Count of how many times the underlying QuickJS runtime was created. */
     @Volatile
@@ -462,9 +491,12 @@ class PluginRuntime(
     }
 
     private fun cancelAllTimers() {
-        val jobs = activeTimers.values.toList()
-        activeTimers.clear()
-        for (j in jobs) j.cancel()
+        val iter = activeTimers.entries.iterator()
+        while (iter.hasNext()) {
+            val entry = iter.next()
+            iter.remove()
+            entry.value.cancelAndRelease()
+        }
     }
 
     private fun releaseAllResponseBodies() {
@@ -616,7 +648,7 @@ class PluginRuntime(
                 Unit
             }
 
-            // §11.1 / S3: true cancellable timers & immediate settle cleanup (max 256 active timers)
+            // §11.1 / S3: true cancellable timers & immediate settle cleanup (atomic 256 active timer cap)
             asyncFunction("sleep") { args ->
                 requireToken(expectedToken, args)
                 val timerId = (args.getOrNull(1) as? Number)?.toInt() ?: return@asyncFunction false
@@ -624,25 +656,38 @@ class PluginRuntime(
                 val gen = (args.getOrNull(3) as? Number)?.toInt() ?: -1
                 if (gen != callGeneration.get()) return@asyncFunction false
                 val scope = activeCallScope ?: return@asyncFunction false
-                if (activeTimers.size >= MAX_ACTIVE_TIMERS) {
+                if (!tryReserveTimerSlot()) {
                     throw IllegalStateException("同时活跃的定时器数量超过上限（最多 $MAX_ACTIVE_TIMERS 个）")
                 }
 
-                val done = CompletableDeferred<Boolean>()
-                val job = scope.launch {
-                    try {
-                        if (ms > 0) delay(ms)
-                        done.complete(gen == callGeneration.get())
-                    } catch (_: CancellationException) {
-                        done.complete(false)
-                    } finally {
-                        activeTimers.remove(timerId)
+                val slotReleased = java.util.concurrent.atomic.AtomicBoolean(false)
+                val releaseOnce = {
+                    if (slotReleased.compareAndSet(false, true)) {
+                        releaseTimerSlot()
                     }
                 }
-                activeTimers[timerId] = job
+                val done = CompletableDeferred<Boolean>()
+                val job = try {
+                    scope.launch {
+                        try {
+                            if (ms > 0) delay(ms)
+                            done.complete(gen == callGeneration.get())
+                        } catch (_: CancellationException) {
+                            done.complete(false)
+                        } finally {
+                            activeTimers.remove(timerId)
+                            releaseOnce()
+                        }
+                    }
+                } catch (t: Throwable) {
+                    releaseOnce()
+                    throw t
+                }
+                val handle = ActiveTimerHandle(job, releaseOnce)
+                activeTimers.put(timerId, handle)?.cancelAndRelease()
                 if (gen != callGeneration.get()) {
-                    job.cancel()
-                    activeTimers.remove(timerId)
+                    activeTimers.remove(timerId, handle)
+                    handle.cancelAndRelease()
                     return@asyncFunction false
                 }
                 done.await()
@@ -651,7 +696,7 @@ class PluginRuntime(
             function("cancelTimer") { args ->
                 requireToken(expectedToken, args)
                 val timerId = (args.getOrNull(1) as? Number)?.toInt() ?: return@function Unit
-                activeTimers.remove(timerId)?.cancel()
+                activeTimers.remove(timerId)?.cancelAndRelease()
                 Unit
             }
 
@@ -665,7 +710,8 @@ class PluginRuntime(
                 Unit
             }
 
-            // §11.1 / B2: binary fetch bridge (no base64 JSON inflation, 8 MB body / 16 MB in-flight cap)
+            // §11.1 / B2: binary fetch bridge with pre-parse envelope/body/header/URL caps
+            // and atomic 16-request queue cap BEFORE decoding request body bytes.
             asyncFunction("fetchMeta") { args ->
                 requireToken(expectedToken, args)
                 val reqJson = args.getOrNull(1)?.toString()
@@ -673,6 +719,11 @@ class PluginRuntime(
                 val gen = (args.getOrNull(2) as? Number)?.toInt() ?: -1
                 if (gen != callGeneration.get()) {
                     throw CancellationException("Call already finished")
+                }
+                if (reqJson.length > PluginFetchGateway.MAX_FETCH_META_JSON_BYTES ||
+                    reqJson.toByteArray(Charsets.UTF_8).size > PluginFetchGateway.MAX_FETCH_META_JSON_BYTES
+                ) {
+                    throw FetchRequestTooLargeException("请求内容超过大小限制（请求体上限 2 MB）")
                 }
                 val obj = json.parseToJsonElement(reqJson) as JsonObject
                 val url = (obj["url"] as? JsonPrimitive)?.content
@@ -682,28 +733,51 @@ class PluginRuntime(
                 val headers = headersObj?.mapValues { (_, v) ->
                     (v as? JsonPrimitive)?.content ?: v.toString()
                 } ?: emptyMap()
+                fetchGateway.validateRequestMetadata(url, headers)
+
                 val bodyBase64 = (obj["bodyBase64"] as? JsonPrimitive)?.content
                 val bodyText = (obj["bodyText"] as? JsonPrimitive)?.content
-                val bodyBytes = when {
-                    bodyBase64 != null -> PluginCrypto.base64Decode(bodyBase64)
-                    bodyText != null -> bodyText.toByteArray(Charsets.UTF_8)
-                    else -> null
+                if (bodyBase64 != null) {
+                    val approxBytes = (bodyBase64.length.toLong() * 3L) / 4L
+                    if (approxBytes > PluginFetchGateway.MAX_REQUEST_BODY_BYTES + 3L) {
+                        throw FetchRequestTooLargeException("请求体超过大小限制（上限 2 MB）")
+                    }
+                } else if (bodyText != null) {
+                    if (bodyText.length > PluginFetchGateway.MAX_REQUEST_BODY_BYTES ||
+                        bodyText.toByteArray(Charsets.UTF_8).size > PluginFetchGateway.MAX_REQUEST_BODY_BYTES
+                    ) {
+                        throw FetchRequestTooLargeException("请求体超过大小限制（上限 2 MB）")
+                    }
                 }
                 val contentType = (obj["contentType"] as? JsonPrimitive)?.content
                 val timeoutMs = (obj["timeoutMs"] as? JsonPrimitive)?.longOrNull
                 val redirect = (obj["redirect"] as? JsonPrimitive)?.content ?: "follow"
 
-                val resp = fetchGateway.fetch(
-                    FetchRequest(
-                        url = url,
-                        method = method,
-                        headers = headers,
-                        body = bodyBytes,
-                        contentType = contentType,
-                        timeoutMs = timeoutMs,
-                        redirect = redirect,
-                    ),
-                )
+                val resp = fetchGateway.withSlot {
+                    if (gen != callGeneration.get()) {
+                        throw CancellationException("Call already finished")
+                    }
+                    // Decode request body ONLY while holding one of the 4 active execution permits
+                    val bodyBytes = when {
+                        bodyBase64 != null -> PluginCrypto.base64Decode(bodyBase64)
+                        bodyText != null -> bodyText.toByteArray(Charsets.UTF_8)
+                        else -> null
+                    }
+                    fetchGateway.validateRequestBodyBytes(bodyBytes)
+                    withContext(Dispatchers.IO) {
+                        fetchGateway.executeBlocking(
+                            FetchRequest(
+                                url = url,
+                                method = method,
+                                headers = headers,
+                                body = bodyBytes,
+                                contentType = contentType,
+                                timeoutMs = timeoutMs,
+                                redirect = redirect,
+                            ),
+                        )
+                    }
+                }
                 // Reserve buffer bytes against the 16 MB in-flight budget until JS reads or call ends
                 if (gen != callGeneration.get()) {
                     throw CancellationException("Call already finished")

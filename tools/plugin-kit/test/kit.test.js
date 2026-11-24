@@ -838,6 +838,7 @@ test('Round 3: shared zip-vectors.json (incl. dual.zip PoC) and shared dom-vecto
         const doc = arg.mode === 'xml' ? ctx.parse.xml(arg.input) : ctx.parse.html(arg.input);
         return arg.assertions.map((a) => {
           if (a.op === 'rootTag') return doc.tag;
+          if (a.op === 'rootText') return doc.text;
           if (a.op === 'rootChildrenTags') return doc.children.map((c) => c.tag);
           if (a.op === 'firstTag') return doc.querySelector(a.selector)?.tag ?? null;
           if (a.op === 'firstText') return doc.querySelector(a.selector)?.text ?? null;
@@ -846,6 +847,18 @@ test('Round 3: shared zip-vectors.json (incl. dual.zip PoC) and shared dom-vecto
           if (a.op === 'allTags') return doc.querySelectorAll(a.selector).map((n) => n.tag);
           if (a.op === 'allAttrs') return doc.querySelectorAll(a.selector).map((n) => n.attr(a.attr));
           if (a.op === 'childrenTags') return doc.querySelector(a.selector).children.map((c) => c.tag);
+          if (a.op === 'subFirstAttr') {
+            const p = doc.querySelector(a.parent);
+            return p ? (p.querySelector(a.selector)?.attr(a.attr) ?? null) : null;
+          }
+          if (a.op === 'selectorThrows') {
+            try {
+              doc.querySelector(a.selector);
+              return false;
+            } catch {
+              return true;
+            }
+          }
           return null;
         });
       },
@@ -951,6 +964,26 @@ test('Round 3: host memory caps, tool/host parity, redirect safe-headers, cookie
           ctx.storage.set('forgot', 'value');
           return { ok: true };
         }
+        if (m === 'fetch-oversize-body') {
+          await ctx.fetch('https://api.example.com/small', { method: 'POST', body: 'X'.repeat(3 * 1024 * 1024) });
+          return { ok: true };
+        }
+        if (m === 'fetch-oversize-url') {
+          await ctx.fetch('https://api.example.com/' + 'u'.repeat(9 * 1024));
+          return { ok: true };
+        }
+        if (m === 'fetch-oversize-headers') {
+          await ctx.fetch('https://api.example.com/small', { headers: { 'X-Huge': 'H'.repeat(35 * 1024) } });
+          return { ok: true };
+        }
+        if (m === 'fetch-queue-flood') {
+          const ps = [];
+          for (let i = 0; i < 25; i++) {
+            ps.push(ctx.fetch('https://api.example.com/slow-hold?i=' + i).then(() => 'ok', (e) => 'err:' + (e.message || e)));
+          }
+          const results = await Promise.all(ps);
+          return { results };
+        }
         if (m === 'immutable-globals') {
           return ['__d3_invoke', '__d3_invoke_optional', '__d3_exports', '__d3_eval_probe'].map((n) => {
             const d = Object.getOwnPropertyDescriptor(globalThis, n);
@@ -980,6 +1013,10 @@ test('Round 3: host memory caps, tool/host parity, redirect safe-headers, cookie
       }
       if (url.pathname === '/cross-end') {
         redirectTargetHeaders = { ...headers };
+        return { status: 200, headers: {}, setCookies: [], body: Buffer.from('ok') };
+      }
+      if (url.pathname === '/slow-hold') {
+        await new Promise((r) => setTimeout(r, 120));
         return { status: 200, headers: {}, setCookies: [], body: Buffer.from('ok') };
       }
       if (url.pathname.startsWith('/slow-')) {
@@ -1067,6 +1104,17 @@ test('Round 3: host memory caps, tool/host parity, redirect safe-headers, cookie
       () => host.invoke('browse', { categoryId: 'unawaited-storage' }),
       (e) => e instanceof PluginCallError && e.message.includes('ctx.storage.set'),
     );
+
+    // Round 4 Item #2: fetch body > 2 MB, URL > 8 KB, headers > 32 KB, queued > 16 all rejected immediately
+    await assert.rejects(() => host.invoke('browse', { categoryId: 'fetch-oversize-body' }), (e) => e instanceof PluginCallError && e.code === 'Internal');
+    await assert.rejects(() => host.invoke('browse', { categoryId: 'fetch-oversize-url' }), (e) => e instanceof PluginCallError && e.code === 'Internal');
+    await assert.rejects(() => host.invoke('browse', { categoryId: 'fetch-oversize-headers' }), (e) => e instanceof PluginCallError && e.code === 'Internal');
+    const qRes = await host.invoke('browse', { categoryId: 'fetch-queue-flood' });
+    const qErrors = qRes.results.filter((r) => String(r).startsWith('err:'));
+    const qOk = qRes.results.filter((r) => r === 'ok');
+    assert.equal(qOk.length, 20, `Expected 4 active + 16 queued = 20 ok, got ${qOk.length}`);
+    assert.equal(qErrors.length, 5, `Expected 5 rejected above queue cap 16, got ${qErrors.length}`);
+    assert.ok(qErrors.every((e) => e.includes('排队')));
 
     // Item #12: __d3_invoke etc. non-writable & non-configurable
     const globals = await host.invoke('browse', { categoryId: 'immutable-globals' });
