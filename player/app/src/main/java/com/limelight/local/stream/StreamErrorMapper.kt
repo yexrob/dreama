@@ -95,6 +95,11 @@ object StreamErrorMapper {
     }
 
     fun forAutoPair(s: StringLookup, result: AutoPairResult, streamReason: String? = null): UserFacingError = when (result) {
+        AutoPairResult.ClientCertRequired -> UserFacingError(
+            title = s.get(R.string.err_pair_complete_unauth_title),
+            detail = s.get(R.string.err_pair_complete_unauth_detail),
+            retryable = false,
+        )
         AutoPairResult.Rejected -> UserFacingError(
             title = s.get(R.string.err_autopair_rejected_title),
             detail = s.get(R.string.err_autopair_rejected_detail),

@@ -60,6 +60,7 @@ class StreamErrorMapperTest {
             StreamErrorMapper.forPairState(strings, PairState.FAILED, false),
             StreamErrorMapper.forPairState(strings, PairState.FAILED, true),
             StreamErrorMapper.forPairState(strings, PairState.NOT_PAIRED, false),
+            StreamErrorMapper.forAutoPair(strings, AutoPairResult.ClientCertRequired),
             StreamErrorMapper.forAutoPair(strings, AutoPairResult.Rejected),
             StreamErrorMapper.forAutoPair(strings, AutoPairResult.TimedOut),
             StreamErrorMapper.forAutoPair(strings, AutoPairResult.Busy()),
@@ -130,6 +131,10 @@ class StreamErrorMapperTest {
         assertTrue(StreamErrorMapper.forAutoPair(strings, AutoPairResult.Busy()).retryable)
         assertTrue(StreamErrorMapper.forPairComplete(strings, PairCompleteResult.NotPaired).retryable)
         assertTrue(StreamErrorMapper.forPairComplete(strings, PairCompleteResult.TicketExpired).retryable)
+        assertFalse(
+            "M3: Missing local client certificate (401 on /pair) must NOT be retryable",
+            StreamErrorMapper.forAutoPair(strings, AutoPairResult.ClientCertRequired).retryable,
+        )
         assertFalse(
             "M3: Missing local client certificate (401) must NOT be retryable",
             StreamErrorMapper.forPairComplete(strings, PairCompleteResult.Unauthorized).retryable,

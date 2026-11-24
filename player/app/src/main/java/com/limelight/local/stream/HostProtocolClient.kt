@@ -220,7 +220,13 @@ enum class PairNextStep {
 }
 
 sealed interface AutoPairResult {
-    data class Approved(val next: PairNextStep, val ticket: String) : AutoPairResult
+    data class Approved(
+        val next: PairNextStep,
+        val ticket: String,
+        val clientCertFingerprint: String = "",
+    ) : AutoPairResult
+
+    data object ClientCertRequired : AutoPairResult
     data object Rejected : AutoPairResult
     data object TimedOut : AutoPairResult
     data class Busy(val retryAfterSec: Int? = null) : AutoPairResult
@@ -270,13 +276,9 @@ interface HostProtocolApi {
 
     /**
      * Step 1 of two-step Host pairing (`POST /depth3d/v1/pair`, docs/specs/host-protocol.md):
-     * obtains user consent on the Host and returns `(next, ticket)` without waiting for GameStream
-     * pairing. Strictly pinned to [expectedFingerprint] from a verified [getInfo] call.
-     *
-     * Client certificate is ONLY sent when either:
-     * - [hostId] already has a persisted [HostPairedTrust] matching [expectedFingerprint], OR
-     * - [verifiedGameStreamUpgrade] is true (caller already proved over strict HTTPS pinned-cert
-     *   check on the same IPv4 address that this endpoint holds the saved GameStream server cert).
+     * ALWAYS presents the headset's pairing TLS client certificate (generating it first if absent)
+     * and sends `streamPaired: true|false`. Strictly pinned to [expectedFingerprint] from a verified
+     * [getInfo] call. Returns `(next, ticket, clientCertFingerprint)` without waiting for GameStream.
      */
     fun requestAutoPair(
         address: String,
@@ -286,15 +288,14 @@ interface HostProtocolApi {
         deviceId: String,
         pin: String,
         expectedFingerprint: String,
-        presentClientCert: Boolean = false,
-        verifiedGameStreamUpgrade: Boolean = false,
+        streamPaired: Boolean = false,
         approvedNewFingerprint: String? = null,
         cancelToken: CallCancelToken? = null,
     ): AutoPairResult
 
     /**
      * Step 2 of two-step Host pairing (`POST /depth3d/v1/pair/complete`, docs/specs/host-protocol.md):
-     * called with the pairing TLS client certificate and [ticket] after GameStream pairing succeeds
+     * called with the SAME pairing TLS client certificate and [ticket] after GameStream pairing succeeds
      * (or immediately when `/pair` returned `next="done"` for a verified upgrade).
      * Never writes [pinStore]; the caller commits [HostPairedTrust] only after receiving `200 OK`.
      */
@@ -306,6 +307,7 @@ interface HostProtocolApi {
         deviceId: String,
         deviceName: String,
         expectedFingerprint: String,
+        expectedClientCertFingerprint: String? = null,
         approvedNewFingerprint: String? = null,
         cancelToken: CallCancelToken? = null,
     ): PairCompleteResult
@@ -555,8 +557,7 @@ class HttpHostProtocolClient(
         deviceId: String,
         pin: String,
         expectedFingerprint: String,
-        presentClientCert: Boolean,
-        verifiedGameStreamUpgrade: Boolean,
+        streamPaired: Boolean,
         approvedNewFingerprint: String?,
         cancelToken: CallCancelToken?,
     ): AutoPairResult {
@@ -567,26 +568,24 @@ class HttpHostProtocolClient(
         }
 
         val savedPin = pinStore.getFingerprint(hostId)
-        val pairedTrust = pinStore.getPairedTrust(hostId)
         if (savedPin != null && !savedPin.equals(expected, ignoreCase = true)) {
             if (approvedNewFingerprint == null || !approvedNewFingerprint.equals(expected, ignoreCase = true)) {
                 return AutoPairResult.CertificateChanged(hostId, savedPin, expected)
             }
         }
 
-        // B1 + host-protocol.md §升级路径:
-        // Send client cert ONLY when either (1) we already have a matching persisted HostPairedTrust,
-        // OR (2) caller already verified this exact IPv4 endpoint's GameStream HTTPS cert against our
-        // saved paired serverCert (the sole allowed unpinned upgrade case).
-        val hasMatchingSavedTrust = savedPin != null &&
-            pairedTrust != null &&
-            savedPin.equals(expected, ignoreCase = true) &&
-            pairedTrust.hostFingerprint.equals(savedPin, ignoreCase = true)
-        val allowClientCert = presentClientCert && (hasMatchingSavedTrust || verifiedGameStreamUpgrade)
+        // Per host-protocol.md (3676b2b): /pair ALWAYS presents the headset's pairing client cert
+        // (public identity; provider generates it on first use if absent). Ticket is bound to it.
+        val clientIdentity = buildClientKeyManagersWithFingerprint()
+        if (clientIdentity == null) {
+            LimeLog.warning("depth3d: skipping /depth3d/v1/pair because local pairing client cert is unavailable")
+            return AutoPairResult.ClientCertRequired
+        }
+        val (keyManagers, clientCertFp) = clientIdentity
 
         val url = formatHostUrl(address, port, "/depth3d/v1/pair")
-        val payload = "{\"device\":\"${escapeJson(deviceName)}\",\"deviceId\":\"${escapeJson(deviceId)}\",\"pin\":\"${escapeJson(pin)}\"}"
-        LimeLog.info("depth3d: host POST /depth3d/v1/pair -> $address:$port (device=$deviceName, clientCert=$allowClientCert)")
+        val payload = "{\"device\":\"${escapeJson(deviceName)}\",\"deviceId\":\"${escapeJson(deviceId)}\",\"pin\":\"${escapeJson(pin)}\",\"streamPaired\":$streamPaired}"
+        LimeLog.info("depth3d: host POST /depth3d/v1/pair -> $address:$port (device=$deviceName, streamPaired=$streamPaired)")
         val observed = AtomicReference<String?>(null)
         val policy = CertPinPolicy.ExactOnly(
             expectedFingerprint = expected,
@@ -597,9 +596,10 @@ class HttpHostProtocolClient(
             val client = buildClient(
                 hostId = hostId,
                 policy = policy,
-                presentClientCert = allowClientCert,
+                presentClientCert = true,
                 readTimeoutMs = pairReadTimeoutMs,
                 observedFingerprintOut = observed,
+                precomputedKeyManagers = keyManagers,
                 trackedSockets = trackedSockets,
                 cancelToken = cancelToken,
             )
@@ -621,7 +621,9 @@ class HttpHostProtocolClient(
                     }
                     // Never write pinStore here on any response; trust is saved only after /pair/complete 200.
                     when (resp.code) {
-                        200 -> parsePairApprovedJson(body) ?: AutoPairResult.Failed("invalid pair response")
+                        200 -> parsePairApprovedJson(body)?.copy(clientCertFingerprint = clientCertFp)
+                            ?: AutoPairResult.Failed("invalid pair response")
+                        401 -> AutoPairResult.ClientCertRequired
                         403 -> AutoPairResult.Rejected
                         408 -> AutoPairResult.TimedOut
                         426 -> AutoPairResult.UpgradeRequired
@@ -656,6 +658,7 @@ class HttpHostProtocolClient(
         deviceId: String,
         deviceName: String,
         expectedFingerprint: String,
+        expectedClientCertFingerprint: String?,
         approvedNewFingerprint: String?,
         cancelToken: CallCancelToken?,
     ): PairCompleteResult {
@@ -672,10 +675,18 @@ class HttpHostProtocolClient(
             }
         }
 
-        val keyManagers = buildClientKeyManagers()
-        if (keyManagers == null) {
+        val clientIdentity = buildClientKeyManagersWithFingerprint()
+        if (clientIdentity == null) {
             LimeLog.warning("depth3d: skipping /depth3d/v1/pair/complete because pairing client cert is unavailable")
             return PairCompleteResult.Unauthorized
+        }
+        val (keyManagers, clientCertFp) = clientIdentity
+        if (!expectedClientCertFingerprint.isNullOrBlank() &&
+            !expectedClientCertFingerprint.equals(clientCertFp, ignoreCase = true)
+        ) {
+            // Ticket is bound to the client cert presented on /pair (host-protocol.md 3676b2b).
+            LimeLog.warning("depth3d: local client cert changed between /pair and /pair/complete")
+            return PairCompleteResult.TicketExpired
         }
 
         val url = formatHostUrl(address, port, "/depth3d/v1/pair/complete")
@@ -941,7 +952,10 @@ class HttpHostProtocolClient(
             register(delegate.createSocket(address, port, localAddress, localPort))
     }
 
-    private fun buildClientKeyManagers(): Array<KeyManager>? {
+    private fun buildClientKeyManagers(): Array<KeyManager>? =
+        buildClientKeyManagersWithFingerprint()?.first
+
+    private fun buildClientKeyManagersWithFingerprint(): Pair<Array<KeyManager>, String>? {
         val identity = try {
             clientIdentityProvider()
         } catch (e: Exception) {
@@ -955,7 +969,7 @@ class HttpHostProtocolClient(
             ks.setKeyEntry("client", identity.second, CharArray(0), arrayOf(identity.first))
             val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
             kmf.init(ks, CharArray(0))
-            kmf.keyManagers
+            kmf.keyManagers to sha256Hex(identity.first)
         } catch (e: Exception) {
             LimeLog.warning("depth3d: failed to build client KeyManager: ${e.javaClass.simpleName}")
             null

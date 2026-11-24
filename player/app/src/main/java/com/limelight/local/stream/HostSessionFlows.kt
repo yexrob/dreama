@@ -94,6 +94,7 @@ data class PendingPairComplete(
     val hostInfo: HostInfo,
     val hostFingerprint: String,
     val ticket: String,
+    val clientCertFingerprint: String = "",
     val issuedAtMs: Long,
     val deviceId: String,
     val deviceName: String,
@@ -419,9 +420,10 @@ object HostAutoPairOrchestrator {
                 return HostAutoPairOutcome.InfoFailed(infoRes.detail)
         }
 
-        // Step 2 (host-protocol.md §已经在串流层面配过对的头显, M7):
+        // Step 2 (host-protocol.md 3676b2b §已经在串流层面配过对的头显, M7):
         // If we already hold a paired GameStream server cert, strictly verify over HTTPS against
         // this exact IPv4 endpoint BEFORE calling /pair. Never calls /unpair on cancel!
+        // `streamPaired` is true ONLY if this verification passed; false in ALL other cases.
         val verifiedExistingGsPair = if (alreadyPairedGsCert != null) {
             verifyExistingGameStreamPair(token)
         } else {
@@ -429,21 +431,33 @@ object HostAutoPairOrchestrator {
         }
         if (token.isCancelled) return HostAutoPairOutcome.Cancelled
 
-        val existingTrust = pinStore.getPairedTrust(hostId)
-        val hasMatchingSavedTrust = existingTrust != null &&
-            alreadyPairedGsCert != null &&
-            existingTrust.hostFingerprint.equals(verifiedFp, ignoreCase = true) &&
-            existingTrust.computerUuid.equals(computerUuid, ignoreCase = true) &&
-            existingTrust.gsCertFingerprint.equals(HttpHostProtocolClient.sha256Hex(alreadyPairedGsCert), ignoreCase = true)
+        val verifiedGsCert = if (verifiedExistingGsPair) alreadyPairedGsCert else null
+        val streamPaired = verifiedGsCert != null
 
-        // S1 + §升级路径: Only send client cert on /pair when we have a verified GameStream pair on
-        // this exact IPv4 endpoint (prevents Host from returning next="done" when local stream isn't verified).
-        var sendClientCert = verifiedExistingGsPair && (hasMatchingSavedTrust || alreadyPairedGsCert != null)
-        var verifiedUpgradeFlag = verifiedExistingGsPair
-
-        suspend fun invokePair(presentCert: Boolean, verifiedUpgrade: Boolean): AutoPairResult {
+        // Step 3: POST /depth3d/v1/pair (ALWAYS sends client cert + `streamPaired`, consent only).
+        onWaitingAllow()
+        var pairResp = withContext(ioDispatcher) {
+            hostApi.requestAutoPair(
+                address = address,
+                port = controlPort,
+                hostId = hostId,
+                deviceName = deviceName,
+                deviceId = deviceId,
+                pin = pin,
+                expectedFingerprint = verifiedFp,
+                streamPaired = streamPaired,
+                approvedNewFingerprint = approvedNewFingerprint,
+                cancelToken = token,
+            )
+        }
+        // S5: If the previous /pair was just cancelled and Host briefly returns 429 busy while
+        // closing its confirmation window, wait retryAfterSec and retry ONCE automatically!
+        if (justCancelledPreviousPair && pairResp is AutoPairResult.Busy && !token.isCancelled) {
+            val waitMs = busyRetryDelayMs(pairResp.retryAfterSec)
+            delayFn(waitMs)
+            if (token.isCancelled) return HostAutoPairOutcome.Cancelled
             onWaitingAllow()
-            var resp = withContext(ioDispatcher) {
+            pairResp = withContext(ioDispatcher) {
                 hostApi.requestAutoPair(
                     address = address,
                     port = controlPort,
@@ -452,57 +466,14 @@ object HostAutoPairOrchestrator {
                     deviceId = deviceId,
                     pin = pin,
                     expectedFingerprint = verifiedFp,
-                    presentClientCert = presentCert,
-                    verifiedGameStreamUpgrade = verifiedUpgrade,
+                    streamPaired = streamPaired,
                     approvedNewFingerprint = approvedNewFingerprint,
                     cancelToken = token,
                 )
             }
-            // S5: If the previous /pair was just cancelled and Host briefly returns 429 busy while
-            // closing its confirmation window, wait retryAfterSec and retry ONCE automatically!
-            if (justCancelledPreviousPair && resp is AutoPairResult.Busy && !token.isCancelled) {
-                val waitMs = busyRetryDelayMs(resp.retryAfterSec)
-                delayFn(waitMs)
-                if (token.isCancelled) return AutoPairResult.Cancelled
-                onWaitingAllow()
-                resp = withContext(ioDispatcher) {
-                    hostApi.requestAutoPair(
-                        address = address,
-                        port = controlPort,
-                        hostId = hostId,
-                        deviceName = deviceName,
-                        deviceId = deviceId,
-                        pin = pin,
-                        expectedFingerprint = verifiedFp,
-                        presentClientCert = presentCert,
-                        verifiedGameStreamUpgrade = verifiedUpgrade,
-                        approvedNewFingerprint = approvedNewFingerprint,
-                        cancelToken = token,
-                    )
-                }
-            }
-            return resp
         }
-
-        // Step 3: POST /depth3d/v1/pair (consent only; returns immediately with next + ticket)
-        var pairResp = invokePair(sendClientCert, verifiedUpgradeFlag)
         if (token.isCancelled || pairResp == AutoPairResult.Cancelled) {
             return HostAutoPairOutcome.Cancelled
-        }
-
-        // S1: If Host returned next="done" while we had sent client cert without local verified pair,
-        // re-send /pair WITHOUT client cert so Host enters full pairing (next="gamestream")!
-        if (pairResp is AutoPairResult.Approved &&
-            pairResp.next == PairNextStep.DONE &&
-            !verifiedExistingGsPair &&
-            sendClientCert
-        ) {
-            sendClientCert = false
-            verifiedUpgradeFlag = false
-            pairResp = invokePair(presentCert = false, verifiedUpgrade = false)
-            if (token.isCancelled || pairResp == AutoPairResult.Cancelled) {
-                return HostAutoPairOutcome.Cancelled
-            }
         }
 
         val approved = when (pairResp) {
@@ -531,6 +502,7 @@ object HostAutoPairOrchestrator {
                 return HostAutoPairOutcome.UpgradeRequired
             AutoPairResult.Cancelled ->
                 return HostAutoPairOutcome.Cancelled
+            AutoPairResult.ClientCertRequired,
             AutoPairResult.Rejected,
             AutoPairResult.TimedOut,
             is AutoPairResult.Busy,
@@ -540,17 +512,12 @@ object HostAutoPairOrchestrator {
         }
         val ticketIssuedAtMs = clockMs()
 
-        // Step 4: Branch strictly on approved.next (S1)!
+        // Step 4: Branch strictly on approved.next (host-protocol.md 3676b2b + S1)!
         val gsCert: X509Certificate = when (approved.next) {
             PairNextStep.DONE -> {
-                // S1: NEVER run blocking GameStream pm.pair when Host said next="done" (Host did NOT
-                // submit PIN to the engine!). Either we already verified the stream cert in step 2,
-                // or we fail cleanly immediately without hanging!
-                if (verifiedExistingGsPair && alreadyPairedGsCert != null) {
-                    alreadyPairedGsCert
-                } else {
-                    return HostAutoPairOutcome.UnexpectedDoneWithoutVerifiedStream
-                }
+                // Host only returns next="done" when streamPaired=true; if streamPaired was false,
+                // treat as protocol error immediately (never hang in pm.pair!).
+                verifiedGsCert ?: return HostAutoPairOutcome.UnexpectedDoneWithoutVerifiedStream
             }
             PairNextStep.GAMESTREAM -> {
                 onCompletingGameStream()
@@ -583,6 +550,7 @@ object HostAutoPairOrchestrator {
                         hostInfo = verifiedInfo,
                         hostFingerprint = verifiedFp,
                         ticket = approved.ticket,
+                        clientCertFingerprint = approved.clientCertFingerprint,
                         issuedAtMs = ticketIssuedAtMs,
                         deviceId = deviceId,
                         deviceName = deviceName,
@@ -610,6 +578,7 @@ object HostAutoPairOrchestrator {
             hostInfo = verifiedInfo,
             hostFingerprint = verifiedFp,
             ticket = approved.ticket,
+            clientCertFingerprint = approved.clientCertFingerprint,
             issuedAtMs = ticketIssuedAtMs,
             deviceId = deviceId,
             deviceName = deviceName,
@@ -663,6 +632,7 @@ object HostAutoPairOrchestrator {
                     deviceId = pending.deviceId,
                     deviceName = pending.deviceName,
                     expectedFingerprint = pending.hostFingerprint,
+                    expectedClientCertFingerprint = pending.clientCertFingerprint.takeIf { it.isNotBlank() },
                     approvedNewFingerprint = pending.approvedNewFingerprint,
                     cancelToken = token,
                 )
@@ -903,8 +873,7 @@ object HostManualPairOrchestrator {
                 deviceId = deviceId,
                 pin = pin,
                 expectedFingerprint = hostFingerprint,
-                presentClientCert = true,
-                verifiedGameStreamUpgrade = true,
+                streamPaired = true,
                 approvedNewFingerprint = approvedNewFingerprint,
                 cancelToken = token,
             )
@@ -941,6 +910,7 @@ object HostManualPairOrchestrator {
             hostInfo = hostInfo,
             hostFingerprint = hostFingerprint,
             ticket = pairResp.ticket,
+            clientCertFingerprint = pairResp.clientCertFingerprint,
             issuedAtMs = clockMs(),
             deviceId = deviceId,
             deviceName = deviceName,
