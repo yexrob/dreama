@@ -35,6 +35,10 @@ def main() -> None:
     ap.add_argument("--max-height", type=int, default=1080)
     ap.add_argument("--separation", type=float, default=StereoParams.separation_pct)
     ap.add_argument("--convergence", type=float, default=StereoParams.convergence)
+    ap.add_argument("--layout", choices=["pico", "full", "half"], default="pico",
+                    help="pico: L|R at full width per eye, height doubled so a half-SBS player "
+                         "shows the right aspect without halving resolution (PICO 4 built-in player); "
+                         "full: L|R at source size; half: L|R squeezed to source width")
     ap.add_argument("--debug", action="store_true", help="output [left | depth] instead, to inspect the map")
     args = ap.parse_args()
 
@@ -59,12 +63,15 @@ def main() -> None:
     state = StereoState()
     print(f"{src.name}: {w0}x{h0} @ {fps:.2f} -> {w*2}x{h} SBS, model input {model.input_size(h, w)}")
 
+    vf = {"pico": f"scale={w*2}:{h*2}:flags=bicubic", "full": "null", "half": f"scale={w}:{h}:flags=area"}[args.layout]
     enc = subprocess.Popen([
         "ffmpeg", "-loglevel", "error", "-y",
         "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w*2}x{h}", "-r", f"{fps}", "-i", "-",
         "-ss", f"{args.start}", "-i", str(src),
         "-map", "0:v", "-map", "1:a?", "-shortest",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-vf", f"{vf},setsar=1",
+        "-c:v", "libx265", "-preset", "medium", "-crf", "18", "-tag:v", "hvc1", "-pix_fmt", "yuv420p",
+        "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv",
         "-c:a", "aac", "-b:a", "192k", str(out),
     ], stdin=subprocess.PIPE)
 

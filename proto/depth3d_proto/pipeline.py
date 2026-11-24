@@ -190,7 +190,8 @@ def synth_eye(bgr: np.ndarray, offsets_q: np.ndarray, edge_fade_pct: float) -> n
         off *= fade[None, :]
     mx = (np.arange(w, dtype=np.float32)[None, :] + off).astype(np.float32)
     my = np.repeat(np.arange(h, dtype=np.float32)[:, None], w, axis=1)
-    return cv2.remap(bgr, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    # Cubic: bilinear at sub-pixel shifts visibly softens the eye views.
+    return cv2.remap(bgr, mx, my, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
 
 def stereo_frame(bgr: np.ndarray, raw_depth: np.ndarray, st: StereoState, p: StereoParams):
