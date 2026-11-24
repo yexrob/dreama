@@ -7,6 +7,9 @@
 # Moonlight common
 -keep class com.limelight.nvstream.jni.* {*;}
 
+# AirPlay receiver: libairplay finds its callbacks by name
+-keep class com.limelight.local.airplay.AirPlayNative {*;}
+
 # LiteRT GPU delegate, loaded by name from native code. The runtime AAR
 # ships its own rules, the GPU one does not.
 -keep class org.tensorflow.lite.gpu.** {*;}

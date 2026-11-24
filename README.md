@@ -75,7 +75,7 @@ adb install -r -g app/build/outputs/apk/nonRoot/debug/app-nonRoot-debug.apk
 - **首页**：最上面是最近看过的片子（没看过就是最新的一个），按「继续播放」从上次的位置接着看；下面一行「继续观看」，混排所有播放源，点卡片直接续播；再往下每个播放源一行海报，点行标题进入这一类。某个源连不上时只有它那一行显示「连不上」和「重试」。
 - **媒体库**：左边是播放源，右边是选中源里的文件夹；没有海报的文件夹用里面几段视频的画面拼成缩略图。点进去是 6 列海报网格。
 - **详情**：继续播放 / 从头播放，下面是进度和剩余时间。
-- **投屏**：iPad、手机投屏还没做，页面上标着「即将支持」；下面的「电脑串流」进入 Moonlight 原来的电脑列表。右上角齿轮是串流设置。
+- **投屏**：上半部分是 AirPlay 接收（见下文「AirPlay 屏幕镜像」），显示接收端的名字和状态；手机 App 投屏（DLNA）还没做，标着「即将支持」。下面的「电脑串流」进入 Moonlight 原来的电脑列表。右上角齿轮是串流设置。
 
 本机视频的海报是从视频里截的一帧（十分之一处，最多 5 分钟），截一次就缓存在应用缓存目录，不重复解码；网盘里的视频不截帧，用色块和片名代替。观看进度存在 Room 里（`wall.db`），暂停、退出播放时写入；看过 30 秒以上、剩余超过 1 分钟（且超过 5%）的才进「继续观看」。
 
@@ -104,6 +104,47 @@ adb shell am start -n dev.depth3d.player.debug/com.limelight.local.wall.WallActi
 ```
 
 Moonlight 原来的串流入口在「投屏」页的「电脑串流」里。
+
+### AirPlay 屏幕镜像（iPad / iPhone）
+
+App 打开期间，头显在 Wi-Fi 里是一台叫 **depth3d** 的 AirPlay 接收端（前台服务 `local/airplay/AirPlayService`，通知栏里能看到）。用法：
+
+1. 头显和 iPad / iPhone 连同一个 Wi-Fi，打开 depth3d，停在任意页面都行。
+2. iPad 上从右上角下拉出控制中心 → 「屏幕镜像」→ 选「depth3d」。
+3. 头显自动进入 VR，iPad 的画面出现在屏幕上并实时转成 3D；声音从头显出。
+4. 在 iPad 上点「停止镜像」，或在头显里退出播放，都会断开并回到首页。
+
+「投屏」页会跟着状态变：等待投屏 → 正在连接 → 正在显示（进入 VR 后）；没连 Wi-Fi 时整页提示去打开 Wi-Fi 设置。
+
+实现：UxPlay 的 `lib/`（协议、配对、FairPlay 解密）用 NDK 编进 `libairplay.so`（`jni/airplay/`），不用 GStreamer：H.264 → MediaCodec → 一个 GL 合成器（按比例放进固定的画布）→ 渲染器的输入 Surface；AAC-ELD → MediaCodec → AudioTrack。mDNS 用系统的 NsdManager 注册 `_airplay._tcp` 和 `_raop._tcp`（TXT 和 UxPlay 一致）：系统的 mDNS 守护进程负责所有网卡、重名探测和后台应答，也不会和 App 里已有的 jmDNS（找电脑、找 WebDAV）抢 5353 端口。
+
+已知限制：
+
+- **没有 PIN，也没有首次确认**：ux-spec 3.6 要的「小林的 iPhone 想投屏到这里」确认卡片在 VR 里还没有，所以同一个 Wi-Fi 里谁选了 depth3d 都能直接投上来。
+- 只做屏幕镜像。在视频 App 里点 AirPlay 投「视频」（HLS）不支持；只投音乐（ALAC）没有声音。
+- 只报 H.264；H.265 的代码在，但默认不向 iPad 提供。
+- 画布按第一帧定成横屏（最大 1920×1080）。iPad 竖着拿或中途旋转，画面按比例缩放、两侧黑边，不重开 VR。
+- 音画同步只是「解码完立刻播」，音频缓冲约 120 ms，不按时间戳对齐；画面经过深度模型，可能比声音慢一点。
+- 从别的 App 里（不是 depth3d 在前台时）开始镜像，系统可能不让后台拉起 VR 页面，这时点通知栏的「正在显示……的屏幕」进入。
+- 接收端只编 arm64-v8a（APK 里的 .so 不压缩，`libairplay.so` 约 5 MB，大头是又静态链接了一份 OpenSSL）；其他 ABI 放的是一个拒绝加载的空壳，投屏页会显示「投屏没有启动」。四个 ABI 都能编，去掉 `jni/airplay/Android.mk` 里的 ABI 判断和空壳即可。
+
+Mac 上可以不连头显先测协议这一层（记录、/info、配对、FairPlay 握手、断开重连）：
+
+```bash
+sh player/app/src/main/jni/airplay/mac/build.sh     # 需要 Xcode 命令行工具和 brew 的 openssl@3，带 ASan/UBSan
+```
+
+#### 引入的第三方代码
+
+| 代码 | 版本 / 来源 | 许可 | 位置 |
+|---|---|---|---|
+| UxPlay `lib/`（不含 dnssd.c 和 CMake 文件） | v1.73.7，[FDH2/UxPlay](https://github.com/FDH2/UxPlay) df67c212 | GPLv3；其中原 RPiPlay 部分为 LGPL-2.1+ | `jni/airplay/uxplay/` |
+| playfair（FairPlay 解密，随 UxPlay） | 同上 | GPLv3 | `jni/airplay/uxplay/lib/playfair/` |
+| llhttp（随 UxPlay） | 9.3.0 | MIT | `jni/airplay/uxplay/lib/llhttp/` |
+| libplist（只取库本身） | 2.6.0，[libimobiledevice/libplist](https://github.com/libimobiledevice/libplist) 2117b8fd | LGPL-2.1+ | `jni/airplay/libplist/` |
+| OpenSSL libcrypto | 4.0.2，仓库里 moonlight-core 已有的预编译库 | Apache-2.0 | `jni/moonlight-core/openssl/` |
+
+都和本项目的 GPLv3 兼容，许可原文在各自目录里。接入方式参考了 [jqssun/android-airplay-server](https://github.com/jqssun/android-airplay-server)；`jni/airplay/android/` 和 `local/airplay/` 是本项目自己写的。
 
 ## 原型用法
 

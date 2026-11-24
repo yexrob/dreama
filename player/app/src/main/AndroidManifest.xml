@@ -30,6 +30,9 @@
     <uses-permission
         android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"
         android:maxSdkVersion="33" />
+    <!-- The AirPlay receiver (local.airplay.AirPlayService) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
 
     <uses-feature
         android:name="android.hardware.touchscreen"
@@ -324,6 +327,32 @@
                 android:name="android.window.PROPERTY_XR_ACTIVITY_START_MODE"
                 android:value="XR_ACTIVITY_START_MODE_FULL_SPACE_UNMANAGED" />
         </activity>
+        <!-- AirPlay screen mirroring: the receiver runs while the wall is
+             open and brings the player up when an iPad starts mirroring -->
+        <activity
+            android:name=".local.airplay.AirPlayPlayerXR"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection"
+            android:resizeableActivity="false"
+            android:launchMode="singleTask"
+            android:excludeFromRecents="true"
+            android:theme="@style/StreamTheme"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="com.oculus.intent.category.VR" />
+            </intent-filter>
+            <meta-data
+                android:name="pvr.app.type"
+                android:value="vr" />
+            <property
+                android:name="android.window.PROPERTY_XR_ACTIVITY_START_MODE"
+                android:value="XR_ACTIVITY_START_MODE_FULL_SPACE_UNMANAGED" />
+        </activity>
+        <service
+            android:name=".local.airplay.AirPlayService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback"
+            android:label="AirPlay Receiver" />
 
         <service
             android:name=".discovery.DiscoveryService"
