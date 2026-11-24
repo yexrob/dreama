@@ -946,7 +946,7 @@ test('Round 3: shared zip-vectors.json (incl. dual.zip PoC) and shared dom-vecto
   }
   // Step budget, deadline timeout, adoption agency 95k recount, unified element count excluding #document
   {
-    const tight = new PluginDomParser(8, 4 * 1024 * 1024, 200_000, 500);
+    const tight = new PluginDomParser(8, 2 * 1024 * 1024, 24 * 1024 * 1024, 500);
     const r = tight.parseHtml('<ul>' + '<li>x</li>'.repeat(2000) + '</ul>');
     assert.throws(() => tight.selectAllIds(r, 'li'), DomLimitExceededError);
 
@@ -1067,23 +1067,24 @@ test('Round 6: selector hard caps, 16 MB memo budget, budgeted attr/class, dedup
       assert.equal(p.handleCount, expectedHandles, `handle count leaked on iter #${i}`);
     }
 
-    const root2 = p.parseHtml(html190k); // 380,008 <= 400,000
+    const root2 = p.parseHtml(html190k); // 11.60 + 17.39 handles + 11.60 = 40.59 MiB <= 48 MiB
     assert.equal(p.docCount, 2);
     assert.equal(p.totalNodes, 380_008);
-    const html50k = '<div>' + '<i></i>'.repeat(50_000) + '</div>';
-    assert.throws(() => p.parseHtml(html50k), DomLimitExceededError);
+    const html150k = '<div>' + '<i></i>'.repeat(150_000) + '</div>'; // 9.16 MiB -> 49.75 MiB > 48 MiB VM cap
+    assert.throws(() => p.parseHtml(html150k), DomLimitExceededError);
 
     assert.equal(p.closeDoc(root), true);
     assert.equal(p.docCount, 1);
     assert.equal(p.totalNodes, 190_004);
-    const root3 = p.parseHtml(html50k);
+    const root3 = p.parseHtml(html150k);
     assert.equal(p.docCount, 2);
-    assert.equal(p.totalNodes, 240_008);
+    assert.equal(p.totalNodes, 340_008);
     p.closeDoc(root2);
     p.closeDoc(root3);
     assert.equal(p.docCount, 0);
     assert.equal(p.totalNodes, 0);
     assert.equal(p.handleCount, 0);
+    assert.equal(p.currentVmMemoryBytes, 0);
   }
 
   // 5. Small #7 & #9: :nth-* overflow rejection + identical DomLimitExceededError class for step & memory budgets
@@ -1102,11 +1103,11 @@ test('Round 6: selector hard caps, 16 MB memo budget, budgeted attr/class, dedup
       assert.throws(() => p.selectAllIds(r, sel), Error, `Expected rejection for ${sel}`);
     }
 
-    const stepP = new PluginDomParser(8, 4 * 1024 * 1024, 200_000, 10);
+    const stepP = new PluginDomParser(8, 2 * 1024 * 1024, 24 * 1024 * 1024, 10);
     const rs = stepP.parseHtml('<ul>' + '<li></li>'.repeat(50) + '</ul>');
     let stepErr = null;
     try { stepP.selectAllIds(rs, 'li'); } catch (e) { stepErr = e; }
-    const memP = new PluginDomParser(8, 4 * 1024 * 1024, 200_000, 2_000_000, 400_000, 1024);
+    const memP = new PluginDomParser(8, 2 * 1024 * 1024, 24 * 1024 * 1024, 2_000_000, 48 * 1024 * 1024, 1024);
     const rm = memP.parseHtml('<ul>' + '<li></li>'.repeat(200) + '</ul>');
     let memErr = null;
     try { memP.selectAllIds(rm, 'li ~ li'); } catch (e) { memErr = e; }
@@ -1168,6 +1169,137 @@ test('Round 6: selector hard caps, 16 MB memo budget, budgeted attr/class, dedup
   }
 });
 
+test('Round 7: byte-budgeted DOM (2 MB/24 MB/48 MB), :empty caching & loop ticks, 8 MB serialization cap, 200k classed selectors, monotonic nextId', async () => {
+  const { PluginDomParser, DomLimitExceededError, DomTimeoutError } = await import('../src/dom.js');
+
+  // 1. Input > 2 MB rejected, plus 3 OOM payloads (PI, text+comment, <i>x * 200k) aborted mid-parse
+  {
+    const p = new PluginDomParser();
+    assert.throws(() => p.parseHtml('<p>' + 'a'.repeat(2 * 1024 * 1024 + 16) + '</p>'), DomLimitExceededError);
+
+    const pi2Mb = '<?>'.repeat(Math.floor((2 * 1024 * 1024) / 3) - 10);
+    const textCmt2Mb = 'x<!>'.repeat(Math.floor((2 * 1024 * 1024) / 4) - 10);
+    const elemText200k = '<i>x'.repeat(200_000);
+    const elemText100k = '<i>x'.repeat(100_000);
+
+    for (const bad of [pi2Mb, textCmt2Mb, elemText200k]) {
+      const t = Date.now();
+      assert.throws(() => p.parseHtml(bad), DomLimitExceededError);
+      assert.ok(Date.now() - t < 1000);
+      assert.equal(p.docCount, 0);
+      assert.equal(p.currentVmMemoryBytes, 0);
+    }
+
+    // 2 x (<i>x * 100k) = ~43.2 MB <= 48 MB succeeds, then select('*') hits 48 MB VM budget
+    const d1 = p.parseHtml(elemText100k);
+    const d2 = p.parseHtml(elemText100k);
+    assert.throws(() => p.selectAllIds(d1, '*'), DomLimitExceededError);
+    p.closeDoc(d1);
+    p.closeDoc(d2);
+    assert.equal(p.currentVmMemoryBytes, 0);
+
+    // 8 simultaneous live docs near the 48 MB VM cap + select('*') + outerHtml
+    const nearCapDocs = [
+      '<div>' + '<i>x</i>'.repeat(20_000) + '</div>',
+      '<div>' + '<i class="a b"></i>'.repeat(25_000) + '</div>',
+      '<div>' + '<!--c-->'.repeat(45_000) + '<p>ok</p></div>',
+      '<div>' + '<i></i>'.repeat(65_000) + '</div>',
+    ];
+    const roots = [];
+    for (let i = 0; i < 8; i++) roots.push(p.parseHtml(nearCapDocs[i % 4]));
+    assert.equal(p.docCount, 8);
+    assert.throws(() => p.parseHtml('<p>9th</p>'), DomLimitExceededError);
+    for (const r of roots) {
+      try { p.selectAllIds(r, '*'); } catch (e) { assert.ok(e instanceof DomLimitExceededError); }
+      assert.ok(p.outerHtml(r).length > 0);
+    }
+    for (const r of roots) p.closeDoc(r);
+    assert.equal(p.currentVmMemoryBytes, 0);
+  }
+
+  // 2. :empty caching + childNodes/attributes step accounting + entry deadline checks
+  {
+    const p = new PluginDomParser();
+    const rEmpty = p.parseHtml('<div>' + '<!>'.repeat(220_000) + '</div>');
+    p.setCallDeadlineMs(Date.now() + 1000);
+    let t = Date.now();
+    assert.equal(p.selectAllIds(rEmpty, 'div' + ':empty'.repeat(680)).length, 1);
+    assert.ok(Date.now() - t < 1000, ':empty x680 on 220k comments must complete in < 1s');
+    p.clear();
+
+    // Many attributes per element (`MA.java`): 400 elems x 512 attrs x 1000 [id] hits 2M step budget in < 1s
+    let oneMany = '<p';
+    for (let i = 0; i < 510; i++) oneMany += ' a' + i.toString(36);
+    oneMany += ' id=a class=a></p>';
+    const rMa = p.parseHtml('<div>' + oneMany.repeat(400) + '</div>');
+    p.setCallDeadlineMs(Date.now() + 1000);
+    t = Date.now();
+    assert.throws(() => p.selectAllIds(rMa, 'p' + '[id]'.repeat(1000)), DomLimitExceededError);
+    assert.ok(Date.now() - t < 1000);
+
+    // Expired deadline rejected at entry of every DOM method
+    p.setCallDeadlineMs(Date.now() - 1);
+    assert.throws(() => p.parseHtml('<p>x</p>'), DomTimeoutError);
+    assert.throws(() => p.selectFirstId(rMa, 'p'), DomTimeoutError);
+    assert.throws(() => p.selectAllIds(rMa, 'p'), DomTimeoutError);
+    assert.throws(() => p.childrenIds(rMa), DomTimeoutError);
+    assert.throws(() => p.tag(rMa), DomTimeoutError);
+    assert.throws(() => p.text(rMa), DomTimeoutError);
+    assert.throws(() => p.html(rMa), DomTimeoutError);
+    assert.throws(() => p.outerHtml(rMa), DomTimeoutError);
+    assert.throws(() => p.attr(rMa, 'id'), DomTimeoutError);
+    assert.throws(() => p.attrsJson(rMa), DomTimeoutError);
+    p.clear();
+  }
+
+  // 3. 8 MB serialization output cap on html(), outerHtml(), and text()
+  {
+    const p = new PluginDomParser();
+    const rQuot = p.parseHtml("<p a='" + '"'.repeat(1_600_000) + "'></p>");
+    const t = Date.now();
+    assert.throws(() => p.outerHtml(rQuot), DomLimitExceededError);
+    assert.throws(() => p.html(rQuot), DomLimitExceededError);
+    assert.ok(Date.now() - t < 1000);
+    p.clear();
+
+    const smallOut = new PluginDomParser(8, 2 * 1024 * 1024, 24 * 1024 * 1024, 2_000_000, 48 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024);
+    const rTxt = smallOut.parseHtml('<p>' + 'x'.repeat(100_000) + '</p>');
+    assert.throws(() => smallOut.text(rTxt), DomLimitExceededError);
+    smallOut.clear();
+  }
+
+  // 4. 200,000 classed elements on `.a`, `i.a`, `.a.b`, `.a .b` under default 16 MB selector memory budget
+  {
+    const defP = new PluginDomParser();
+    const rDef = defP.parseHtml('<div class="a">' + '<p class="a b">'.repeat(120_000) + '</div>');
+    assert.equal(defP.selectAllIds(rDef, '.a').length, 120_001);
+    assert.equal(defP.selectAllIds(rDef, 'p.a').length, 120_000);
+    assert.equal(defP.selectAllIds(rDef, '.a.b').length, 120_000);
+    assert.equal(defP.selectAllIds(rDef, '.a .b').length, 120_000);
+    defP.clear();
+
+    const p200k = new PluginDomParser(8, 4 * 1024 * 1024, 48 * 1024 * 1024, 2_000_000, 80 * 1024 * 1024, 16 * 1024 * 1024);
+    const r200k = p200k.parseHtml('<div class="a">' + '<i class="a b"></i>'.repeat(200_000) + '</div>');
+    for (const [sel, expected] of [['.a', 200_001], ['i.a', 200_000], ['.a.b', 200_000], ['.a .b', 200_000]]) {
+      const t = Date.now();
+      assert.equal(p200k.selectAllIds(r200k, sel).length, expected, `200k classed selector ${sel}`);
+      assert.ok(Date.now() - t < 1000, `200k classed selector ${sel} exceeded 1s`);
+    }
+    p200k.clear();
+  }
+
+  // 5. Monotonic nextId never reset across clear()
+  {
+    const p = new PluginDomParser();
+    const id1 = p.parseHtml('<p>one</p>');
+    p.clear();
+    const id2 = p.parseHtml('<p>two</p>');
+    assert.ok(id2 > id1, `nextId must not reset on clear(): id1=${id1} id2=${id2}`);
+    assert.equal(p.tag(id1), '');
+    assert.equal(p.tag(id2), '#document');
+  }
+});
+
 test('Round 3: host memory caps, tool/host parity, redirect safe-headers, cookie warnings, unawaited Promise check, immutable globals', async () => {
   const warnings = [];
   let redirectTargetHeaders = null;
@@ -1198,7 +1330,7 @@ test('Round 3: host memory caps, tool/host parity, redirect safe-headers, cookie
           return 'R'.repeat(9 * 1024 * 1024);
         }
         if (m === 'dom-node-flood') {
-          ctx.parse.html('<a></a>'.repeat(210000));
+          ctx.parse.html('<i>x</i>'.repeat(130000));
           return { ok: true };
         }
         if (m === 'timer-flood') {

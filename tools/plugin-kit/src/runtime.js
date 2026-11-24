@@ -554,6 +554,11 @@ export class QuickJsPluginHost {
         try {
           const rawArgs = argHandles.map((a) => vm.dump(a));
           const args = requireToken(rawArgs);
+          if (name !== 'finishCall' && name !== 'cancelTimer' && name !== 'domCloseDoc' &&
+              this.deadlineMs !== Infinity && Date.now() > this.deadlineMs) {
+            this._lastCallTimedOut = true;
+            throw new DomTimeoutError(`宿主调用已超时（${name}）`);
+          }
           if (typeof this._bridgeFaultInjectorForTesting === 'function') {
             this._bridgeFaultInjectorForTesting(name);
           }

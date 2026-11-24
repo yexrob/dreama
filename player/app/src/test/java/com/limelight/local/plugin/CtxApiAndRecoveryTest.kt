@@ -20,6 +20,7 @@ import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.long
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -820,7 +821,7 @@ class CtxApiAndRecoveryTest {
                   return 'R'.repeat(9 * 1024 * 1024);
                 }
                 if (mode === 'dom-node-flood') {
-                  ctx.parse.html('<a></a>'.repeat(210000));
+                  ctx.parse.html('<i>x</i>'.repeat(130000));
                   return { ok: true };
                 }
                 if (mode === 'timer-flood') {
@@ -954,22 +955,22 @@ class CtxApiAndRecoveryTest {
             // Runtime remains healthy after rejecting oversized return
             assertEquals(0, runtime.invoke("home").jsonArray.size)
 
-            // 5. Item #3d: ctx.parse > 200k nodes rejected BEFORE building 210k Jsoup nodes
+            // 5. Item #3d & Round 7 #1: ctx.parse > 24 MB estimated DOM memory rejected mid-parse
             val usedBeforeDomFlood = settledUsedBytes()
             try {
                 runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("dom-node-flood"))))
-                fail("DOM with 210k elements must be rejected")
+                fail("DOM exceeding 24 MB single-doc memory budget must be rejected")
             } catch (_: PluginInternalException) {
             }
             val domFloodDelta = settledUsedBytes() - usedBeforeDomFlood
             assertTrue(
-                "Rejected 210k-node DOM flood must not grow host heap by > 16 MB, got ${domFloodDelta / (1024 * 1024)} MB",
+                "Rejected DOM flood must not grow host heap by > 16 MB, got ${domFloodDelta / (1024 * 1024)} MB",
                 domFloodDelta < 16L * 1024 * 1024,
             )
             val directDom = PluginDomParser()
             try {
-                directDom.parseHtml("<a></a>".repeat(210_000))
-                fail("Direct PluginDomParser must reject 210k elements before building DOM tree")
+                directDom.parseHtml("<i>x</i>".repeat(130_000))
+                fail("Direct PluginDomParser must reject > 24 MB DOM mid-parse")
             } catch (_: DomLimitExceededException) {
             }
             assertEquals("Rejected DOM parse must retain 0 nodes in host parser", 0, directDom.currentTotalNodes())
@@ -1289,11 +1290,11 @@ class CtxApiAndRecoveryTest {
                     op == "html" -> parser.html(nodeId)
                     op == "outer" -> parser.outerHtml(nodeId)
                     op == "attrs" -> parser.attrsJson(nodeId)
-                    op == "children" -> parser.childrenIds(nodeId).joinToString(",") { parser.tag(it.jsonPrimitive.int) }
+                    op == "children" -> parser.childrenIds(nodeId).joinToString(",") { parser.tag(it.jsonPrimitive.long) }
                     op.startsWith("attr:") -> parser.attr(nodeId, op.removePrefix("attr:"))
                     op.startsWith("all:") -> parser.selectAllIds(nodeId, op.removePrefix("all:"))
                         .joinToString("|") { el ->
-                            val cid = el.jsonPrimitive.int
+                            val cid = el.jsonPrimitive.long
                             "${parser.tag(cid)}=${parser.text(cid)}"
                         }
                     else -> fail("Unknown op: $op").toString()
@@ -1597,6 +1598,452 @@ class CtxApiAndRecoveryTest {
             tmpDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun round7CalibratesDomByteEstimatorEnforcesOutputCapsEmptyCachingClass200kLongIdsAnd30sSoakUnderXmx256m() {
+        val javaBin = File(System.getProperty("java.home"), "bin/java").absolutePath
+        val classpath = System.getProperty("java.class.path")
+
+        // 1. Calibration probe: across 14 distinct document shapes (pure elements, elements+text,
+        //    unclosed formatting elements, PIs, bogus comments, comments, text+comments, many attrs,
+        //    long attr, long text, deep nesting, classed elements, XML PI, XML CDATA), estimated bytes
+        //    MUST be >= 80% of real JVM retained heap.
+        val calibProc = ProcessBuilder(
+            javaBin,
+            "-Xmx512m",
+            "-cp",
+            classpath,
+            Round7CalibrationSubprocessMain::class.java.name,
+        ).redirectErrorStream(true).start()
+        val calibOut = calibProc.inputStream.bufferedReader().readText()
+        val calibExit = calibProc.waitFor()
+        assertEquals("Round 7 DOM byte estimator calibration MUST pass:\n$calibOut", 0, calibExit)
+        assertTrue("Calibration probe must report CALIBRATION_PASSED:\n$calibOut", calibOut.contains("CALIBRATION_PASSED"))
+
+        // 2. Round 7 worst-case & 30-second soak probe under strict -Xmx256m:
+        //    - 2 MB input cap, 24 MB single-doc cap, 48 MB VM cap (docs + handles + class cache)
+        //    - PI flood (`<?>`), text+comment flood (`x<!>`), `<i>x` x 200k, 8 docs near cap
+        //    - 30s loop of parse + select('*') + outerHtml without OOM and retained heap <= 96 MB
+        //    - :empty caching + budgeted childNodes/attributes loops + entry deadline checks
+        //    - 8 MB html()/outerHtml()/text() serialization output cap
+        //    - 200k classed elements `.a`, `i.a`, `.a.b`, `.a .b` without false-positive memory error
+        //    - Monotonic Long nextId never reset across clear()
+        val soakProc = ProcessBuilder(
+            javaBin,
+            "-Xmx256m",
+            "-cp",
+            classpath,
+            Round7SoakAndFixesSubprocessMain::class.java.name,
+        ).redirectErrorStream(true).start()
+        val soakOut = soakProc.inputStream.bufferedReader().readText()
+        val soakExit = soakProc.waitFor()
+        assertEquals("Round 7 -Xmx256m 30s soak & fixes suite MUST pass:\n$soakOut", 0, soakExit)
+        assertTrue("Soak probe must report ROUND7_SOAK_PASSED:\n$soakOut", soakOut.contains("ROUND7_SOAK_PASSED"))
+    }
+}
+
+/**
+ * Isolated JVM process calibrating [PluginDomParser.estimateDocumentBytes] against
+ * real JVM retained heap across 14 document shapes, asserting `estimated >= 0.80 * actual`.
+ */
+object Round7CalibrationSubprocessMain {
+    private fun retainedBytes(): Long {
+        val mem = java.lang.management.ManagementFactory.getMemoryMXBean()
+        repeat(5) {
+            System.gc()
+            Thread.sleep(20)
+        }
+        return mem.heapMemoryUsage.used
+    }
+
+    private fun checkShape(name: String, input: String, isXml: Boolean) {
+        val base = retainedBytes()
+        val parser = if (isXml) {
+            org.jsoup.parser.Parser.xmlParser().settings(org.jsoup.parser.ParseSettings.preserveCase)
+        } else {
+            org.jsoup.parser.Parser.htmlParser().settings(org.jsoup.parser.ParseSettings.htmlDefault)
+        }
+        parser.setMaxDepth(512)
+        val doc = parser.parseInput(input, "")
+        val after = retainedBytes()
+        val actual = (after - base).coerceAtLeast(1L)
+        val est = PluginDomParser.estimateDocumentBytes(doc)
+        val ratio = est.toDouble() / actual.toDouble()
+        println(
+            String.format(
+                java.util.Locale.ROOT,
+                "CALIB %-18s actual=%.2fMB est=%.2fMB ratio=%.2fx",
+                name,
+                actual / 1048576.0,
+                est / 1048576.0,
+                ratio,
+            ),
+        )
+        // Keep doc strongly reachable until measurement finishes
+        if (doc.childNodeSize() < 0) println(doc)
+        if (ratio < 0.80) {
+            throw AssertionError(
+                "Estimator under-estimated shape '$name': est=${est}B < 80% of actual=${actual}B (ratio=${"%.2f".format(ratio)})",
+            )
+        }
+    }
+
+    @JvmStatic
+    fun main(args: Array<String>) {
+        // Warm up Jsoup classes before measuring retained heap deltas
+        org.jsoup.Jsoup.parse("<p>warmup</p>")
+
+        val multiAttr = buildString {
+            append("<div>")
+            repeat(200) {
+                append("<p")
+                for (i in 0 until 200) append(" a").append(i).append("=v").append(i)
+                append("></p>")
+            }
+            append("</div>")
+        }
+        val deep = buildString {
+            repeat(500) { append("<div>") }
+            append("<i></i>".repeat(50_000))
+        }
+
+        checkShape("pure_elem", "<div>" + "<i></i>".repeat(100_000) + "</div>", isXml = false)
+        checkShape("elem_text", "<div>" + "<i>x</i>".repeat(100_000) + "</div>", isXml = false)
+        checkShape("elem_short", "<i>x".repeat(100_000), isXml = false)
+        checkShape("pi_html", "<?>".repeat(200_000), isXml = false)
+        checkShape("bogus_html", "<!>".repeat(200_000), isXml = false)
+        checkShape("comment_html", "<!--a-->".repeat(200_000), isXml = false)
+        checkShape("text_comment", "x<!>".repeat(150_000), isXml = false)
+        checkShape("many_attr", multiAttr, isXml = false)
+        checkShape("long_attr", "<p x='" + "a".repeat(1_000_000) + "'></p>", isXml = false)
+        checkShape("long_text", "<p>" + "a".repeat(1_000_000) + "</p>", isXml = false)
+        checkShape("deep_nest", deep, isXml = false)
+        checkShape("classed", "<div>" + "<i class=\"card item\"></i>".repeat(100_000) + "</div>", isXml = false)
+        checkShape("xml_pi", "<r>" + "<?p x?>".repeat(100_000) + "</r>", isXml = true)
+        checkShape("xml_cdata", "<r>" + "<![CDATA[hello]]>".repeat(50_000) + "</r>", isXml = true)
+
+        println("CALIBRATION_PASSED")
+        kotlin.system.exitProcess(0)
+    }
+}
+
+/**
+ * Isolated `-Xmx256m` child JVM verifying all Round 7 fixes and running a full
+ * 30-second soak loop of `parse + select('*') + outerHtml` across worst-case inputs
+ * and 8 simultaneous documents right below the VM memory cap, asserting zero OOM
+ * and retained heap <= 96 MB.
+ */
+object Round7SoakAndFixesSubprocessMain {
+    private fun retainedMb(): Long {
+        val mem = java.lang.management.ManagementFactory.getMemoryMXBean()
+        repeat(4) {
+            System.gc()
+            Thread.sleep(15)
+        }
+        return mem.heapMemoryUsage.used / (1024L * 1024L)
+    }
+
+    private inline fun assertFastUnder1s(name: String, block: () -> Unit) {
+        val t0 = System.nanoTime()
+        block()
+        val ms = (System.nanoTime() - t0) / 1_000_000L
+        if (ms >= 1000L) throw AssertionError("Case '$name' exceeded 1000ms: ${ms}ms")
+        println("OK [$name] ${ms}ms")
+    }
+
+    @JvmStatic
+    fun main(args: Array<String>) {
+        // 1. Input > 2 MB rejected immediately
+        run {
+            val p = PluginDomParser()
+            val over2Mb = "<p>" + "a".repeat(2 * 1024 * 1024 + 16) + "</p>"
+            assertFastUnder1s("R7_input_over_2mb_rejected") {
+                try {
+                    p.parseHtml(over2Mb)
+                    throw AssertionError("Input > 2 MB must throw DomLimitExceededException")
+                } catch (_: DomLimitExceededException) {
+                }
+            }
+        }
+
+        // 2. Three exact OOM payloads from Round 7 Item #1 (scaled to <= 2 MB input)
+        val pi2Mb = "<?>".repeat((2 * 1024 * 1024) / 3 - 10)
+        val textCmt2Mb = "x<!>".repeat((2 * 1024 * 1024) / 4 - 10)
+        val elemText200k = "<i>x".repeat(200_000) // 800 KB, ~43 MB > 24 MB single-doc cap
+        val elemText100k = "<i>x".repeat(100_000) // 400 KB, ~21.6 MB <= 24 MB single-doc cap
+
+        run {
+            val p = PluginDomParser()
+            assertFastUnder1s("R7_pi_2mb_aborted_midparse") {
+                try {
+                    p.parseHtml(pi2Mb)
+                    throw AssertionError("2 MB PI flood must throw DomLimitExceededException")
+                } catch (_: DomLimitExceededException) {
+                }
+            }
+            assertFastUnder1s("R7_textcmt_2mb_aborted_midparse") {
+                try {
+                    p.parseHtml(textCmt2Mb)
+                    throw AssertionError("2 MB text+comment flood must throw DomLimitExceededException")
+                } catch (_: DomLimitExceededException) {
+                }
+            }
+            assertFastUnder1s("R7_elemtext_200k_rejected") {
+                try {
+                    p.parseHtml(elemText200k)
+                    throw AssertionError("<i>x * 200k must exceed 24 MB single-doc budget")
+                } catch (_: DomLimitExceededException) {
+                }
+            }
+            // 2 x (<i>x * 100k) (~21.6 MB each = ~43.2 MB <= 48 MB) succeed, then select('*') hits 48 MB VM budget!
+            val d1 = p.parseHtml(elemText100k)
+            val d2 = p.parseHtml(elemText100k)
+            assertFastUnder1s("R7_two_docs_plus_handles_48mb_cap") {
+                try {
+                    p.selectAllIds(d1, "*")
+                    throw AssertionError("43.2 MB live docs + 9.6 MB handles must exceed 48 MB VM budget")
+                } catch (_: DomLimitExceededException) {
+                }
+            }
+            p.closeDoc(d1)
+            p.closeDoc(d2)
+            if (p.currentVmMemoryBytes() != 0L) throw AssertionError("closeDoc must zero VM memory")
+        }
+
+        // 3. Item #2: :empty caching + childNodes/attributes step accounting + entry deadline checks
+        run {
+            // 220k comments inside <div> (~21 MB <= 24 MB) + div:empty x680 with 1s deadline -> < 1s!
+            val p = PluginDomParser()
+            val rEmpty = p.parseHtml("<div>" + "<!>".repeat(220_000) + "</div>")
+            p.setCallDeadlineNanos(System.nanoTime() + 1_000_000_000L)
+            assertFastUnder1s("R7_empty_x680_cached_and_budgeted") {
+                val res = p.selectAllIds(rEmpty, "div" + ":empty".repeat(680))
+                if (res.size != 1) throw AssertionError("div with only comments is :empty, expected 1 got ${res.size}")
+            }
+            p.clear()
+
+            // Even with lifted doc budget for 1,390,000 comments -> step budget/deadline aborts in < 1s!
+            val bigP = PluginDomParser(
+                maxDocBytes = 5 * 1024 * 1024,
+                maxDocMemoryBytes = 200L * 1024 * 1024,
+                maxVmMemoryBytes = 200L * 1024 * 1024,
+            )
+            val rHugeEmpty = bigP.parseHtml("<div>" + "<!>".repeat(1_390_000) + "</div>")
+            bigP.setCallDeadlineNanos(System.nanoTime() + 1_000_000_000L)
+            assertFastUnder1s("R7_empty_1390k_comments_under_1s") {
+                try {
+                    bigP.selectAllIds(rHugeEmpty, "div" + ":empty".repeat(680))
+                    // Either cached in 1 pass (< 1s) or tripped step budget (< 1s)
+                } catch (_: DomLimitExceededException) {
+                } catch (_: DomTimeoutException) {
+                }
+            }
+            bigP.clear()
+
+            // Multi-attribute loop (`MA.java`): 512 attrs/elem x 400 elems x 1000 [id] -> trips 2M step budget in < 1s
+            val oneMany = buildString {
+                append("<p")
+                for (i in 0 until 510) append(" a").append(i.toString(36))
+                append(" id=a class=a></p>")
+            }
+            val manyAttrDoc = "<div>" + oneMany.repeat(400) + "</div>"
+            val rMa = p.parseHtml(manyAttrDoc)
+            p.setCallDeadlineNanos(System.nanoTime() + 1_000_000_000L)
+            assertFastUnder1s("R7_many_attr_list_budgeted") {
+                try {
+                    p.selectAllIds(rMa, "p" + "[id]".repeat(1000))
+                    throw AssertionError("400 elems x 512 attrs x 1000 [id] must hit 2M step budget")
+                } catch (_: DomLimitExceededException) {
+                }
+            }
+
+            // Entry deadline check on every DOM operation
+            p.setCallDeadlineNanos(System.nanoTime() - 1L)
+            val ops: List<Pair<String, () -> Unit>> = listOf(
+                "parseHtml" to { p.parseHtml("<p>x</p>") },
+                "selectFirstId" to { p.selectFirstId(rMa, "p") },
+                "selectAllIds" to { p.selectAllIds(rMa, "p") },
+                "childrenIds" to { p.childrenIds(rMa) },
+                "tag" to { p.tag(rMa) },
+                "text" to { p.text(rMa) },
+                "html" to { p.html(rMa) },
+                "outerHtml" to { p.outerHtml(rMa) },
+                "attr" to { p.attr(rMa, "id") },
+                "attrsJson" to { p.attrsJson(rMa) },
+            )
+            for ((opName, fn) in ops) {
+                try {
+                    fn()
+                    throw AssertionError("Expired deadline must throw DomTimeoutException at entry of $opName")
+                } catch (_: DomTimeoutException) {
+                }
+            }
+            p.clear()
+        }
+
+        // 4. Item #3: 8 MB serialization cap on html(), outerHtml(), and text()
+        run {
+            val p = PluginDomParser()
+            // 1.6 MB of `"` expands 6x to 9.6 MB (`&quot;`) > 8 MB cap -> aborts cleanly with DomLimitExceededException
+            val quotDoc = "<p a='" + "\"".repeat(1_600_000) + "'></p>"
+            val rQuot = p.parseHtml(quotDoc)
+            assertFastUnder1s("R7_outerHtml_8mb_cap") {
+                try {
+                    p.outerHtml(rQuot)
+                    throw AssertionError("9.6 MB escaped outerHtml must throw DomLimitExceededException")
+                } catch (_: DomLimitExceededException) {
+                }
+            }
+            assertFastUnder1s("R7_html_8mb_cap") {
+                try {
+                    p.html(rQuot)
+                    throw AssertionError("9.6 MB escaped html must throw DomLimitExceededException")
+                } catch (_: DomLimitExceededException) {
+                }
+            }
+            p.clear()
+
+            // text() cap verified with custom small maxOutputBytes = 64 KB
+            val smallOut = PluginDomParser(maxOutputBytes = 64 * 1024)
+            val rTxt = smallOut.parseHtml("<p>" + "x".repeat(100_000) + "</p>")
+            assertFastUnder1s("R7_text_output_cap") {
+                try {
+                    smallOut.text(rTxt)
+                    throw AssertionError("text() exceeding maxOutputBytes must throw DomLimitExceededException")
+                } catch (_: DomLimitExceededException) {
+                }
+            }
+            smallOut.clear()
+        }
+
+        // 5. Item #4: 200,000 classed elements with `.a`, `i.a`, `.a.b`, `.a .b` MUST succeed
+        //    under the default 16 MB selector memory budget (zero false-positive cache overflow!)
+        run {
+            // 5a: Default 2 MB / 24 MB / 48 MB limits with 120k classed elements
+            val defP = PluginDomParser()
+            val defDoc = "<div class=\"a\">" + "<p class=\"a b\">".repeat(120_000) + "</div>"
+            val rDef = defP.parseHtml(defDoc)
+            assertFastUnder1s("R7_class_default_120k") {
+                if (defP.selectAllIds(rDef, ".a").size != 120_001) throw AssertionError(".a mismatch")
+                if (defP.selectAllIds(rDef, "p.a").size != 120_000) throw AssertionError("p.a mismatch")
+                if (defP.selectAllIds(rDef, ".a.b").size != 120_000) throw AssertionError(".a.b mismatch")
+                if (defP.selectAllIds(rDef, ".a .b").size != 120_000) throw AssertionError(".a .b mismatch")
+            }
+            defP.clear()
+
+            // 5b: Explicit 200,000 classed elements (default 16 MB selector memory budget!)
+            val cls200kP = PluginDomParser(
+                maxDocBytes = 4 * 1024 * 1024,
+                maxDocMemoryBytes = 48L * 1024 * 1024,
+                maxVmMemoryBytes = 80L * 1024 * 1024,
+            )
+            val doc200k = "<div class=\"a\">" + "<i class=\"a b\"></i>".repeat(200_000) + "</div>"
+            val r200k = cls200kP.parseHtml(doc200k)
+            assertFastUnder1s("R7_class_200k_dot_a") {
+                if (cls200kP.selectAllIds(r200k, ".a").size != 200_001) throw AssertionError(".a on 200k mismatch")
+            }
+            assertFastUnder1s("R7_class_200k_i_dot_a") {
+                if (cls200kP.selectAllIds(r200k, "i.a").size != 200_000) throw AssertionError("i.a on 200k mismatch")
+            }
+            assertFastUnder1s("R7_class_200k_dot_a_dot_b") {
+                if (cls200kP.selectAllIds(r200k, ".a.b").size != 200_000) throw AssertionError(".a.b on 200k mismatch")
+            }
+            assertFastUnder1s("R7_class_200k_dot_a_space_dot_b") {
+                if (cls200kP.selectAllIds(r200k, ".a .b").size != 200_000) throw AssertionError(".a .b on 200k mismatch")
+            }
+            cls200kP.clear()
+        }
+
+        // 6. Item #5: Monotonic Long nextId never reset across clear()
+        run {
+            val p = PluginDomParser()
+            val id1: Long = p.parseHtml("<p>one</p>")
+            p.clear()
+            val id2: Long = p.parseHtml("<p>two</p>")
+            if (id2 <= id1) throw AssertionError("nextId must be monotonic across clear(): id1=$id1 id2=$id2")
+            if (p.tag(id1) != "") throw AssertionError("Stale handle id1 must not resolve after clear()")
+            if (p.tag(id2) != "#document") throw AssertionError("Fresh handle id2 must resolve")
+            p.clear()
+            println("OK [R7_monotonic_long_nextId] id1=$id1 id2=$id2")
+        }
+
+        // 7. 30-second -Xmx256m soak loop:
+        //    8 simultaneous live docs each right below the per-doc share of the 48 MB VM cap
+        //    + the 3 worst-case attack payloads (PI, text+comment, <i>x * 200k)
+        //    + select('*') + outerHtml -> assert zero OOM and retained heap <= 96 MB!
+        run {
+            val p = PluginDomParser()
+            // Each doc is ~4.3 MB estimated (30k * <i>x -> ~4.3 MB? Let's use 20k * <i>x = ~4.4 MB);
+            // 8 simultaneous live docs = ~35.2 MB <= 48 MB, leaving headroom for handles & outerHtml!
+            val nearCapDocs = arrayOf(
+                "<div>" + "<i>x</i>".repeat(20_000) + "</div>",
+                "<div>" + "<i class=\"a b\"></i>".repeat(25_000) + "</div>",
+                "<div>" + "<!--c-->".repeat(45_000) + "<p>ok</p></div>",
+                "<div>" + "<i></i>".repeat(65_000) + "</div>",
+                "<div>" + "<i>x</i>".repeat(20_000) + "</div>",
+                "<div>" + "<i class=\"a b\"></i>".repeat(25_000) + "</div>",
+                "<div>" + "<!--c-->".repeat(45_000) + "<p>ok</p></div>",
+                "<div>" + "<i></i>".repeat(65_000) + "</div>",
+            )
+            val startMs = System.currentTimeMillis()
+            var cycles = 0
+            var maxRetainedMb = 0L
+            while (System.currentTimeMillis() - startMs < 30_000L) {
+                // a) Hit all 3 attack payloads — every one must fail cleanly without leaking
+                for (attack in listOf(pi2Mb, textCmt2Mb, elemText200k)) {
+                    try {
+                        p.parseHtml(attack)
+                        throw AssertionError("Attack payload unexpectedly succeeded during soak cycle #$cycles")
+                    } catch (_: DomLimitExceededException) {
+                    }
+                }
+                // b) Keep 8 simultaneous live docs near the 48 MB VM cap, run select('*') + outerHtml
+                val roots = LongArray(8)
+                for (i in 0 until 8) {
+                    roots[i] = p.parseHtml(nearCapDocs[i])
+                }
+                if (p.currentLiveDocCount() != 8) {
+                    throw AssertionError("Expected 8 live docs, got ${p.currentLiveDocCount()}")
+                }
+                // 9th doc must be rejected
+                try {
+                    p.parseHtml("<p>ninth</p>")
+                    throw AssertionError("9th live doc must throw DomLimitExceededException")
+                } catch (_: DomLimitExceededException) {
+                }
+                for (i in 0 until 8) {
+                    try {
+                        p.selectAllIds(roots[i], "*")
+                    } catch (_: DomLimitExceededException) {
+                        // Expected if handle table pushes total past 48 MB VM cap
+                    }
+                    val html = p.outerHtml(roots[i])
+                    if (html.isEmpty()) throw AssertionError("outerHtml returned empty")
+                }
+                if (cycles % 10 == 0) {
+                    val ret = retainedMb()
+                    if (ret > maxRetainedMb) maxRetainedMb = ret
+                    if (ret > 96L) {
+                        throw AssertionError("Retained heap exceeded 96 MB while 8 docs live: ${ret}MB")
+                    }
+                }
+                for (i in 0 until 8) p.closeDoc(roots[i])
+                if (p.currentLiveDocCount() != 0 || p.currentVmMemoryBytes() != 0L) {
+                    throw AssertionError("Leak after closing 8 docs: vmMem=${p.currentVmMemoryBytes()}")
+                }
+                cycles += 1
+            }
+            val finalRetained = retainedMb()
+            if (finalRetained > maxRetainedMb) maxRetainedMb = finalRetained
+            println("SOAK_30S cycles=$cycles maxRetainedMb=$maxRetainedMb finalRetainedMb=$finalRetained")
+            if (maxRetainedMb > 96L) {
+                throw AssertionError("Peak retained heap exceeded 96 MB cap: ${maxRetainedMb}MB")
+            }
+        }
+
+        println("ROUND7_SOAK_PASSED")
+        kotlin.system.exitProcess(0)
+    }
 }
 
 /**
@@ -1773,34 +2220,36 @@ object Round6WorstCaseSubprocessMain {
             }
             println("OK [R4_dedup_190k_select_star_40x] handles=$expectedHandles")
 
-            // Live total element cap = 400k across live docs + doc.close() reclamation
-            val root2 = p.parseHtml(html190k) // 190,004 * 2 = 380,008 <= 400,000
+            // Live VM DOM memory cap = 48 MiB (docs + handles) + doc.close() reclamation
+            val root2 = p.parseHtml(html190k) // 11.60 MiB doc1 + 17.39 MiB handles + 11.60 MiB doc2 = 40.59 MiB <= 48 MiB
             if (p.currentLiveDocCount() != 2 || p.currentTotalNodes() != 380_008) {
                 throw AssertionError("Expected 2 live docs / 380008 nodes, got ${p.currentLiveDocCount()} / ${p.currentTotalNodes()}")
             }
-            val html50k = "<div>" + "<i></i>".repeat(50_000) + "</div>"
-            assertFastUnder1s("R4_live_400k_cap_enforced") {
+            val html150k = "<div>" + "<i></i>".repeat(150_000) + "</div>" // 9.16 MiB -> 49.75 MiB > 48 MiB VM cap
+            assertFastUnder1s("R4_live_48mb_vm_cap_enforced") {
                 try {
-                    p.parseHtml(html50k)
-                    throw AssertionError("380k + 50k > 400k live cap must throw DomLimitExceededException")
+                    p.parseHtml(html150k)
+                    throw AssertionError("Exceeding 48 MB VM DOM budget must throw DomLimitExceededException")
                 } catch (_: DomLimitExceededException) {
                 }
             }
-            // Closing doc #1 immediately reclaims its 190,004 elements and handles!
+            // Closing doc #1 immediately reclaims BOTH its doc bytes AND its 190,005 handle bytes!
             if (!p.closeDoc(root)) throw AssertionError("closeDoc(root) returned false")
             if (p.currentLiveDocCount() != 1 || p.currentTotalNodes() != 190_004) {
                 throw AssertionError("After closeDoc: docs=${p.currentLiveDocCount()} nodes=${p.currentTotalNodes()}")
             }
-            val root3 = p.parseHtml(html50k) // 190,004 + 50,004 = 240,008 <= 400,000 -> succeeds!
-            if (p.currentLiveDocCount() != 2 || p.currentTotalNodes() != 240_008) {
+            val root3 = p.parseHtml(html150k) // 11.60 MiB + 9.16 MiB = 20.76 MiB <= 48 MiB -> succeeds!
+            if (p.currentLiveDocCount() != 2 || p.currentTotalNodes() != 340_008) {
                 throw AssertionError("After reclaim+parse: docs=${p.currentLiveDocCount()} nodes=${p.currentTotalNodes()}")
             }
             p.closeDoc(root2)
             p.closeDoc(root3)
-            if (p.currentLiveDocCount() != 0 || p.currentTotalNodes() != 0 || p.currentHandleCount() != 0) {
-                throw AssertionError("All closed docs must release to 0")
+            if (p.currentLiveDocCount() != 0 || p.currentTotalNodes() != 0 || p.currentHandleCount() != 0 ||
+                p.currentVmMemoryBytes() != 0L
+            ) {
+                throw AssertionError("All closed docs must release to 0 (vmMem=${p.currentVmMemoryBytes()})")
             }
-            println("OK [R4_live_400k_and_doc_close]")
+            println("OK [R4_live_48mb_and_doc_close]")
         }
 
         // Case 5 (Small #7 & #9): :nth-* overflow rejection + identical exception class for step & memory budgets

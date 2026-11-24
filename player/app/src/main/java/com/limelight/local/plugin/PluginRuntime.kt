@@ -174,6 +174,8 @@ class PluginRuntime(
     @Volatile
     private var hostOomInCall: Boolean = false
     @Volatile
+    private var callDeadlineNanos: Long = Long.MAX_VALUE
+    @Volatile
     internal var bridgeFaultInjectorForTesting: ((String) -> Unit)? = null
     private val callGeneration = AtomicInteger(0)
 
@@ -282,9 +284,9 @@ class PluginRuntime(
             context = androidContext,
         )
         qjs.evaluationTimeoutMillis = timeoutMs
-        domParser.setCallDeadlineNanos(
-            System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMs),
-        )
+        val dl = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        callDeadlineNanos = dl
+        domParser.setCallDeadlineNanos(dl)
 
         val argJson = arg?.toString() ?: "null"
         val hasArg = arg != null
@@ -384,9 +386,9 @@ class PluginRuntime(
         qjs.memoryLimit = memoryLimitBytes
         qjs.maxStackSize = MAX_STACK_BYTES
         qjs.evaluationTimeoutMillis = timeoutMs
-        domParser.setCallDeadlineNanos(
-            System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMs),
-        )
+        val dl = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        callDeadlineNanos = dl
+        domParser.setCallDeadlineNanos(dl)
         bridgeToken = PluginCrypto.hexEncode(PluginCrypto.randomBytes(16))
         creationCount += 1
 
@@ -489,6 +491,7 @@ class PluginRuntime(
     private fun cleanupActiveCall(scope: CoroutineScope) {
         callGeneration.incrementAndGet()
         activeCallScope = null
+        callDeadlineNanos = Long.MAX_VALUE
         cancelAllTimers()
         fetchGateway.cancelAllActive()
         scope.cancel()
@@ -498,6 +501,7 @@ class PluginRuntime(
 
     private fun cancelAllCallResources() {
         callGeneration.incrementAndGet()
+        callDeadlineNanos = Long.MAX_VALUE
         cancelAllTimers()
         fetchGateway.cancelAllActive()
         activeCallScope?.cancel()
@@ -653,6 +657,13 @@ class PluginRuntime(
 
     private inline fun <T> guardBridgeSync(opName: String, block: () -> T): T {
         return try {
+            if (opName != "finishCall" && opName != "cancelTimer" && opName != "domCloseDoc") {
+                val dl = callDeadlineNanos
+                if (dl != Long.MAX_VALUE && System.nanoTime() > dl) {
+                    domTimedOutInCall = true
+                    throw DomTimeoutException("宿主调用已超时（$opName）")
+                }
+            }
             bridgeFaultInjectorForTesting?.invoke(opName)
             block()
         } catch (e: DomTimeoutException) {
@@ -670,6 +681,11 @@ class PluginRuntime(
 
     private suspend inline fun <T> guardBridgeAsync(opName: String, block: suspend () -> T): T {
         return try {
+            val dl = callDeadlineNanos
+            if (dl != Long.MAX_VALUE && System.nanoTime() > dl) {
+                domTimedOutInCall = true
+                throw DomTimeoutException("宿主调用已超时（$opName）")
+            }
             bridgeFaultInjectorForTesting?.invoke(opName)
             block()
         } catch (e: DomTimeoutException) {
@@ -1003,50 +1019,50 @@ class PluginRuntime(
                 PluginCrypto.base64Encode(PluginCrypto.hexDecode(hex))
             }
 
-            // §11.1 / S4: lazy handle-based ctx.parse (deduplicated handles + explicit doc.close())
+            // §11.1 / S4: lazy handle-based ctx.parse (deduplicated monotonic Long handles + doc.close())
             safeFunction("parseHtml") { args ->
-                domParser.parseHtml(args.getOrNull(1)?.toString() ?: "")
+                domParser.parseHtml(args.getOrNull(1)?.toString() ?: "").toDouble()
             }
             safeFunction("parseXml") { args ->
-                domParser.parseXml(args.getOrNull(1)?.toString() ?: "")
+                domParser.parseXml(args.getOrNull(1)?.toString() ?: "").toDouble()
             }
             safeFunction("domCloseDoc") { args ->
-                val docId = (args.getOrNull(1) as? Number)?.toInt() ?: return@safeFunction false
+                val docId = (args.getOrNull(1) as? Number)?.toLong() ?: return@safeFunction false
                 domParser.closeDoc(docId)
             }
             safeFunction("domSelectFirstId") { args ->
-                val id = (args.getOrNull(1) as? Number)?.toInt() ?: return@safeFunction 0
-                val sel = args.getOrNull(2)?.toString() ?: return@safeFunction 0
-                domParser.selectFirstId(id, sel)
+                val id = (args.getOrNull(1) as? Number)?.toLong() ?: return@safeFunction 0.0
+                val sel = args.getOrNull(2)?.toString() ?: return@safeFunction 0.0
+                domParser.selectFirstId(id, sel).toDouble()
             }
             safeFunction("domSelectAllIds") { args ->
-                val id = (args.getOrNull(1) as? Number)?.toInt() ?: return@safeFunction "[]"
+                val id = (args.getOrNull(1) as? Number)?.toLong() ?: return@safeFunction "[]"
                 val sel = args.getOrNull(2)?.toString() ?: return@safeFunction "[]"
                 domParser.selectAllIds(id, sel).toString()
             }
             safeFunction("domChildrenIds") { args ->
-                val id = (args.getOrNull(1) as? Number)?.toInt() ?: return@safeFunction "[]"
+                val id = (args.getOrNull(1) as? Number)?.toLong() ?: return@safeFunction "[]"
                 domParser.childrenIds(id).toString()
             }
             safeFunction("domTag") { args ->
-                domParser.tag((args.getOrNull(1) as? Number)?.toInt() ?: 0)
+                domParser.tag((args.getOrNull(1) as? Number)?.toLong() ?: 0L)
             }
             safeFunction("domText") { args ->
-                domParser.text((args.getOrNull(1) as? Number)?.toInt() ?: 0)
+                domParser.text((args.getOrNull(1) as? Number)?.toLong() ?: 0L)
             }
             safeFunction("domHtml") { args ->
-                domParser.html((args.getOrNull(1) as? Number)?.toInt() ?: 0)
+                domParser.html((args.getOrNull(1) as? Number)?.toLong() ?: 0L)
             }
             safeFunction("domOuterHtml") { args ->
-                domParser.outerHtml((args.getOrNull(1) as? Number)?.toInt() ?: 0)
+                domParser.outerHtml((args.getOrNull(1) as? Number)?.toLong() ?: 0L)
             }
             safeFunction("domAttr") { args ->
-                val id = (args.getOrNull(1) as? Number)?.toInt() ?: return@safeFunction null
+                val id = (args.getOrNull(1) as? Number)?.toLong() ?: return@safeFunction null
                 val name = args.getOrNull(2)?.toString() ?: return@safeFunction null
                 domParser.attr(id, name)
             }
             safeFunction("domAttrs") { args ->
-                domParser.attrsJson((args.getOrNull(1) as? Number)?.toInt() ?: 0)
+                domParser.attrsJson((args.getOrNull(1) as? Number)?.toLong() ?: 0L)
             }
 
             // ctx.log (truncate to 4 KB BEFORE regex redaction to protect host CPU & heap)
