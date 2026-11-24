@@ -88,6 +88,7 @@ public final class EngineSupervisor: @unchecked Sendable {
     private let backoffDelays: [TimeInterval]
     private let stableRunResetSeconds: TimeInterval
     private let queue = DispatchQueue(label: "dev.depth3d.host.engine.supervisor", qos: .userInitiated)
+    private let queueKey = DispatchSpecificKey<UInt8>()
 
     private var activeLaunch: LaunchRecord?
     private var logState = EngineLogState()
@@ -120,6 +121,7 @@ public final class EngineSupervisor: @unchecked Sendable {
         self.ledger = ledger ?? ChildProcessLedger(ledgerURL: paths.childLedgerFile)
         self.backoffDelays = backoffDelays
         self.stableRunResetSeconds = stableRunResetSeconds
+        self.queue.setSpecific(key: queueKey, value: 1)
     }
 
     deinit {
@@ -222,14 +224,23 @@ public final class EngineSupervisor: @unchecked Sendable {
         }
     }
 
+    /// Serializes `stop()` onto the exact same serial `queue` as `start()`/`restart()`/`pause()`/`resume()`
+    /// so `stop()` can NEVER race between `proc.run()` and `activeLaunch` assignment and leak a running engine.
     public func stop() {
-        cancelRestartWork()
-        lock.lock()
-        shouldBeRunning = false
-        isPaused = false
-        lock.unlock()
-        terminateCurrentProcessSync()
-        publishState(.stopped)
+        let stopWork = {
+            self.cancelRestartWork()
+            self.lock.lock()
+            self.shouldBeRunning = false
+            self.isPaused = false
+            self.lock.unlock()
+            self.terminateCurrentProcessSync()
+            self.publishState(.stopped)
+        }
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            stopWork()
+        } else {
+            queue.sync(execute: stopWork)
+        }
     }
 
     private func cancelRestartWork() {

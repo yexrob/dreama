@@ -39,7 +39,8 @@ host/scripts/build.sh --arch arm64 --config Release
 ### 1. 为什么选择「子进程监管内置引擎」而不是「静态编译成库」？
 
 - **故障隔离与自动恢复**：VideoToolbox、ScreenCaptureKit、Core Audio 进程 Tap、FFmpeg 等底层组件在显示器热插拔、系统休眠唤醒或权限变化时可能异常退出；独立子进程崩溃不会拖垮菜单栏、主窗口、控制接口与媒体服务，`EngineSupervisor` 会在指数退避后自动拉起。
-- **零孤儿与零目录污染**：子进程通过内置看护工具 `Contents/Helpers/depth3d-child-guard`（kqueue `EVFILT_PROC` `NOTE_EXIT`）监视宿主 PID，配合 `running-children.json` PID 账本与 `proc_pidpath` 校验，即使主进程崩溃或被 `SIGKILL`，引擎与 rclone 子进程都会自动退出并在下次启动兜底清理；引擎运行期将 `HOME`、`XDG_CONFIG_HOME` 与 `log_path` 全部隔离在 `~/Library/Application Support/depth3d Host/engine/` 下，完全不触碰用户的 `~/.config/sunshine`。
+- **零孤儿与零目录污染**：子进程通过内置看护工具 `Contents/Helpers/depth3d-child-guard`（kqueue `EVFILT_PROC` `NOTE_EXIT`）监视宿主 PID，并将子进程放入独立的子进程组（`POSIX_SPAWN_SETPGROUP`），配合 `running-children.json` PID + 启动时间账本与 `proc_pidpath` 校验，即使主进程崩溃、正常停止或被 `SIGKILL`，引擎、rclone 及子进程组内的孙进程都会自动退出并在下次启动兜底清理；引擎运行期将 `HOME`、`XDG_CONFIG_HOME` 与 `log_path` 全部隔离在 `~/Library/Application Support/depth3d Host/engine/` 下，完全不触碰用户的 `~/.config/sunshine`。
+  - *已知限制*：子进程组清理依赖进程组归属；如果某个孙进程主动调用 `setsid()` / `setpgid()` 脱离了子进程组，无法在无私有 API 的情况下仅靠进程组信号追踪并回收。
 - **画质档位**：直接映射到 VideoToolbox 实际生效的 `max_bitrate`（流畅 20 Mbps / 均衡 50 Mbps / 清晰 0 不限）与 `vt_coder` 参数（不使用 VideoToolbox 忽略的 `qp`）。
 - **权限归属透明**：引擎以无独立 `Info.plist` 的辅助二进制放在 `Contents/Helpers/depth3d-stream-engine`，macOS TCC 将屏幕录制、辅助功能、本地网络和系统音频权限直接归属给 `depth3d Host.app`，用户永远不会在系统设置里看到上游组件名。
 - **代价**：应用包体积较大（包含引擎及其动态库未压缩约 95 MB）；重启引擎切换显示器或画质时有约 1–2 秒中断；IPC 通过本机回环 HTTPS API 与日志管道进行（暂无法在编码前零拷贝拦截 `CVPixelBuffer`，3D 深度卸载阶段需改用自编译引擎，见 `docs/specs/host-depth-offload.md`）。

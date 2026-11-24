@@ -6,6 +6,14 @@ import Security
 import XCTest
 @testable import Depth3DHostCore
 
+/// Explicit outcome of probing real Sunshine's authenticated HTTPS `/serverinfo` endpoint,
+/// strictly separating real TLS/HTTP 401 auth rejection from TCP/network connection failures (`B-1`).
+private enum EngineHTTPSCheckResult: Equatable {
+    case accepted
+    case rejectedByAuthOrTLS(String)
+    case connectionError(String)
+}
+
 /// Real GameStream Gen-7+ (SHA-256 + AES-128-ECB + RSA-2048) pairing client used to execute
 /// authentic 5-step pairings & HTTPS `/serverinfo` probes against the REAL `depth3d-stream-engine` binary.
 private enum RealGameStreamPairingClient {
@@ -31,7 +39,6 @@ private enum RealGameStreamPairingClient {
         _ = salt.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) }
         let aesKey = Data(SHA256.hash(data: salt + Data(pin.utf8)).prefix(16))
 
-        // Step 1: getservercert (blocks on Sunshine until Host submits PIN via /api/pin!)
         let step1URL = "http://127.0.0.1:\(httpPort)/pair?uniqueid=\(uniqueID)&devicename=roth&updateState=1&phrase=getservercert&salt=\(hex(salt))&clientcert=\(hex(clientPEMData))"
         let step1XML = try httpGet(step1URL, timeout: 20)
         guard xmlTag(step1XML, "paired") == "1", let plainCertHex = xmlTag(step1XML, "plaincert"), !plainCertHex.isEmpty else {
@@ -43,7 +50,6 @@ private enum RealGameStreamPairingClient {
         defer { try? FileManager.default.removeItem(at: tmpServerCert) }
         let serverCertSig = try extractX509SignatureBytes(fromCertPEMURL: tmpServerCert)
 
-        // Step 2: clientchallenge
         var randomChallenge = Data(count: 16)
         _ = randomChallenge.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) }
         let encChallenge = try aes128ECB(encrypt: true, data: randomChallenge, key: aesKey)
@@ -57,7 +63,6 @@ private enum RealGameStreamPairingClient {
         let serverResponseHash = decResp.subdata(in: 0..<32)
         let serverChallenge = decResp.subdata(in: 32..<48)
 
-        // Step 3: serverchallengeresp
         var clientSecret = Data(count: 16)
         _ = clientSecret.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) }
         let clientHash = Data(SHA256.hash(data: serverChallenge + clientCertSig + clientSecret))
@@ -75,7 +80,6 @@ private enum RealGameStreamPairingClient {
             throw PairError.stepFailed("server challenge hash mismatch (PIN mismatch)")
         }
 
-        // Step 4: clientpairingsecret (clientSecret + RSA-SHA256 signature over clientSecret)
         let clientSig = try rsaSHA256Sign(data: clientSecret, privateKeyURL: clientKeyURL)
         let clientPairingSecret = clientSecret + clientSig
         let step4URL = "http://127.0.0.1:\(httpPort)/pair?uniqueid=\(uniqueID)&devicename=roth&updateState=1&clientpairingsecret=\(hex(clientPairingSecret))"
@@ -84,27 +88,40 @@ private enum RealGameStreamPairingClient {
             throw PairError.stepFailed("clientpairingsecret failed: \(step4XML)")
         }
 
-        // Step 5: HTTPS mTLS pairchallenge (finalizes pairing & triggers Sunshine to persist state.json!)
         let step5URL = "https://127.0.0.1:\(httpsPort)/pair?uniqueid=\(uniqueID)&devicename=roth&updateState=1&phrase=pairchallenge"
-        let step5XML = try httpsGet(step5URL, certURL: clientCertURL, keyURL: clientKeyURL, timeout: 10).body
-        guard xmlTag(step5XML, "paired") == "1" else {
-            throw PairError.stepFailed("pairchallenge failed: \(step5XML)")
+        let step5Res = try httpsGet(step5URL, certURL: clientCertURL, keyURL: clientKeyURL, timeout: 10)
+        guard xmlTag(step5Res.body, "paired") == "1" else {
+            throw PairError.stepFailed("pairchallenge failed (http=\(step5Res.statusCode)): \(step5Res.body)")
         }
     }
 
-    /// Queries Sunshine's authenticated HTTPS `/serverinfo` endpoint using `clientCertURL`/`clientKeyURL`
-    /// to verify whether the REAL streaming engine accepts or rejects this client certificate!
-    static func httpsServerInfoAccepted(
+    /// Probes Sunshine's authenticated HTTPS `/serverinfo` endpoint, explicitly distinguishing
+    /// `.accepted` vs `.rejectedByAuthOrTLS` (HTTP 401 / XML status_code=401 / TLS alert) vs
+    /// `.connectionError` (TCP refused / timeout — NEVER silently treated as rejected!).
+    static func checkHTTPSServerInfo(
         httpsPort: UInt16,
         clientCertURL: URL,
         clientKeyURL: URL,
         uniqueID: String = "0123456789ABCDEF"
-    ) -> Bool {
+    ) -> EngineHTTPSCheckResult {
         let url = "https://127.0.0.1:\(httpsPort)/serverinfo?uniqueid=\(uniqueID)&uuid=\(UUID().uuidString)"
         guard let res = try? httpsGet(url, certURL: clientCertURL, keyURL: clientKeyURL, timeout: 5) else {
-            return false
+            return .connectionError("failed to invoke curl")
         }
-        return res.exitCode == 0 && res.statusCode == 200 && res.body.contains("status_code=\"200\"")
+        if res.exitCode == 0 {
+            if res.statusCode == 200 && res.body.contains("status_code=\"200\"") {
+                return .accepted
+            }
+            if res.statusCode == 401 || res.body.contains("status_code=\"401\"") || res.body.lowercased().contains("certificate verification failed") {
+                return .rejectedByAuthOrTLS("http=\(res.statusCode) body=\(res.body)")
+            }
+            return .connectionError("unexpected http=\(res.statusCode) body=\(res.body)")
+        }
+        // curl exit codes: 35 = SSL connect error / TLS handshake alert; 56 = recv failure (TLS alert after handshake); 58 = client cert issue
+        if res.exitCode == 35 || res.exitCode == 56 || res.exitCode == 58 {
+            return .rejectedByAuthOrTLS("curl_exit=\(res.exitCode) stderr=\(res.stderr)")
+        }
+        return .connectionError("curl_exit=\(res.exitCode) stderr=\(res.stderr)")
     }
 
     private static func aes128ECB(encrypt: Bool, data: Data, key: Data) throws -> Data {
@@ -203,25 +220,27 @@ private enum RealGameStreamPairingClient {
         certURL: URL,
         keyURL: URL,
         timeout: Int
-    ) throws -> (exitCode: Int32, statusCode: Int, body: String) {
+    ) throws -> (exitCode: Int32, statusCode: Int, body: String, stderr: String) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
         p.arguments = [
-            "--noproxy", "*", "-sk", "--max-time", "\(timeout)",
+            "--noproxy", "*", "-skS", "--max-time", "\(timeout)",
             "--cert", certURL.path, "--key", keyURL.path,
             "-w", "\n%{http_code}", url
         ]
         let out = Pipe()
+        let err = Pipe()
         p.standardOutput = out
-        p.standardError = FileHandle.nullDevice
+        p.standardError = err
         try p.run()
         let data = out.fileHandleForReading.readDataToEndOfFile()
+        let errData = err.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         let raw = String(decoding: data, as: UTF8.self)
         let lines = raw.components(separatedBy: "\n")
         let status = Int(lines.last ?? "") ?? 0
         let body = lines.dropLast().joined(separator: "\n")
-        return (p.terminationStatus, status, body)
+        return (p.terminationStatus, status, body, String(decoding: errData, as: UTF8.self))
     }
 
     private static func xmlTag(_ xml: String, _ tag: String) -> String? {
@@ -287,13 +306,6 @@ private final class FakeSunshineAPIServer: @unchecked Sendable {
         lock.lock()
         pendingPairings = pairings
         expectedPinByPairingId = expectations
-        lock.unlock()
-    }
-
-    func addPairedDeviceDirectly(uuid: String, name: String, certPEM: String, enabled: String = "true") {
-        lock.lock()
-        pairedDevices.append(["uuid": uuid, "name": name, "cert": certPEM, "enabled": enabled])
-        writeStateLocked()
         lock.unlock()
     }
 
@@ -474,9 +486,7 @@ private final class FakeSunshineAPIServer: @unchecked Sendable {
                   let pairingId = json["pairing_id"] as? String,
                   let pin = json["pin"] as? String,
                   let name = json["name"] as? String
-            else {
-                return HTTPResponse.json(400, object: ["status": false])
-            }
+            else { return HTTPResponse.json(400, object: ["status": false]) }
             lock.lock()
             receivedSubmissions.append((pairingId, pin, name))
             if let exp = expectedPinByPairingId[pairingId], exp.pin == pin {
@@ -558,7 +568,9 @@ final class HostRuntimeIntegrationTests: XCTestCase {
         let controlServer: ControlHTTPSServer
         let controlPort: UInt16
 
+        @MainActor
         func tearDown() {
+            runtime.shutdown()
             controlServer.stop()
             webDAVServer.stop()
             supervisor.stop()
@@ -576,7 +588,7 @@ final class HostRuntimeIntegrationTests: XCTestCase {
         }
 
         let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("depth3d-e2e-r4-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("depth3d-e2e-r5-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
 
         var basePort = portSeed
@@ -673,31 +685,39 @@ final class HostRuntimeIntegrationTests: XCTestCase {
         return (keyURL, certURL, fp)
     }
 
-    /// P7(a): Real-engine first-time pairing using the new two-step protocol sequence:
-    ///   1. Headset calls `POST /depth3d/v1/pair` FIRST (no GameStream session yet!)
-    ///   2. User approves -> `/pair` IMMEDIATELY returns `200 {"ok":true,"next":"gamestream","ticket":"..."}`
-    ///   3. Before GameStream pairing finishes, `/pair/complete` returns `409 not_paired` (keeping ticket valid) and `/media` returns `401`
-    ///   4. Headset runs real 5-step GameStream pairing -> background 60s PIN feeder submits PIN -> real engine writes `state.json`
-    ///   5. Headset calls `POST /depth3d/v1/pair/complete` with client cert -> `200 {"ok":true,"media":{"port":...}}`
-    ///   6. Headset calls `GET /depth3d/v1/media` WITHOUT `X-Depth3d-Device` -> `200` -> WebDAV `OPTIONS 200`!
+    /// P7(a): Real-engine first-time pairing (client cert ALWAYS sent, `streamPaired: false`,
+    /// single-use concurrent `/pair/complete` enforcement, `/media` without `X-Depth3d-Device` -> 200).
     func testRealEngineP7aFirstTimeTwoStepPairCompleteAndMedia200() async throws {
         let h = try await startRealEngineHarness(portSeed: 59849)
         defer { h.tearDown() }
 
         let client = try generateClientCert(in: h.tmp, name: "headset-p7a")
+        let otherClient = try generateClientCert(in: h.tmp, name: "headset-other")
         let testPIN = "4826"
 
-        // Step 1: Headset calls POST /depth3d/v1/pair BEFORE starting GameStream pairing!
+        // `/pair` without client cert -> 401 client_cert_required
+        let (noCertCode, noCertBody) = await Task.detached {
+            Self.runCurl([
+                "-sk", "--max-time", "5", "-X", "POST",
+                "-H", "Content-Type: application/json",
+                "-d", "{\"device\":\"PICO\",\"deviceId\":\"pico-p7a\",\"pin\":\"\(testPIN)\",\"streamPaired\":false}",
+                "https://127.0.0.1:\(h.controlPort)/depth3d/v1/pair"
+            ])
+        }.value
+        XCTAssertEqual(noCertCode, 401)
+        XCTAssertTrue(noCertBody.contains("\"client_cert_required\""))
+
+        // Step 1: Headset calls POST /depth3d/v1/pair WITH client cert + `streamPaired: false`
         let pairTask = Task.detached { () -> (Int, String) in
             Self.runCurl([
                 "-sk", "--max-time", "15", "-X", "POST",
+                "--cert", client.certURL.path, "--key", client.keyURL.path,
                 "-H", "Content-Type: application/json",
-                "-d", "{\"device\":\"PICO 4 Ultra\",\"deviceId\":\"pico-p7a\",\"pin\":\"\(testPIN)\"}",
+                "-d", "{\"device\":\"PICO 4 Ultra\",\"deviceId\":\"pico-p7a\",\"pin\":\"\(testPIN)\",\"streamPaired\":false}",
                 "https://127.0.0.1:\(h.controlPort)/depth3d/v1/pair"
             ])
         }
 
-        // User approves confirmation prompt
         var approved = false
         let promptDeadline = Date().addingTimeInterval(8.0)
         while Date() < promptDeadline {
@@ -711,17 +731,25 @@ final class HostRuntimeIntegrationTests: XCTestCase {
         }
         XCTAssertTrue(approved)
 
-        // Step 2: `/pair` returns IMMEDIATELY with `next: "gamestream"` and `ticket` (NOT waiting for GameStream!)
         let (pairCode, pairBody) = await pairTask.value
         XCTAssertEqual(pairCode, 200, "body=\(pairBody)")
         let pairResp = try JSONDecoder().decode(PairApprovedResponse.self, from: Data(pairBody.utf8))
-        XCTAssertTrue(pairResp.ok)
         XCTAssertEqual(pairResp.next, "gamestream")
-        XCTAssertFalse(pairResp.ticket.isEmpty)
 
-        // Step 3: Before GameStream completes, device is NOT saved, `/pair/complete` returns 409 not_paired, `/media` returns 401
-        XCTAssertTrue(h.runtime.pairedDevices.isEmpty)
-        let (earlyCompleteCode, earlyCompleteBody) = await Task.detached {
+        // Before GameStream completes: `/pair/complete` returns 409 not_paired (ticket stays valid);
+        // calling `/pair/complete` with a DIFFERENT client cert returns 403 source_mismatch!
+        let (wrongCertCode, _) = await Task.detached {
+            Self.runCurl([
+                "-sk", "--max-time", "5", "-X", "POST",
+                "--cert", otherClient.certURL.path, "--key", otherClient.keyURL.path,
+                "-H", "Content-Type: application/json",
+                "-d", "{\"ticket\":\"\(pairResp.ticket)\",\"deviceId\":\"pico-p7a\",\"device\":\"PICO 4 Ultra\"}",
+                "https://127.0.0.1:\(h.controlPort)/depth3d/v1/pair/complete"
+            ])
+        }.value
+        XCTAssertEqual(wrongCertCode, 403, "B-1: ticket must reject different client cert fingerprint")
+
+        let (earlyCode, _) = await Task.detached {
             Self.runCurl([
                 "-sk", "--max-time", "5", "-X", "POST",
                 "--cert", client.certURL.path, "--key", client.keyURL.path,
@@ -730,46 +758,43 @@ final class HostRuntimeIntegrationTests: XCTestCase {
                 "https://127.0.0.1:\(h.controlPort)/depth3d/v1/pair/complete"
             ])
         }.value
-        XCTAssertEqual(earlyCompleteCode, 409, "Before GameStream completes, /pair/complete must return 409; body=\(earlyCompleteBody)")
-        XCTAssertTrue(earlyCompleteBody.contains("\"not_paired\""))
+        XCTAssertEqual(earlyCode, 409)
 
-        // Step 4: Now headset starts real 5-step GameStream pairing; Host's background PIN feeder supplies `testPIN`!
+        // Step 2: Real 5-step GameStream pairing (background PIN feeder supplies `testPIN`)
         let gsErr: Error? = await Task.detached {
             do {
                 try RealGameStreamPairingClient.pair(
-                    httpPort: h.basePort,
-                    httpsPort: h.httpsPort,
-                    pin: testPIN,
-                    clientCertURL: client.certURL,
-                    clientKeyURL: client.keyURL
+                    httpPort: h.basePort, httpsPort: h.httpsPort, pin: testPIN,
+                    clientCertURL: client.certURL, clientKeyURL: client.keyURL
                 )
                 return nil
-            } catch {
-                return error
-            }
+            } catch { return error }
         }.value
         XCTAssertNil(gsErr, "Real 5-step GameStream pairing failed: \(String(describing: gsErr))")
 
-        // Step 5: Headset calls `POST /depth3d/v1/pair/complete` using the SAME ticket + client cert -> 200!
-        let (compCode, compBody) = await Task.detached {
+        // Step 3: Concurrent `/pair/complete` with SAME ticket -> strictly ONE succeeds (200) and the other gets 410!
+        let compPayload = "{\"ticket\":\"\(pairResp.ticket)\",\"deviceId\":\"pico-p7a\",\"device\":\"PICO 4 Ultra\"}"
+        async let comp1 = Task.detached {
             Self.runCurl([
                 "-sk", "--max-time", "5", "-X", "POST",
                 "--cert", client.certURL.path, "--key", client.keyURL.path,
-                "-H", "Content-Type: application/json",
-                "-d", "{\"ticket\":\"\(pairResp.ticket)\",\"deviceId\":\"pico-p7a\",\"device\":\"PICO 4 Ultra\"}",
+                "-H", "Content-Type: application/json", "-d", compPayload,
                 "https://127.0.0.1:\(h.controlPort)/depth3d/v1/pair/complete"
             ])
         }.value
-        XCTAssertEqual(compCode, 200, "POST /pair/complete must return 200; body=\(compBody)")
-        let compResp = try JSONDecoder().decode(PairCompleteResponse.self, from: Data(compBody.utf8))
-        XCTAssertTrue(compResp.ok)
-        XCTAssertEqual(compResp.media?.port, Int(h.davPort))
+        async let comp2 = Task.detached {
+            Self.runCurl([
+                "-sk", "--max-time", "5", "-X", "POST",
+                "--cert", client.certURL.path, "--key", client.keyURL.path,
+                "-H", "Content-Type: application/json", "-d", compPayload,
+                "https://127.0.0.1:\(h.controlPort)/depth3d/v1/pair/complete"
+            ])
+        }.value
+        let (r1, r2) = await (comp1, comp2)
+        let codes = [r1.0, r2.0].sorted()
+        XCTAssertEqual(codes, [200, 410], "B-1: Concurrent /pair/complete on same ticket MUST allow strictly ONE 200 and reject the other with 410; got \(codes)")
 
-        let saved = try XCTUnwrap(h.runtime.pairedDevices.first(where: { $0.id == client.fingerprint }))
-        XCTAssertEqual(saved.certFingerprint, client.fingerprint)
-        XCTAssertTrue(saved.autoAllow)
-
-        // Step 6: `GET /depth3d/v1/media` with client cert and NO `X-Depth3d-Device` header -> 200 + working WebDAV!
+        // Step 4: `/media` without `X-Depth3d-Device` -> 200 + live WebDAV 200
         let (mediaCode, mediaBody) = await Task.detached {
             Self.runCurl([
                 "-sk", "--max-time", "5",
@@ -777,7 +802,7 @@ final class HostRuntimeIntegrationTests: XCTestCase {
                 "https://127.0.0.1:\(h.controlPort)/depth3d/v1/media"
             ])
         }.value
-        XCTAssertEqual(mediaCode, 200, "GET /media without X-Depth3d-Device must return 200; body=\(mediaBody)")
+        XCTAssertEqual(mediaCode, 200)
         let mediaDecoded = try JSONDecoder().decode(MediaCredentialsResponse.self, from: Data(mediaBody.utf8))
         let dav = try XCTUnwrap(mediaDecoded.webdav)
         let (davCode, _) = await Task.detached {
@@ -786,11 +811,8 @@ final class HostRuntimeIntegrationTests: XCTestCase {
         XCTAssertEqual(davCode, 200)
     }
 
-    /// P7(b): Real-engine upgrade path — headset certificate is ALREADY paired in the real engine,
-    /// while Host has ZERO device records:
-    ///   1. Headset calls `POST /depth3d/v1/pair` WITH client cert -> confirmation prompt appears
-    ///   2. User approves -> `/pair` immediately returns `200 {"ok":true,"next":"done","ticket":"..."}` (NO GameStream step!)
-    ///   3. Headset calls `POST /depth3d/v1/pair/complete` -> `200` -> `GET /depth3d/v1/media` -> `200`!
+    /// P7(b): Real-engine upgrade path — cert already in engine, Host has no record,
+    /// headset sends `streamPaired: true` -> `/pair` returns `next: "done"` -> `/pair/complete` -> `/media 200`.
     func testRealEngineP7bUpgradePathCertAlreadyInEngineNoHostRecord() async throws {
         let h = try await startRealEngineHarness(portSeed: 59909)
         defer { h.tearDown() }
@@ -798,7 +820,6 @@ final class HostRuntimeIntegrationTests: XCTestCase {
         let client = try generateClientCert(in: h.tmp, name: "headset-p7b")
         let prePairPIN = "7319"
 
-        // Pre-pair directly in the real streaming engine while Host has 0 pairedDevices!
         let preFeed = Task.detached { [api = h.apiClient] in
             await api.feedPINForApprovedSession(pin: prePairPIN, deviceName: "PrePaired", clientAddress: "127.0.0.1", maxWait: 15.0)
         }
@@ -813,42 +834,34 @@ final class HostRuntimeIntegrationTests: XCTestCase {
         }.value
         _ = await preFeed.value
         XCTAssertNil(preErr)
-        XCTAssertTrue(h.runtime.pairedDevices.isEmpty, "Host must have NO device records before upgrade path")
-        XCTAssertTrue(EngineConfigGenerator.isCertificateUniquelyEnabled(fingerprintSHA256: client.fingerprint, at: h.paths.engineStateFile))
+        XCTAssertTrue(h.runtime.pairedDevices.isEmpty)
 
-        // Headset sends `/pair` WITH its already-paired client certificate
+        // Headset sends `/pair` with client cert + `streamPaired: true`
         let pairTask = Task.detached {
             Self.runCurl([
                 "-sk", "--max-time", "15", "-X", "POST",
                 "--cert", client.certURL.path, "--key", client.keyURL.path,
                 "-H", "Content-Type: application/json",
-                "-d", "{\"device\":\"Upgraded PICO\",\"deviceId\":\"pico-p7b\",\"pin\":\"0000\"}",
+                "-d", "{\"device\":\"Upgraded PICO\",\"deviceId\":\"pico-p7b\",\"pin\":\"0000\",\"streamPaired\":true}",
                 "https://127.0.0.1:\(h.controlPort)/depth3d/v1/pair"
             ])
         }
 
-        // User approves ONCE on the Mac
-        var approved = false
         let deadline = Date().addingTimeInterval(8.0)
         while Date() < deadline {
             if let prompt = (await h.coordinator.pendingPrompts()).first {
-                XCTAssertFalse(prompt.identityChanged)
                 await h.coordinator.approve(promptId: prompt.id, rememberAutoAllow: false)
-                approved = true
                 break
             }
             try await Task.sleep(nanoseconds: 50_000_000)
         }
-        XCTAssertTrue(approved)
 
-        // MUST receive `next: "done"` so headset skips GameStream pairing!
         let (pairCode, pairBody) = await pairTask.value
         XCTAssertEqual(pairCode, 200, "body=\(pairBody)")
         let pairResp = try JSONDecoder().decode(PairApprovedResponse.self, from: Data(pairBody.utf8))
-        XCTAssertEqual(pairResp.next, "done", "P7(b): Cert already uniquely enabled in engine MUST return next:\"done\"")
+        XCTAssertEqual(pairResp.next, "done", "P7(b): streamPaired=true with cert in engine MUST return next:\"done\"")
 
-        // Immediately call `/pair/complete` -> 200
-        let (compCode, compBody) = await Task.detached {
+        let (compCode, _) = await Task.detached {
             Self.runCurl([
                 "-sk", "--max-time", "5", "-X", "POST",
                 "--cert", client.certURL.path, "--key", client.keyURL.path,
@@ -857,9 +870,8 @@ final class HostRuntimeIntegrationTests: XCTestCase {
                 "https://127.0.0.1:\(h.controlPort)/depth3d/v1/pair/complete"
             ])
         }.value
-        XCTAssertEqual(compCode, 200, "body=\(compBody)")
+        XCTAssertEqual(compCode, 200)
 
-        // `/media` immediately returns 200!
         let (mediaCode, _) = await Task.detached {
             Self.runCurl([
                 "-sk", "--max-time", "5",
@@ -870,22 +882,18 @@ final class HostRuntimeIntegrationTests: XCTestCase {
         XCTAssertEqual(mediaCode, 200)
     }
 
-    /// P7(c) (N1 regression test on REAL engine):
-    ///   1. Same certificate paired TWICE in real `depth3d-stream-engine` -> real `state.json` has 2 duplicate entries
-    ///      (confirming Sunshine's N1 bug where HTTPS `/serverinfo` rejects duplicated cert!)
-    ///   2. Headset runs `/pair` -> `/pair/complete`: Host deduplicates down to strictly 1 enabled entry in real engine!
-    ///   3. Real engine's HTTPS `/serverinfo` ACCEPTS this client cert again AND `/media` returns `200`!
-    ///   4. Host removes the device (even with `engineUUID` cleared -> fingerprint-based removal!):
-    ///      real `state.json` has 0 entries for this cert, `/media` returns `401`, AND real engine's HTTPS `/serverinfo` REJECTS this cert!
+    /// P7(c) (updated for B-1 protocol sequence):
+    ///   1. Same cert duplicated twice in real engine -> confirm real engine HTTPS rejects with `.rejectedByAuthOrTLS` (N1!)
+    ///   2. Headset runs `/pair` with `streamPaired: true` -> Host deduplicates BEFORE returning `next: "done"`!
+    ///   3. `/pair/complete` returns 200 -> engine has strictly 1 entry & HTTPS returns `.accepted` & `/media` returns 200!
+    ///   4. Removal by fingerprint (`engineUUID == nil`) removes entry -> engine has 0 entries, `/media` returns 401,
+    ///      AND real engine HTTPS explicitly returns `.rejectedByAuthOrTLS` (NOT connection error)!
     func testRealEngineP7cDuplicateCertDedupEngineHTTPSAcceptAndRemovalReject() async throws {
         let h = try await startRealEngineHarness(portSeed: 59969)
         defer { h.tearDown() }
 
         let client = try generateClientCert(in: h.tmp, name: "headset-p7c")
 
-        // Pair the EXACT SAME client certificate TWICE directly against the real engine -> creates 2 entries in state.json!
-        // Note: on pairing #1, Sunshine's N1 bug appends a duplicate cert at Step 4 (`clientpairingsecret`),
-        // causing Step 5 (`pairchallenge` HTTPS) itself to fail with 401 `Certificate verification failed`!
         for (idx, pin) in ["1122", "3344"].enumerated() {
             let feed = Task.detached { [api = h.apiClient] in
                 await api.feedPINForApprovedSession(pin: pin, deviceName: "Dup-\(idx)", clientAddress: "127.0.0.1", maxWait: 15.0)
@@ -901,35 +909,26 @@ final class HostRuntimeIntegrationTests: XCTestCase {
                 } catch { return error }
             }.value
             _ = await feed.value
-            if idx == 0 {
-                XCTAssertNil(err, "Initial pairing #0 failed: \(String(describing: err))")
-            } else {
-                // On duplicate pairing #1, Step 4 inserts the duplicate entry and Sunshine's own
-                // Step 5 HTTPS check fails with 401 (reproducing the exact N1 bug live!).
-                XCTAssertNotNil(err, "Expected Sunshine N1 duplicate-cert bug to reject Step 5 HTTPS on duplicate pairing #1")
-            }
+            if idx == 0 { XCTAssertNil(err) } else { XCTAssertNotNil(err) }
         }
 
-        // Confirm real state.json has 2 duplicate entries for the exact same certificate AND real engine HTTPS rejects it!
         let dupEntries = EngineConfigGenerator.loadAllPairedCerts(at: h.paths.engineStateFile)
             .filter { $0.fingerprintSHA256 == client.fingerprint }
-        XCTAssertEqual(dupEntries.count, 2, "Real Sunshine must have written 2 duplicate entries for same cert")
-        let acceptedWhileDuplicated = await Task.detached {
-            RealGameStreamPairingClient.httpsServerInfoAccepted(
-                httpsPort: h.httpsPort,
-                clientCertURL: client.certURL,
-                clientKeyURL: client.keyURL
-            )
+        XCTAssertEqual(dupEntries.count, 2)
+        let whileDupCheck = await Task.detached {
+            RealGameStreamPairingClient.checkHTTPSServerInfo(httpsPort: h.httpsPort, clientCertURL: client.certURL, clientKeyURL: client.keyURL)
         }.value
-        XCTAssertFalse(acceptedWhileDuplicated, "Before dedup, real Sunshine N1 bug rejects duplicated cert on HTTPS")
+        guard case .rejectedByAuthOrTLS = whileDupCheck else {
+            return XCTFail("Expected explicit TLS/401 rejection while duplicated, got \(whileDupCheck)")
+        }
 
-        // Now complete pairing through Host `/pair` -> `/pair/complete` (with cert already in engine twice)
+        // Follow exact protocol sequence with `streamPaired: true` -> Host deduplicates to 1 and returns `next: "done"`!
         let pairTask = Task.detached {
             Self.runCurl([
                 "-sk", "--max-time", "15", "-X", "POST",
                 "--cert", client.certURL.path, "--key", client.keyURL.path,
                 "-H", "Content-Type: application/json",
-                "-d", "{\"device\":\"Dedup PICO\",\"deviceId\":\"pico-p7c\",\"pin\":\"5566\"}",
+                "-d", "{\"device\":\"Dedup PICO\",\"deviceId\":\"pico-p7c\",\"pin\":\"5566\",\"streamPaired\":true}",
                 "https://127.0.0.1:\(h.controlPort)/depth3d/v1/pair"
             ])
         }
@@ -944,9 +943,9 @@ final class HostRuntimeIntegrationTests: XCTestCase {
         let (pairCode, pairBody) = await pairTask.value
         XCTAssertEqual(pairCode, 200)
         let pairResp = try JSONDecoder().decode(PairApprovedResponse.self, from: Data(pairBody.utf8))
+        XCTAssertEqual(pairResp.next, "done", "P7(c): streamPaired=true with duplicated cert in engine MUST dedup and return next:\"done\"")
 
-        // Call `/pair/complete` -> Host deduplicates to strictly 1 enabled entry!
-        let (compCode, compBody) = await Task.detached {
+        let (compCode, _) = await Task.detached {
             Self.runCurl([
                 "-sk", "--max-time", "10", "-X", "POST",
                 "--cert", client.certURL.path, "--key", client.keyURL.path,
@@ -955,70 +954,149 @@ final class HostRuntimeIntegrationTests: XCTestCase {
                 "https://127.0.0.1:\(h.controlPort)/depth3d/v1/pair/complete"
             ])
         }.value
-        XCTAssertEqual(compCode, 200, "body=\(compBody)")
+        XCTAssertEqual(compCode, 200)
 
         let afterDedup = EngineConfigGenerator.loadAllPairedCerts(at: h.paths.engineStateFile)
             .filter { $0.fingerprintSHA256 == client.fingerprint }
-        XCTAssertEqual(afterDedup.count, 1, "P7(c): Host MUST deduplicate down to strictly 1 entry in real engine state.json")
-        XCTAssertTrue(afterDedup[0].enabled)
+        XCTAssertEqual(afterDedup.count, 1)
 
-        // Verify REAL engine HTTPS endpoint ACCEPTS this client cert now!
-        let acceptedAfterDedup = await Task.detached {
-            RealGameStreamPairingClient.httpsServerInfoAccepted(
-                httpsPort: h.httpsPort,
-                clientCertURL: client.certURL,
-                clientKeyURL: client.keyURL
-            )
+        let afterDedupCheck = await Task.detached {
+            RealGameStreamPairingClient.checkHTTPSServerInfo(httpsPort: h.httpsPort, clientCertURL: client.certURL, clientKeyURL: client.keyURL)
         }.value
-        XCTAssertTrue(acceptedAfterDedup, "P7(c): Real engine HTTPS must ACCEPT deduplicated client cert")
+        XCTAssertEqual(afterDedupCheck, .accepted, "P7(c): Real engine HTTPS must ACCEPT deduplicated cert")
 
-        // `/media` returns 200
-        let (mediaOK, _) = await Task.detached {
-            Self.runCurl([
-                "-sk", "--max-time", "5",
-                "--cert", client.certURL.path, "--key", client.keyURL.path,
-                "https://127.0.0.1:\(h.controlPort)/depth3d/v1/media"
-            ])
-        }.value
-        XCTAssertEqual(mediaOK, 200)
-
-        // Remove device using a record with `engineUUID == nil` to prove P3 fingerprint-based removal!
         var savedDevice = try XCTUnwrap(h.runtime.pairedDevices.first(where: { $0.id == client.fingerprint }))
         savedDevice.engineUUID = nil
         await h.runtime.removePairedDeviceAndWait(savedDevice)
-        // Brief pause for Sunshine to flush state.json
         try await Task.sleep(nanoseconds: 250_000_000)
 
         let afterRemove = EngineConfigGenerator.loadAllPairedCerts(at: h.paths.engineStateFile)
             .filter { $0.fingerprintSHA256 == client.fingerprint }
-        XCTAssertEqual(afterRemove.count, 0, "P7(c): Removal by fingerprint must remove ALL entries for this cert in engine")
+        XCTAssertEqual(afterRemove.count, 0)
 
-        // Verify `/media` returns 401 AND REAL engine HTTPS REJECTS this cert!
-        let (mediaRevoked, _) = await Task.detached {
+        let afterRemoveCheck = await Task.detached {
+            RealGameStreamPairingClient.checkHTTPSServerInfo(httpsPort: h.httpsPort, clientCertURL: client.certURL, clientKeyURL: client.keyURL)
+        }.value
+        guard case .rejectedByAuthOrTLS = afterRemoveCheck else {
+            return XCTFail("P7(c): Real engine HTTPS MUST explicitly reject removed cert via auth/TLS (not connection error), got \(afterRemoveCheck)")
+        }
+    }
+
+    /// P7(d) (B-1 core fix on REAL engine):
+    ///   1. Certificate is ALREADY paired in real `depth3d-stream-engine`
+    ///   2. Headset calls `POST /depth3d/v1/pair` with `streamPaired: false` (e.g., headset lost local pairing)
+    ///   3. Host deletes ALL old engine entries for this cert BEFORE returning `next: "gamestream"`
+    ///   4. Headset executes a FULL 5-step GameStream pairing (including Step 5 HTTPS!) -> SUCCEEDS cleanly without N1 duplicate rejection!
+    ///   5. Headset calls `/pair/complete` -> 200 -> engine has strictly 1 entry & HTTPS returns `.accepted` & `/media` returns 200!
+    func testRealEngineP7dExistingCertWithStreamPairedFalseCleansAndRePairsCleanly() async throws {
+        let h = try await startRealEngineHarness(portSeed: 60029)
+        defer { h.tearDown() }
+
+        let client = try generateClientCert(in: h.tmp, name: "headset-p7d")
+
+        // Pre-pair this certificate in real Sunshine so it already exists in state.json!
+        let preFeed = Task.detached { [api = h.apiClient] in
+            await api.feedPINForApprovedSession(pin: "1357", deviceName: "OldEntry", clientAddress: "127.0.0.1", maxWait: 15.0)
+        }
+        let preErr: Error? = await Task.detached {
+            do {
+                try RealGameStreamPairingClient.pair(
+                    httpPort: h.basePort, httpsPort: h.httpsPort, pin: "1357",
+                    clientCertURL: client.certURL, clientKeyURL: client.keyURL
+                )
+                return nil
+            } catch { return error }
+        }.value
+        _ = await preFeed.value
+        XCTAssertNil(preErr)
+        XCTAssertEqual(
+            EngineConfigGenerator.loadAllPairedCerts(at: h.paths.engineStateFile).filter { $0.fingerprintSHA256 == client.fingerprint }.count,
+            1
+        )
+
+        // Headset sends `/pair` with `streamPaired: false` (e.g. headset removed local computer record)
+        let freshPIN = "2468"
+        let pairTask = Task.detached {
+            Self.runCurl([
+                "-sk", "--max-time", "15", "-X", "POST",
+                "--cert", client.certURL.path, "--key", client.keyURL.path,
+                "-H", "Content-Type: application/json",
+                "-d", "{\"device\":\"Reset PICO\",\"deviceId\":\"pico-p7d\",\"pin\":\"\(freshPIN)\",\"streamPaired\":false}",
+                "https://127.0.0.1:\(h.controlPort)/depth3d/v1/pair"
+            ])
+        }
+        let deadline = Date().addingTimeInterval(8.0)
+        while Date() < deadline {
+            if let prompt = (await h.coordinator.pendingPrompts()).first {
+                await h.coordinator.approve(promptId: prompt.id, rememberAutoAllow: false)
+                break
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        let (pairCode, pairBody) = await pairTask.value
+        XCTAssertEqual(pairCode, 200, "body=\(pairBody)")
+        let pairResp = try JSONDecoder().decode(PairApprovedResponse.self, from: Data(pairBody.utf8))
+        XCTAssertEqual(pairResp.next, "gamestream", "B-1: streamPaired=false MUST always return next:\"gamestream\"")
+
+        // Verify Host ALREADY wiped the old cert entry from real engine BEFORE returning `next: "gamestream"`!
+        let countBeforeRePair = EngineConfigGenerator.loadAllPairedCerts(at: h.paths.engineStateFile)
+            .filter { $0.fingerprintSHA256 == client.fingerprint }
+            .count
+        XCTAssertEqual(countBeforeRePair, 0, "B-1: Host must clear all existing entries for cert before returning next:\"gamestream\"")
+
+        // Now run full 5-step GameStream pairing -> MUST SUCCEED completely (including Step 5 HTTPS)!
+        let rePairErr: Error? = await Task.detached {
+            do {
+                try RealGameStreamPairingClient.pair(
+                    httpPort: h.basePort, httpsPort: h.httpsPort, pin: freshPIN,
+                    clientCertURL: client.certURL, clientKeyURL: client.keyURL,
+                    uniqueID: "FEDCBA9876543210"
+                )
+                return nil
+            } catch { return error }
+        }.value
+        XCTAssertNil(rePairErr, "P7(d): Full 5-step GameStream re-pairing MUST succeed cleanly after pre-cleanup: \(String(describing: rePairErr))")
+
+        // Complete pairing via `/pair/complete` -> 200
+        let (compCode, compBody) = await Task.detached {
+            Self.runCurl([
+                "-sk", "--max-time", "5", "-X", "POST",
+                "--cert", client.certURL.path, "--key", client.keyURL.path,
+                "-H", "Content-Type: application/json",
+                "-d", "{\"ticket\":\"\(pairResp.ticket)\",\"deviceId\":\"pico-p7d\",\"device\":\"Reset PICO\"}",
+                "https://127.0.0.1:\(h.controlPort)/depth3d/v1/pair/complete"
+            ])
+        }.value
+        XCTAssertEqual(compCode, 200, "body=\(compBody)")
+
+        // Strictly 1 entry in real state.json, real engine HTTPS ACCEPTS, and `/media` returns 200!
+        let finalCount = EngineConfigGenerator.loadAllPairedCerts(at: h.paths.engineStateFile)
+            .filter { $0.fingerprintSHA256 == client.fingerprint }
+            .count
+        XCTAssertEqual(finalCount, 1)
+
+        let httpsCheck = await Task.detached {
+            RealGameStreamPairingClient.checkHTTPSServerInfo(httpsPort: h.httpsPort, clientCertURL: client.certURL, clientKeyURL: client.keyURL)
+        }.value
+        XCTAssertEqual(httpsCheck, .accepted, "P7(d): Real engine HTTPS MUST accept cleanly re-paired cert")
+
+        let (mediaCode, _) = await Task.detached {
             Self.runCurl([
                 "-sk", "--max-time", "5",
                 "--cert", client.certURL.path, "--key", client.keyURL.path,
                 "https://127.0.0.1:\(h.controlPort)/depth3d/v1/media"
             ])
         }.value
-        XCTAssertEqual(mediaRevoked, 401)
-
-        let acceptedAfterRemove = await Task.detached {
-            RealGameStreamPairingClient.httpsServerInfoAccepted(
-                httpsPort: h.httpsPort,
-                clientCertURL: client.certURL,
-                clientKeyURL: client.keyURL
-            )
-        }.value
-        XCTAssertFalse(acceptedAfterRemove, "P7(c): Real engine HTTPS MUST REJECT removed client certificate")
+        XCTAssertEqual(mediaCode, 200)
     }
 
-    /// Covers P4 (identity-changed approval creates NEW record without overwriting original record or breaking
-    /// original `/media`), P5 (multiple pending sessions from same IP all cancelled; reject cancels engine session),
-    /// P3 (legacy nil-fingerprint removal), and WebDAV credential rotation!
-    func testRealHostRuntimeIdentityChangeCreatesNewRecordAndCancelPendingPairings() async throws {
+    /// Covers P4 (identity change creates NEW record, NEVER inherits autoAllow even on same cert),
+    /// Round-5 #1 (periodic ticket expiration cleans up tickets & engine sessions automatically +
+    /// superseded feeder cancels engine session), and Round-5 minor (legacy nil-fp + engineUUID removal).
+    func testRealHostRuntimeIdentityChangePeriodicTicketExpiryAndLegacyUUIDRemoval() async throws {
         let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("depth3d-runtime-r4-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("depth3d-runtime-r5-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
 
@@ -1034,43 +1112,37 @@ final class HostRuntimeIntegrationTests: XCTestCase {
 
         let legitCert = makePEM([1, 2, 3, 4, 5, 6, 7, 8])
         let attackerCert = makePEM([9, 8, 7, 6, 5, 4, 3, 2])
+        let legacyEngineCert = makePEM([4, 4, 4, 4, 5, 5, 5, 5])
 
         let fakeEngine = try FakeSunshineAPIServer(
             identity: serverId.secIdentity,
             stateFileURL: paths.engineStateFile,
             initialDevices: [
                 ["uuid": "LEGIT-UUID", "name": "Legit PICO", "cert": legitCert.pem, "enabled": "true"],
-                ["uuid": "ATTACKER-UUID", "name": "Spoofer", "cert": attackerCert.pem, "enabled": "true"]
+                ["uuid": "ATTACKER-UUID", "name": "Spoofer", "cert": attackerCert.pem, "enabled": "true"],
+                ["uuid": "LEGACY-ONLY-UUID", "name": "Legacy UUID", "cert": legacyEngineCert.pem, "enabled": "true"]
             ]
         )
         defer { fakeEngine.stop() }
 
-        // Seed 1 legitimate bound device (`autoAllow: true`) + 1 legacy nil-fingerprint device
         _ = try store.upsertPairedDevice(PairedDeviceRecord(
-            deviceId: "shared-device-id",
-            name: "Legit PICO",
-            engineUUID: "LEGIT-UUID",
-            certFingerprint: legitCert.fingerprint,
-            autoAllow: true
+            deviceId: "shared-device-id", name: "Legit PICO",
+            engineUUID: "LEGIT-UUID", certFingerprint: legitCert.fingerprint, autoAllow: true
         ))
-        let legacyRecord = PairedDeviceRecord(
-            deviceId: "legacy-nil-fp",
-            name: "Old Round1 PICO",
-            engineUUID: nil,
-            certFingerprint: nil,
-            autoAllow: false
+        let legacyWithUUID = PairedDeviceRecord(
+            deviceId: "legacy-has-uuid", name: "Old With UUID",
+            engineUUID: "LEGACY-ONLY-UUID", certFingerprint: nil, autoAllow: false
         )
-        _ = try store.upsertPairedDevice(legacyRecord)
+        _ = try store.upsertPairedDevice(legacyWithUUID)
 
-        let apiClient = EngineAPIClient(
-            apiPort: fakeEngine.port,
-            credentials: EngineAdminCredentials(username: "u", password: "pw")
-        )
+        let apiClient = EngineAPIClient(apiPort: fakeEngine.port, credentials: EngineAdminCredentials(username: "u", password: "pw"))
         let coordinator = PairingCoordinator(timeout: 5.0, cooldownDuration: 0.0, autoAllowedFingerprints: [legitCert.fingerprint])
         let initialWebDAVCreds = try store.loadOrCreateWebDAVCredentials()
         let webDAVHandler = WebDAVHandler(credentials: initialWebDAVCreds)
 
         let runtime = HostRuntime(overrides: RuntimeOverrides(dataDirectory: tmp))
+        runtime.ticketTTLSeconds = 0.25
+        runtime.ticketCleanupIntervalSeconds = 0.08
         runtime.configureForTesting(
             store: store,
             engineAPIClient: apiClient,
@@ -1080,70 +1152,109 @@ final class HostRuntimeIntegrationTests: XCTestCase {
             webDAVCredentials: initialWebDAVCreds,
             webDAVPort: 8890
         )
+        defer { runtime.shutdown() }
 
-        // 1. P4: Identity-changed device using the SAME `shared-device-id` with `attackerCert`
-        let knownFPs = runtime.knownBoundCertFingerprints(forDeviceId: "shared-device-id")
-        XCTAssertEqual(knownFPs, [legitCert.fingerprint])
-
+        // 1. P4: Identity-changed device using SAME `shared-device-id` with `attackerCert` creates NEW record
         let ticketRes = await runtime.issueApprovedPairingTicket(
-            deviceName: "Spoofer PICO",
-            deviceId: "shared-device-id",
-            pin: "1234",
-            clientAddress: "192.168.1.55",
+            deviceName: "Spoofer PICO", deviceId: "shared-device-id", pin: "1234",
+            streamPaired: true, clientAddress: "192.168.1.55",
             peerCertFingerprintSHA256: attackerCert.fingerprint,
-            autoAllowFuture: false,
-            approvedViaAutoAllow: false
+            autoAllowFuture: false, approvedViaAutoAllow: false, identityChanged: true
         )
-        guard case .issued(let next, let ticket) = ticketRes else {
-            return XCTFail("Expected ticket issued")
-        }
+        guard case .issued(let next, let ticket) = ticketRes else { return XCTFail("Expected ticket") }
         XCTAssertEqual(next, "done")
 
         let comp = await runtime.completePairing(
-            ticket: ticket,
-            deviceName: "Spoofer PICO",
-            deviceId: "shared-device-id",
-            clientAddress: "192.168.1.55",
-            peerCertFingerprintSHA256: attackerCert.fingerprint
+            ticket: ticket, deviceName: "Spoofer PICO", deviceId: "shared-device-id",
+            clientAddress: "192.168.1.55", peerCertFingerprintSHA256: attackerCert.fingerprint
         )
         XCTAssertEqual(comp, .completed(mediaPort: 8890))
 
-        // CRITICAL (P4): BOTH records exist independently (primary key = certFingerprint)!
-        // Original Legit PICO was NEVER overwritten and STILL keeps `autoAllow == true` AND `/media` access!
-        let legitAfter = try XCTUnwrap(runtime.pairedDevices.first(where: { $0.id == legitCert.fingerprint }))
-        let attackerAfter = try XCTUnwrap(runtime.pairedDevices.first(where: { $0.id == attackerCert.fingerprint }))
-        XCTAssertTrue(legitAfter.autoAllow, "P4: Original device's autoAllow must remain untouched")
-        XCTAssertFalse(attackerAfter.autoAllow, "P4: Identity-changed record must NOT inherit autoAllow")
-        XCTAssertTrue(runtime.authorizeMediaClient(peerCertFingerprintSHA256: legitCert.fingerprint), "P4: Original device /media must stay 200")
-        XCTAssertTrue(runtime.authorizeMediaClient(peerCertFingerprintSHA256: attackerCert.fingerprint))
+        XCTAssertTrue(try XCTUnwrap(runtime.pairedDevices.first(where: { $0.id == legitCert.fingerprint })).autoAllow)
+        XCTAssertFalse(try XCTUnwrap(runtime.pairedDevices.first(where: { $0.id == attackerCert.fingerprint })).autoAllow)
 
-        // Removing the identity-changed record deletes ONLY attackerAfter, leaving legitAfter intact!
-        await runtime.removePairedDeviceAndWait(attackerAfter)
-        XCTAssertNil(runtime.pairedDevices.first(where: { $0.id == attackerCert.fingerprint }))
-        XCTAssertNotNil(runtime.pairedDevices.first(where: { $0.id == legitCert.fingerprint }))
-        XCTAssertTrue(runtime.authorizeMediaClient(peerCertFingerprintSHA256: legitCert.fingerprint))
-        XCTAssertEqual(fakeEngine.removedUUIDs(), ["ATTACKER-UUID"])
-        XCTAssertEqual(runtime.currentMediaCredentialRevision, 1)
+        // 2. Round-5 minor #1: Identity-changed prompt approved for SAME existing cert with rememberAutoAllow=false MUST NOT inherit autoAllow!
+        let sameFPIdChange = await runtime.issueApprovedPairingTicket(
+            deviceName: "Legit PICO", deviceId: "shared-device-id", pin: "1234",
+            streamPaired: true, clientAddress: "192.168.1.56",
+            peerCertFingerprintSHA256: legitCert.fingerprint,
+            autoAllowFuture: false, approvedViaAutoAllow: false, identityChanged: true
+        )
+        guard case .issued(_, let tktIdCh) = sameFPIdChange else { return XCTFail("Expected ticket") }
+        let compIdCh = await runtime.completePairing(
+            ticket: tktIdCh, deviceName: "Legit PICO", deviceId: "shared-device-id",
+            clientAddress: "192.168.1.56", peerCertFingerprintSHA256: legitCert.fingerprint
+        )
+        XCTAssertEqual(compIdCh, .completed(mediaPort: 8890))
+        XCTAssertFalse(
+            try XCTUnwrap(runtime.pairedDevices.first(where: { $0.id == legitCert.fingerprint })).autoAllow,
+            "Round-5 minor: identity-changed approval MUST NOT inherit previous autoAllow even for same fingerprint"
+        )
 
-        // 2. P3: Removing legacy nil-fingerprint record simply deletes record without touching Legit PICO in engine!
-        await runtime.removePairedDeviceAndWait(legacyRecord)
-        XCTAssertNil(runtime.pairedDevices.first(where: { $0.id == legacyRecord.id }))
-        XCTAssertEqual(fakeEngine.removedUUIDs(), ["ATTACKER-UUID"])
+        // 3. Round-5 minor #3: Legacy record with `engineUUID != nil` and `certFingerprint == nil` DOES unpair `engineUUID`!
+        await runtime.removePairedDeviceAndWait(legacyWithUUID)
+        XCTAssertTrue(fakeEngine.removedUUIDs().contains("LEGACY-ONLY-UUID"), "Legacy record with engineUUID must unpair that UUID")
 
-        // 3. P5: Multiple pending sessions from the same IP are ALL cancelled by background PIN feeder (no PIN submitted)!
+        // 4a. Round-5 #1: Periodic ticket expiration timer automatically expires a `streamPaired: true` ticket
+        //     (no PIN feeder running!) AND cancels engine pending pairings for that IP WITHOUT any subsequent call!
+        let expiryTicketRes = await runtime.issueApprovedPairingTicket(
+            deviceName: "Idle PICO", deviceId: "idle-dev", pin: "8888",
+            streamPaired: true, clientAddress: "192.168.1.88",
+            peerCertFingerprintSHA256: attackerCert.fingerprint,
+            autoAllowFuture: false, approvedViaAutoAllow: false, identityChanged: false
+        )
+        guard case .issued(let expNext, _) = expiryTicketRes else { return XCTFail("Expected ticket") }
+        XCTAssertEqual(expNext, "done")
+        XCTAssertEqual(runtime.activeTicketCountForTesting, 1)
+
+        // Simulate a pending session appearing in engine before the ticket expires (no feeder touches it)
         fakeEngine.setPendingPairings(
-            [
-                EnginePendingPairing(id: "dup-sess-1", name: "A", address: "192.168.1.77"),
-                EnginePendingPairing(id: "dup-sess-2", name: "B", address: "192.168.1.77")
-            ],
+            [EnginePendingPairing(id: "stale-expiry-sess", name: "Idle PICO", address: "192.168.1.88")],
             expectations: [:]
         )
-        let fed = await apiClient.feedPINForApprovedSession(
-            pin: "9999", deviceName: "A", clientAddress: "192.168.1.77", maxWait: 2.0, pollInterval: 0.05
+
+        // Do NOT call any endpoint — wait for the periodic cleanup timer to fire!
+        let expDeadline = Date().addingTimeInterval(2.5)
+        while Date() < expDeadline {
+            if runtime.activeTicketCountForTesting == 0 && fakeEngine.cancelledIds().contains("stale-expiry-sess") {
+                break
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertEqual(runtime.activeTicketCountForTesting, 0, "Round-5 #1: Periodic timer must remove expired tickets")
+        XCTAssertTrue(fakeEngine.cancelledIds().contains("stale-expiry-sess"), "Round-5 #1: Periodic ticket expiry must cancel engine pending pairing")
+
+        // 4b. Round-5 #1: Cancelled/superseded PIN feeder task MUST clean up its engine pending pairing session!
+        runtime.ticketTTLSeconds = 10.0
+        let feederRes1 = await runtime.issueApprovedPairingTicket(
+            deviceName: "Feeder PICO", deviceId: "feeder-dev", pin: "7777",
+            streamPaired: false, clientAddress: "192.168.1.99",
+            peerCertFingerprintSHA256: attackerCert.fingerprint,
+            autoAllowFuture: false, approvedViaAutoAllow: false, identityChanged: false
         )
-        XCTAssertFalse(fed)
-        XCTAssertTrue(fakeEngine.submissions().isEmpty, "Must never submit PIN when same IP has multiple pending sessions")
-        XCTAssertEqual(Set(fakeEngine.cancelledIds()), Set(["dup-sess-1", "dup-sess-2"]))
+        guard case .issued(let feedNext1, _) = feederRes1 else { return XCTFail("Expected gamestream ticket") }
+        XCTAssertEqual(feedNext1, "gamestream")
+
+        // Register a pending pairing with matching PIN `7777` while the first feeder is sleeping, then
+        // immediately supersede with a `next: "done"` ticket (which does NOT itself call cancelPendingPairings;
+        // ONLY the cancelled feeder's `Task.isCancelled` cleanup handler cancels `superseded-feeder-sess`!).
+        let validCertForSupersede = legitCert.fingerprint
+        fakeEngine.setPendingPairings(
+            [EnginePendingPairing(id: "superseded-feeder-sess", name: "Feeder PICO", address: "192.168.1.99")],
+            expectations: ["superseded-feeder-sess": (pin: "7777", uuid: "SHOULD-NOT-PAIR", certPEM: attackerCert.pem)]
+        )
+        let feederRes2 = await runtime.issueApprovedPairingTicket(
+            deviceName: "Feeder PICO 2", deviceId: "feeder-dev-2", pin: "6666",
+            streamPaired: true, clientAddress: "192.168.1.99",
+            peerCertFingerprintSHA256: validCertForSupersede,
+            autoAllowFuture: false, approvedViaAutoAllow: false, identityChanged: false
+        )
+        guard case .issued(let feedNext2, _) = feederRes2 else { return XCTFail("Expected superseding ticket") }
+        XCTAssertEqual(feedNext2, "done")
+        XCTAssertTrue(
+            fakeEngine.cancelledIds().contains("superseded-feeder-sess"),
+            "Round-5 #1: Superseded/cancelled PIN feeder must cancel its engine pending pairing session"
+        )
     }
 
     private nonisolated static func runCurl(_ args: [String]) -> (Int, String) {

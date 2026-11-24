@@ -455,6 +455,72 @@ final class EngineAndSystemTests: XCTestCase {
         XCTAssertTrue(grandchildDead, "m-4: Normal stop must terminate grandchildren in the child's process group")
     }
 
+    /// Round-5 #3: Serializing `stop()` onto the exact same serial queue as `start()`/`restart()`
+    /// prevents `stop()` from racing between `proc.run()` and `activeLaunch` assignment and leaking
+    /// an untracked running engine.
+    func testEngineSupervisorConcurrentStartAndStopNeverLeaksEngine() throws {
+        guard let guardBin = locateBuiltChildGuard() else {
+            throw XCTSkip("depth3d-child-guard executable not built in expected SwiftPM path")
+        }
+
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("depth3d-start-stop-race-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let spawnedLog = tmp.appendingPathComponent("spawned.pids")
+        let script = tmp.appendingPathComponent("engine-race.sh")
+        try """
+        #!/bin/sh
+        echo $$ >> "\(spawnedLog.path)"
+        exec /bin/sleep 60
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let paths = HostPaths(rootDirectory: tmp.appendingPathComponent("data", isDirectory: true))
+        let ledger = ChildProcessLedger(ledgerURL: paths.childLedgerFile)
+        let supervisor = EngineSupervisor(
+            paths: paths,
+            adminCredentials: EngineAdminCredentials(username: "u", password: "pw"),
+            engineExecutableOverride: script,
+            childGuardOverride: guardBin,
+            ledger: ledger
+        )
+        defer { supervisor.stop() }
+
+        var testPort: UInt16 = 59469
+        while !PortProbe.occupiedTCPPorts(in: HostPortDefaults.engineTCPPorts(basePort: testPort)).isEmpty {
+            testPort += 30
+        }
+        let cfg = EngineConfigGenerator.Input(
+            hostName: "RaceTest", basePort: testPort, quality: .balanced, displayID: nil, paths: paths
+        )
+
+        // Rapidly issue start() + stop() with staggered 0..60ms delays to hit the launch window.
+        for delayMs in [0, 5, 15, 30, 60] {
+            supervisor.start(config: cfg)
+            if delayMs > 0 {
+                Thread.sleep(forTimeInterval: TimeInterval(delayMs) / 1000.0)
+            }
+            supervisor.stop()
+        }
+
+        // Allow kernel brief drain, then confirm ZERO spawned processes survive and ledger is empty!
+        Thread.sleep(forTimeInterval: 0.25)
+        let rawPIDs = (try? String(contentsOf: spawnedLog, encoding: .utf8)) ?? ""
+        let pids = rawPIDs
+            .components(separatedBy: .newlines)
+            .compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
+            .filter { $0 > 1 }
+        for pid in pids {
+            if kill(pid, 0) == 0 {
+                _ = kill(pid, SIGKILL)
+                XCTFail("Round-5 #3: Engine child PID \(pid) leaked after serialized start()/stop()!")
+            }
+        }
+        XCTAssertTrue(ledger.allEntries().isEmpty, "Ledger must be empty after serialized stop()")
+    }
+
     /// m1: Verifies `EngineSupervisor` always overwrites stale `credentials.json` on launch.
     func testEngineSupervisorAlwaysSynchronizesStaleCredentialsFile() throws {
         let tmp = FileManager.default.temporaryDirectory
@@ -640,6 +706,40 @@ final class EngineAndSystemTests: XCTestCase {
         let rotated = try store.rotateWebDAVCredentials()
         XCTAssertNotEqual(rotated.pass, davCreds1.pass)
         XCTAssertEqual(try store.loadOrCreateWebDAVCredentials(), rotated)
+
+        // Round-5 minor: Legacy paired-devices.json with two entries sharing the same fingerprint
+        // (even with different casing / deviceId) merges cleanly keeping the most recent record!
+        let olderDate = Date(timeIntervalSince1970: 1_700_000_000)
+        let newerDate = Date(timeIntervalSince1970: 1_750_000_000)
+        let rawLegacyJSON = """
+        [
+          {
+            "autoAllow": true,
+            "certFingerprint": "aabbccdd1122",
+            "deviceId": "old-dev-id",
+            "engineUUID": "OLD-UUID",
+            "lastSeenAt": "2023-11-14T22:13:20Z",
+            "name": "Old Name",
+            "pairedAt": "2023-11-14T22:13:20Z"
+          },
+          {
+            "autoAllow": false,
+            "certFingerprint": "AABBCCDD1122",
+            "deviceId": "new-dev-id",
+            "engineUUID": "NEW-UUID",
+            "lastSeenAt": "2025-06-15T12:26:40Z",
+            "name": "Newer Name",
+            "pairedAt": "2025-06-15T12:26:40Z"
+          }
+        ]
+        """
+        try Data(rawLegacyJSON.utf8).write(to: store.paths.pairedDevicesFile, options: .atomic)
+        let migrated = store.loadPairedDevices()
+        XCTAssertEqual(migrated.count, 1, "Duplicate-fingerprint legacy records must merge on load")
+        XCTAssertEqual(migrated[0].certFingerprint, "AABBCCDD1122")
+        XCTAssertEqual(migrated[0].name, "Newer Name")
+        XCTAssertEqual(migrated[0].engineUUID, "NEW-UUID")
+        XCTAssertGreaterThan(newerDate, olderDate)
     }
 
     /// m-1 (upgraded m6): Verifies `fetch-engine.sh --verify-only` validates against the

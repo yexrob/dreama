@@ -36,23 +36,45 @@ public enum IPAddressNormalizer {
     }
 }
 
-/// Bounds the maximum number of simultaneous active TCP connections globally and optionally per source IP.
+/// Bounds the maximum number of simultaneous active TCP connections globally, per source IP,
+/// and reserves a guaranteed pool of slots exclusively for authenticated paired client certificates.
 public final class ConnectionGuard: @unchecked Sendable {
     public let maxConnections: Int
     public let maxConnectionsPerIP: Int?
+    public let reservedPairedSlots: Int
     private let lock = NSLock()
     private var active: Int = 0
+    private var activeUnauthenticated: Int = 0
     private var activeByIP: [String: Int] = [:]
 
-    public init(maxConnections: Int, maxConnectionsPerIP: Int? = nil) {
-        self.maxConnections = max(1, maxConnections)
+    public init(maxConnections: Int, maxConnectionsPerIP: Int? = nil, reservedPairedSlots: Int = 0) {
+        let total = max(1, maxConnections)
+        self.maxConnections = total
         self.maxConnectionsPerIP = maxConnectionsPerIP.map { max(1, $0) }
+        self.reservedPairedSlots = min(max(0, reservedPairedSlots), max(0, total - 1))
+    }
+
+    public var unauthenticatedCeiling: Int {
+        max(1, maxConnections - reservedPairedSlots)
     }
 
     public var activeCount: Int {
         lock.lock()
         defer { lock.unlock() }
         return active
+    }
+
+    public var activeUnauthenticatedCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeUnauthenticated
+    }
+
+    /// True when the unauthenticated pool is already full and only reserved paired slots remain.
+    public var isInReservedPairedZone: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeUnauthenticated >= unauthenticatedCeiling
     }
 
     public func activeCount(forIP rawIP: String) -> Int {
@@ -76,25 +98,52 @@ public final class ConnectionGuard: @unchecked Sendable {
         lock.unlock()
     }
 
-    public func tryAcquire(forIP rawIP: String) -> Bool {
+    /// Acquires a pre-handshake slot (counted as unauthenticated until TLS identifies a paired cert).
+    /// Returns `(acquired: true, inReservedZone: Bool)` when allowed.
+    public func tryAcquireWithZone(forIP rawIP: String) -> (acquired: Bool, inReservedZone: Bool) {
         let ip = IPAddressNormalizer.normalize(rawIP)
         lock.lock()
         defer { lock.unlock() }
-        guard active < maxConnections else { return false }
+        guard active < maxConnections else { return (false, false) }
         if let perIPLimit = maxConnectionsPerIP {
             let currentIP = activeByIP[ip] ?? 0
-            guard currentIP < perIPLimit else { return false }
+            guard currentIP < perIPLimit else { return (false, false) }
             activeByIP[ip] = currentIP + 1
         }
+        let inReserved = activeUnauthenticated >= unauthenticatedCeiling
         active += 1
-        return true
+        activeUnauthenticated += 1
+        return (true, inReserved)
     }
 
-    public func release(forIP rawIP: String) {
+    public func tryAcquire(forIP rawIP: String) -> Bool {
+        tryAcquireWithZone(forIP: rawIP).acquired
+    }
+
+    /// Promotes an already-acquired connection from the unauthenticated pool into the paired pool
+    /// after TLS verifies its client certificate matches a bound device fingerprint.
+    public func promoteToPaired() {
+        lock.lock()
+        activeUnauthenticated = max(0, activeUnauthenticated - 1)
+        lock.unlock()
+    }
+
+    /// Checks whether an unauthenticated connection may stay open (false when it landed inside the
+    /// reserved paired-certificate zone because `unauthenticatedCeiling` is already saturated).
+    public func allowUnauthenticatedAdmission() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeUnauthenticated <= unauthenticatedCeiling
+    }
+
+    public func release(forIP rawIP: String, wasPromotedToPaired: Bool = false) {
         let ip = IPAddressNormalizer.normalize(rawIP)
         lock.lock()
         defer { lock.unlock() }
         active = max(0, active - 1)
+        if !wasPromotedToPaired {
+            activeUnauthenticated = max(0, activeUnauthenticated - 1)
+        }
         if maxConnectionsPerIP != nil, let current = activeByIP[ip] {
             if current <= 1 {
                 activeByIP.removeValue(forKey: ip)

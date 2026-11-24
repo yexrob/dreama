@@ -257,11 +257,25 @@ public struct PairRequestPayload: Codable, Equatable, Sendable {
     public let device: String
     public let deviceId: String
     public let pin: String
+    public let streamPaired: Bool
 
-    public init(device: String, deviceId: String, pin: String) {
+    public init(device: String, deviceId: String, pin: String, streamPaired: Bool = false) {
         self.device = device
         self.deviceId = deviceId
         self.pin = pin
+        self.streamPaired = streamPaired
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case device, deviceId, pin, streamPaired
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.device = try c.decode(String.self, forKey: .device)
+        self.deviceId = try c.decode(String.self, forKey: .deviceId)
+        self.pin = try c.decode(String.self, forKey: .pin)
+        self.streamPaired = try c.decodeIfPresent(Bool.self, forKey: .streamPaired) ?? false
     }
 }
 
@@ -373,10 +387,12 @@ public protocol ControlProtocolDelegate: Sendable {
         deviceName: String,
         deviceId: String,
         pin: String,
+        streamPaired: Bool,
         clientAddress: String,
-        peerCertFingerprintSHA256: String?,
+        peerCertFingerprintSHA256: String,
         autoAllowFuture: Bool,
-        approvedViaAutoAllow: Bool
+        approvedViaAutoAllow: Bool,
+        identityChanged: Bool
     ) async -> PairTicketIssueResult
     func completePairing(
         ticket: String,
@@ -472,6 +488,10 @@ public final class ControlProtocolRouter: Sendable {
     }
 
     private func handlePair(_ request: HTTPRequest) async -> HTTPResponse {
+        // Protocol v1 (3676b2b): `/pair` MUST carry the headset's TLS client certificate.
+        guard let peerCertFP = request.peerCertificateFingerprintSHA256 else {
+            return HTTPResponse.json(401, object: ["error": "client_cert_required"])
+        }
         guard let payload = try? JSONDecoder().decode(PairRequestPayload.self, from: request.body) else {
             return HTTPResponse.json(400, object: ["error": "invalid_request"])
         }
@@ -496,19 +516,32 @@ public final class ControlProtocolRouter: Sendable {
             deviceName: device,
             deviceId: deviceId,
             clientAddress: request.remoteAddress,
-            peerCertFingerprintSHA256: request.peerCertificateFingerprintSHA256,
+            peerCertFingerprintSHA256: peerCertFP,
             knownBoundFingerprintsForDeviceId: knownBoundFPs
         )
 
+        // If the client disconnected while the prompt was open, treat as cancelled & issue NO ticket!
+        if Task.isCancelled {
+            let delegateRef = self.delegate
+            let remoteIP = request.remoteAddress
+            await Task.detached {
+                await delegateRef.cancelPendingEnginePairings(forClientAddress: remoteIP)
+            }.value
+            return HTTPResponse.json(403, object: ["error": "rejected"])
+        }
+
         switch decision {
-        case .approved(let rememberAutoAllow):
+        case .approved(let rememberAutoAllow, let identityChanged):
             return await issueTicketResponse(
                 device: device,
                 deviceId: deviceId,
                 pin: pin,
+                streamPaired: payload.streamPaired,
+                peerCertFP: peerCertFP,
                 request: request,
                 autoAllowFuture: rememberAutoAllow,
-                approvedViaAutoAllow: false
+                approvedViaAutoAllow: false,
+                identityChanged: identityChanged
             )
 
         case .autoApproved:
@@ -516,9 +549,12 @@ public final class ControlProtocolRouter: Sendable {
                 device: device,
                 deviceId: deviceId,
                 pin: pin,
+                streamPaired: payload.streamPaired,
+                peerCertFP: peerCertFP,
                 request: request,
                 autoAllowFuture: true,
-                approvedViaAutoAllow: true
+                approvedViaAutoAllow: true,
+                identityChanged: false
             )
 
         case .rejected:
@@ -553,18 +589,23 @@ public final class ControlProtocolRouter: Sendable {
         device: String,
         deviceId: String,
         pin: String,
+        streamPaired: Bool,
+        peerCertFP: String,
         request: HTTPRequest,
         autoAllowFuture: Bool,
-        approvedViaAutoAllow: Bool
+        approvedViaAutoAllow: Bool,
+        identityChanged: Bool
     ) async -> HTTPResponse {
         let result = await delegate.issueApprovedPairingTicket(
             deviceName: device,
             deviceId: deviceId,
             pin: pin,
+            streamPaired: streamPaired,
             clientAddress: request.remoteAddress,
-            peerCertFingerprintSHA256: request.peerCertificateFingerprintSHA256,
+            peerCertFingerprintSHA256: peerCertFP,
             autoAllowFuture: autoAllowFuture,
-            approvedViaAutoAllow: approvedViaAutoAllow
+            approvedViaAutoAllow: approvedViaAutoAllow,
+            identityChanged: identityChanged
         )
         switch result {
         case .issued(let next, let ticket):

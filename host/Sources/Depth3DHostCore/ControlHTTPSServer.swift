@@ -71,24 +71,118 @@ private final class ActiveTLSConnection: @unchecked Sendable {
     }
 }
 
+/// Coordinates safe single-close + slot-release across the async routing Task and the
+/// `DispatchSourceRead` client-disconnect monitor so `fd` is NEVER closed while monitored.
+private final class ConnectionLifecycleBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private let conn: ActiveTLSConnection
+    private let connectionGuard: ConnectionGuard
+    private let peerIP: String
+    private var wasPromotedToPaired: Bool
+    private var sourceCancelled = false
+    private var routeFinished = false
+    private var clientDisconnected = false
+    private var finalized = false
+    private var routeTask: Task<Void, Never>?
+
+    init(
+        conn: ActiveTLSConnection,
+        connectionGuard: ConnectionGuard,
+        peerIP: String,
+        wasPromotedToPaired: Bool
+    ) {
+        self.conn = conn
+        self.connectionGuard = connectionGuard
+        self.peerIP = peerIP
+        self.wasPromotedToPaired = wasPromotedToPaired
+    }
+
+    func attachRouteTask(_ task: Task<Void, Never>) {
+        lock.lock()
+        routeTask = task
+        let alreadyDisconnected = clientDisconnected
+        lock.unlock()
+        if alreadyDisconnected {
+            task.cancel()
+        }
+    }
+
+    func markPromotedToPaired() {
+        lock.lock()
+        wasPromotedToPaired = true
+        lock.unlock()
+    }
+
+    func markClientDisconnectedAndCancelRoute() -> Bool {
+        lock.lock()
+        let first = !clientDisconnected
+        clientDisconnected = true
+        let taskToCancel = routeTask
+        lock.unlock()
+        if first {
+            taskToCancel?.cancel()
+        }
+        return first
+    }
+
+    var isClientDisconnected: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return clientDisconnected
+    }
+
+    @available(macOS, deprecated: 10.15)
+    func markSourceCancelled() {
+        lock.lock()
+        sourceCancelled = true
+        let shouldClose = routeFinished && !finalized
+        if shouldClose {
+            finalized = true
+            routeTask = nil
+        }
+        let promoted = wasPromotedToPaired
+        lock.unlock()
+        if shouldClose {
+            conn.close()
+            connectionGuard.release(forIP: peerIP, wasPromotedToPaired: promoted)
+        }
+    }
+
+    @available(macOS, deprecated: 10.15)
+    func markRouteFinished() {
+        lock.lock()
+        routeFinished = true
+        let shouldClose = sourceCancelled && !finalized
+        if shouldClose {
+            finalized = true
+            routeTask = nil
+        }
+        let promoted = wasPromotedToPaired
+        lock.unlock()
+        if shouldClose {
+            conn.close()
+            connectionGuard.release(forIP: peerIP, wasPromotedToPaired: promoted)
+        }
+    }
+}
+
 /// HTTPS server for `/depth3d/v1/*` with optional TLS client certificate authentication
-/// (SecureTransport `.tryAuthenticate`):
-///   - Connection cap (`ConnectionGuard`) to prevent socket/memory exhaustion
+/// (SecureTransport `.tryAuthenticate`), bound strictly on IPv4 per `docs/specs/host-protocol.md`:
+///   - Global connection ceiling (`maxConnections`) with reserved slots (`reservedPairedSlots`)
+///     guaranteed for bound-fingerprint paired client certificates
+///   - Per-IP concurrent connection cap enforced BEFORE TLS handshake (`maxConnectionsPerIP`)
 ///   - Strict per-connection monotonic ABSOLUTE deadlines across TLS handshake & request read
-///   - Per-IP rate limiting for unauthenticated connections (`IPRateLimiter`)
-///   - Non-blocking async dispatch so `/depth3d/v1/pair` waits never tie up worker threads
-///
-/// Note on TLS stack (m7): Apple's `Network.framework` marks
-/// `sec_protocol_options_set_peer_authentication_optional` as `API_UNAVAILABLE(macos, ios, ...)`
-/// in the macOS SDK (`SecProtocolOptions.h`), leaving no single-port optional-mTLS option in
-/// `Network.framework`. SecureTransport `.tryAuthenticate` cryptographically verifies client
-/// `CertificateVerify` handshake signatures (proof of private-key possession) over TLS 1.2.
+///     (with a tighter handshake deadline when operating inside the reserved paired-cert zone)
+///   - Per-IP rate limiting for unauthenticated / unknown-cert connections (`IPRateLimiter`)
+///   - Event-driven client-disconnect detection (`DispatchSourceRead`) that immediately cancels
+///     pending `/depth3d/v1/pair` prompts when a headset disconnects
 public final class ControlHTTPSServer: @unchecked Sendable {
     private let identity: SecIdentity
     private let router: ControlProtocolRouter
     private let connectionGuard: ConnectionGuard
     private let unauthRateLimiter: IPRateLimiter
     private let handshakeTimeout: TimeInterval
+    private let reservedZoneHandshakeTimeout: TimeInterval
     private let readTimeout: TimeInterval
 
     private let lock = NSLock()
@@ -97,6 +191,7 @@ public final class ControlHTTPSServer: @unchecked Sendable {
     private var boundPort: UInt16 = 0
     private var acceptQueue = DispatchQueue(label: "dev.depth3d.host.control.accept", qos: .userInitiated)
     private var ioQueue = DispatchQueue(label: "dev.depth3d.host.control.io", qos: .userInitiated, attributes: .concurrent)
+    private var disconnectQueue = DispatchQueue(label: "dev.depth3d.host.control.disconnect", qos: .userInitiated)
 
     public var port: UInt16 {
         lock.lock()
@@ -109,22 +204,27 @@ public final class ControlHTTPSServer: @unchecked Sendable {
         router: ControlProtocolRouter,
         maxConnections: Int = 32,
         maxConnectionsPerIP: Int = 8,
+        reservedPairedSlots: Int = 8,
         unauthRateLimitPerWindow: Int = 30,
         unauthRateWindowSeconds: TimeInterval = 10.0,
         handshakeTimeoutSec: TimeInterval = 5.0,
+        reservedZoneHandshakeTimeoutSec: TimeInterval? = nil,
         readTimeoutSec: TimeInterval = 5.0
     ) {
         self.identity = identity
         self.router = router
         self.connectionGuard = ConnectionGuard(
             maxConnections: maxConnections,
-            maxConnectionsPerIP: maxConnectionsPerIP
+            maxConnectionsPerIP: maxConnectionsPerIP,
+            reservedPairedSlots: reservedPairedSlots
         )
         self.unauthRateLimiter = IPRateLimiter(
             maxEvents: unauthRateLimitPerWindow,
             windowSeconds: unauthRateWindowSeconds
         )
-        self.handshakeTimeout = max(0.2, handshakeTimeoutSec)
+        let clampedHS = max(0.2, handshakeTimeoutSec)
+        self.handshakeTimeout = clampedHS
+        self.reservedZoneHandshakeTimeout = max(0.2, min(clampedHS, reservedZoneHandshakeTimeoutSec ?? min(clampedHS, 1.5)))
         self.readTimeout = max(0.2, readTimeoutSec)
     }
 
@@ -160,7 +260,7 @@ public final class ControlHTTPSServer: @unchecked Sendable {
         self.running = true
         lock.unlock()
 
-        HostLogger.info("Control HTTPS server listening on port \(actualPort)", category: "control")
+        HostLogger.info("Control HTTPS server listening on IPv4 port \(actualPort)", category: "control")
 
         acceptQueue.async { [weak self] in
             self?.acceptLoop(listenFD: fd)
@@ -184,9 +284,7 @@ public final class ControlHTTPSServer: @unchecked Sendable {
         }
     }
 
-    /// Binds strictly on IPv4 (`AF_INET`, `INADDR_ANY`) per `docs/specs/host-protocol.md` (S-3)
-    /// so control connections and GameStream pairing connections always share the exact same IPv4
-    /// source address instead of mismatching IPv6 vs IPv4 on dual-stack LANs.
+    /// Binds strictly on IPv4 (`AF_INET`, `INADDR_ANY`) per `docs/specs/host-protocol.md` (S-3).
     private func openListeningSocket(port: UInt16) throws -> (Int32, UInt16) {
         let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else {
@@ -245,15 +343,15 @@ public final class ControlHTTPSServer: @unchecked Sendable {
 
             let peerIP = IPAddressNormalizer.peerAddress(from: &storage)
 
-            // Enforce BOTH global and per-IP concurrent connection ceilings BEFORE TLS handshake (S-5).
-            guard connectionGuard.tryAcquire(forIP: peerIP) else {
+            // Enforce global + per-IP connection ceilings BEFORE TLS handshake.
+            let acquire = connectionGuard.tryAcquireWithZone(forIP: peerIP)
+            guard acquire.acquired else {
                 Darwin.close(clientFD)
                 continue
             }
 
             var one: Int32 = 1
             setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-            // Use non-blocking socket paired with poll() against per-connection absolute deadline.
             let flags = fcntl(clientFD, F_GETFL, 0)
             if flags >= 0 {
                 _ = fcntl(clientFD, F_SETFL, flags | O_NONBLOCK)
@@ -264,25 +362,28 @@ public final class ControlHTTPSServer: @unchecked Sendable {
                     Darwin.close(clientFD)
                     return
                 }
-                self.startTLSAndDispatch(fd: clientFD, peerIP: peerIP)
+                self.startTLSAndDispatch(fd: clientFD, peerIP: peerIP, inReservedZone: acquire.inReservedZone)
             }
         }
     }
 
-    private func startTLSAndDispatch(fd: Int32, peerIP: String) {
-        performTLSRead(fd: fd, peerIP: peerIP)
+    private func startTLSAndDispatch(fd: Int32, peerIP: String, inReservedZone: Bool) {
+        performTLSRead(fd: fd, peerIP: peerIP, inReservedZone: inReservedZone)
     }
 
     @available(macOS, deprecated: 10.15)
-    private func performTLSRead(fd: Int32, peerIP: String) {
+    private func performTLSRead(fd: Int32, peerIP: String, inReservedZone: Bool) {
         guard let ctx = SSLCreateContext(kCFAllocatorDefault, .serverSide, .streamType) else {
             Darwin.close(fd)
-            connectionGuard.release(forIP: peerIP)
+            connectionGuard.release(forIP: peerIP, wasPromotedToPaired: false)
             return
         }
 
         let startUptime = ProcessInfo.processInfo.systemUptime
-        let handshakeDeadline = startUptime + handshakeTimeout
+        // Use a tighter absolute handshake deadline when operating inside the reserved paired-cert zone
+        // so unauthenticated connections cannot hold reserved slots open during slow handshakes.
+        let effectiveHandshakeTimeout = inReservedZone ? reservedZoneHandshakeTimeout : handshakeTimeout
+        let handshakeDeadline = startUptime + effectiveHandshakeTimeout
         let ioCtx = TLSIOContext(fd: fd, deadlineUptime: handshakeDeadline)
         let conn = ActiveTLSConnection(fd: fd, ctx: ctx, ioCtx: ioCtx)
 
@@ -385,14 +486,9 @@ public final class ControlHTTPSServer: @unchecked Sendable {
         }
         guard handshakeStatus == noErr && !ioCtx.timedOut else {
             conn.close()
-            connectionGuard.release(forIP: peerIP)
+            connectionGuard.release(forIP: peerIP, wasPromotedToPaired: false)
             return
         }
-
-        // Set absolute request-read deadline (bounded by both readTimeout and total pre-dispatch cap).
-        let now = ProcessInfo.processInfo.systemUptime
-        let readDeadline = min(now + readTimeout, startUptime + handshakeTimeout + readTimeout)
-        ioCtx.deadlineUptime = readDeadline
 
         // Extract optional peer client certificate (cryptographically verified via TLS CertificateVerify).
         var peerDER: Data?
@@ -404,6 +500,23 @@ public final class ControlHTTPSServer: @unchecked Sendable {
         {
             peerDER = SecCertificateCopyData(leaf) as Data
         }
+
+        // If this connection landed in the reserved paired-cert zone and presented NO client certificate
+        // at all, reject immediately after handshake without waiting to read an HTTP request.
+        if inReservedZone && peerDER == nil {
+            ioCtx.deadlineUptime = ProcessInfo.processInfo.systemUptime + 1.0
+            let busy = HTTPResponse.json(503, object: ["error": "busy"], extraHeaders: [("Retry-After", "2")])
+            writeAll(ctx: ctx, data: busy.serialize())
+            conn.close()
+            connectionGuard.release(forIP: peerIP, wasPromotedToPaired: false)
+            return
+        }
+
+        // Set absolute request-read deadline (unauthenticated/reserved-zone connections get tighter read cap).
+        let now = ProcessInfo.processInfo.systemUptime
+        let effectiveReadTimeout = (inReservedZone || peerDER == nil) ? min(readTimeout, reservedZoneHandshakeTimeout) : readTimeout
+        let readDeadline = min(now + effectiveReadTimeout, startUptime + effectiveHandshakeTimeout + effectiveReadTimeout)
+        ioCtx.deadlineUptime = readDeadline
 
         guard let request = readHTTPRequest(
             ctx: ctx,
@@ -417,19 +530,45 @@ public final class ControlHTTPSServer: @unchecked Sendable {
                 writeAll(ctx: ctx, data: bad.serialize())
             }
             conn.close()
-            connectionGuard.release(forIP: peerIP)
+            connectionGuard.release(forIP: peerIP, wasPromotedToPaired: false)
             return
         }
 
-        // Hand off rate-limit verification & routing to an async Swift Task so long-running
-        // `/depth3d/v1/pair` waits (up to 60s) suspend cooperatively without occupying ANY GCD thread.
-        // Only genuinely paired client certificates bypass `unauthRateLimiter`; presenting an
-        // arbitrary self-signed client certificate MUST still be rate-limited (S-5).
+        // Hand off paired-cert slot promotion, rate-limit checks, and routing to an async Task,
+        // paired with a `DispatchSourceRead` monitor so client disconnect while a confirmation
+        // prompt is open immediately cancels `routeTask` and dismisses the prompt (B-1)!
         let router = self.router
         let ioQueue = self.ioQueue
         let guardRef = self.connectionGuard
         let rateLimiter = self.unauthRateLimiter
-        Task {
+        let lifecycle = ConnectionLifecycleBox(
+            conn: conn,
+            connectionGuard: guardRef,
+            peerIP: peerIP,
+            wasPromotedToPaired: false
+        )
+
+        // Configure and resume `readSource` strictly BEFORE spawning `routeTask` so no other
+        // thread can ever call `readSource.cancel()` concurrently with `setEventHandler`/`resume()`.
+        let readSource = DispatchSource.makeReadSource(fileDescriptor: conn.fd, queue: disconnectQueue)
+        readSource.setCancelHandler {
+            lifecycle.markSourceCancelled()
+        }
+        readSource.setEventHandler {
+            var peekByte: UInt8 = 0
+            let n = Darwin.recv(conn.fd, &peekByte, 1, MSG_PEEK | MSG_DONTWAIT)
+            if n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) || (n > 0 && peekByte == 0x15) {
+                if lifecycle.markClientDisconnectedAndCancelRoute() {
+                    readSource.cancel()
+                }
+            } else if n > 0 {
+                // Unexpected non-alert bytes on a Connection: close stream; stop monitoring to avoid level-triggered spin.
+                readSource.cancel()
+            }
+        }
+        readSource.resume()
+
+        let routeTask = Task {
             let isKnownPaired: Bool
             if let fp = request.peerCertificateFingerprintSHA256 {
                 isKnownPaired = await router.isKnownPairedCertificate(fingerprintSHA256: fp)
@@ -437,8 +576,20 @@ public final class ControlHTTPSServer: @unchecked Sendable {
                 isKnownPaired = false
             }
 
+            if isKnownPaired {
+                guardRef.promoteToPaired()
+                lifecycle.markPromotedToPaired()
+            }
+
             let response: HTTPResponse
-            if !isKnownPaired && !rateLimiter.allow(key: peerIP) {
+            if !isKnownPaired && !guardRef.allowUnauthenticatedAdmission() {
+                // Unauthenticated connection landed in reserved paired-cert slots -> reject promptly!
+                response = HTTPResponse.json(
+                    503,
+                    object: ["error": "busy"],
+                    extraHeaders: [("Retry-After", "2")]
+                )
+            } else if !isKnownPaired && !rateLimiter.allow(key: peerIP) {
                 response = HTTPResponse.json(
                     429,
                     object: ["error": "rate_limited"],
@@ -449,13 +600,16 @@ public final class ControlHTTPSServer: @unchecked Sendable {
             }
 
             ioQueue.async {
-                conn.ioCtx.timedOut = false
-                conn.ioCtx.deadlineUptime = ProcessInfo.processInfo.systemUptime + 10.0
-                Self.writeAllStatic(ctx: conn.ctx, data: response.serialize(includeBody: request.method != "HEAD"))
-                conn.close()
-                guardRef.release(forIP: peerIP)
+                readSource.cancel()
+                if !lifecycle.isClientDisconnected {
+                    conn.ioCtx.timedOut = false
+                    conn.ioCtx.deadlineUptime = ProcessInfo.processInfo.systemUptime + 10.0
+                    Self.writeAllStatic(ctx: conn.ctx, data: response.serialize(includeBody: request.method != "HEAD"))
+                }
+                lifecycle.markRouteFinished()
             }
         }
+        lifecycle.attachRouteTask(routeTask)
     }
 
     @available(macOS, deprecated: 10.15)

@@ -71,20 +71,25 @@ public final class HostRuntime: ObservableObject {
     private struct PendingPairingTicket {
         let ticket: String
         let clientIP: String
+        let certFingerprintSHA256: String
         let deviceName: String
         let deviceId: String
         let rememberAutoAllow: Bool
         let approvedViaAutoAllow: Bool
+        let identityChanged: Bool
         let expiresAt: Date
         var feederTask: Task<Void, Never>?
     }
 
     private var pendingPairingTickets: [String: PendingPairingTicket] = [:]
+    private var ticketCleanupTask: Task<Void, Never>?
     internal var ticketTTLSeconds: TimeInterval = 120.0
     internal var pinFeederWindowSeconds: TimeInterval = 60.0
+    internal var ticketCleanupIntervalSeconds: TimeInterval = 10.0
 
     internal var currentWebDAVCredentials: WebDAVCredentials? { webDAVCredentials }
     internal var currentMediaCredentialRevision: Int { mediaCredentialRevision }
+    internal var activeTicketCountForTesting: Int { pendingPairingTickets.count }
 
     public var activeEngineBasePort: UInt16 {
         if let override = overrides.engineBasePort {
@@ -185,6 +190,7 @@ public final class HostRuntime: ObservableObject {
         self.permissions = PermissionSnapshot(screenRecording: .granted, accessibility: .granted, localNetwork: .granted)
         self.network = NetworkSnapshot(isConnected: true, interfaceSummary: HostStrings.string("network.wifi"), localIPv4: "127.0.0.1")
         self.isInitialized = true
+        startTicketCleanupTimer()
     }
 
     internal func makeProtocolDelegateForTesting() -> ControlProtocolDelegate {
@@ -366,7 +372,8 @@ public final class HostRuntime: ObservableObject {
             // 9. Sleep/wake and display hotplug observers.
             observeSystemLifecycle()
 
-            // 10. Start streaming engine and probe rclone availability in background.
+            // 10. Start streaming engine, periodic ticket expiration cleaner, and probe rclone.
+            startTicketCleanupTimer()
             startEngineWithCurrentSettings()
             refreshCloudRemotes()
 
@@ -394,6 +401,8 @@ public final class HostRuntime: ObservableObject {
         webDAVServer?.stop()
         rcloneManager?.stopAll()
         engineSupervisor?.stop()
+        ticketCleanupTask?.cancel()
+        ticketCleanupTask = nil
         for entry in pendingPairingTickets.values {
             entry.feederTask?.cancel()
         }
@@ -536,6 +545,10 @@ public final class HostRuntime: ObservableObject {
                 fallbackUUID: device.engineUUID,
                 stateFileURL: store.paths.engineStateFile
             )
+            refreshPairedClientsFromEngine()
+        } else if let uuid = device.engineUUID, !uuid.isEmpty, let api = engineAPIClient {
+            // Legacy record with engineUUID but no certFingerprint: still remove that UUID from engine.
+            _ = try? await api.unpairClient(uuid: uuid)
             refreshPairedClientsFromEngine()
         }
     }
@@ -804,45 +817,60 @@ public final class HostRuntime: ObservableObject {
         )
     }
 
-    /// Step 1 of two-step pairing (`POST /depth3d/v1/pair`):
-    /// - Returns IMMEDIATELY with `next: "done"` (cert already uniquely enabled in engine) or
-    ///   `next: "gamestream"` (spawns 60s background PIN feeder for `clientAddress`) plus an opaque
-    ///   120s `ticket`. NEVER waits for GameStream pairing to finish here.
+    /// Step 1 of two-step pairing (`POST /depth3d/v1/pair`, protocol `3676b2b`):
+    /// - `next == "done"` ONLY when `streamPaired == true` AND the client's certificate is already
+    ///   in the engine's paired list (deduplicated to the single newest enabled entry if needed).
+    /// - Otherwise `next == "gamestream"`: BEFORE returning `200`, cancels any superseded feeder &
+    ///   stale pending pairing sessions for `clientAddress` AND deletes ALL existing engine entries
+    ///   for `peerCertFingerprintSHA256` (so Sunshine's non-deduplicating `add_authorized_client`
+    ///   never creates duplicates that fail Step 5 HTTPS!), then launches the 60s PIN feeder.
     internal func issueApprovedPairingTicket(
         deviceName: String,
         deviceId: String,
         pin: String,
+        streamPaired: Bool,
         clientAddress: String,
-        peerCertFingerprintSHA256: String?,
+        peerCertFingerprintSHA256: String,
         autoAllowFuture: Bool,
-        approvedViaAutoAllow: Bool
+        approvedViaAutoAllow: Bool,
+        identityChanged: Bool
     ) async -> PairTicketIssueResult {
-        pruneExpiredPairingTickets()
+        await pruneExpiredPairingTickets()
         let fallbackReason = streamReadyInfo.reason ?? HostStrings.string("protocol.stream.unavailable")
         guard let store, let api = engineAPIClient, engineState.isReadyForClients else {
             return .streamNotReady(reason: fallbackReason)
         }
 
         let targetIP = IPAddressNormalizer.normalize(clientAddress)
-        let alreadyUniquelyPaired: Bool
-        if let peerFP = peerCertFingerprintSHA256?.trimmingCharacters(in: .whitespacesAndNewlines), !peerFP.isEmpty {
-            alreadyUniquelyPaired = EngineConfigGenerator.isCertificateUniquelyEnabled(
-                fingerprintSHA256: peerFP,
-                at: store.paths.engineStateFile
-            )
-        } else {
-            alreadyUniquelyPaired = false
-        }
+        let normalizedFP = peerCertFingerprintSHA256.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
 
-        let nextStep = alreadyUniquelyPaired ? "done" : "gamestream"
-        let ticket = SecureRandom.hexString(byteCount: 24)
-
-        // Cancel any earlier superseded feeder from the same source IP so two feeders never collide.
-        for (oldKey, oldEntry) in pendingPairingTickets where oldEntry.clientIP == targetIP {
+        // Cancel & await any earlier superseded ticket/feeder from the same IP before mutating engine state.
+        let supersededEntries = pendingPairingTickets.values.filter { $0.clientIP == targetIP }
+        for oldEntry in supersededEntries {
+            pendingPairingTickets.removeValue(forKey: oldEntry.ticket)
             oldEntry.feederTask?.cancel()
-            pendingPairingTickets.removeValue(forKey: oldKey)
+            _ = await oldEntry.feederTask?.value
         }
 
+        let nextStep: String
+        if streamPaired,
+           await api.ensureUniqueEnabledCert(fingerprintSHA256: normalizedFP, stateFileURL: store.paths.engineStateFile) != nil
+        {
+            nextStep = "done"
+        } else {
+            nextStep = "gamestream"
+            // Mandatory pre-gamestream cleanup (B-1):
+            // 1. Cancel any stale pending GameStream pairing sessions from `targetIP`.
+            // 2. Remove ALL existing engine entries for `normalizedFP` so fresh 5-step pairing succeeds cleanly.
+            await api.cancelPendingPairings(forIP: targetIP)
+            await api.unpairAllEntries(
+                forFingerprint: normalizedFP,
+                fallbackUUID: nil,
+                stateFileURL: store.paths.engineStateFile
+            )
+        }
+
+        let ticket = SecureRandom.hexString(byteCount: 24)
         var feederTask: Task<Void, Never>?
         if nextStep == "gamestream" {
             let maxWait = pinFeederWindowSeconds
@@ -859,27 +887,29 @@ public final class HostRuntime: ObservableObject {
         pendingPairingTickets[ticket] = PendingPairingTicket(
             ticket: ticket,
             clientIP: targetIP,
+            certFingerprintSHA256: normalizedFP,
             deviceName: deviceName,
             deviceId: deviceId,
             rememberAutoAllow: autoAllowFuture,
             approvedViaAutoAllow: approvedViaAutoAllow,
+            identityChanged: identityChanged,
             expiresAt: Date().addingTimeInterval(ticketTTLSeconds),
             feederTask: feederTask
         )
 
         HostLogger.info(
-            "Issued pairing ticket for \(deviceName) (\(targetIP), next=\(nextStep))",
+            "Issued pairing ticket for \(deviceName) (\(targetIP), streamPaired=\(streamPaired), next=\(nextStep))",
             category: "pair"
         )
         return .issued(next: nextStep, ticket: ticket)
     }
 
     /// Step 2 of two-step pairing (`POST /depth3d/v1/pair/complete`):
-    /// - Validates `ticket` existence/expiry (120s) and matching source IP
-    /// - Verifies the TLS handshake client certificate fingerprint is enabled in engine `state.json`
-    /// - Deduplicates duplicate entries for that certificate (keeps newest enabled, unpairs extras)
-    /// - Persists `PairedDeviceRecord` keyed strictly by certificate fingerprint (never overwriting
-    ///   a different certificate that shares `deviceId`)
+    /// - Atomically claims the single-use `ticket` before suspending so concurrent `/pair/complete`
+    ///   calls can NEVER both succeed (`B-1`)
+    /// - Validates expiry (120s), matching source IP, AND matching client certificate fingerprint
+    /// - Verifies & deduplicates the certificate in engine `state.json` (restoring the ticket only
+    ///   on `409 not_paired` if unexpired so sequential 5s retries succeed)
     internal func completePairing(
         ticket: String,
         deviceName: String?,
@@ -887,15 +917,21 @@ public final class HostRuntime: ObservableObject {
         clientAddress: String,
         peerCertFingerprintSHA256: String
     ) async -> PairCompleteOutcome {
-        pruneExpiredPairingTickets()
+        await pruneExpiredPairingTickets()
         let normalizedIP = IPAddressNormalizer.normalize(clientAddress)
         let normalizedFP = peerCertFingerprintSHA256.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
 
         guard let entry = pendingPairingTickets[ticket] else {
             return .ticketExpired
         }
-        guard entry.clientIP == normalizedIP else {
-            HostLogger.warning("Pairing complete source mismatch: expected \(entry.clientIP), got \(normalizedIP)", category: "pair")
+        guard entry.expiresAt > Date() else {
+            pendingPairingTickets.removeValue(forKey: ticket)
+            entry.feederTask?.cancel()
+            return .ticketExpired
+        }
+        // Ticket binds BOTH source IP and the certificate fingerprint presented to `/pair` (B-1).
+        guard entry.clientIP == normalizedIP, entry.certFingerprintSHA256 == normalizedFP else {
+            HostLogger.warning("Pairing complete mismatch (ip or cert fingerprint) for \(normalizedIP)", category: "pair")
             return .sourceMismatch
         }
         guard let store, let api = engineAPIClient, engineState.isReadyForClients else {
@@ -903,16 +939,21 @@ public final class HostRuntime: ObservableObject {
             return .streamNotReady(reason: reason)
         }
 
+        // Atomically claim the single-use ticket BEFORE awaiting so concurrent calls cannot both succeed!
+        pendingPairingTickets.removeValue(forKey: ticket)
+
         guard let verifiedCert = await api.ensureUniqueEnabledCert(
             fingerprintSHA256: normalizedFP,
             stateFileURL: store.paths.engineStateFile
         ) else {
-            // Do NOT consume `ticket` or stop the feeder: headset may retry within 5s while engine flushes.
+            // Engine hasn't flushed state.json yet -> restore ticket if still unexpired for 5s retry.
+            if entry.expiresAt > Date() && pendingPairingTickets[ticket] == nil {
+                pendingPairingTickets[ticket] = entry
+            }
             return .notPaired
         }
 
-        // Ticket verified & certificate uniquely enabled in engine: consume ticket & persist record.
-        pendingPairingTickets.removeValue(forKey: ticket)
+        // Completed! Cancel background feeder cleanly (pairing already succeeded in engine).
         entry.feederTask?.cancel()
 
         let finalName = (deviceName?.isEmpty == false ? deviceName! : entry.deviceName)
@@ -924,7 +965,8 @@ public final class HostRuntime: ObservableObject {
             engineUUID: verifiedCert.uuid,
             certFingerprintSHA256: normalizedFP,
             rememberAutoAllow: entry.rememberAutoAllow,
-            approvedViaAutoAllow: entry.approvedViaAutoAllow
+            approvedViaAutoAllow: entry.approvedViaAutoAllow,
+            identityChanged: entry.identityChanged
         )
         refreshPairedClientsFromEngine()
         return .completed(mediaPort: webDAVPort)
@@ -934,18 +976,34 @@ public final class HostRuntime: ObservableObject {
         await engineAPIClient?.cancelPendingPairings(forIP: clientAddress)
     }
 
-    private func pruneExpiredPairingTickets() {
-        let now = Date()
-        var expiredIPs: [String] = []
-        for (key, entry) in pendingPairingTickets where entry.expiresAt <= now {
-            entry.feederTask?.cancel()
-            pendingPairingTickets.removeValue(forKey: key)
-            expiredIPs.append(entry.clientIP)
-        }
-        if !expiredIPs.isEmpty, let api = engineAPIClient {
-            for ip in Set(expiredIPs) {
-                Task { await api.cancelPendingPairings(forIP: ip) }
+    internal func restartTicketCleanupTimerForTesting() {
+        startTicketCleanupTimer()
+    }
+
+    private func startTicketCleanupTimer() {
+        ticketCleanupTask?.cancel()
+        let interval = max(0.05, ticketCleanupIntervalSeconds)
+        ticketCleanupTask = Task { @MainActor [weak self] in
+            let ns = UInt64(interval * 1_000_000_000)
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: ns)
+                guard !Task.isCancelled, let self else { break }
+                await self.pruneExpiredPairingTickets()
             }
+        }
+    }
+
+    private func pruneExpiredPairingTickets() async {
+        let now = Date()
+        var expiredEntries: [PendingPairingTicket] = []
+        for (key, entry) in pendingPairingTickets where entry.expiresAt <= now {
+            pendingPairingTickets.removeValue(forKey: key)
+            expiredEntries.append(entry)
+        }
+        for entry in expiredEntries {
+            entry.feederTask?.cancel()
+            _ = await entry.feederTask?.value
+            await engineAPIClient?.cancelPendingPairings(forIP: entry.clientIP)
         }
     }
 
@@ -955,19 +1013,17 @@ public final class HostRuntime: ObservableObject {
         engineUUID: String,
         certFingerprintSHA256: String,
         rememberAutoAllow: Bool,
-        approvedViaAutoAllow: Bool
+        approvedViaAutoAllow: Bool,
+        identityChanged: Bool
     ) async {
         guard let store else { return }
         let normalizedFP = certFingerprintSHA256.uppercased()
 
-        // Primary key lookup is STRICTLY by certificate fingerprint (P4):
-        // an identity-changed re-pair with a different fingerprint creates a NEW record and NEVER
-        // overwrites or modifies the original certificate's record!
         let existingByFP = pairedDevices.first(where: {
             $0.certFingerprint?.caseInsensitiveCompare(normalizedFP) == .orderedSame
         })
 
-        // Upgrade legacy unbound stubs (`certFingerprint == nil`) sharing `deviceId`, if any,
+        // Upgrade legacy unbound stubs (`certFingerprint == nil`) sharing `deviceId`,
         // without ever touching any record that already has a bound certificate fingerprint.
         if existingByFP == nil,
            let legacyStub = pairedDevices.first(where: { $0.certFingerprint == nil && $0.deviceId == deviceId })
@@ -977,11 +1033,14 @@ public final class HostRuntime: ObservableObject {
             }
         }
 
+        // Security rule: NEVER inherit `autoAllow` after an identity-changed prompt (or any manual
+        // prompt where the user did not check the box); only preserve `true` on genuine auto-allow.
         let shouldAutoAllow: Bool
-        if let existing = existingByFP {
-            shouldAutoAllow = approvedViaAutoAllow ? true : (rememberAutoAllow || existing.autoAllow)
+        if identityChanged {
+            shouldAutoAllow = rememberAutoAllow
+        } else if approvedViaAutoAllow {
+            shouldAutoAllow = true
         } else {
-            // Brand-new certificate (including identity-changed deviceId): NEVER inherit any old record's autoAllow!
             shouldAutoAllow = rememberAutoAllow
         }
 
@@ -1219,10 +1278,12 @@ private final class RuntimeControlProtocolAdapter: ControlProtocolDelegate, @unc
         deviceName: String,
         deviceId: String,
         pin: String,
+        streamPaired: Bool,
         clientAddress: String,
-        peerCertFingerprintSHA256: String?,
+        peerCertFingerprintSHA256: String,
         autoAllowFuture: Bool,
-        approvedViaAutoAllow: Bool
+        approvedViaAutoAllow: Bool,
+        identityChanged: Bool
     ) async -> PairTicketIssueResult {
         guard let runtime else {
             return .streamNotReady(reason: HostStrings.string("protocol.stream.not_initialized"))
@@ -1231,10 +1292,12 @@ private final class RuntimeControlProtocolAdapter: ControlProtocolDelegate, @unc
             deviceName: deviceName,
             deviceId: deviceId,
             pin: pin,
+            streamPaired: streamPaired,
             clientAddress: clientAddress,
             peerCertFingerprintSHA256: peerCertFingerprintSHA256,
             autoAllowFuture: autoAllowFuture,
-            approvedViaAutoAllow: approvedViaAutoAllow
+            approvedViaAutoAllow: approvedViaAutoAllow,
+            identityChanged: identityChanged
         )
     }
 

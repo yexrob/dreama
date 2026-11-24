@@ -268,6 +268,9 @@ public final class EngineAPIClient: @unchecked Sendable {
                         HostLogger.info("Background PIN feeder completed GameStream pairing for \(deviceName) (\(targetIP))", category: "pair")
                         return true
                     }
+                    if Task.isCancelled {
+                        break
+                    }
                     HostLogger.warning("Background PIN submission failed for \(targetIP); cancelling pending sessions", category: "pair")
                     await cancelPendingPairings(forIP: targetIP)
                     return false
@@ -281,6 +284,13 @@ public final class EngineAPIClient: @unchecked Sendable {
         if !Task.isCancelled {
             HostLogger.warning("Background PIN feeder timed out after \(Int(maxWait))s for \(targetIP); cancelling pending sessions", category: "pair")
             await cancelPendingPairings(forIP: targetIP)
+        } else {
+            // Cancelled (superseded ticket, expired ticket, or shutdown): best-effort cleanup of
+            // any pending pairing session left open for this IP using an uncancelled cleanup task.
+            let api = self
+            await Task.detached {
+                await api.cancelPendingPairings(forIP: targetIP)
+            }.value
         }
         return false
     }
@@ -350,24 +360,38 @@ public final class EngineAPIClient: @unchecked Sendable {
     }
 
     /// Removes EVERY entry in the streaming engine matching `fingerprintSHA256` (including any
-    /// duplicates or entries without a stored `engineUUID`), plus `fallbackUUID` if provided.
+    /// duplicates or entries without a stored `engineUUID`), plus `fallbackUUID` if provided,
+    /// and waits briefly for Sunshine to flush `state.json` so a subsequent fresh pairing
+    /// cannot collide with an un-flushed duplicate entry (B-1).
     public func unpairAllEntries(
         forFingerprint fingerprintSHA256: String,
         fallbackUUID: String? = nil,
         stateFileURL: URL
     ) async {
-        var uuidsToRemove: [String] = []
-        let all = EngineConfigGenerator.loadAllPairedCerts(at: stateFileURL)
-        for cert in all where cert.fingerprintSHA256?.caseInsensitiveCompare(fingerprintSHA256) == .orderedSame {
-            if !uuidsToRemove.contains(cert.uuid) {
-                uuidsToRemove.append(cert.uuid)
+        await serializer.runSerialized { [self] in
+            var uuidsToRemove: [String] = []
+            let all = EngineConfigGenerator.loadAllPairedCerts(at: stateFileURL)
+            for cert in all where cert.fingerprintSHA256?.caseInsensitiveCompare(fingerprintSHA256) == .orderedSame {
+                if !uuidsToRemove.contains(cert.uuid) {
+                    uuidsToRemove.append(cert.uuid)
+                }
             }
-        }
-        if let fallbackUUID, !fallbackUUID.isEmpty, !uuidsToRemove.contains(fallbackUUID) {
-            uuidsToRemove.append(fallbackUUID)
-        }
-        for uuid in uuidsToRemove {
-            _ = try? await unpairClient(uuid: uuid)
+            if let fallbackUUID, !fallbackUUID.isEmpty, !uuidsToRemove.contains(fallbackUUID) {
+                uuidsToRemove.append(fallbackUUID)
+            }
+            guard !uuidsToRemove.isEmpty else { return }
+            for uuid in uuidsToRemove {
+                _ = try? await self.unpairClient(uuid: uuid)
+            }
+
+            let flushDeadline = Date().addingTimeInterval(1.0)
+            while Date() < flushDeadline {
+                let remaining = EngineConfigGenerator.loadAllPairedCerts(at: stateFileURL).filter {
+                    $0.fingerprintSHA256?.caseInsensitiveCompare(fingerprintSHA256) == .orderedSame
+                }
+                if remaining.isEmpty { break }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
         }
     }
 

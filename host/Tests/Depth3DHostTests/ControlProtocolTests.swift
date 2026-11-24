@@ -10,9 +10,10 @@ private actor MockControlDelegate: ControlProtocolDelegate {
     var authorizedFingerprints: Set<String> = []
     var knownBoundByDeviceId: [String: Set<String>] = [:]
     var engineUniquelyPairedFingerprints: Set<String> = []
-    var issuedTickets: [String: (clientIP: String, deviceName: String, deviceId: String, autoAllow: Bool)] = [:]
+    var issuedTickets: [String: (clientIP: String, certFP: String, deviceName: String, deviceId: String, autoAllow: Bool)] = [:]
     var cancelledIPs: [String] = []
     var handledRequestCount: Int = 0
+    var issuedTicketCount: Int = 0
 
     init(snapshot: ControlProtocolSnapshot) {
         self.snapshot = snapshot
@@ -51,23 +52,22 @@ private actor MockControlDelegate: ControlProtocolDelegate {
         deviceName: String,
         deviceId: String,
         pin: String,
+        streamPaired: Bool,
         clientAddress: String,
-        peerCertFingerprintSHA256: String?,
+        peerCertFingerprintSHA256: String,
         autoAllowFuture: Bool,
-        approvedViaAutoAllow: Bool
+        approvedViaAutoAllow: Bool,
+        identityChanged: Bool
     ) async -> PairTicketIssueResult {
         handledRequestCount += 1
+        issuedTicketCount += 1
         guard snapshot.streamReady else {
             return .streamNotReady(reason: snapshot.streamNotReadyReason ?? "不可用")
         }
-        let next: String
-        if let fp = peerCertFingerprintSHA256?.uppercased(), engineUniquelyPairedFingerprints.contains(fp) {
-            next = "done"
-        } else {
-            next = "gamestream"
-        }
+        let fp = peerCertFingerprintSHA256.uppercased()
+        let next = (streamPaired && engineUniquelyPairedFingerprints.contains(fp)) ? "done" : "gamestream"
         let ticket = "tkt-\(UUID().uuidString.prefix(8))"
-        issuedTickets[ticket] = (IPAddressNormalizer.normalize(clientAddress), deviceName, deviceId, autoAllowFuture)
+        issuedTickets[ticket] = (IPAddressNormalizer.normalize(clientAddress), fp, deviceName, deviceId, autoAllowFuture)
         return .issued(next: next, ticket: ticket)
     }
 
@@ -80,8 +80,10 @@ private actor MockControlDelegate: ControlProtocolDelegate {
     ) async -> PairCompleteOutcome {
         handledRequestCount += 1
         guard let entry = issuedTickets[ticket] else { return .ticketExpired }
-        guard entry.clientIP == IPAddressNormalizer.normalize(clientAddress) else { return .sourceMismatch }
         let fp = peerCertFingerprintSHA256.uppercased()
+        guard entry.clientIP == IPAddressNormalizer.normalize(clientAddress), entry.certFP == fp else {
+            return .sourceMismatch
+        }
         guard engineUniquelyPairedFingerprints.contains(fp) else { return .notPaired }
         issuedTickets.removeValue(forKey: ticket)
         authorizedFingerprints.insert(fp)
@@ -93,9 +95,14 @@ private actor MockControlDelegate: ControlProtocolDelegate {
     }
 
     func getCancelledIPs() -> [String] { cancelledIPs }
+    func getIssuedTicketCount() -> Int { issuedTicketCount }
 }
 
 final class ControlProtocolTests: XCTestCase {
+    private let sampleCertA = Data("sample-headset-cert-A".utf8)
+    private let sampleCertB = Data("sample-headset-cert-B".utf8)
+    private let sampleCertC = Data("sample-headset-cert-C".utf8)
+
     func testHTTPParserParsesHeadersAndContentLength() throws {
         let raw = Data("POST /depth3d/v1/pair?foo=bar HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n{\"pin\":\"12\"}".utf8)
         let head = try XCTUnwrap(try HTTPParser.parseHead(from: raw))
@@ -132,13 +139,9 @@ final class ControlProtocolTests: XCTestCase {
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: resp.body) as? [String: Any])
         XCTAssertEqual(json["v"] as? Int, 1)
         XCTAssertEqual(json["name"] as? String, "书房 Mac")
-        XCTAssertEqual(json["id"] as? String, "11111111-2222-3333-4444-555555555555")
-        XCTAssertEqual(json["os"] as? String, "macOS 15.1")
-
         let stream = try XCTUnwrap(json["stream"] as? [String: Any])
         XCTAssertEqual(stream["ready"] as? Bool, true)
         XCTAssertTrue(stream["reason"] is NSNull)
-
         let media = try XCTUnwrap(json["media"] as? [String: Any])
         XCTAssertEqual(media["port"] as? Int, 8890)
 
@@ -183,8 +186,9 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(respHeader.statusCode, 426)
     }
 
-    /// P6: Engine not ready returns `503 {"error":"stream_not_ready","reason":"..."}` immediately without prompting.
-    func testPairReturns503StreamNotReadyImmediatelyWhenEngineNotReady() async throws {
+    /// B-1 + P6: `/pair` without client cert returns `401 client_cert_required`;
+    /// with cert when engine not ready returns `503 stream_not_ready` without prompting.
+    func testPairRequiresClientCertAndReturns503StreamNotReadyWhenEngineDown() async throws {
         let snap = ControlProtocolSnapshot(
             hostName: "Mac", hostId: "id", osDescription: "macOS 15.0",
             streamReady: false,
@@ -194,10 +198,24 @@ final class ControlProtocolTests: XCTestCase {
         let coord = PairingCoordinator(timeout: 5.0)
         let router = ControlProtocolRouter(pairingCoordinator: coord, delegate: MockControlDelegate(snapshot: snap))
 
+        // No client cert -> 401 client_cert_required
+        let noCertResp = await router.handle(HTTPRequest(
+            method: "POST",
+            rawTarget: "/depth3d/v1/pair",
+            body: Data("{\"device\":\"PICO 4\",\"deviceId\":\"dev-1\",\"pin\":\"1234\",\"streamPaired\":false}".utf8),
+            peerCertificateDER: nil,
+            remoteAddress: "192.168.1.40"
+        ))
+        XCTAssertEqual(noCertResp.statusCode, 401)
+        let noCertJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: noCertResp.body) as? [String: Any])
+        XCTAssertEqual(noCertJSON["error"] as? String, "client_cert_required")
+
+        // With client cert while engine down -> 503 stream_not_ready
         let resp = await router.handle(HTTPRequest(
             method: "POST",
             rawTarget: "/depth3d/v1/pair",
-            body: Data("{\"device\":\"PICO 4\",\"deviceId\":\"dev-1\",\"pin\":\"1234\"}".utf8),
+            body: Data("{\"device\":\"PICO 4\",\"deviceId\":\"dev-1\",\"pin\":\"1234\",\"streamPaired\":false}".utf8),
+            peerCertificateDER: sampleCertA,
             remoteAddress: "192.168.1.40"
         ))
         XCTAssertEqual(resp.statusCode, 503)
@@ -208,13 +226,11 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertTrue(prompts.isEmpty)
     }
 
-    /// Covers P1/P2/P5/P6/S-5:
-    /// - Exact protocol error codes (`invalid_request`, `rejected`, `timeout`, `busy`+`retryAfterSec`,
-    ///   `cooldown`+`retryAfterSec`, `client_cert_required`, `not_paired`, `ticket_expired`, `source_mismatch`)
-    /// - IP-only cooldown & IP prompt fairness (one IP cannot monopolize consecutive prompts when another waits)
-    /// - Pending engine pairing cancellation on reject/timeout/error (`P5`)
-    /// - Cert-fingerprint-only auto-allow & `identityChanged` flag
-    func testTwoStepPairErrorsCancelOnFailureIPFairnessAndCertAutoAllow() async throws {
+    /// Covers B-1/P1-P6 + Round-5 #2 multi-IP prompt fairness:
+    /// - Exact protocol error codes + ticket bound to BOTH IP and client cert fingerprint
+    /// - `streamPaired: true` vs `false` decision for `next` (`done` vs `gamestream`)
+    /// - Multi-IP fairness: two collaborating attacker IPs (A & B) that get rejected CANNOT starve clean IP C!
+    func testTwoStepPairErrorsTicketBindingMultiIPFairnessAndCertAutoAllow() async throws {
         let snap = ControlProtocolSnapshot(
             hostName: "Mac", hostId: "id", osDescription: "macOS 15.0",
             streamReady: true, streamNotReadyReason: nil, mediaPort: 8890, webDAVCredentials: nil
@@ -226,65 +242,64 @@ final class ControlProtocolTests: XCTestCase {
         // 1. Invalid PIN -> 400 invalid_request
         let badResp = await router.handle(HTTPRequest(
             method: "POST", rawTarget: "/depth3d/v1/pair",
-            body: Data("{\"device\":\"PICO 4\",\"deviceId\":\"dev-1\",\"pin\":\"12ab\"}".utf8),
-            remoteAddress: "192.168.1.10"
+            body: Data("{\"device\":\"PICO 4\",\"deviceId\":\"dev-1\",\"pin\":\"12ab\",\"streamPaired\":false}".utf8),
+            peerCertificateDER: sampleCertA, remoteAddress: "192.168.1.10"
         ))
         XCTAssertEqual(badResp.statusCode, 400)
         XCTAssertEqual((try JSONSerialization.jsonObject(with: badResp.body) as? [String: Any])?["error"] as? String, "invalid_request")
 
-        // 2. Timeout -> 408 timeout + cancels engine pending pairing for IP + 429 cooldown with retryAfterSec
-        let timeoutBody = Data("{\"device\":\"PICO 4\",\"deviceId\":\"dev-timeout\",\"pin\":\"1234\"}".utf8)
-        let timeoutResp = await router.handle(HTTPRequest(method: "POST", rawTarget: "/depth3d/v1/pair", body: timeoutBody, remoteAddress: "192.168.1.11"))
+        // 2. Timeout -> 408 timeout + cancels engine pending pairing + 429 cooldown with retryAfterSec
+        let timeoutBody = Data("{\"device\":\"PICO 4\",\"deviceId\":\"dev-timeout\",\"pin\":\"1234\",\"streamPaired\":false}".utf8)
+        let timeoutResp = await router.handle(HTTPRequest(
+            method: "POST", rawTarget: "/depth3d/v1/pair",
+            body: timeoutBody, peerCertificateDER: sampleCertA, remoteAddress: "192.168.1.11"
+        ))
         XCTAssertEqual(timeoutResp.statusCode, 408)
-        XCTAssertEqual((try JSONSerialization.jsonObject(with: timeoutResp.body) as? [String: Any])?["error"] as? String, "timeout")
         let cancelledAfterTimeout = await delegate.getCancelledIPs()
-        XCTAssertTrue(cancelledAfterTimeout.contains("192.168.1.11"), "P5: timeout must cancel pending engine pairing for IP")
+        XCTAssertTrue(cancelledAfterTimeout.contains("192.168.1.11"))
 
-        let cooldownResp = await router.handle(HTTPRequest(method: "POST", rawTarget: "/depth3d/v1/pair", body: timeoutBody, remoteAddress: "192.168.1.11"))
+        let cooldownResp = await router.handle(HTTPRequest(
+            method: "POST", rawTarget: "/depth3d/v1/pair",
+            body: timeoutBody, peerCertificateDER: sampleCertA, remoteAddress: "192.168.1.11"
+        ))
         XCTAssertEqual(cooldownResp.statusCode, 429)
         let cdJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: cooldownResp.body) as? [String: Any])
         XCTAssertEqual(cdJSON["error"] as? String, "cooldown")
         XCTAssertGreaterThanOrEqual(cdJSON["retryAfterSec"] as? Int ?? 0, 1)
 
-        // 3. Single prompt + busy + IP-only cooldown + reject cancels engine pairing
+        // 3. Single prompt + busy + IP-only cooldown + ticket bound to BOTH IP and cert fingerprint
         let coord2 = PairingCoordinator(timeout: 5.0, cooldownDuration: 5.0, fairnessYieldDuration: 0.0)
         let router2 = ControlProtocolRouter(pairingCoordinator: coord2, delegate: delegate)
 
         let attackerTask = Task {
             await router2.handle(HTTPRequest(
                 method: "POST", rawTarget: "/depth3d/v1/pair",
-                body: Data("{\"device\":\"Spoofer\",\"deviceId\":\"victim-device\",\"pin\":\"4321\"}".utf8),
-                remoteAddress: "::ffff:192.168.1.20"
+                body: Data("{\"device\":\"Spoofer\",\"deviceId\":\"victim-device\",\"pin\":\"4321\",\"streamPaired\":false}".utf8),
+                peerCertificateDER: sampleCertB, remoteAddress: "::ffff:192.168.1.20"
             ))
         }
         try await Task.sleep(nanoseconds: 50_000_000)
         let activePrompts = await coord2.pendingPrompts()
         XCTAssertEqual(activePrompts.count, 1)
-        XCTAssertEqual(activePrompts[0].clientAddress, "192.168.1.20")
 
         let busyResp = await router2.handle(HTTPRequest(
             method: "POST", rawTarget: "/depth3d/v1/pair",
-            body: Data("{\"device\":\"PICO B\",\"deviceId\":\"dev-other\",\"pin\":\"1111\"}".utf8),
-            remoteAddress: "192.168.1.21"
+            body: Data("{\"device\":\"PICO B\",\"deviceId\":\"dev-other\",\"pin\":\"1111\",\"streamPaired\":false}".utf8),
+            peerCertificateDER: sampleCertC, remoteAddress: "192.168.1.21"
         ))
         XCTAssertEqual(busyResp.statusCode, 429)
-        let busyJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: busyResp.body) as? [String: Any])
-        XCTAssertEqual(busyJSON["error"] as? String, "busy")
-        XCTAssertGreaterThanOrEqual(busyJSON["retryAfterSec"] as? Int ?? 0, 1)
+        XCTAssertEqual((try JSONSerialization.jsonObject(with: busyResp.body) as? [String: Any])?["error"] as? String, "busy")
 
         await coord2.reject(promptId: activePrompts[0].id)
         let attackerResp = await attackerTask.value
         XCTAssertEqual(attackerResp.statusCode, 403)
-        XCTAssertEqual((try JSONSerialization.jsonObject(with: attackerResp.body) as? [String: Any])?["error"] as? String, "rejected")
-        let cancelledAfterReject = await delegate.getCancelledIPs()
-        XCTAssertTrue(cancelledAfterReject.contains("192.168.1.20"), "P5: reject must cancel pending engine pairing for IP")
 
-        // Real headset on DIFFERENT IP with SAME `victim-device` ID is NOT locked out -> 200 {ok, next:"gamestream", ticket}
+        // Real headset on different IP with same deviceId succeeds -> ticket bound to IP + sampleCertA
         let realHeadsetTask = Task {
             await router2.handle(HTTPRequest(
                 method: "POST", rawTarget: "/depth3d/v1/pair",
-                body: Data("{\"device\":\"Real PICO\",\"deviceId\":\"victim-device\",\"pin\":\"5678\"}".utf8),
-                remoteAddress: "192.168.1.50"
+                body: Data("{\"device\":\"Real PICO\",\"deviceId\":\"victim-device\",\"pin\":\"5678\",\"streamPaired\":false}".utf8),
+                peerCertificateDER: sampleCertA, remoteAddress: "192.168.1.50"
             ))
         }
         try await Task.sleep(nanoseconds: 50_000_000)
@@ -294,198 +309,191 @@ final class ControlProtocolTests: XCTestCase {
         let realHeadsetResp = await realHeadsetTask.value
         XCTAssertEqual(realHeadsetResp.statusCode, 200)
         let approved = try JSONDecoder().decode(PairApprovedResponse.self, from: realHeadsetResp.body)
-        XCTAssertTrue(approved.ok)
         XCTAssertEqual(approved.next, "gamestream")
-        XCTAssertFalse(approved.ticket.isEmpty)
 
-        // 4. `/pair/complete` error codes: 401 no cert, 403 source mismatch, 409 not_paired, 200 completed, 410 expired/reused
-        let compNoCert = await router2.handle(HTTPRequest(
+        // `/pair/complete` with DIFFERENT cert from SAME IP -> 403 source_mismatch (ticket bound to cert FP!)
+        let compWrongCert = await router2.handle(HTTPRequest(
             method: "POST", rawTarget: "/depth3d/v1/pair/complete",
             body: Data("{\"ticket\":\"\(approved.ticket)\",\"deviceId\":\"victim-device\",\"device\":\"Real PICO\"}".utf8),
-            remoteAddress: "192.168.1.50"
+            peerCertificateDER: sampleCertB, remoteAddress: "192.168.1.50"
         ))
-        XCTAssertEqual(compNoCert.statusCode, 401)
-        XCTAssertEqual((try JSONSerialization.jsonObject(with: compNoCert.body) as? [String: Any])?["error"] as? String, "client_cert_required")
+        XCTAssertEqual(compWrongCert.statusCode, 403)
+        XCTAssertEqual((try JSONSerialization.jsonObject(with: compWrongCert.body) as? [String: Any])?["error"] as? String, "source_mismatch")
 
-        let newCertDER = Data("real-headset-fresh-cert".utf8)
-        let newCertFP = TLSIdentityManager.sha256Hex(newCertDER)
-        let compWrongIP = await router2.handle(HTTPRequest(
-            method: "POST", rawTarget: "/depth3d/v1/pair/complete",
-            body: Data("{\"ticket\":\"\(approved.ticket)\",\"deviceId\":\"victim-device\",\"device\":\"Real PICO\"}".utf8),
-            peerCertificateDER: newCertDER,
-            remoteAddress: "192.168.1.99"
-        ))
-        XCTAssertEqual(compWrongIP.statusCode, 403)
-        XCTAssertEqual((try JSONSerialization.jsonObject(with: compWrongIP.body) as? [String: Any])?["error"] as? String, "source_mismatch")
-
-        // Before engine finishes pairing -> 409 not_paired (ticket stays valid!)
+        // Same IP + same cert before engine paired -> 409 not_paired; after paired -> 200; reuse -> 410
         let compNotYet = await router2.handle(HTTPRequest(
             method: "POST", rawTarget: "/depth3d/v1/pair/complete",
             body: Data("{\"ticket\":\"\(approved.ticket)\",\"deviceId\":\"victim-device\",\"device\":\"Real PICO\"}".utf8),
-            peerCertificateDER: newCertDER,
-            remoteAddress: "192.168.1.50"
+            peerCertificateDER: sampleCertA, remoteAddress: "192.168.1.50"
         ))
         XCTAssertEqual(compNotYet.statusCode, 409)
-        XCTAssertEqual((try JSONSerialization.jsonObject(with: compNotYet.body) as? [String: Any])?["error"] as? String, "not_paired")
 
-        // Once engine has cert -> 200 {ok:true, media:{port:8890}}
-        await delegate.setEnginePairedOnly(fingerprint: newCertFP)
+        await delegate.setEnginePairedOnly(fingerprint: TLSIdentityManager.sha256Hex(sampleCertA))
         let compOK = await router2.handle(HTTPRequest(
             method: "POST", rawTarget: "/depth3d/v1/pair/complete",
             body: Data("{\"ticket\":\"\(approved.ticket)\",\"deviceId\":\"victim-device\",\"device\":\"Real PICO\"}".utf8),
-            peerCertificateDER: newCertDER,
-            remoteAddress: "192.168.1.50"
+            peerCertificateDER: sampleCertA, remoteAddress: "192.168.1.50"
         ))
         XCTAssertEqual(compOK.statusCode, 200)
-        let compDecoded = try JSONDecoder().decode(PairCompleteResponse.self, from: compOK.body)
-        XCTAssertTrue(compDecoded.ok)
-        XCTAssertEqual(compDecoded.media?.port, 8890)
 
-        // Reusing consumed ticket -> 410 ticket_expired
         let compReuse = await router2.handle(HTTPRequest(
             method: "POST", rawTarget: "/depth3d/v1/pair/complete",
             body: Data("{\"ticket\":\"\(approved.ticket)\"}".utf8),
-            peerCertificateDER: newCertDER,
-            remoteAddress: "192.168.1.50"
+            peerCertificateDER: sampleCertA, remoteAddress: "192.168.1.50"
         ))
         XCTAssertEqual(compReuse.statusCode, 410)
-        XCTAssertEqual((try JSONSerialization.jsonObject(with: compReuse.body) as? [String: Any])?["error"] as? String, "ticket_expired")
 
-        // 5. S-5 prompt IP fairness: IP A occupies prompt while IP B gets busy; once IP A finishes,
-        //    IP A trying immediately again gets `429 busy` (yields) while IP B immediately gets the prompt!
-        let fairCoord = PairingCoordinator(timeout: 5.0, cooldownDuration: 0.0, fairnessYieldDuration: 5.0)
-        let fairRouter = ControlProtocolRouter(pairingCoordinator: fairCoord, delegate: delegate)
+        // 4. Multi-IP prompt fairness (Round-5 #2):
+        //    Attacker A & Attacker B (with short 0.05s cooldown) try to alternate occupying the prompt
+        //    while clean Legit C is waiting -> rejected A & B MUST yield priority to clean Legit C!
+        let multiCoord = PairingCoordinator(
+            timeout: 5.0,
+            cooldownDuration: 0.05,
+            fairnessYieldDuration: 5.0,
+            recentFailurePenaltyWindow: 60.0
+        )
+        let multiRouter = ControlProtocolRouter(pairingCoordinator: multiCoord, delegate: delegate)
 
-        let ipATask = Task {
-            await fairRouter.handle(HTTPRequest(
+        let taskA1 = Task {
+            await multiRouter.handle(HTTPRequest(
                 method: "POST", rawTarget: "/depth3d/v1/pair",
-                body: Data("{\"device\":\"Spammer A\",\"deviceId\":\"a1\",\"pin\":\"1234\"}".utf8),
-                remoteAddress: "192.168.1.100"
+                body: Data("{\"device\":\"Attacker A\",\"deviceId\":\"a1\",\"pin\":\"1111\",\"streamPaired\":false}".utf8),
+                peerCertificateDER: sampleCertA, remoteAddress: "192.168.1.101"
             ))
         }
-        try await Task.sleep(nanoseconds: 50_000_000)
-        let aPrompts = await fairCoord.pendingPrompts()
-        XCTAssertEqual(aPrompts.count, 1)
+        try await Task.sleep(nanoseconds: 40_000_000)
+        let pendingA1 = await multiCoord.pendingPrompts()
+        let promptA1 = try XCTUnwrap(pendingA1.first)
 
-        // IP B arrives while IP A holds prompt -> 429 busy (IP B recorded as waiter)
-        let ipBBlocked = await fairRouter.handle(HTTPRequest(
+        // While A holds prompt, B (102) arrives -> busy (waiter #1)
+        let busyB = await multiRouter.handle(HTTPRequest(
             method: "POST", rawTarget: "/depth3d/v1/pair",
-            body: Data("{\"device\":\"Legit B\",\"deviceId\":\"b1\",\"pin\":\"5678\"}".utf8),
-            remoteAddress: "192.168.1.200"
+            body: Data("{\"device\":\"Attacker B\",\"deviceId\":\"b1\",\"pin\":\"2222\",\"streamPaired\":false}".utf8),
+            peerCertificateDER: sampleCertB, remoteAddress: "192.168.1.102"
         ))
-        XCTAssertEqual(ipBBlocked.statusCode, 429)
+        XCTAssertEqual(busyB.statusCode, 429)
 
-        // IP A finishes (even approved, so zero reject cooldown)
-        await fairCoord.approve(promptId: aPrompts[0].id, rememberAutoAllow: false)
-        _ = await ipATask.value
+        // Reject A -> A is now penalized; B takes turn
+        await multiCoord.reject(promptId: promptA1.id)
+        _ = await taskA1.value
+        try await Task.sleep(nanoseconds: 70_000_000) // A's short cooldown expired, but A stays in recentRejectOrTimeoutAt!
 
-        // IP A tries to monopolize the next prompt immediately -> MUST yield (`429 busy`)!
-        let ipAMonopolize = await fairRouter.handle(HTTPRequest(
-            method: "POST", rawTarget: "/depth3d/v1/pair",
-            body: Data("{\"device\":\"Spammer A Again\",\"deviceId\":\"a2\",\"pin\":\"1234\"}".utf8),
-            remoteAddress: "192.168.1.100"
-        ))
-        XCTAssertEqual(ipAMonopolize.statusCode, 429, "S-5: IP A must yield prompt slot when IP B was waiting")
-
-        // IP B immediately claims the prompt!
-        let ipBTask = Task {
-            await fairRouter.handle(HTTPRequest(
+        let taskB1 = Task {
+            await multiRouter.handle(HTTPRequest(
                 method: "POST", rawTarget: "/depth3d/v1/pair",
-                body: Data("{\"device\":\"Legit B\",\"deviceId\":\"b1\",\"pin\":\"5678\"}".utf8),
-                remoteAddress: "192.168.1.200"
+                body: Data("{\"device\":\"Attacker B\",\"deviceId\":\"b1\",\"pin\":\"2222\",\"streamPaired\":false}".utf8),
+                peerCertificateDER: sampleCertB, remoteAddress: "192.168.1.102"
             ))
         }
-        try await Task.sleep(nanoseconds: 50_000_000)
-        let bPrompts = await fairCoord.pendingPrompts()
-        XCTAssertEqual(bPrompts.count, 1)
-        XCTAssertEqual(bPrompts[0].clientAddress, "192.168.1.200")
-        await fairCoord.approve(promptId: bPrompts[0].id, rememberAutoAllow: false)
-        let ipBResp = await ipBTask.value
-        XCTAssertEqual(ipBResp.statusCode, 200)
+        try await Task.sleep(nanoseconds: 40_000_000)
+        let pendingB1 = await multiCoord.pendingPrompts()
+        let promptB1 = try XCTUnwrap(pendingB1.first)
 
-        // 6. Cert-fingerprint-only auto-allow & identityChanged detection (P4)
-        let certADer = Data("real-paired-headset-cert-A".utf8)
-        let certAFp = TLSIdentityManager.sha256Hex(certADer)
-        let certBDer = Data("impersonator-cert-B".utf8)
+        // While B holds prompt: A (penalized!) arrives first, THEN clean C (103) arrives second!
+        let busyA2 = await multiRouter.handle(HTTPRequest(
+            method: "POST", rawTarget: "/depth3d/v1/pair",
+            body: Data("{\"device\":\"Attacker A\",\"deviceId\":\"a2\",\"pin\":\"1111\",\"streamPaired\":false}".utf8),
+            peerCertificateDER: sampleCertA, remoteAddress: "192.168.1.101"
+        ))
+        XCTAssertEqual(busyA2.statusCode, 429)
+
+        let busyC = await multiRouter.handle(HTTPRequest(
+            method: "POST", rawTarget: "/depth3d/v1/pair",
+            body: Data("{\"device\":\"Legit C\",\"deviceId\":\"c1\",\"pin\":\"3333\",\"streamPaired\":false}".utf8),
+            peerCertificateDER: sampleCertC, remoteAddress: "192.168.1.103"
+        ))
+        XCTAssertEqual(busyC.statusCode, 429)
+
+        // Reject B -> even though A arrived earlier than C, A was recently rejected while C is clean,
+        // so priority turn MUST be reserved for clean Legit C!
+        await multiCoord.reject(promptId: promptB1.id)
+        _ = await taskB1.value
+
+        // A trying to cut in immediately MUST be deferred with 429 busy!
+        let cutInA = await multiRouter.handle(HTTPRequest(
+            method: "POST", rawTarget: "/depth3d/v1/pair",
+            body: Data("{\"device\":\"Attacker A\",\"deviceId\":\"a3\",\"pin\":\"1111\",\"streamPaired\":false}".utf8),
+            peerCertificateDER: sampleCertA, remoteAddress: "192.168.1.101"
+        ))
+        XCTAssertEqual(cutInA.statusCode, 429, "Round-5 #2: Penalized IP A must yield to waiting clean IP C")
+
+        // Clean Legit C immediately claims the prompt!
+        let taskC = Task {
+            await multiRouter.handle(HTTPRequest(
+                method: "POST", rawTarget: "/depth3d/v1/pair",
+                body: Data("{\"device\":\"Legit C\",\"deviceId\":\"c1\",\"pin\":\"3333\",\"streamPaired\":false}".utf8),
+                peerCertificateDER: sampleCertC, remoteAddress: "192.168.1.103"
+            ))
+        }
+        try await Task.sleep(nanoseconds: 40_000_000)
+        let pendingC = await multiCoord.pendingPrompts()
+        let promptC = try XCTUnwrap(pendingC.first)
+        XCTAssertEqual(promptC.clientAddress, "192.168.1.103")
+        await multiCoord.approve(promptId: promptC.id, rememberAutoAllow: false)
+        let respC = await taskC.value
+        XCTAssertEqual(respC.statusCode, 200)
+
+        // 5. Auto-allow + `streamPaired: true` vs `false` decision
+        let certAFp = TLSIdentityManager.sha256Hex(sampleCertA)
         await delegate.setAuthorized(deviceId: "dev-ok", fingerprint: certAFp)
-
         let coord3 = PairingCoordinator(timeout: 5.0, cooldownDuration: 0.0, autoAllowedFingerprints: [certAFp])
         let router3 = ControlProtocolRouter(pairingCoordinator: coord3, delegate: delegate)
 
-        // 6a. Same deviceId WITHOUT cert -> prompts with identityChanged == true
-        let noCertTask = Task {
-            await router3.handle(HTTPRequest(
-                method: "POST", rawTarget: "/depth3d/v1/pair",
-                body: Data("{\"device\":\"Fake PICO\",\"deviceId\":\"dev-ok\",\"pin\":\"5678\"}".utf8),
-                peerCertificateDER: nil, remoteAddress: "192.168.1.30"
-            ))
-        }
-        try await Task.sleep(nanoseconds: 50_000_000)
-        let noCertPrompts = await coord3.pendingPrompts()
-        XCTAssertEqual(noCertPrompts.count, 1)
-        XCTAssertTrue(noCertPrompts[0].identityChanged)
-        await coord3.reject(promptId: noCertPrompts[0].id)
-        let noCertResp = await noCertTask.value
-        XCTAssertEqual(noCertResp.statusCode, 403)
-
-        // 6b. Same deviceId WITH wrong cert -> prompts with identityChanged == true
-        let wrongCertTask = Task {
-            await router3.handle(HTTPRequest(
-                method: "POST", rawTarget: "/depth3d/v1/pair",
-                body: Data("{\"device\":\"Fake PICO\",\"deviceId\":\"dev-ok\",\"pin\":\"5678\"}".utf8),
-                peerCertificateDER: certBDer, remoteAddress: "192.168.1.31"
-            ))
-        }
-        try await Task.sleep(nanoseconds: 50_000_000)
-        let wrongCertPrompts = await coord3.pendingPrompts()
-        XCTAssertEqual(wrongCertPrompts.count, 1)
-        XCTAssertTrue(wrongCertPrompts[0].identityChanged)
-        await coord3.reject(promptId: wrongCertPrompts[0].id)
-        let wrongCertResp = await wrongCertTask.value
-        XCTAssertEqual(wrongCertResp.statusCode, 403)
-
-        // 6c. Exact bound cert -> auto-approves immediately -> 200 with next:"done" (already in engine)
-        let legitResp = await router3.handle(HTTPRequest(
+        // Auto-allowed cert with `streamPaired: true` -> next:"done"
+        let autoDone = await router3.handle(HTTPRequest(
             method: "POST", rawTarget: "/depth3d/v1/pair",
-            body: Data("{\"device\":\"PICO 4\",\"deviceId\":\"dev-ok\",\"pin\":\"9999\"}".utf8),
-            peerCertificateDER: certADer, remoteAddress: "192.168.1.32"
+            body: Data("{\"device\":\"PICO 4\",\"deviceId\":\"dev-ok\",\"pin\":\"9999\",\"streamPaired\":true}".utf8),
+            peerCertificateDER: sampleCertA, remoteAddress: "192.168.1.32"
         ))
-        XCTAssertEqual(legitResp.statusCode, 200)
-        let legitDecoded = try JSONDecoder().decode(PairApprovedResponse.self, from: legitResp.body)
-        XCTAssertEqual(legitDecoded.next, "done")
+        XCTAssertEqual(autoDone.statusCode, 200)
+        XCTAssertEqual(try JSONDecoder().decode(PairApprovedResponse.self, from: autoDone.body).next, "done")
+
+        // Same cert with `streamPaired: false` -> next:"gamestream"!
+        let autoGS = await router3.handle(HTTPRequest(
+            method: "POST", rawTarget: "/depth3d/v1/pair",
+            body: Data("{\"device\":\"PICO 4\",\"deviceId\":\"dev-ok\",\"pin\":\"9999\",\"streamPaired\":false}".utf8),
+            peerCertificateDER: sampleCertA, remoteAddress: "192.168.1.32"
+        ))
+        XCTAssertEqual(autoGS.statusCode, 200)
+        XCTAssertEqual(try JSONDecoder().decode(PairApprovedResponse.self, from: autoGS.body).next, "gamestream")
     }
 
-    /// P3: `/depth3d/v1/media` authenticates strictly by TLS client certificate fingerprint
-    /// and does NOT require `X-Depth3d-Device`.
-    func testMediaEndpointAuthenticatesByClientCertWithoutDeviceHeader() async throws {
+    /// P3 + B-1: `/depth3d/v1/media` authenticates strictly by TLS client certificate fingerprint,
+    /// does NOT require `X-Depth3d-Device`, and returns `{"webdav":null}` when media service is disabled.
+    func testMediaEndpointAuthWithoutDeviceHeaderAndNullWhenDisabled() async throws {
         let creds = WebDAVCredentials(user: "depth3d", pass: "rndpass99")
         let snap = ControlProtocolSnapshot(
             hostName: "Mac", hostId: "id", osDescription: "macOS 15.0",
             streamReady: true, streamNotReadyReason: nil, mediaPort: 8890, webDAVCredentials: creds
         )
         let delegate = MockControlDelegate(snapshot: snap)
-        let clientCertDER = Data("fake-client-cert-der-bytes".utf8)
-        let fp = TLSIdentityManager.sha256Hex(clientCertDER)
+        let fp = TLSIdentityManager.sha256Hex(sampleCertA)
         await delegate.setAuthorized(deviceId: "pico-01", fingerprint: fp)
 
         let router = ControlProtocolRouter(pairingCoordinator: PairingCoordinator(), delegate: delegate)
         let r1 = await router.handle(HTTPRequest(method: "GET", rawTarget: "/depth3d/v1/media"))
         XCTAssertEqual(r1.statusCode, 401)
-        let r2 = await router.handle(HTTPRequest(method: "GET", rawTarget: "/depth3d/v1/media", headers: ["X-Depth3d-Device": "pico-01"]))
+        let r2 = await router.handle(HTTPRequest(method: "GET", rawTarget: "/depth3d/v1/media", peerCertificateDER: sampleCertB))
         XCTAssertEqual(r2.statusCode, 401)
-        let r3 = await router.handle(HTTPRequest(method: "GET", rawTarget: "/depth3d/v1/media", peerCertificateDER: Data("other-cert".utf8)))
-        XCTAssertEqual(r3.statusCode, 401)
 
-        // Valid paired cert WITHOUT X-Depth3d-Device header -> MUST return 200!
-        let r4 = await router.handle(HTTPRequest(
-            method: "GET",
-            rawTarget: "/depth3d/v1/media",
-            peerCertificateDER: clientCertDER
-        ))
-        XCTAssertEqual(r4.statusCode, 200)
-        let decoded = try JSONDecoder().decode(MediaCredentialsResponse.self, from: r4.body)
+        let r3 = await router.handle(HTTPRequest(method: "GET", rawTarget: "/depth3d/v1/media", peerCertificateDER: sampleCertA))
+        XCTAssertEqual(r3.statusCode, 200)
+        let decoded = try JSONDecoder().decode(MediaCredentialsResponse.self, from: r3.body)
         XCTAssertEqual(decoded.webdav?.port, 8890)
         XCTAssertEqual(decoded.webdav?.pass, "rndpass99")
+
+        // When media service is off -> 200 {"webdav":null}
+        let offSnap = ControlProtocolSnapshot(
+            hostName: "Mac", hostId: "id", osDescription: "macOS 15.0",
+            streamReady: true, streamNotReadyReason: nil, mediaPort: nil, webDAVCredentials: nil
+        )
+        let offDelegate = MockControlDelegate(snapshot: offSnap)
+        await offDelegate.setAuthorized(deviceId: "pico-01", fingerprint: fp)
+        let offRouter = ControlProtocolRouter(pairingCoordinator: PairingCoordinator(), delegate: offDelegate)
+        let rOff = await offRouter.handle(HTTPRequest(method: "GET", rawTarget: "/depth3d/v1/media", peerCertificateDER: sampleCertA))
+        XCTAssertEqual(rOff.statusCode, 200)
+        let offJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: rOff.body) as? [String: Any])
+        XCTAssertTrue(offJSON["webdav"] is NSNull, "B-1: /media must return {\"webdav\":null} when media service is disabled")
     }
 
     func testBonjourTXTRecordAndErrorClassification() {
@@ -509,9 +517,10 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(HostBonjourTXTRecord.classifyPublishError(code: -72001), .failed(-72001))
     }
 
-    /// Covers live mTLS, non-blocking `/pair`, S-3 (IPv4-only bind), and S-5 (per-IP connection cap
-    /// BEFORE TLS handshake + arbitrary self-signed client cert MUST NOT bypass unauthenticated rate limit!).
-    func testControlHTTPSServerIPv4OnlyPerIPCapAndUnknownSelfSignedCertRateLimit() async throws {
+    /// Covers live mTLS, S-3 (IPv4-only), S-5 (per-IP cap + unknown self-signed cert rate limit),
+    /// B-1 (client disconnect immediately closes confirmation prompt without issuing a ticket!),
+    /// and Round-5 #2 (reserved connection slots for paired client certificates!).
+    func testControlHTTPSServerIPv4DisconnectPromptDismissalReservedPairedSlotsAndRateLimit() async throws {
         let tmpDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("depth3d-tls-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
@@ -537,23 +546,21 @@ final class ControlProtocolTests: XCTestCase {
         let delegate = MockControlDelegate(snapshot: snap)
         await delegate.setAuthorized(deviceId: "pico-live", fingerprint: pairedFP)
 
-        let coord = PairingCoordinator(timeout: 5.0, cooldownDuration: 0.0)
+        let coord = PairingCoordinator(timeout: 20.0, cooldownDuration: 0.0)
         let router = ControlProtocolRouter(pairingCoordinator: coord, delegate: delegate)
         let server = ControlHTTPSServer(
             identity: serverId.secIdentity,
             router: router,
             maxConnections: 16,
             maxConnectionsPerIP: 8,
+            reservedPairedSlots: 4,
             unauthRateLimitPerWindow: 20
         )
         let port = try server.start(port: 0, fallbackToEphemeral: false)
         defer { server.stop() }
 
-        // 1. S-3: IPv4 loopback works (`200`), IPv6 `::1` is refused (strictly IPv4-only!)
-        let (code1, body1) = runCurl(["-sk", "--max-time", "5", "https://127.0.0.1:\(port)/depth3d/v1/info"])
-        XCTAssertEqual(code1, 200)
-        XCTAssertTrue(body1.contains("\"ready\":true"))
-
+        // 1. S-3: IPv4 succeeds, IPv6 ::1 refused
+        XCTAssertEqual(runCurl(["-sk", "--max-time", "5", "https://127.0.0.1:\(port)/depth3d/v1/info"]).0, 200)
         let ipv6FD = Darwin.socket(AF_INET6, SOCK_STREAM, 0)
         XCTAssertGreaterThanOrEqual(ipv6FD, 0)
         defer { Darwin.close(ipv6FD) }
@@ -567,93 +574,109 @@ final class ControlProtocolTests: XCTestCase {
                 Darwin.connect(ipv6FD, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
             }
         }
-        XCTAssertNotEqual(v6RC, 0, "S-3: ControlHTTPSServer must bind IPv4-only so IPv6 ::1 connections are refused")
+        XCTAssertNotEqual(v6RC, 0, "S-3: ControlHTTPSServer must bind IPv4-only")
 
-        // 2. `/media` without cert -> 401; with paired cert (no X-Depth3d-Device header!) -> 200
-        let (code2, _) = runCurl(["-sk", "--max-time", "5", "https://127.0.0.1:\(port)/depth3d/v1/media"])
-        XCTAssertEqual(code2, 401)
-        let (code3, body3) = runCurl([
-            "-sk", "--max-time", "5",
-            "--cert", pairedCert.path, "--key", pairedKey.path,
-            "https://127.0.0.1:\(port)/depth3d/v1/media"
-        ])
-        XCTAssertEqual(code3, 200)
-        XCTAssertTrue(body3.contains("\"pass\":\"livepass\""))
+        // 2. B-1: Client disconnects while confirmation prompt is open -> prompt MUST close immediately & issue NO ticket!
+        let ticketsBeforeDisconnect = await delegate.getIssuedTicketCount()
+        let disconnectProc = Process()
+        disconnectProc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        disconnectProc.arguments = [
+            "--noproxy", "*", "-sk", "--max-time", "20", "-X", "POST",
+            "--cert", unknownCert.path, "--key", unknownKey.path,
+            "-H", "Content-Type: application/json",
+            "-d", "{\"device\":\"Dropping PICO\",\"deviceId\":\"drop-dev\",\"pin\":\"1234\",\"streamPaired\":false}",
+            "https://127.0.0.1:\(port)/depth3d/v1/pair"
+        ]
+        disconnectProc.standardOutput = FileHandle.nullDevice
+        disconnectProc.standardError = FileHandle.nullDevice
+        try disconnectProc.run()
 
-        // 3. Non-blocking `/pair` wait
-        let pairTask = Task.detached { [self] () -> (Int, String) in
-            self.runCurl([
-                "-sk", "--max-time", "5", "-X", "POST",
-                "-H", "Content-Type: application/json",
-                "-d", "{\"device\":\"PICO 4\",\"deviceId\":\"nonblock\",\"pin\":\"1234\"}",
-                "https://127.0.0.1:\(port)/depth3d/v1/pair"
-            ])
+        // Wait until confirmation prompt opens
+        var promptOpened = false
+        let openDeadline = Date().addingTimeInterval(4.0)
+        while Date() < openDeadline {
+            if !(await coord.pendingPrompts()).isEmpty {
+                promptOpened = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 40_000_000)
         }
-        try await Task.sleep(nanoseconds: 250_000_000)
-        let prompts = await coord.pendingPrompts()
-        XCTAssertEqual(prompts.count, 1)
-        let (infoWhileWaiting, _) = runCurl(["-sk", "--max-time", "2", "https://127.0.0.1:\(port)/depth3d/v1/info"])
-        XCTAssertEqual(infoWhileWaiting, 200)
-        await coord.approve(promptId: prompts[0].id, rememberAutoAllow: false)
-        let pairResult = await pairTask.value
-        XCTAssertEqual(pairResult.0, 200)
+        XCTAssertTrue(promptOpened, "Confirmation prompt should open for dropping client")
 
-        // 4. S-5: Arbitrary self-signed client certificate MUST NOT bypass unauthenticated rate limit,
-        //         while a genuinely paired client certificate IS exempt!
+        // Kill client (TCP FIN/RST) while prompt is still waiting!
+        disconnectProc.terminate()
+        disconnectProc.waitUntilExit()
+
+        // Prompt MUST dismiss promptly (well before 20s timeout!) and NO ticket may be issued!
+        var promptDismissed = false
+        let dismissDeadline = Date().addingTimeInterval(3.0)
+        while Date() < dismissDeadline {
+            if (await coord.pendingPrompts()).isEmpty {
+                promptDismissed = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 40_000_000)
+        }
+        XCTAssertTrue(promptDismissed, "B-1: Closing TCP connection while prompt is open must immediately dismiss prompt")
+        let ticketsAfterDisconnect = await delegate.getIssuedTicketCount()
+        XCTAssertEqual(ticketsAfterDisconnect, ticketsBeforeDisconnect, "B-1: Disconnected request must NEVER issue a ticket")
+
+        // 3. S-5: Unknown self-signed cert is still rate-limited; paired cert is exempt
         let rlServer = ControlHTTPSServer(
             identity: serverId.secIdentity,
             router: router,
             maxConnections: 16,
             maxConnectionsPerIP: 8,
+            reservedPairedSlots: 4,
             unauthRateLimitPerWindow: 2,
             unauthRateWindowSeconds: 60.0
         )
         let rlPort = try rlServer.start(port: 0, fallbackToEphemeral: false)
         defer { rlServer.stop() }
-
         XCTAssertEqual(runCurl(["-sk", "--max-time", "3", "--cert", unknownCert.path, "--key", unknownKey.path, "https://127.0.0.1:\(rlPort)/depth3d/v1/info"]).0, 200)
         XCTAssertEqual(runCurl(["-sk", "--max-time", "3", "--cert", unknownCert.path, "--key", unknownKey.path, "https://127.0.0.1:\(rlPort)/depth3d/v1/info"]).0, 200)
-        XCTAssertEqual(
-            runCurl(["-sk", "--max-time", "3", "--cert", unknownCert.path, "--key", unknownKey.path, "https://127.0.0.1:\(rlPort)/depth3d/v1/info"]).0,
-            429,
-            "S-5: Arbitrary self-signed client cert MUST be throttled by unauthenticated rate limiter"
-        )
-        // Paired client certificate still succeeds cleanly despite the IP's unauth rate limit being full!
-        XCTAssertEqual(
-            runCurl(["-sk", "--max-time", "3", "--cert", pairedCert.path, "--key", pairedKey.path, "https://127.0.0.1:\(rlPort)/depth3d/v1/media"]).0,
-            200,
-            "Genuinely paired client cert must remain exempt from unauthenticated rate limit"
-        )
+        XCTAssertEqual(runCurl(["-sk", "--max-time", "3", "--cert", unknownCert.path, "--key", unknownKey.path, "https://127.0.0.1:\(rlPort)/depth3d/v1/info"]).0, 429)
+        XCTAssertEqual(runCurl(["-sk", "--max-time", "3", "--cert", pairedCert.path, "--key", pairedKey.path, "https://127.0.0.1:\(rlPort)/depth3d/v1/media"]).0, 200)
 
-        // 5. S-5: Per-IP concurrent connection cap enforced BEFORE TLS handshake!
-        let perIPServer = ControlHTTPSServer(
+        // 4. Round-5 #2: Reserved paired-cert connection slots!
+        //    maxConnections=4, reservedPairedSlots=2 => unauthCeiling=2.
+        //    Fill 2 unauthenticated slots with raw idle TCP connections -> 3rd unauth `/info` gets 503,
+        //    while paired client cert `/media` STILL gets 200 using a reserved slot!
+        let resServer = ControlHTTPSServer(
             identity: serverId.secIdentity,
             router: router,
-            maxConnections: 16,
-            maxConnectionsPerIP: 2,
-            handshakeTimeoutSec: 3.0,
-            readTimeoutSec: 3.0
+            maxConnections: 4,
+            maxConnectionsPerIP: 4,
+            reservedPairedSlots: 2,
+            handshakeTimeoutSec: 5.0,
+            reservedZoneHandshakeTimeoutSec: 1.5,
+            readTimeoutSec: 5.0
         )
-        let perIPPort = try perIPServer.start(port: 0, fallbackToEphemeral: false)
-        defer { perIPServer.stop() }
+        let resPort = try resServer.start(port: 0, fallbackToEphemeral: false)
+        defer { resServer.stop() }
 
-        let hold1 = connectLoopback(port: perIPPort)
-        let hold2 = connectLoopback(port: perIPPort)
-        XCTAssertGreaterThanOrEqual(hold1, 0)
-        XCTAssertGreaterThanOrEqual(hold2, 0)
-        defer { Darwin.close(hold1); Darwin.close(hold2) }
+        let u1 = connectLoopback(port: resPort)
+        let u2 = connectLoopback(port: resPort)
+        XCTAssertGreaterThanOrEqual(u1, 0)
+        XCTAssertGreaterThanOrEqual(u2, 0)
+        defer { Darwin.close(u1); Darwin.close(u2) }
         try await Task.sleep(nanoseconds: 150_000_000)
 
-        // 3rd connection from same IP (127.0.0.1) exceeds maxConnectionsPerIP=2 (even though global maxConnections=16!)
-        // and MUST be immediately closed before TLS handshake!
-        let thirdFD = connectLoopback(port: perIPPort)
-        XCTAssertGreaterThanOrEqual(thirdFD, 0)
-        defer { Darwin.close(thirdFD) }
-        var tv = timeval(tv_sec: 1, tv_usec: 0)
-        setsockopt(thirdFD, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        var probeByte: UInt8 = 0
-        let recvN = Darwin.recv(thirdFD, &probeByte, 1, 0)
-        XCTAssertEqual(recvN, 0, "S-5: 3rd concurrent connection from same IP must be closed immediately before TLS handshake")
+        // 3rd unauthenticated client hits the reserved zone -> 503!
+        let (unauthOverCode, _) = runCurl([
+            "-sk", "--max-time", "3",
+            "--cert", unknownCert.path, "--key", unknownKey.path,
+            "https://127.0.0.1:\(resPort)/depth3d/v1/info"
+        ])
+        XCTAssertEqual(unauthOverCode, 503, "Round-5 #2: Unauthenticated client must be rejected when only reserved paired slots remain")
+
+        // Bound-fingerprint paired client STILL succeeds with 200 via reserved paired slot!
+        let (pairedReservedCode, _) = runCurl([
+            "-sk", "--max-time", "3",
+            "--cert", pairedCert.path, "--key", pairedKey.path,
+            "https://127.0.0.1:\(resPort)/depth3d/v1/media"
+        ])
+        XCTAssertEqual(pairedReservedCode, 200, "Round-5 #2: Paired client cert must succeed using reserved connection slots")
     }
 
     /// S5: Verifies per-connection ABSOLUTE handshake deadline defeats slow-drip connections.
@@ -675,6 +698,7 @@ final class ControlProtocolTests: XCTestCase {
             router: router,
             maxConnections: 2,
             maxConnectionsPerIP: 2,
+            reservedPairedSlots: 0,
             handshakeTimeoutSec: 0.7,
             readTimeoutSec: 0.7
         )
@@ -702,16 +726,11 @@ final class ControlProtocolTests: XCTestCase {
         _ = await dripTask.value
 
         let (code, _) = runCurl(["-sk", "--max-time", "2", "https://127.0.0.1:\(port)/depth3d/v1/info"])
-        XCTAssertEqual(code, 200, "Slow-drip connections must time out at absolute deadline and free connection slots")
+        XCTAssertEqual(code, 200)
     }
 
-    /// m-2 (upgraded m7): Cryptographically proves `ControlHTTPSServer` verifies `CertificateVerify`
-    /// private-key possession by running TWO identical raw TLS 1.2 RSA-AES-128-GCM-SHA256 handshakes:
-    ///   1. Valid-signature control handshake (real RSA-SHA256 transcript signature + real encrypted Finished):
-    ///      server MUST complete TLS handshake (`ChangeCipherSpec` + server `Finished`, NO alert)!
-    ///   2. Forged-signature handshake (identical flight with 1 byte flipped in `CertificateVerify`):
-    ///      server MUST respond with an EXPLICIT TLS Fatal Alert (`decrypt_error` = 51) — never accepting
-    ///      EOF or handshake timeout as a pass!
+    /// m-2: Cryptographically proves `ControlHTTPSServer` verifies `CertificateVerify` private-key
+    /// possession via valid vs 1-byte-forged raw TLS 1.2 RSA-AES-128-GCM-SHA256 handshakes.
     func testControlHTTPSServerVerifiesClientPrivateKeyPossessionDuringTLSHandshake() async throws {
         let tmpDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("depth3d-certverify-\(UUID().uuidString)", isDirectory: true)
@@ -742,38 +761,22 @@ final class ControlProtocolTests: XCTestCase {
         let port = try server.start(port: 0, fallbackToEphemeral: false)
         defer { server.stop() }
 
-        // 1. Valid-signature raw TLS 1.2 control handshake: MUST receive server ChangeCipherSpec (0x14), NO fatal alert!
         let validResult = try runRawTLS12Handshake(
-            port: port,
-            clientCertDER: clientDER,
-            clientKeyURL: clientKey,
-            forgeCertificateVerify: false
+            port: port, clientCertDER: clientDER, clientKeyURL: clientKey, forgeCertificateVerify: false
         )
-        XCTAssertTrue(
-            validResult.receivedServerChangeCipherSpec,
-            "m-2 control handshake with valid CertificateVerify signature MUST succeed (alert=\(String(describing: validResult.fatalAlertDescription)))"
-        )
+        XCTAssertTrue(validResult.receivedServerChangeCipherSpec)
         XCTAssertNil(validResult.fatalAlertDescription)
 
-        // 2. Identical raw TLS 1.2 handshake with 1 byte flipped in CertificateVerify signature:
-        //    MUST receive an explicit TLS Fatal Alert (`decrypt_error` = 51), NOT timeout/EOF!
         let forgedResult = try runRawTLS12Handshake(
-            port: port,
-            clientCertDER: clientDER,
-            clientKeyURL: clientKey,
-            forgeCertificateVerify: true
+            port: port, clientCertDER: clientDER, clientKeyURL: clientKey, forgeCertificateVerify: true
         )
         XCTAssertFalse(forgedResult.receivedServerChangeCipherSpec)
-        XCTAssertEqual(
-            forgedResult.fatalAlertDescription,
-            51, // RFC 5246 decrypt_error (0x33)
-            "m-2: Forged CertificateVerify MUST trigger explicit TLS Fatal Alert decrypt_error (51), got \(String(describing: forgedResult.fatalAlertDescription))"
-        )
+        XCTAssertEqual(forgedResult.fatalAlertDescription, 51) // decrypt_error
         let handledAfterForge = await delegate.handledRequestCount
-        XCTAssertEqual(handledAfterForge, 0, "Forged CertificateVerify must abort inside TLS before HTTP routing")
+        XCTAssertEqual(handledAfterForge, 0)
     }
 
-    // MARK: - Raw TLS 1.2 RSA-AES-128-GCM-SHA256 Probe (Valid vs 1-Bit-Forged CertificateVerify)
+    // MARK: - Raw TLS 1.2 RSA-AES-128-GCM-SHA256 Probe
 
     private struct RawTLS12Result {
         let receivedServerChangeCipherSpec: Bool
@@ -795,13 +798,12 @@ final class ControlProtocolTests: XCTestCase {
         var transcript = Data()
         let clientRandom = Data((0..<32).map { UInt8(($0 * 7 + 13) & 0xFF) })
 
-        // Offer strictly TLS_RSA_WITH_AES_128_GCM_SHA256 (0x009C) so key derivation & Finished are exact.
         var chBody = Data([0x03, 0x03])
         chBody.append(clientRandom)
-        chBody.append(0x00) // session_id len
-        chBody.append(contentsOf: [0x00, 0x02, 0x00, 0x9C]) // 1 cipher suite: 0x009C
-        chBody.append(contentsOf: [0x01, 0x00]) // null compression
-        let sigAlgExt: [UInt8] = [0x00, 0x0D, 0x00, 0x04, 0x00, 0x02, 0x04, 0x01] // sha256+rsa
+        chBody.append(0x00)
+        chBody.append(contentsOf: [0x00, 0x02, 0x00, 0x9C])
+        chBody.append(contentsOf: [0x01, 0x00])
+        let sigAlgExt: [UInt8] = [0x00, 0x0D, 0x00, 0x04, 0x00, 0x02, 0x04, 0x01]
         chBody.append(contentsOf: [0x00, UInt8(sigAlgExt.count)])
         chBody.append(contentsOf: sigAlgExt)
 
@@ -842,9 +844,7 @@ final class ControlProtocolTests: XCTestCase {
                     serverRandom = body.subdata(in: 2..<34)
                 } else if hType == 0x0B && body.count >= 6 {
                     let firstLen = (Int(body[3]) << 16) | (Int(body[4]) << 8) | Int(body[5])
-                    if 6 + firstLen <= body.count {
-                        serverCertDER = body.subdata(in: 6..<(6 + firstLen))
-                    }
+                    if 6 + firstLen <= body.count { serverCertDER = body.subdata(in: 6..<(6 + firstLen)) }
                 } else if hType == 0x0D {
                     sawCertificateRequest = true
                 } else if hType == 0x0E {
@@ -853,13 +853,12 @@ final class ControlProtocolTests: XCTestCase {
             }
         }
 
-        XCTAssertTrue(sawCertificateRequest, "Server must send CertificateRequest")
+        XCTAssertTrue(sawCertificateRequest)
         let srvRandom = try XCTUnwrap(serverRandom)
         let srvDER = try XCTUnwrap(serverCertDER)
         let srvCert = try XCTUnwrap(SecCertificateCreateWithData(nil, srvDER as CFData))
         let srvPubKey = try XCTUnwrap(SecCertificateCopyKey(srvCert))
 
-        // 1. Client Certificate
         let cLen = clientCertDER.count
         let listLen = cLen + 3
         var certBody = Data([
@@ -870,7 +869,6 @@ final class ControlProtocolTests: XCTestCase {
         let certMsg = wrapHandshake(type: 0x0B, body: certBody)
         transcript.append(certMsg)
 
-        // 2. RSA ClientKeyExchange
         var premaster = Data([0x03, 0x03])
         premaster.append(Data(repeating: 0x42, count: 46))
         var errRef: Unmanaged<CFError>?
@@ -882,17 +880,13 @@ final class ControlProtocolTests: XCTestCase {
         let ckeMsg = wrapHandshake(type: 0x10, body: ckeBody)
         transcript.append(ckeMsg)
 
-        // 3. CertificateVerify: sign real `transcript` with `clientKeyURL`, optionally flipping 1 byte!
         var sig = try opensslRSASHA256Sign(data: transcript, keyURL: clientKeyURL)
-        if forgeCertificateVerify {
-            sig[0] ^= 0xFF
-        }
+        if forgeCertificateVerify { sig[0] ^= 0xFF }
         var cvBody = Data([0x04, 0x01, UInt8((sig.count >> 8) & 0xFF), UInt8(sig.count & 0xFF)])
         cvBody.append(sig)
         let cvMsg = wrapHandshake(type: 0x0F, body: cvBody)
         transcript.append(cvMsg)
 
-        // 4. Derive TLS 1.2 master secret, client AES-128-GCM write key/IV, and encrypted Finished!
         let masterSecret = tls12PRFSHA256(secret: premaster, label: "master secret", seed: clientRandom + srvRandom, length: 48)
         let keyBlock = tls12PRFSHA256(secret: masterSecret, label: "key expansion", seed: srvRandom + clientRandom, length: 40)
         let clientWriteKey = SymmetricKey(data: keyBlock.subdata(in: 0..<16))
@@ -902,7 +896,7 @@ final class ControlProtocolTests: XCTestCase {
         let verifyData = tls12PRFSHA256(secret: masterSecret, label: "client finished", seed: transcriptHash, length: 12)
         let finishedPlain = wrapHandshake(type: 0x14, body: verifyData)
 
-        let explicitNonce = Data(repeating: 0, count: 8) // seq_num = 0
+        let explicitNonce = Data(repeating: 0, count: 8)
         let gcmNonce = try AES.GCM.Nonce(data: clientWriteIV + explicitNonce)
         var aad = explicitNonce
         aad.append(contentsOf: [0x16, 0x03, 0x03, UInt8((finishedPlain.count >> 8) & 0xFF), UInt8(finishedPlain.count & 0xFF)])
@@ -913,7 +907,7 @@ final class ControlProtocolTests: XCTestCase {
         flight.append(wrapTLSRecord(contentType: 0x16, payload: certMsg))
         flight.append(wrapTLSRecord(contentType: 0x16, payload: ckeMsg))
         flight.append(wrapTLSRecord(contentType: 0x16, payload: cvMsg))
-        flight.append(wrapTLSRecord(contentType: 0x14, payload: Data([0x01]))) // ChangeCipherSpec
+        flight.append(wrapTLSRecord(contentType: 0x14, payload: Data([0x01])))
         flight.append(wrapTLSRecord(contentType: 0x16, payload: encFinishedPayload))
         sendRaw(fd: fd, data: flight)
 

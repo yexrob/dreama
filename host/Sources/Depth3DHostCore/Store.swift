@@ -40,10 +40,53 @@ public final class HostStateStore: @unchecked Sendable {
         try writeJSON(settings, to: paths.settingsFile, restricted: false)
     }
 
+    /// Loads paired devices, automatically migrating legacy files that contain duplicate records
+    /// sharing the same certificate fingerprint (keeping the most recently seen/paired record).
     public func loadPairedDevices() -> [PairedDeviceRecord] {
         lock.lock()
         defer { lock.unlock() }
-        return readJSON(paths.pairedDevicesFile) ?? []
+        let raw: [PairedDeviceRecord] = readJSON(paths.pairedDevicesFile) ?? []
+        let (deduped, changed) = Self.deduplicatePairedDevices(raw)
+        if changed {
+            try? writeJSON(deduped, to: paths.pairedDevicesFile, restricted: true)
+        }
+        return deduped
+    }
+
+    /// Merges duplicate records that share the same normalized `certFingerprint` (keeping the record
+    /// with the latest `lastSeenAt`, tie-broken by `pairedAt`). Legacy nil-fingerprint records are
+    /// deduplicated by `deviceId`.
+    internal static func deduplicatePairedDevices(_ devices: [PairedDeviceRecord]) -> (records: [PairedDeviceRecord], didMerge: Bool) {
+        var byKey: [String: (index: Int, record: PairedDeviceRecord)] = [:]
+        var ordered: [PairedDeviceRecord] = []
+        var didMerge = false
+
+        for item in devices {
+            // Normalize fingerprint casing for migrated records loaded from older JSON.
+            let normalized = PairedDeviceRecord(
+                deviceId: item.deviceId,
+                name: item.name,
+                engineUUID: item.engineUUID,
+                certFingerprint: item.certFingerprint,
+                autoAllow: item.autoAllow,
+                pairedAt: item.pairedAt,
+                lastSeenAt: item.lastSeenAt
+            )
+            let key = normalized.id
+            if let existing = byKey[key] {
+                didMerge = true
+                let keepNew = normalized.lastSeenAt > existing.record.lastSeenAt
+                    || (normalized.lastSeenAt == existing.record.lastSeenAt && normalized.pairedAt > existing.record.pairedAt)
+                if keepNew {
+                    ordered[existing.index] = normalized
+                    byKey[key] = (existing.index, normalized)
+                }
+            } else {
+                byKey[key] = (ordered.count, normalized)
+                ordered.append(normalized)
+            }
+        }
+        return (ordered, didMerge)
     }
 
     public func savePairedDevices(_ devices: [PairedDeviceRecord]) throws {
