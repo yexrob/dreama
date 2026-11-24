@@ -6,6 +6,14 @@ buildscript {
     }
     dependencies {
         classpath 'com.android.tools.build:gradle:9.4.0'
+        // AGP 9 compiles Kotlin itself but only pulls in Kotlin 2.2, which
+        // cannot read the metadata of current Compose and Room. Naming the
+        // plugin here moves the built-in compiler up; the Compose compiler
+        // plugin has to be the same version.
+        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:2.4.21'
+        classpath 'org.jetbrains.kotlin:compose-compiler-gradle-plugin:2.4.21'
+        // Room's code generator
+        classpath 'com.google.devtools.ksp:symbol-processing-gradle-plugin:2.3.14'
     }
 }
 

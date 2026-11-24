@@ -37,31 +37,31 @@ import okhttp3.Response;
  * Drive (scripts/serve-gdrive.sh), which also announces itself as
  * _webdav._tcp so the headset can find it without an address typed in.
  */
-final class WebDav {
+public final class WebDav {
     static final String PREFS = "depth3d_webdav";
 
-    static final class Server {
-        final String base;  // http://host:port, no trailing slash
-        final String user;
-        final String pass;
+    public static final class Server {
+        public final String base;  // http://host:port, no trailing slash
+        public final String user;
+        public final String pass;
 
-        Server(String base, String user, String pass) {
+        public Server(String base, String user, String pass) {
             this.base = base.replaceAll("/+$", "");
             this.user = user;
             this.pass = pass;
         }
 
-        String auth() {
+        public String auth() {
             String raw = user + ":" + pass;
             return "Basic " + Base64.encodeToString(raw.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
         }
     }
 
-    static final class Item implements Comparable<Item> {
-        final String href;   // as the server sent it, percent-encoded
-        final String name;
-        final boolean dir;
-        final long size;
+    public static final class Item implements Comparable<Item> {
+        public final String href;   // as the server sent it, percent-encoded
+        public final String name;
+        public final boolean dir;
+        public final long size;
 
         Item(String href, String name, boolean dir, long size) {
             this.href = href;
@@ -104,21 +104,21 @@ final class WebDav {
             + "<d:resourcetype/><d:getcontentlength/><d:displayname/>"
             + "</d:prop></d:propfind>";
 
-    static Server load(Context c) {
+    public static Server load(Context c) {
         SharedPreferences p = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         String base = p.getString("base", null);
         return base == null ? null
                 : new Server(base, p.getString("user", "depth3d"), p.getString("pass", ""));
     }
 
-    static void save(Context c, Server s) {
+    public static void save(Context c, Server s) {
         c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                 .putString("base", s.base).putString("user", s.user).putString("pass", s.pass)
                 .apply();
     }
 
     /** Files and folders directly under path (which starts with "/"). Network, not on main. */
-    static List<Item> list(Server s, String path) throws IOException {
+    public static List<Item> list(Server s, String path) throws IOException {
         Request req = new Request.Builder()
                 .url(s.base + path)
                 .header("Authorization", s.auth())
@@ -204,7 +204,7 @@ final class WebDav {
         return slash < 0 ? "/" : href.substring(slash);
     }
 
-    static String decode(String s) {
+    public static String decode(String s) {
         try {
             return URLDecoder.decode(s.replace("+", "%2B"), "UTF-8");
         } catch (Exception e) {
@@ -216,7 +216,7 @@ final class WebDav {
      * Looks for a _webdav._tcp service on the Wi-Fi for up to timeoutMs and
      * returns its http://host:port, or null. Network, not on main.
      */
-    static String discover(Context c, int timeoutMs) {
+    public static String discover(Context c, int timeoutMs) {
         WifiManager wifi = (WifiManager) c.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         WifiManager.MulticastLock lock = wifi.createMulticastLock("depth3d-dav");
         lock.setReferenceCounted(false);

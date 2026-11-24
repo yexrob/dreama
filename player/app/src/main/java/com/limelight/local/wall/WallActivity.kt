@@ -1,0 +1,119 @@
+package com.limelight.local.wall
+
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.provider.Settings
+import android.view.MotionEvent
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
+import com.limelight.LimeLog
+import com.limelight.PcView
+import com.limelight.local.LocalPlayerXR
+import com.limelight.local.WebDav
+import com.limelight.local.media.LocalVideoSource
+import com.limelight.local.media.PlaybackInfo
+import com.limelight.preferences.StreamSettings
+
+/**
+ * depth3d's front door: the play wall on the 2D panel. Picking something
+ * starts [LocalPlayerXR]; Moonlight's host list (PcView) and its settings
+ * stay reachable from 投屏 and the gear.
+ */
+class WallActivity : ComponentActivity(), WallActions {
+    private val model: WallModel by viewModels()
+
+    // The storage prompt can be asked for from the wall, and Android stops
+    // showing it once refused twice; then the wall's button opens app info
+    private var askedByUser = false
+    private val storage = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) {
+            model.refresh(LocalVideoSource.ID)
+        } else if (askedByUser && !shouldShowRequestPermissionRationale(LocalVideoSource.permission)) {
+            startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", packageName, null)))
+        }
+        askedByUser = false
+    }
+
+    private var loggedHover = false
+    private var loggedTouch = false
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // adb can still hand over a server, as with the old Google Drive page:
+        //   am start -n …/com.limelight.local.wall.WallActivity --es base http://… --es pass …
+        intent.getStringExtra("base")?.let {
+            WebDav.save(this, WebDav.Server(it, intent.getStringExtra("user") ?: "depth3d",
+                intent.getStringExtra("pass") ?: ""))
+        }
+        if (savedInstanceState == null && !LocalVideoSource.hasPermission(this)) {
+            storage.launch(LocalVideoSource.permission)
+        }
+        setContent { WallApp(model, this) }
+        // The mockups assume a 1280 wide panel at about 24 px per degree;
+        // what the headset really gives is worth knowing (ux-spec §8 #1)
+        window.decorView.post {
+            val v = window.decorView
+            LimeLog.info("depth3d: wall window ${v.width}x${v.height} px, density ${resources.displayMetrics.density}, " +
+                "${v.width / DESIGN_WIDTH} px per design unit")
+        }
+    }
+
+    override fun onRestart() {
+        super.onRestart()
+        // Back from the player, PcView or system settings: files may have
+        // been added and a server may have come up
+        model.refreshAll()
+    }
+
+    // Whether the controller ray reaches Compose as hover at all is the one
+    // thing the hover design rests on (ux-spec §8 #9), so the first of each is logged
+    override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        if (!loggedHover && ev.actionMasked == MotionEvent.ACTION_HOVER_MOVE) {
+            loggedHover = true
+            LimeLog.info("depth3d: first hover ${ev.x},${ev.y} source=0x${Integer.toHexString(ev.source)} tool=${ev.getToolType(0)}")
+        }
+        return super.dispatchGenericMotionEvent(ev)
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (!loggedTouch && ev.actionMasked == MotionEvent.ACTION_DOWN) {
+            loggedTouch = true
+            LimeLog.info("depth3d: first touch ${ev.x},${ev.y} source=0x${Integer.toHexString(ev.source)} tool=${ev.getToolType(0)}")
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    override fun launchPlayer(info: PlaybackInfo, sourceId: String, itemId: String) {
+        val play = Intent(this, LocalPlayerXR::class.java)
+            .setData(Uri.parse(info.url))
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            .putExtra(LocalPlayerXR.EXTRA_TITLE, info.title)
+            .putExtra(LocalPlayerXR.EXTRA_START_MS, info.startPositionMs)
+            .putExtra(LocalPlayerXR.EXTRA_SOURCE_ID, sourceId)
+            .putExtra(LocalPlayerXR.EXTRA_ITEM_ID, itemId)
+        // The player takes one header, which is all WebDAV needs
+        info.headers["Authorization"]?.let { play.putExtra(LocalPlayerXR.EXTRA_AUTH, it) }
+        startActivity(play)
+    }
+
+    override fun openStreaming() {
+        startActivity(Intent(this, PcView::class.java))
+    }
+
+    override fun openSettings() {
+        startActivity(Intent(this, StreamSettings::class.java))
+    }
+
+    override fun requestStorage() {
+        askedByUser = true
+        storage.launch(LocalVideoSource.permission)
+    }
+
+    override fun toast(text: String) {
+        Toast.makeText(this, text, Toast.LENGTH_LONG).show()
+    }
+}

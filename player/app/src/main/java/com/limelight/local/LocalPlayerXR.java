@@ -1,6 +1,7 @@
 package com.limelight.local;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.media.MediaMetadataRetriever;
@@ -15,6 +16,7 @@ import android.widget.Toast;
 import com.limelight.LimeLog;
 import com.limelight.binding.video.XrRenderer;
 import com.limelight.binding.video.XrStartFailure;
+import com.limelight.local.media.WatchHistory;
 import com.limelight.preferences.PreferenceConfiguration;
 
 import java.util.Collections;
@@ -36,14 +38,19 @@ public class LocalPlayerXR extends Activity
 
     private static final int SEEK_STEP_MS = 10_000;
     // An Authorization header for an http source (the WebDAV share)
-    static final String EXTRA_AUTH = "auth";
-    static final String EXTRA_TITLE = "title";
+    public static final String EXTRA_AUTH = "auth";
+    public static final String EXTRA_TITLE = "title";
+    // Where to start, and what the wall files the watch progress under
+    public static final String EXTRA_START_MS = "start_ms";
+    public static final String EXTRA_SOURCE_ID = "source_id";
+    public static final String EXTRA_ITEM_ID = "item_id";
 
     private Map<String, String> headers = Collections.emptyMap();
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private volatile XrRenderer renderer;
     private MediaPlayer player;
+    private boolean prepared;
     private boolean finishing;
 
     // The transport strip and where the pointer is on the picture. The
@@ -125,7 +132,15 @@ public class LocalPlayerXR extends Activity
                     return false;
                 });
             }
-            mp.setOnPreparedListener(MediaPlayer::start);
+            mp.setOnPreparedListener(p -> {
+                prepared = true;
+                long start = getIntent().getLongExtra(EXTRA_START_MS, 0);
+                // A resume point in the last seconds would only loop round to the start
+                if (start > 0 && start < p.getDuration() - 5000) {
+                    p.seekTo((int) start);
+                }
+                p.start();
+            });
             mp.setOnErrorListener((p, what, extra) -> {
                 r.showNotice("播放出错", "what=" + what + " extra=" + extra);
                 return true;
@@ -222,6 +237,7 @@ public class LocalPlayerXR extends Activity
                     mp.seekTo((int) (f * mp.getDuration()));
                 } else if (mp.isPlaying()) {
                     mp.pause();
+                    saveProgress();
                 } else {
                     mp.start();
                 }
@@ -323,8 +339,26 @@ public class LocalPlayerXR extends Activity
         main.post(() -> {
             if (player != null && player.isPlaying()) {
                 player.pause();
+                saveProgress();
             }
         });
+    }
+
+    // For 继续观看. Only when the wall said which item this is: an adb launch
+    // with a bare uri has nothing to file it under.
+    private void saveProgress() {
+        MediaPlayer mp = player;
+        Intent in = getIntent();
+        String source = in.getStringExtra(EXTRA_SOURCE_ID);
+        String item = in.getStringExtra(EXTRA_ITEM_ID);
+        if (mp == null || !prepared || source == null || item == null) {
+            return;
+        }
+        try {
+            WatchHistory.save(this, source, item, in.getStringExtra(EXTRA_TITLE),
+                    mp.getCurrentPosition(), mp.getDuration());
+        } catch (IllegalStateException ignored) {
+        }
     }
 
     // ---- lifecycle ----
@@ -334,6 +368,7 @@ public class LocalPlayerXR extends Activity
         super.onStop();
         // Before the first focus a boundary prompt can stop us without the
         // user having left; after it, a stop means they did
+        saveProgress();
         XrRenderer r = renderer;
         if (r != null && r.hasBeenFocused()) {
             finish();
@@ -349,6 +384,7 @@ public class LocalPlayerXR extends Activity
         finishing = true;
         main.removeCallbacks(barTick);
         if (player != null) {
+            saveProgress();
             player.release();
             player = null;
         }
