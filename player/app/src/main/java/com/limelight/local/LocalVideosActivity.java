@@ -31,10 +31,16 @@ public class LocalVideosActivity extends Activity {
     private static final class Entry {
         final Uri uri;
         final String label;
+        final Class<?> target;  // a home entry rather than a video
 
         Entry(Uri uri, String label) {
+            this(uri, label, null);
+        }
+
+        Entry(Uri uri, String label, Class<?> target) {
             this.uri = uri;
             this.label = label;
+            this.target = target;
         }
 
         @Override
@@ -58,12 +64,16 @@ public class LocalVideosActivity extends Activity {
         root.addView(list);
         root.addView(empty);
         setContentView(root);
-        setTitle("depth3d — 选择视频");
+        setTitle("depth3d");
 
         list.setOnItemClickListener(new AdapterView.OnItemClickListener() {
             @Override
             public void onItemClick(AdapterView<?> parent, View view, int position, long id) {
                 Entry e = (Entry) parent.getItemAtPosition(position);
+                if (e.target != null) {
+                    startActivity(new Intent(LocalVideosActivity.this, e.target));
+                    return;
+                }
                 Intent play = new Intent(LocalVideosActivity.this, LocalPlayerXR.class);
                 play.setData(e.uri);
                 play.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
@@ -77,10 +87,8 @@ public class LocalVideosActivity extends Activity {
         super.onResume();
         if (checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
                 != PackageManager.PERMISSION_GRANTED) {
-            empty.setText("需要读取存储的权限才能列出视频。");
             requestPermissions(new String[]{Manifest.permission.READ_EXTERNAL_STORAGE},
                     PERMISSION_REQUEST);
-            return;
         }
         load();
     }
@@ -95,6 +103,8 @@ public class LocalVideosActivity extends Activity {
 
     private void load() {
         List<Entry> entries = new ArrayList<>();
+        entries.add(new Entry(null, "🖥  Mac 串流（Moonlight）\n串流电脑桌面或游戏，同样实时转 3D", com.limelight.PcView.class));
+        entries.add(new Entry(null, "☁  Google Drive\n经 Mac 上的 rclone（scripts/serve-gdrive.sh）", RemoteBrowserActivity.class));
         String[] cols = {
                 MediaStore.Video.Media._ID,
                 MediaStore.Video.Media.DISPLAY_NAME,
@@ -103,6 +113,11 @@ public class LocalVideosActivity extends Activity {
                 MediaStore.Video.Media.HEIGHT,
                 MediaStore.Video.Media.RELATIVE_PATH,
         };
+        if (checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED) {
+            list.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, entries));
+            return;
+        }
         try (Cursor c = getContentResolver().query(MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
                 cols, null, null, MediaStore.Video.Media.DATE_MODIFIED + " DESC")) {
             if (c != null) {
@@ -119,7 +134,7 @@ public class LocalVideosActivity extends Activity {
                 }
             }
         }
-        empty.setText("没有找到视频。把视频拷到头显的 Movies 或 Download 文件夹里。");
+        
         list.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, entries));
     }
 }

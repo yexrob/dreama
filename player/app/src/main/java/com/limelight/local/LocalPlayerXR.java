@@ -17,7 +17,10 @@ import com.limelight.binding.video.XrRenderer;
 import com.limelight.binding.video.XrStartFailure;
 import com.limelight.preferences.PreferenceConfiguration;
 
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.Locale;
+import java.util.Map;
 
 /**
  * Plays a local video on MoonlightXR's virtual screen. The renderer hands out
@@ -32,6 +35,11 @@ public class LocalPlayerXR extends Activity
         implements XrRenderer.InputListener, XrRenderer.SessionListener {
 
     private static final int SEEK_STEP_MS = 10_000;
+    // An Authorization header for an http source (the WebDAV share)
+    static final String EXTRA_AUTH = "auth";
+    static final String EXTRA_TITLE = "title";
+
+    private Map<String, String> headers = Collections.emptyMap();
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private volatile XrRenderer renderer;
@@ -49,6 +57,11 @@ public class LocalPlayerXR extends Activity
             return;
         }
 
+        String auth = getIntent().getStringExtra(EXTRA_AUTH);
+        if (auth != null) {
+            headers = new HashMap<>();
+            headers.put("Authorization", auth);
+        }
         new Thread(() -> startSession(uri), "depth3d-start").start();
     }
 
@@ -85,9 +98,18 @@ public class LocalPlayerXR extends Activity
         }
         MediaPlayer mp = new MediaPlayer();
         try {
-            mp.setDataSource(this, uri);
+            mp.setDataSource(this, uri, headers);
             mp.setSurface(r.getInputSurface());
             mp.setLooping(true);
+            if (isHttp(uri)) {
+                r.showNotice("正在从网盘缓冲…", getIntent().getStringExtra(EXTRA_TITLE));
+                mp.setOnInfoListener((p, what, extra) -> {
+                    if (what == MediaPlayer.MEDIA_INFO_BUFFERING_START) {
+                        r.showNotice("缓冲中…", null);
+                    }
+                    return false;
+                });
+            }
             mp.setOnPreparedListener(MediaPlayer::start);
             mp.setOnErrorListener((p, what, extra) -> {
                 r.showNotice("播放出错", "what=" + what + " extra=" + extra);
@@ -106,7 +128,11 @@ public class LocalPlayerXR extends Activity
     private int[] videoSize(Uri uri) {
         MediaMetadataRetriever mmr = new MediaMetadataRetriever();
         try {
-            mmr.setDataSource(this, uri);
+            if (isHttp(uri)) {
+                mmr.setDataSource(uri.toString(), headers);
+            } else {
+                mmr.setDataSource(this, uri);
+            }
             int w = parse(mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH), 1920);
             int h = parse(mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT), 1080);
             int rot = parse(mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION), 0);
@@ -124,7 +150,7 @@ public class LocalPlayerXR extends Activity
     private float frameRate(Uri uri) {
         MediaExtractor ex = new MediaExtractor();
         try {
-            ex.setDataSource(this, uri, null);
+            ex.setDataSource(this, uri, headers);
             for (int i = 0; i < ex.getTrackCount(); i++) {
                 MediaFormat f = ex.getTrackFormat(i);
                 String mime = f.getString(MediaFormat.KEY_MIME);
@@ -137,6 +163,11 @@ public class LocalPlayerXR extends Activity
             ex.release();
         }
         return 30f;
+    }
+
+    private static boolean isHttp(Uri uri) {
+        String s = uri.getScheme();
+        return "http".equals(s) || "https".equals(s);
     }
 
     private static int parse(String s, int fallback) {

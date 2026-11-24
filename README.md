@@ -68,6 +68,23 @@ adb install -r -g app/build/outputs/apk/nonRoot/debug/app-nonRoot-debug.apk
 
 头显应用库里叫 **depth3d (Debug)**，打开后列出所有视频，点一个就用 3D 播放。扳机键暂停或继续，摇杆每推一下跳 10 秒。基于 MoonlightXR 75d92f2，代码在 `player/app/src/main/java/com/limelight/local/`。
 
+### Google Drive（经 Mac）
+
+Mac 上用 rclone 把 Drive 开成局域网 WebDAV，并通过 Bonjour（`_webdav._tcp`）广播，头显打开「Google Drive」会自己找到：
+
+```bash
+scripts/serve-gdrive.sh            # 默认 gdrive:，端口 8890，只读
+```
+
+登录名 `depth3d`，密码在 `~/.config/depth3d/webdav-pass`（第一次运行时生成），头显里填一次即可。也可以用 adb 直接写进去：
+
+```bash
+adb shell am start -n dev.depth3d.player.debug/com.limelight.local.RemoteBrowserActivity \
+  --es base http://<Mac IP>:8890 --es user depth3d --es pass <密码>
+```
+
+首页另外保留了 Moonlight 原来的串流入口（「Mac 串流」）。
+
 ## 原型用法
 
 ```bash

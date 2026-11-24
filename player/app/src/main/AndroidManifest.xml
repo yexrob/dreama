@@ -276,6 +276,12 @@
             <meta-data android:name="pvr.app.type" android:value="2d" />
         </activity>
         <activity
+            android:name=".local.RemoteBrowserActivity"
+            android:label="Google Drive"
+            android:exported="true">
+            <meta-data android:name="pvr.app.type" android:value="2d" />
+        </activity>
+        <activity
             android:name=".local.LocalPlayerXR"
             android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection"
             android:resizeableActivity="false"
