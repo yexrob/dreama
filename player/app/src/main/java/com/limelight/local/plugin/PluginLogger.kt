@@ -17,9 +17,12 @@ data class PluginLogEntry(
  * Plugin logger backing `ctx.log.{debug,info,warn,error}` (protocol §5 &
  * quality bar):
  * - Unified prefix `depth3d: plugin <pluginId>`
+ * - Truncates every message to [MAX_MESSAGE_BYTES] (4 KB) BEFORE regex redaction
+ *   so hostile plugins cannot trigger multi-megabyte regex scans or OOM the host
  * - Redacts configured secret values (password config fields) and common
- *   credential/token patterns before emitting to logcat/LimeLog or the
- *   in-memory diagnostic buffer.
+ *   credential/token patterns before emitting to logcat/LimeLog or the ring buffer
+ * - Caps the in-memory ring buffer by BOTH entry count ([maxEntries] = 200) AND
+ *   total UTF-8 byte size ([maxBufferBytes] = 256 KB)
  */
 class PluginLogger(
     private val pluginId: String,
@@ -32,25 +35,41 @@ class PluginLogger(
             PluginLogLevel.ERROR -> LimeLog.severe(line)
         }
     },
-    private val maxEntries: Int = 200,
+    private val maxEntries: Int = MAX_ENTRIES,
+    private val maxMessageBytes: Int = MAX_MESSAGE_BYTES,
+    private val maxBufferBytes: Int = MAX_BUFFER_BYTES,
 ) {
-    private val ring = ArrayDeque<PluginLogEntry>(maxEntries)
+    private data class StoredEntry(
+        val entry: PluginLogEntry,
+        val byteSize: Int,
+    )
+
+    private val ring = ArrayDeque<StoredEntry>(maxEntries)
+    private var totalBufferedBytes: Int = 0
     private val lock = Any()
 
     fun log(level: PluginLogLevel, rawMessage: String) {
-        val scrubbed = redact(rawMessage, knownSecretsProvider())
-        val formatted = "depth3d: plugin $pluginId [$instanceId] ${level.name}: $scrubbed"
+        val truncated = truncateUtf8(rawMessage, maxMessageBytes)
+        val scrubbed = redact(truncated, knownSecretsProvider())
+        val finalMsg = truncateUtf8(scrubbed, maxMessageBytes)
+        val msgBytes = finalMsg.toByteArray(Charsets.UTF_8).size
+        val formatted = "depth3d: plugin $pluginId [$instanceId] ${level.name}: $finalMsg"
         synchronized(lock) {
-            if (ring.size >= maxEntries) ring.removeFirst()
-            ring.addLast(
-                PluginLogEntry(
-                    timestampMs = System.currentTimeMillis(),
-                    level = level,
-                    pluginId = pluginId,
-                    instanceId = instanceId,
-                    message = scrubbed,
-                ),
+            while (ring.size >= maxEntries && ring.isNotEmpty()) {
+                totalBufferedBytes -= ring.removeFirst().byteSize
+            }
+            while (ring.isNotEmpty() && totalBufferedBytes + msgBytes > maxBufferBytes) {
+                totalBufferedBytes -= ring.removeFirst().byteSize
+            }
+            val entry = PluginLogEntry(
+                timestampMs = System.currentTimeMillis(),
+                level = level,
+                pluginId = pluginId,
+                instanceId = instanceId,
+                message = finalMsg,
             )
+            ring.addLast(StoredEntry(entry, msgBytes))
+            totalBufferedBytes += msgBytes
         }
         sink(level, formatted)
     }
@@ -60,9 +79,14 @@ class PluginLogger(
     fun warn(msg: String) = log(PluginLogLevel.WARN, msg)
     fun error(msg: String) = log(PluginLogLevel.ERROR, msg)
 
-    fun recentEntries(): List<PluginLogEntry> = synchronized(lock) { ring.toList() }
+    fun recentEntries(): List<PluginLogEntry> = synchronized(lock) { ring.map { it.entry } }
+    fun currentBufferedBytes(): Int = synchronized(lock) { totalBufferedBytes }
 
     companion object {
+        const val MAX_ENTRIES = 200
+        const val MAX_MESSAGE_BYTES = 4 * 1024
+        const val MAX_BUFFER_BYTES = 256 * 1024
+        private const val TRUNCATION_SUFFIX = "...[truncated]"
         private const val REDACTED = "[REDACTED]"
 
         private val AUTH_HEADER_REGEX = Regex(
@@ -77,6 +101,35 @@ class PluginLogger(
         private val URL_USERINFO_REGEX = Regex(
             """(https?://)([^/\s:@]+:[^/\s@]+)(@)""",
         )
+
+        fun truncateUtf8(input: String, maxBytes: Int): String {
+            if (maxBytes <= 0) return ""
+            // Fast path: UTF-8 takes at most 3 bytes per BMP char (4 bytes per surrogate pair)
+            if (input.length <= maxBytes / 4) return input
+            val suffixBytes = TRUNCATION_SUFFIX.length
+            val limit = (maxBytes - suffixBytes).coerceAtLeast(0)
+            var bytes = 0
+            var cutIdx = -1
+            var i = 0
+            val len = input.length
+            while (i < len) {
+                val cp = Character.codePointAt(input, i)
+                val charCount = Character.charCount(cp)
+                val cpBytes = when {
+                    cp <= 0x7F -> 1
+                    cp <= 0x7FF -> 2
+                    cp <= 0xFFFF -> 3
+                    else -> 4
+                }
+                if (bytes + cpBytes > maxBytes) {
+                    return if (cutIdx >= 0) input.substring(0, cutIdx) + TRUNCATION_SUFFIX else input.substring(0, i)
+                }
+                bytes += cpBytes
+                i += charCount
+                if (bytes <= limit) cutIdx = i
+            }
+            return input
+        }
 
         fun redact(input: String, knownSecrets: Collection<String> = emptyList()): String {
             var out = input

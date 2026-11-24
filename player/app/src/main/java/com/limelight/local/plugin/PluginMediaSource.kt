@@ -102,7 +102,7 @@ class PluginMediaSource(
 
     override val authMode: PluginAuthMode = manifest.auth
     val capabilities: Set<PluginCapability> = manifest.capabilities
-    val networkPolicy: NetworkPolicy get() = mapper.networkPolicy
+    internal val networkPolicy: NetworkPolicy get() = mapper.networkPolicy
 
     // Bounded LRU caches so long sessions cannot grow memory unboundedly
     private val pageCursors = ConcurrentHashMap<String, ConcurrentHashMap<Int, String>>()
@@ -113,16 +113,16 @@ class PluginMediaSource(
         },
     )
 
-    /** Creates a Media3 [PlaybackMediaSourceFactory] bound to this instance's [NetworkPolicy] and device codecs. */
-    fun createPlaybackFactory(client: OkHttpClient = okHttpClient): PlaybackMediaSourceFactory =
+    /** Internal factory; external callers MUST use [PluginPlayback.createMediaSource]. */
+    internal fun createPlaybackFactory(client: OkHttpClient = okHttpClient): PlaybackMediaSourceFactory =
         PlaybackMediaSourceFactory(
             networkPolicy = mapper.networkPolicy,
             deviceCodecs = runtime.deviceInfo.codecs,
             okHttpClient = client,
         )
 
-    /** Creates a [PlaybackSessionController] bound to this source and its [NetworkPolicy]. */
-    fun createPlaybackSessionController(
+    /** Internal session controller helper; external callers MUST use [PluginPlayback.createSessionController]. */
+    internal fun createPlaybackSessionController(
         client: OkHttpClient = okHttpClient,
         clockMs: () -> Long = System::currentTimeMillis,
     ): PlaybackSessionController = PlaybackSessionController(
@@ -131,8 +131,8 @@ class PluginMediaSource(
         clockMs = clockMs,
     )
 
-    /** Creates a [PluginImageFetcher] enforcing §11.3 on all artwork loads for this instance. */
-    fun createImageFetcher(client: OkHttpClient = okHttpClient): PluginImageFetcher =
+    /** Internal image fetcher; external callers MUST use [PluginImages.loadBytes]. */
+    internal fun createImageFetcher(client: OkHttpClient = okHttpClient): PluginImageFetcher =
         PluginImageFetcher(mapper.networkPolicy, client)
 
     override suspend fun home(): List<Shelf> = guarded {

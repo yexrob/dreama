@@ -153,7 +153,7 @@ class StorageCorruptedException(message: String, cause: Throwable? = null) : IOE
 class InstanceStorage(
     private val file: File,
     private val secretBox: SecretBox,
-    private val maxBytes: Int = MAX_STORAGE_BYTES,
+    val maxBytes: Int = MAX_STORAGE_BYTES,
 ) {
     private val json = Json { ignoreUnknownKeys = true }
     private val lock = ReentrantReadWriteLock()
@@ -167,6 +167,22 @@ class InstanceStorage(
     } ?: lock.write {
         ensureLoadedLocked()
         entries[key]
+    }
+
+    /**
+     * Checks UTF-8 byte length BEFORE parsing [rawJson] so a hostile multi-MB
+     * payload is rejected without allocating a JSON AST on the host heap.
+     */
+    fun setRawJson(key: String, rawJson: String) {
+        val keyBytes = key.toByteArray(Charsets.UTF_8).size
+        val valBytes = rawJson.toByteArray(Charsets.UTF_8).size
+        if (keyBytes + valBytes + 6 > maxBytes) {
+            throw StorageQuotaExceededException(
+                "插件存储空间超过上限（${maxBytes / 1024} KB）",
+            )
+        }
+        val parsed = json.parseToJsonElement(rawJson)
+        set(key, parsed)
     }
 
     fun set(key: String, value: JsonElement) = lock.write {

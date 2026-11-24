@@ -16,8 +16,13 @@
     "nat64-loopback.example": ["64:ff9b::7f00:1"],
     "nat64-private.example": ["64:ff9b::c0a8:132"],
     "nat64-public.example": ["64:ff9b::5db8:d822"],
+    "nat64-local-public.example": ["64:ff9b:1::5db8:d822"],
     "v4compat-loopback.example": ["::127.0.0.1"],
     "v4mapped-private.example": ["::ffff:10.0.0.1"],
+    "v4mapped-public.example": ["::ffff:93.184.216.34"],
+    "teredo.example.com": ["2001:0000:4136:e378:8000:63bf:3fff:fdd2"],
+    "sitelocal-fec0.example": ["fec0::1"],
+    "relay6to4.example": ["192.88.99.1"],
     "ula.example.com": ["fd12:3456:789a::1"],
     "cgnat.example.com": ["100.64.1.5"],
     "mixed-evil.example.com": ["93.184.216.34", "127.0.0.1"]
@@ -169,6 +174,62 @@
       "userHosts": [],
       "url": "https://mixed-evil.example.com/",
       "allow": false
+    },
+    {
+      "name": "Teredo 2001::/32 blocked even with lan=true",
+      "policy": { "hosts": ["teredo.example.com"], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "https://teredo.example.com/",
+      "allow": false
+    },
+    {
+      "name": "IPv4-mapped ::ffff:0:0/96 blocked even for public IPv4",
+      "policy": { "hosts": ["v4mapped-public.example"], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "https://v4mapped-public.example/",
+      "allow": false
+    },
+    {
+      "name": "IPv4-mapped literal [::ffff:93.184.216.34] blocked even with userHosts+lan",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": ["::ffff:93.184.216.34"],
+      "url": "https://[::ffff:93.184.216.34]/",
+      "allow": false
+    },
+    {
+      "name": "6to4 relay 192.88.99.0/24 blocked even with lan=true",
+      "policy": { "hosts": ["relay6to4.example"], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "https://relay6to4.example/",
+      "allow": false
+    },
+    {
+      "name": "deprecated site-local fec0::/10 blocked even with lan=true",
+      "policy": { "hosts": ["sitelocal-fec0.example"], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "https://sitelocal-fec0.example/",
+      "allow": false
+    },
+    {
+      "name": "NAT64 local-use 64:ff9b:1::/48 treated as private (rejected without lan)",
+      "policy": { "hosts": ["nat64-local-public.example"], "userHosts": false, "lan": false },
+      "userHosts": [],
+      "url": "https://nat64-local-public.example/",
+      "allow": false
+    },
+    {
+      "name": "NAT64 local-use 64:ff9b:1::/48 allowed when lan=true and host declared",
+      "policy": { "hosts": ["nat64-local-public.example"], "userHosts": false, "lan": true },
+      "userHosts": [],
+      "url": "https://nat64-local-public.example/",
+      "allow": true
+    },
+    {
+      "name": "IPv6 literal canonical host match in userHosts (fd12:3456:789a::0001 == fd12:3456:789a::1)",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": ["[fd12:3456:789a::1]"],
+      "url": "http://[fd12:3456:789a::0001]:8096/Items",
+      "allow": true
     }
   ],
   "resourceCases": [
@@ -283,6 +344,41 @@
       "userHosts": [],
       "url": "https://nat64-public.example/a.mp4",
       "allow": true
+    },
+    {
+      "name": "Teredo literal [2001::1] rejected for playback",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "http://[2001::1]/a.mp4",
+      "allow": false
+    },
+    {
+      "name": "IPv4-mapped literal [::ffff:93.184.216.34] rejected for playback",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "http://[::ffff:93.184.216.34]/a.mp4",
+      "allow": false
+    },
+    {
+      "name": "6to4 relay literal 192.88.99.1 rejected for playback",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "http://192.88.99.1/a.mp4",
+      "allow": false
+    },
+    {
+      "name": "deprecated site-local literal [fec0::1] rejected for playback",
+      "policy": { "hosts": [], "userHosts": true, "lan": true },
+      "userHosts": [],
+      "url": "http://[fec0::1]/a.mp4",
+      "allow": false
+    },
+    {
+      "name": "NAT64 local-use 64:ff9b:1::5db8:d822 rejected for playback without lan",
+      "policy": { "hosts": [], "userHosts": false, "lan": false },
+      "userHosts": [],
+      "url": "https://nat64-local-public.example/a.mp4",
+      "allow": false
     }
   ]
 }

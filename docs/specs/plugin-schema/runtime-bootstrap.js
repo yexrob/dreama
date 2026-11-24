@@ -183,33 +183,76 @@
     };
   }
 
-  // Single-call scoped setTimeout / clearTimeout with true host cancellation (§11.1)
+  // Single-call scoped setTimeout / clearTimeout with true host cancellation
+  // and strict per-instance active timer limit (256 max, §11.1).
+  const MAX_ACTIVE_TIMERS = 256;
+  const MAX_RETURN_BYTES = 8 * 1024 * 1024;
   let currentGen = 0;
   let nextTimerId = 1;
+  const activeTimerIds = new Set();
   const cancelledTimers = new Set();
+  let strictAwaitTracking = false;
+  let trackedAsyncOps = [];
 
   globalThis.setTimeout = function (fn, delayMs, ...args) {
     if (typeof fn !== 'function') throw new TypeError('setTimeout requires a function');
+    if (activeTimerIds.size >= MAX_ACTIVE_TIMERS) {
+      throw new RangeError('同时活跃的定时器数量超过上限（最多 ' + MAX_ACTIVE_TIMERS + ' 个）');
+    }
     const id = nextTimerId++;
     const gen = currentGen;
     const ms = Number(delayMs) || 0;
+    activeTimerIds.add(id);
     host.sleep(BRIDGE_TOKEN, id, ms, gen).then((stillActive) => {
+      activeTimerIds.delete(id);
       if (stillActive && gen === currentGen && !cancelledTimers.has(id)) {
         cancelledTimers.delete(id);
         fn(...args);
       }
-    }).catch(() => {});
+    }).catch(() => {
+      activeTimerIds.delete(id);
+    });
     return id;
   };
 
   globalThis.clearTimeout = function (id) {
     const numId = Number(id);
     if (!Number.isFinite(numId)) return;
+    activeTimerIds.delete(numId);
     cancelledTimers.add(numId);
     try {
       host.cancelTimer(BRIDGE_TOKEN, numId);
     } catch (_) {}
   };
+
+  class TrackedPromise extends Promise {
+    constructor(executor, record) {
+      super(executor);
+      this.__d3Record = record || null;
+    }
+    then(onFulfilled, onRejected) {
+      if (this.__d3Record) this.__d3Record.awaited = true;
+      return super.then(onFulfilled, onRejected);
+    }
+    catch(onRejected) {
+      if (this.__d3Record) this.__d3Record.awaited = true;
+      return super.catch(onRejected);
+    }
+    finally(onFinally) {
+      if (this.__d3Record) this.__d3Record.awaited = true;
+      return super.finally(onFinally);
+    }
+  }
+
+  function trackAwaitableOp(opName, promise) {
+    if (!strictAwaitTracking) return promise;
+    const stack = (new Error(opName)).stack || '';
+    const record = { op: opName, stack: String(stack), awaited: false };
+    trackedAsyncOps.push(record);
+    return new TrackedPromise((resolve, reject) => {
+      promise.then(resolve, reject);
+    }, record);
+  }
 
   // Lazy DOM handle wrapper (§11.1, S4): never eagerly serializes html/outerHtml/text
   function wrapLazyNode(nodeId) {
@@ -303,28 +346,32 @@
         const meta = JSON.parse(rawMeta);
         const handleId = meta.handleId;
         const headers = deepFreeze(meta.headers || {});
-        let cachedText = null;
-        let cachedBuf = null;
+        // Single-consume Response body matching Web Fetch semantics & releasing host
+        // in-flight byte budget immediately upon first read (Android & plugin-kit parity).
+        let bodyConsumed = false;
+        function consumeBody(mode) {
+          if (bodyConsumed) {
+            throw new TypeError('Response body already consumed');
+          }
+          bodyConsumed = true;
+          if (mode === 'bytes') {
+            return toArrayBuffer(host.fetchReadBytes(BRIDGE_TOKEN, handleId));
+          }
+          return host.fetchReadText(BRIDGE_TOKEN, handleId);
+        }
         const resp = {
           status: meta.status,
           ok: meta.status >= 200 && meta.status < 300,
           url: meta.url,
           headers,
           bytes() {
-            if (cachedBuf === null) {
-              const raw = host.fetchReadBytes(BRIDGE_TOKEN, handleId);
-              cachedBuf = toArrayBuffer(raw);
-            }
-            return cachedBuf.slice(0);
+            return consumeBody('bytes');
           },
           text() {
-            if (cachedText === null) {
-              cachedText = host.fetchReadText(BRIDGE_TOKEN, handleId);
-            }
-            return cachedText;
+            return consumeBody('text');
           },
           json() {
-            return JSON.parse(resp.text());
+            return JSON.parse(consumeBody('text'));
           },
         };
         return Object.freeze(resp);
@@ -332,27 +379,45 @@
 
       // §11.1: ctx.storage.* are async and MUST be awaited
       storage: Object.freeze({
-        async get(key) {
-          const raw = await host.storageGet(BRIDGE_TOKEN, String(key));
-          return raw === null || raw === undefined ? null : JSON.parse(raw);
+        get(key) {
+          return trackAwaitableOp('ctx.storage.get', (async () => {
+            const raw = await host.storageGet(BRIDGE_TOKEN, String(key));
+            return raw === null || raw === undefined ? null : JSON.parse(raw);
+          })());
         },
-        async set(key, value) {
-          await host.storageSet(BRIDGE_TOKEN, String(key), JSON.stringify(value === undefined ? null : value));
+        set(key, value) {
+          return trackAwaitableOp('ctx.storage.set', (async () => {
+            await host.storageSet(BRIDGE_TOKEN, String(key), JSON.stringify(value === undefined ? null : value));
+          })());
         },
-        async remove(key) {
-          await host.storageRemove(BRIDGE_TOKEN, String(key));
+        remove(key) {
+          return trackAwaitableOp('ctx.storage.remove', (async () => {
+            await host.storageRemove(BRIDGE_TOKEN, String(key));
+          })());
         },
-        async keys() {
-          const raw = await host.storageKeys(BRIDGE_TOKEN);
-          return JSON.parse(raw);
+        keys() {
+          return trackAwaitableOp('ctx.storage.keys', (async () => {
+            const raw = await host.storageKeys(BRIDGE_TOKEN);
+            return JSON.parse(raw);
+          })());
         },
       }),
 
       // §11.1: ctx.cookies.* are async and MUST be awaited
       cookies: Object.freeze({
-        async get(url) { return await host.cookiesGet(BRIDGE_TOKEN, String(url)); },
-        async set(url, cookie) { await host.cookiesSet(BRIDGE_TOKEN, String(url), String(cookie)); },
-        async clear() { await host.cookiesClear(BRIDGE_TOKEN); },
+        get(url) {
+          return trackAwaitableOp('ctx.cookies.get', (async () => await host.cookiesGet(BRIDGE_TOKEN, String(url)))());
+        },
+        set(url, cookie) {
+          return trackAwaitableOp('ctx.cookies.set', (async () => {
+            await host.cookiesSet(BRIDGE_TOKEN, String(url), String(cookie));
+          })());
+        },
+        clear() {
+          return trackAwaitableOp('ctx.cookies.clear', (async () => {
+            await host.cookiesClear(BRIDGE_TOKEN);
+          })());
+        },
       }),
 
       crypto: Object.freeze({
@@ -457,6 +522,9 @@
     if (initialized) throw new Error('Bootstrap already sealed');
     initialized = true;
     BRIDGE_TOKEN = String(token);
+    strictAwaitTracking = typeof host.isStrictAwaitTracking === 'function'
+      ? Boolean(host.isStrictAwaitTracking(BRIDGE_TOKEN))
+      : false;
     ctx = buildCtx();
     try { delete globalThis.__d3_seal_bootstrap; } catch (_) {}
   };
@@ -469,25 +537,46 @@
     try { delete globalThis.__d3_register; } catch (_) {}
   };
 
-  globalThis.__d3_exports = function () {
+  function defineReadOnlyGlobal(name, fn) {
+    Object.defineProperty(globalThis, name, {
+      value: fn,
+      writable: false,
+      configurable: false,
+      enumerable: false,
+    });
+  }
+
+  defineReadOnlyGlobal('__d3_exports', function () {
     if (!pluginExport) return '[]';
     return JSON.stringify(Object.keys(pluginExport).filter((k) => typeof pluginExport[k] === 'function'));
-  };
+  });
 
   async function callPlugin(method, argJson, hasArg, gen, optional) {
     currentGen = gen;
+    activeTimerIds.clear();
     cancelledTimers.clear();
+    trackedAsyncOps = [];
     if (!pluginExport) throw new Error('Plugin not loaded');
     const fn = pluginExport[method];
     if (typeof fn !== 'function') {
       if (optional) return 'undefined';
       throw new Error('Plugin does not implement method: ' + method);
     }
+    let succeeded = false;
     try {
       const res = hasArg
         ? await fn.call(pluginExport, ctx, JSON.parse(argJson))
         : await fn.call(pluginExport, ctx);
-      return res === undefined ? 'undefined' : JSON.stringify(res);
+      if (res === undefined) {
+        succeeded = true;
+        return 'undefined';
+      }
+      const serialized = JSON.stringify(res);
+      if (serialized && serialized.length > MAX_RETURN_BYTES) {
+        throw new Error('Plugin return value exceeds 8 MB size limit');
+      }
+      succeeded = true;
+      return serialized;
     } catch (err) {
       if (err && err.__d3Error) {
         const payload = { code: err.code || 'Internal' };
@@ -499,28 +588,49 @@
       }
       throw err;
     } finally {
+      if (strictAwaitTracking && succeeded && trackedAsyncOps.length > 0) {
+        const unawaited = trackedAsyncOps.filter((op) => !op.awaited);
+        if (unawaited.length > 0 && typeof host.reportUnawaitedOps === 'function') {
+          try {
+            host.reportUnawaitedOps(BRIDGE_TOKEN, JSON.stringify(unawaited));
+          } catch (_) {}
+        }
+      }
+      trackedAsyncOps = [];
       // Cancel all remaining timers & in-flight fetches as soon as the call's Promise settles (§11.1)
       currentGen = -1;
+      activeTimerIds.clear();
       cancelledTimers.clear();
       try { host.finishCall(BRIDGE_TOKEN, gen); } catch (_) {}
     }
   }
 
-  globalThis.__d3_invoke = function (method, argJson, hasArg, gen) {
+  defineReadOnlyGlobal('__d3_invoke', function (method, argJson, hasArg, gen) {
     return callPlugin(method, argJson, hasArg, gen, false);
-  };
-  globalThis.__d3_invoke_optional = function (method, argJson, hasArg, gen) {
+  });
+  defineReadOnlyGlobal('__d3_invoke_optional', function (method, argJson, hasArg, gen) {
     return callPlugin(method, argJson, hasArg, gen, true);
-  };
-  globalThis.__d3_eval_probe = async function (fnCode, gen) {
+  });
+  defineReadOnlyGlobal('__d3_eval_probe', async function (fnCode, gen) {
     currentGen = gen;
+    activeTimerIds.clear();
+    cancelledTimers.clear();
+    trackedAsyncOps = [];
     try {
       const fn = new Function('ctx', 'return (async () => { ' + fnCode + ' })();');
       const res = await fn(ctx);
-      return res === undefined ? 'undefined' : JSON.stringify(res);
+      if (res === undefined) return 'undefined';
+      const serialized = JSON.stringify(res);
+      if (serialized && serialized.length > MAX_RETURN_BYTES) {
+        throw new Error('Plugin return value exceeds 8 MB size limit');
+      }
+      return serialized;
     } finally {
       currentGen = -1;
+      activeTimerIds.clear();
+      cancelledTimers.clear();
+      trackedAsyncOps = [];
       try { host.finishCall(BRIDGE_TOKEN, gen); } catch (_) {}
     }
-  };
+  });
 })();

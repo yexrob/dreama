@@ -52,7 +52,7 @@ class NetworkPolicy(
     private val normalizedHosts: List<String> = permissions.hosts.map { canonicalizePattern(it) }
     private val normalizedUserHosts: Set<String> = userConfiguredHosts.map { canonicalizeHost(it) }.toSet()
     private val normalizedUserIps: Set<String> = userConfiguredHosts.mapNotNull { raw ->
-        parseAnyIpLiteral(canonicalizeHost(raw))?.hostAddress
+        parseAnyIpLiteral(raw)?.let { formatIpBytes(it.address) }
     }.toSet()
 
     /**
@@ -172,6 +172,23 @@ class NetworkPolicy(
         if (schemePrefix != "http" && schemePrefix != "https") {
             throw NetworkPolicyException("仅允许 http 或 https 协议")
         }
+        // Inspect raw bracketed IPv6 host BEFORE OkHttp HttpUrl silently down-converts
+        // ::ffff:a.b.c.d to a plain IPv4 host string.
+        val rawAuthority = trimmed.substringAfter("://")
+            .substringBefore("/")
+            .substringBefore("?")
+            .substringBefore("#")
+            .substringAfterLast("@")
+        if (rawAuthority.startsWith("[")) {
+            val endBracket = rawAuthority.indexOf(']')
+            if (endBracket > 1) {
+                val rawV6 = rawAuthority.substring(1, endBracket)
+                val parsedV6 = parseIpv6Literal(rawV6)
+                if (parsedV6 != null && isAlwaysBlockedAddress(parsedV6)) {
+                    throw NetworkPolicyException("禁止访问回环、链路本地或保留地址：$rawV6")
+                }
+            }
+        }
         val parsed = trimmed.toHttpUrlOrNull()
             ?: throw NetworkPolicyException("不支持或无效的请求地址")
         if (parsed.scheme != "http" && parsed.scheme != "https") {
@@ -191,7 +208,7 @@ class NetworkPolicy(
 
     private fun isUserConfiguredHost(canonicalHost: String, resolved: List<InetAddress>): Boolean {
         if (canonicalHost in normalizedUserHosts) return true
-        if (normalizedUserIps.isNotEmpty() && resolved.all { addr -> addr.hostAddress?.let { it in normalizedUserIps } == true }) {
+        if (normalizedUserIps.isNotEmpty() && resolved.all { addr -> formatIpBytes(addr.address) in normalizedUserIps }) {
             return true
         }
         return false
@@ -256,7 +273,30 @@ class NetworkPolicy(
             while (h.endsWith(".")) {
                 h = h.dropLast(1)
             }
+            // Canonicalize IPv6 literals identically across Android & Node (e.g. fd00::0001 == fd00::1)
+            if (h.contains(':')) {
+                parseIpv6Literal(h)?.let { ip ->
+                    return formatIpBytes(ip.address)
+                }
+            }
             return h
+        }
+
+        fun formatIpBytes(bytes: ByteArray): String {
+            if (bytes.size == 4) {
+                return "${bytes[0].toInt() and 0xFF}.${bytes[1].toInt() and 0xFF}." +
+                    "${bytes[2].toInt() and 0xFF}.${bytes[3].toInt() and 0xFF}"
+            }
+            if (bytes.size == 16) {
+                val sb = StringBuilder(39)
+                for (i in 0 until 8) {
+                    if (i > 0) sb.append(':')
+                    val group = ((bytes[i * 2].toInt() and 0xFF) shl 8) or (bytes[i * 2 + 1].toInt() and 0xFF)
+                    sb.append(group.toString(16))
+                }
+                return sb.toString()
+            }
+            return ""
         }
 
         private fun canonicalizePattern(raw: String): String {
@@ -404,7 +444,9 @@ class NetworkPolicy(
                 host
             }
             val bytes = parsePureIpv6Bytes(normalized) ?: return null
-            return InetAddress.getByAddress(bytes)
+            // Use Inet6Address.getByAddress(..., -1) so ::ffff:a.b.c.d keeps its 16-byte
+            // IPv6 representation instead of JDK InetAddress.getByAddress silently stripping ::ffff:.
+            return java.net.Inet6Address.getByAddress(null, bytes, -1)
         }
 
         private fun parsePureIpv6Bytes(ip: String): ByteArray? {
@@ -460,7 +502,7 @@ class NetworkPolicy(
          * AND the host is in the plugin's declared scope per §11.3).
          */
         fun isPrivateAddress(addr: InetAddress): Boolean {
-            if (addr.isSiteLocalAddress) return true
+            if (isAlwaysBlockedAddress(addr)) return false
             val bytes = addr.address
             if (bytes.size == 4) {
                 return isPrivateIpv4(bytes)
@@ -485,6 +527,8 @@ class NetworkPolicy(
             if (b0 == 192 && b1 == 0 && b2 == 0) return true
             // 192.0.2.0/24 (TEST-NET-1)
             if (b0 == 192 && b1 == 0 && b2 == 2) return true
+            // 192.88.99.0/24 (6to4 relay anycast RFC 7526)
+            if (b0 == 192 && b1 == 88 && b2 == 99) return true
             // 198.51.100.0/24 (TEST-NET-2)
             if (b0 == 198 && b1 == 51 && b2 == 100) return true
             // 203.0.113.0/24 (TEST-NET-3)
@@ -508,20 +552,37 @@ class NetworkPolicy(
         private fun isAlwaysBlockedIpv6(b: ByteArray): Boolean {
             val b0 = b[0].toInt() and 0xFF
             val b1 = b[1].toInt() and 0xFF
+            val b2 = b[2].toInt() and 0xFF
+            val b3 = b[3].toInt() and 0xFF
             // :: (unspecified) or ::1 (loopback)
             val first15Zero = (0 until 15).all { b[it] == 0.toByte() }
             if (first15Zero && (b[15] == 0.toByte() || b[15] == 1.toByte())) return true
             // fe80::/10 (link-local)
             if (b0 == 0xFE && (b1 and 0xC0) == 0x80) return true
+            // fec0::/10 (deprecated site-local RFC 3879)
+            if (b0 == 0xFE && (b1 and 0xC0) == 0xC0) return true
             // ff00::/8 (multicast)
             if (b0 == 0xFF) return true
             // 100::/64 (discard-only RFC 6666)
             if (b0 == 0x01 && b1 == 0x00 && (2 until 8).all { b[it] == 0.toByte() }) return true
+            // 2001::/32 (Teredo tunneling RFC 4380)
+            if (b0 == 0x20 && b1 == 0x01 && b2 == 0x00 && b3 == 0x00) return true
             // 2001:db8::/32 (documentation)
-            if (b0 == 0x20 && b1 == 0x01 && (b[2].toInt() and 0xFF) == 0x0D && (b[3].toInt() and 0xFF) == 0xB8) {
+            if (b0 == 0x20 && b1 == 0x01 && b2 == 0x0D && b3 == 0xB8) return true
+            // ::ffff:0:0/96 (ALL IPv4-mapped IPv6 addresses)
+            if ((0 until 10).all { b[it] == 0.toByte() } &&
+                (b[10].toInt() and 0xFF) == 0xFF && (b[11].toInt() and 0xFF) == 0xFF
+            ) {
                 return true
             }
-            // Embedded IPv4 in IPv4-mapped, IPv4-compatible, NAT64, or 6to4
+            // ::ffff:0:0:0/96 (IPv4-translated SIIT RFC 2765)
+            if ((0 until 8).all { b[it] == 0.toByte() } &&
+                (b[8].toInt() and 0xFF) == 0xFF && (b[9].toInt() and 0xFF) == 0xFF &&
+                b[10] == 0.toByte() && b[11] == 0.toByte()
+            ) {
+                return true
+            }
+            // Embedded IPv4 in IPv4-compatible, NAT64, or 6to4
             extractEmbeddedIpv4(b)?.let { v4 ->
                 if (isAlwaysBlockedIpv4(v4)) return true
             }

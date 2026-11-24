@@ -304,7 +304,10 @@ class ReferenceAndJellyfinConformanceTest {
         val expectedToken = fixtures["authSuccess"]!!.jsonObject["AccessToken"]!!.jsonPrimitive.content
 
         val seenPaths = CopyOnWriteArrayList<String>()
+        val seenAuthHeaders = CopyOnWriteArrayList<String>()
         val playbackReqBodies = CopyOnWriteArrayList<String>()
+        val progressBodies = CopyOnWriteArrayList<Pair<String, String>>()
+        val forceExpiredToken = java.util.concurrent.atomic.AtomicBoolean(false)
 
         val server = MockWebServer()
         server.dispatcher = object : Dispatcher() {
@@ -318,7 +321,12 @@ class ReferenceAndJellyfinConformanceTest {
                     .addHeader("Content-Type", "application/json")
                     .setBody(el.toString())
 
+                if (path == "/System/Info/Public") {
+                    return okRaw(fixtures["systemInfoPublic"]!!)
+                }
                 if (path == "/Users/AuthenticateByName" && request.method == "POST") {
+                    val authHdr = request.getHeader("Authorization").orEmpty()
+                    seenAuthHeaders += authHdr
                     val body = json.parseToJsonElement(request.body.readUtf8()).jsonObject
                     return if (body["Pw"]?.jsonPrimitive?.content == "wrong-pw") {
                         MockResponse().setResponseCode(401).setBody("""{"message":"Unauthorized"}""")
@@ -327,7 +335,8 @@ class ReferenceAndJellyfinConformanceTest {
                     }
                 }
                 val authHdr = request.getHeader("Authorization").orEmpty()
-                if (!authHdr.contains("""Token="$expectedToken"""")) {
+                seenAuthHeaders += authHdr
+                if (forceExpiredToken.get() || !authHdr.contains("""Token="$expectedToken"""")) {
                     return MockResponse().setResponseCode(401)
                 }
 
@@ -364,8 +373,11 @@ class ReferenceAndJellyfinConformanceTest {
                     path == "/Shows/$seriesId/Seasons" -> okRaw(fixtures["seriesSeasons"]!!)
                     path == "/Shows/$seriesId/Episodes" -> okRaw(fixtures["seasonEpisodes"]!!)
                     path == "/Search/Hints" -> okRaw(fixtures["searchHints"]!!)
-                    path.startsWith("/Sessions/Playing") ||
-                        path.startsWith("/UserFavoriteItems/") ||
+                    path.startsWith("/Sessions/Playing") -> {
+                        progressBodies += path to request.body.readUtf8()
+                        MockResponse().setResponseCode(204)
+                    }
+                    path.startsWith("/UserFavoriteItems/") ||
                         path.startsWith("/UserPlayedItems/") ||
                         path == "/Sessions/Logout" -> MockResponse().setResponseCode(204)
                     else -> MockResponse().setResponseCode(404)
@@ -469,27 +481,70 @@ class ReferenceAndJellyfinConformanceTest {
             assertTrue(pb480.url.contains("/master.m3u8"))
             assertFalse("S10: transcode URL must not contain ApiKey", pb480.url.contains("apikey", ignoreCase = true))
 
-            // Search, suggest, progress, favorites, played, logout
+            // Search, suggest, progress (with PlayMethod DirectPlay & Transcode), favorites, played, logout
             assertTrue(source.search("Test").items.size >= 2)
             assertTrue(source.suggest("Test").isNotEmpty())
             source.reportProgress(h264MovieId, 1500L, 4000L, ProgressEvent.START, pbH264.sessionId)
             source.reportProgress(h264MovieId, 2000L, 4000L, ProgressEvent.PAUSE, pbH264.sessionId)
-            source.reportProgress(h264MovieId, 2000L, 4000L, ProgressEvent.STOP, pbH264.sessionId)
+            source.reportProgress(hevcMovieId, 2500L, 4000L, ProgressEvent.STOP, pb480.sessionId)
             source.setFavorite(h264MovieId, true)
+            source.setFavorite(h264MovieId, false)
             source.setPlayed(h264MovieId, true)
+            source.setPlayed(h264MovieId, false)
+
+            // Item #10: verify full MediaBrowser Authorization header format on authenticated requests
+            val authRegex = Regex(
+                """^MediaBrowser Client="depth3d", Device="[^"]+", DeviceId="depth3d-[0-9a-f]{16}", Version="[^"]+", Token="$expectedToken"$""",
+            )
+            assertTrue(
+                "Authenticated requests must match full MediaBrowser Authorization header format",
+                seenAuthHeaders.drop(1).all { authRegex.matches(it) },
+            )
+
+            // Item #10: verify exact request bodies for reportProgress (including PlayMethod!)
+            assertEquals(3, progressBodies.size)
+            val startBody = json.parseToJsonElement(progressBodies[0].second).jsonObject
+            assertEquals("/Sessions/Playing", progressBodies[0].first)
+            assertEquals(h264MovieId, startBody["ItemId"]!!.jsonPrimitive.content)
+            assertEquals(h264MovieId, startBody["MediaSourceId"]!!.jsonPrimitive.content)
+            assertEquals(15_000_000L, startBody["PositionTicks"]!!.jsonPrimitive.content.toLong())
+            assertEquals(false, startBody["IsPaused"]!!.jsonPrimitive.content.toBoolean())
+            assertEquals("DirectPlay", startBody["PlayMethod"]!!.jsonPrimitive.content)
+            assertEquals(pbH264.sessionId, startBody["PlaySessionId"]!!.jsonPrimitive.content)
+
+            val pauseBody = json.parseToJsonElement(progressBodies[1].second).jsonObject
+            assertEquals("/Sessions/Playing/Progress", progressBodies[1].first)
+            assertEquals(true, pauseBody["IsPaused"]!!.jsonPrimitive.content.toBoolean())
+            assertEquals("DirectPlay", pauseBody["PlayMethod"]!!.jsonPrimitive.content)
+
+            val stopBody = json.parseToJsonElement(progressBodies[2].second).jsonObject
+            assertEquals("/Sessions/Playing/Stopped", progressBodies[2].first)
+            assertEquals("Transcode", stopBody["PlayMethod"]!!.jsonPrimitive.content)
 
             // S10: ZERO unbounded ms_* keys written to storage.enc!
             val persistedStorage = InstanceStorage(File(rootDir, "instances/${inst.instanceId}/storage.enc"), secretBox)
             assertEquals(listOf("deviceId", "session"), persistedStorage.keys().sorted())
 
+            // Item #10: 401 on expired token clears session & throws SourceNeedsAuthException
+            forceExpiredToken.set(true)
+            assertThrowsType<SourceNeedsAuthException> { source.categories() }
+            val afterExpired = InstanceStorage(File(rootDir, "instances/${inst.instanceId}/storage.enc"), secretBox)
+            assertEquals(null, afterExpired.get("session"))
+            forceExpiredToken.set(false)
+
+            // Re-login & logout cleanly
+            assertTrue(source.loginForm().ok)
             source.logout()
+            assertTrue(seenPaths.contains("GET /System/Info/Public"))
             assertTrue(seenPaths.contains("GET /UserViews"))
             assertTrue(seenPaths.contains("GET /UserItems/Resume"))
             assertTrue(seenPaths.contains("POST /Sessions/Playing"))
             assertTrue(seenPaths.contains("POST /Sessions/Playing/Progress"))
             assertTrue(seenPaths.contains("POST /Sessions/Playing/Stopped"))
             assertTrue(seenPaths.contains("POST /UserFavoriteItems/$h264MovieId"))
+            assertTrue(seenPaths.contains("DELETE /UserFavoriteItems/$h264MovieId"))
             assertTrue(seenPaths.contains("POST /UserPlayedItems/$h264MovieId"))
+            assertTrue(seenPaths.contains("DELETE /UserPlayedItems/$h264MovieId"))
             assertTrue(seenPaths.contains("POST /Sessions/Logout"))
 
             // Wrong password -> SourceAuthFailedException
@@ -505,6 +560,181 @@ class ReferenceAndJellyfinConformanceTest {
             assertThrowsType<SourceAuthFailedException> { badSrc.loginForm() }
         } finally {
             mgr.shutdownAll()
+            server.shutdown()
+            rootDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun jellyfinHandlesVersionRoutingPartialHomeFailureCrossOriginUrlsAndDeviceCapabilityFallback(): Unit = runBlocking {
+        val jfDir = File(repoRoot, "plugins/jellyfin")
+        val fixtures = json.parseToJsonElement(
+            File(jfDir, "fixtures/recorded-responses.json").readText(),
+        ).jsonObject
+        val ids = fixtures["_meta"]!!.jsonObject["ids"]!!.jsonObject
+        val userId = ids["userId"]!!.jsonPrimitive.content
+        val moviesViewId = ids["moviesViewId"]!!.jsonPrimitive.content
+
+        val serverVersion = java.util.concurrent.atomic.AtomicReference("10.7.7")
+        val failNextUp = java.util.concurrent.atomic.AtomicBoolean(false)
+        val seenPaths = CopyOnWriteArrayList<String>()
+
+        val server = MockWebServer()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val url = request.requestUrl!!
+                val path = url.encodedPath
+                seenPaths += "${request.method} $path"
+
+                fun okJson(body: String) = MockResponse()
+                    .setResponseCode(200)
+                    .addHeader("Content-Type", "application/json")
+                    .setBody(body)
+
+                return when {
+                    path == "/System/Info/Public" -> okJson("""{"Version":"${serverVersion.get()}","ServerName":"Test"}""")
+                    path == "/Users/AuthenticateByName" -> okJson(fixtures["authSuccess"]!!.toString())
+                    path == "/Users/$userId/Views" || path == "/UserViews" -> okJson(fixtures["views"]!!.toString())
+                    path == "/Users/$userId/Items/Resume" || path == "/UserItems/Resume" -> okJson(fixtures["resume"]!!.toString())
+                    path == "/Shows/NextUp" -> {
+                        if (failNextUp.get()) MockResponse().setResponseCode(500)
+                        else okJson(fixtures["nextUp"]!!.toString())
+                    }
+                    path == "/Users/$userId/Items/Latest" || path == "/Items/Latest" -> {
+                        val pid = url.queryParameter("ParentId").orEmpty()
+                        okJson((fixtures["latestByParent"]!!.jsonObject[pid] ?: json.parseToJsonElement("[]")).toString())
+                    }
+                    path == "/Users/$userId/FavoriteItems/m1" || path == "/Users/$userId/PlayedItems/m1" ->
+                        MockResponse().setResponseCode(204)
+                    path == "/Items/cross-origin-item/PlaybackInfo" -> okJson(
+                        """
+                        {
+                          "PlaySessionId": "sess-cross",
+                          "MediaSources": [{
+                            "Id": "ms-cross",
+                            "SupportsDirectPlay": false,
+                            "TranscodingUrl": "https://other-cdn.example.net/transcode/master.m3u8?ApiKey=leaked",
+                            "RunTimeTicks": 600000000,
+                            "MediaStreams": [
+                              {"Type":"Video","Index":0,"Codec":"h264","Width":1920,"Height":1080},
+                              {"Type":"Subtitle","Index":1,"Codec":"srt","Language":"zh","DeliveryUrl":"https://subs-cdn.example.net/1.srt?api_key=leaked"}
+                            ]
+                          }]
+                        }
+                        """.trimIndent(),
+                    )
+                    path == "/Items/over-cap-item/PlaybackInfo" -> okJson(
+                        """
+                        {
+                          "PlaySessionId": "sess-cap",
+                          "MediaSources": [{
+                            "Id": "ms-cap",
+                            "SupportsDirectPlay": true,
+                            "RunTimeTicks": 600000000,
+                            "MediaStreams": [
+                              {"Type":"Video","Index":0,"Codec":"av1","Width":3840,"Height":2160}
+                            ]
+                          }]
+                        }
+                        """.trimIndent(),
+                    )
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+        }
+        server.start()
+
+        val rootDir = Files.createTempDirectory("d3-jf-r3").toFile()
+        val okHttp = OkHttpClient.Builder()
+            .proxy(Proxy.NO_PROXY)
+            .socketFactory(LocalRedirectSocketFactory("192.168.1.50", server.port))
+            .build()
+        val zip = PackageManagerAndMigrationTest.buildPluginZip(
+            manifestJson = File(jfDir, "manifest.json").readText(),
+            mainJs = File(jfDir, "main.js").readText(),
+            locales = mapOf("zh-CN" to File(jfDir, "locales/zh-CN.json").readText()),
+        )
+
+        try {
+            // 1. Server < 10.8.0 (10.7.7) -> SourceUnsupportedException
+            val mgr107 = PluginPackageManager(
+                rootDir = File(rootDir, "v107"),
+                store = InMemoryPluginStore(),
+                secretBox = SoftwareAesSecretBox(),
+                okHttpClient = okHttp,
+            )
+            try {
+                mgr107.installFromBytes(zip)
+                val inst = mgr107.createInstance(
+                    "dev.depth3d.jellyfin",
+                    "JF 10.7",
+                    mapOf(
+                        "server" to JsonPrimitive("http://192.168.1.50:${server.port}"),
+                        "username" to JsonPrimitive("d3tester"),
+                        "password" to JsonPrimitive("pw"),
+                    ),
+                )
+                val src = mgr107.openSource(inst.instanceId) { listOf(InetAddress.getByName("192.168.1.50")) }
+                val ex = assertThrowsType<SourceUnsupportedException> { src.loginForm() }
+                assertTrue("Unsupported message must mention 10.7.7 / 10.8", ex.message.orEmpty().contains("10.8"))
+            } finally {
+                mgr107.shutdownAll()
+            }
+
+            // 2. Server 10.8.13 -> legacy /Users/{uid}/... routes + partial home() failure tolerance + cross-origin URLs + device capability fallback
+            serverVersion.set("10.8.13")
+            failNextUp.set(true)
+            val mgr108 = PluginPackageManager(
+                rootDir = File(rootDir, "v108"),
+                store = InMemoryPluginStore(),
+                secretBox = SoftwareAesSecretBox(),
+                okHttpClient = okHttp,
+                // Device only supports 1920x1080 H.264/HEVC (NOT 4K AV1)
+                deviceInfo = DeviceInfo(maxWidth = 1920, maxHeight = 1080, codecs = listOf("avc", "hevc")),
+            )
+            try {
+                mgr108.installFromBytes(zip)
+                val inst = mgr108.createInstance(
+                    "dev.depth3d.jellyfin",
+                    "JF 10.8",
+                    mapOf(
+                        "server" to JsonPrimitive("http://192.168.1.50:${server.port}"),
+                        "username" to JsonPrimitive("d3tester"),
+                        "password" to JsonPrimitive("pw"),
+                    ),
+                )
+                val src = mgr108.openSource(inst.instanceId) { listOf(InetAddress.getByName("192.168.1.50")) }
+                assertTrue(src.loginForm().ok)
+
+                // home() succeeds even though /Shows/NextUp returned HTTP 500!
+                val shelves = src.home()
+                assertTrue("Surviving Resume shelf must still render", shelves.any { it.style == ShelfStyle.CONTINUE })
+                assertTrue("Surviving Latest shelf must still render", shelves.any { it.category.id == moviesViewId })
+
+                src.setFavorite("m1", true)
+                src.setPlayed("m1", true)
+                assertTrue("10.8.x must use legacy /Users/{uid}/Views", seenPaths.contains("GET /Users/$userId/Views"))
+                assertTrue("10.8.x must use legacy /Users/{uid}/Items/Resume", seenPaths.contains("GET /Users/$userId/Items/Resume"))
+                assertTrue("10.8.x must use legacy /Users/{uid}/Items/Latest", seenPaths.contains("GET /Users/$userId/Items/Latest"))
+                assertTrue("10.8.x must use legacy /Users/{uid}/FavoriteItems/m1", seenPaths.contains("POST /Users/$userId/FavoriteItems/m1"))
+                assertTrue("10.8.x must use legacy /Users/{uid}/PlayedItems/m1", seenPaths.contains("POST /Users/$userId/PlayedItems/m1"))
+
+                // Cross-origin TranscodingUrl & subtitle DeliveryUrl MUST NOT carry Jellyfin Authorization header!
+                val pbCross = src.playback("cross-origin-item")
+                assertEquals("https://other-cdn.example.net/transcode/master.m3u8", pbCross.url)
+                assertFalse("Cross-origin TranscodingUrl must omit Authorization", pbCross.headers.containsKey("Authorization"))
+                assertEquals(1, pbCross.subtitles.size)
+                assertEquals("https://subs-cdn.example.net/1.srt", pbCross.subtitles[0].url)
+                assertFalse("Cross-origin DeliveryUrl must omit Authorization", pbCross.subtitles[0].headers.containsKey("Authorization"))
+
+                // Device capability check: 4K AV1 item on 1080p AVC/HEVC device MUST fall back to HLS transcode!
+                val pbOverCap = src.playback("over-cap-item")
+                assertEquals("application/x-mpegURL", pbOverCap.mimeType)
+                assertTrue("Exceeding device resolution/codec must fall back to HLS transcode", pbOverCap.url.contains("/master.m3u8"))
+            } finally {
+                mgr108.shutdownAll()
+            }
+        } finally {
             server.shutdown()
             rootDir.deleteRecursively()
         }

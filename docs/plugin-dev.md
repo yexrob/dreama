@@ -4,6 +4,7 @@
 
 权威协议规范请直接查阅：
 - 完整协议与 API 参考：[docs/specs/plugin-protocol.md](specs/plugin-protocol.md)
+- 宿主播放器/播放墙接入规范（含 S7 异常分派与 `PluginPlayback`/`PluginImages` 入口）：[docs/specs/plugin-host-integration.md](specs/plugin-host-integration.md)
 - 共用 JSON Schema（App 与命令行工具同源校验）：[docs/specs/plugin-schema/](specs/plugin-schema/)
 - 覆盖全部能力的参考实现：[plugins/reference/](../plugins/reference/)
 - 真实服务端对接示例（Jellyfin）：[plugins/jellyfin/](../plugins/jellyfin/)
@@ -220,12 +221,12 @@ d3plugin serve ./my-media-plugin --port 8787
 |---|---|
 | `ctx.config` | 只读（已冻结）的用户配置对象 |
 | `ctx.instanceId` | 当前实例的唯一 ID，可用于区分多实例状态 |
-| `ctx.fetch(url, opts)` | 沙箱 HTTP 请求，支持 `method`、`headers`、`body`、`timeoutMs`、`redirect`（`follow`/`manual`/`error`），显式 `Cookie` 头与实例 Cookie 罐合并（同名显式优先）；禁止设置 `Host` 头与 HTTPS 降级重定向；单响应体上限 8 MB、每实例并发上限 4、在途字节上限 16 MB；返回 `{ status, ok, url, headers, text(), json(), bytes() }`（`bytes()` 返回 `ArrayBuffer`） |
-| `ctx.storage` | **异步**（必须 `await`）每实例独立加密存储：`await ctx.storage.get(k)`、`set(k, v)`、`remove(k)`、`keys()`，值为任意 JSON，总大小上限 1 MB；登录令牌请存这里 |
-| `ctx.cookies` | **异步**（必须 `await`）每实例独立加密 Cookie 罐（上限 256 KB）：`await ctx.cookies.get(url)` 返回可直接填入 `Cookie` 头的字符串，`await ctx.cookies.set(url, cookie)`，`await ctx.cookies.clear()` |
+| `ctx.fetch(url, opts)` | 沙箱 HTTP 请求，支持 `method`、`headers`、`body`、`timeoutMs`（**整条重定向链总时限**）、`redirect`（`follow`/`manual`/`error`），显式 `Cookie` 头与实例 Cookie 罐合并（同名显式优先）；禁止设置 `Host` 头与 HTTPS 降级重定向；跨源重定向仅保留 `Accept`、`Accept-Language`、`User-Agent`、`Range`，其余头（含 `Authorization`、`Cookie`、`Referer` 与插件自定义头）全部剥离；单响应体上限 8 MB、每实例并发上限 4、在途字节上限 16 MB；返回 `{ status, ok, url, headers, text(), json(), bytes() }`（`bytes()` 返回 `ArrayBuffer`）。**响应体为一次性消费**：首次调用 `text()`/`json()`/`bytes()` 后即释放宿主缓冲与在途字节配额，再次读取会抛出 `TypeError('Response body already consumed')`（App 与 `d3plugin` 行为一致） |
+| `ctx.storage` | **异步**（必须 `await`，`d3plugin run`/`check` 发现漏写 `await` 会直接报错并指出调用点）每实例独立加密存储：`await ctx.storage.get(k)`、`set(k, v)`、`remove(k)`、`keys()`，值为任意 JSON，总大小上限 1 MB（写入前按 UTF-8 字节数检查配额）；登录令牌请存这里 |
+| `ctx.cookies` | **异步**（必须 `await`，`d3plugin run`/`check` 同样检测漏写 `await`）每实例独立加密 Cookie 罐（上限 256 KB）：`await ctx.cookies.get(url)` 返回可直接填入 `Cookie` 头的字符串，`await ctx.cookies.set(url, cookie)`，`await ctx.cookies.clear()`；遵循 RFC 6265（`Max-Age` 优先于 `Expires`，忽略公共后缀或 Domain 不匹配的 Cookie 并记录 `WARN` 日志） |
 | `ctx.crypto` | `md5`、`sha1`、`sha256`、`hmac(algo, key, data)`、`aes.encrypt/decrypt(mode, key, iv, data, aad?)`（支持 `CBC` 与 `GCM`）、`rsa.encrypt(publicKeyPem, data, padding?)`、`randomBytes(n)`、`base64.encode/decode`、`hex.encode/decode` |
-| `ctx.parse` | `html(text)` / `xml(text)` 返回惰性只读 DOM 句柄（单次调用最多 8 个文档、单个上限 4 MB），支持 `querySelector` / `querySelectorAll` / `selectFirst` / `select` / `attr` / `attrs` / `text` / `html` / `outerHtml` / `children` |
-| `ctx.log` | `debug` / `info` / `warn` / `error`，自动加前缀 `depth3d: plugin <id>` 并抹掉常见凭据和密码 |
+| `ctx.parse` | `html(text)` / `xml(text)` 返回惰性只读 Document 根句柄（`tag === '#document'`；HTML 标签小写、XML 保留大小写并真正按 XML 解析自闭合标签与 CDATA；`text` 合并空白并去首尾空格；缺失属性 `attr()` 返回 `null`）；单次调用最多 8 个文档、单个上限 4 MB、总节点数上限 200,000，支持 `querySelector` / `querySelectorAll` / `selectFirst` / `select` / `attr` / `attrs` / `text` / `html` / `outerHtml` / `children` |
+| `ctx.log` | `debug` / `info` / `warn` / `error`，单条上限 4 KB（脱敏前截断）、环形缓冲上限 200 条且总计不超过 256 KB，自动加前缀 `depth3d: plugin <id>` 并抹掉常见凭据和密码 |
 | `ctx.device` | `{ appVersion, locale, model, maxWidth, maxHeight, codecs, hdr }`，用于按设备解码能力选流 |
 | `ctx.t(key, vars?)` | 读取 `locales/*.json` 中的翻译文案，支持 `{{name}}` 占位符 |
 | `new ctx.Error(code, msg?, opts?)` | 抛出协议定义错误；`RateLimited` 可传 `{ retryAfterSec: 30 }` |
@@ -234,10 +235,10 @@ d3plugin serve ./my-media-plugin --port 8787
 
 ## 5. 错误处理与运行时约束
 
-- **不要抛出原始技术异常给用户看**：业务可预期错误请抛出 `new ctx.Error(code, '给用户看的简体中文短句')`，可选的 `code` 为：`NeedsAuth`、`AuthFailed`、`NeedsSetup`、`Unavailable`、`NotFound`、`Forbidden`、`RateLimited`、`Unsupported`、`Internal`。
-- **无状态假设**：宿主随时可能销毁并重建 QuickJS 实例（例如超时或超过 64 MB 堆内存限制后）。跨调用必须持久化的凭据或会话 ID 请写入 `ctx.storage`。
-- **超时、内存与取消**：普通调用超时 15 秒，`playback` 超时 30 秒，超时后宿主取消在途网络请求、映射为 `Unavailable` 并重建运行时；单实例堆上限 64 MB。调用返回的 Promise 落定时，未完成的定时器和 `fetch` 会立即取消。
-- **音视频分离流、图片与地址过期**：当片源音视频分离时，在 `PlaybackInfo` 里返回 `dash: { video, audio }` 且**必须提供 `durationMs`**（带 `initRange`/`indexRange` 时 App 自动合成带 `dvb:priority` 的标准 MPD 支持字节范围拖动与按顺序容灾切换，否则使用 `MergingMediaSource` 按设备编码与所选音轨合并并自动切换 `backupUrls`）。`live: true` 不可与 `dash` 同时使用（直播请返回 `url` 如 HLS）。播放器拉取的所有流地址、清单内地址、分片、字幕和图片地址均在每次请求与每跳重定向经过网络策略校验，跨源重定向时剥离敏感头。如果播放链接带过期时间，请填写 `expiresAt`（毫秒时间戳），播放器会在过期前 60 秒自动重取。
+- **不要抛出原始技术异常给用户看**：业务可预期错误请抛出 `new ctx.Error(code, '给用户看的简体中文短句')`，可选的 `code` 为：`NeedsAuth`、`AuthFailed`、`NeedsSetup`、`Unavailable`、`NotFound`、`Forbidden`、`RateLimited`、`Unsupported`、`Internal`。普通 `Error`（哪怕消息里包含 `timeout`）一律归类为 `Internal`，只有宿主真实超时或中断才映射为 `Unavailable`。
+- **无状态假设**：宿主随时可能销毁并重建 QuickJS 实例（例如宿主超时或超过 64 MB 堆内存限制后；插件主动抛出 `new ctx.Error('Unavailable', ...)` 不会触发重建）。跨调用必须持久化的凭据或会话 ID 请写入 `ctx.storage`。
+- **超时、内存与资源上限**：普通调用超时 15 秒，`playback` 超时 30 秒，超时后宿主取消在途网络请求、映射为 `Unavailable` 并重建运行时；单实例堆上限 64 MB；单次调用返回值序列化上限 8 MB（超出映射为 `Internal`）；同时活跃的 `setTimeout` 上限 256 个。调用返回的 Promise 落定时，未完成的定时器和 `fetch` 会立即取消。
+- **音视频分离流、图片与地址过期**：当片源音视频分离时，在 `PlaybackInfo` 里返回 `dash: { video, audio }` 且**必须提供 `durationMs`**（带 `initRange`/`indexRange` 时 App 自动合成带 `dvb:priority` 的标准 MPD 支持字节范围拖动与按顺序容灾切换，否则使用 `MergingMediaSource` 按设备编码与所选音轨合并并支持打开失败与播放中途断流自动切换 `backupUrls`）。`live: true` 不可与 `dash` 同时使用（直播请返回 `url` 如 HLS）。播放器拉取的所有流地址、清单内地址、分片、字幕和图片地址均在每次请求与每跳重定向经过网络策略校验，跨源重定向剥离敏感头，且与主地址不同源的字幕不继承 `PlaybackInfo.headers`（只带字幕自身的 `headers`）。如果播放链接带过期时间，请填写 `expiresAt`（毫秒时间戳），播放器会在过期前 60 秒自动重取。
 - **DRM 与包体积**：协议 v1 不支持 Widevine 等 DRM，遇到加密流请明确抛出 `new ctx.Error('Unsupported', '该片源受 DRM 保护，暂不支持播放。')`。单个 `.d3plugin` 安装包上限 8 MB，仓库地址必须使用 HTTPS。
 
 ---

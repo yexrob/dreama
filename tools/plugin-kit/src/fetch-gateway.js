@@ -11,6 +11,7 @@ export const MAX_REDIRECTS = 10;
 
 const REDIRECT_CODES = new Set([301, 302, 303, 307, 308]);
 const ALLOWED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
+const CROSS_ORIGIN_SAFE_HEADERS = new Set(['accept', 'accept-language', 'user-agent', 'range']);
 
 export class FetchResponseTooLargeError extends Error {
   constructor(message) {
@@ -138,6 +139,7 @@ export class FetchGateway {
     }
 
     const timeoutMs = Math.min(Math.max(Number(req.timeoutMs || defaultTimeoutMs), 100), 30_000);
+    const deadlineMs = Date.now() + timeoutMs;
     let currentUrl = String(req.url);
     let prevScheme = null;
     let currentMethod = method;
@@ -147,6 +149,10 @@ export class FetchGateway {
 
     while (true) {
       if (signal.aborted) throw new Error('请求已取消');
+      const remainingMs = deadlineMs - Date.now();
+      if (remainingMs <= 0) {
+        throw new Error(`请求总耗时超过 ${timeoutMs} ms 上限`);
+      }
       const validated = await this.policy.validateFetchUrl(currentUrl, prevScheme);
       const urlObj = validated.url;
 
@@ -165,8 +171,8 @@ export class FetchGateway {
       if (mergedCookie) reqHeaders.Cookie = mergedCookie;
 
       const resp = this.transportOverride
-        ? await this._runTransportOverride(urlObj, validated.addresses, currentMethod, reqHeaders, currentBody, timeoutMs, signal)
-        : await this._httpRequest(urlObj, validated.addresses, currentMethod, reqHeaders, currentBody, timeoutMs, signal);
+        ? await this._runTransportOverride(urlObj, validated.addresses, currentMethod, reqHeaders, currentBody, remainingMs, deadlineMs, timeoutMs, signal)
+        : await this._httpRequest(urlObj, validated.addresses, currentMethod, reqHeaders, currentBody, remainingMs, deadlineMs, timeoutMs, signal);
 
       if (this.cookieJar && resp.setCookies?.length) {
         this.cookieJar.saveFromHeaders(urlObj.toString(), resp.setCookies);
@@ -191,8 +197,10 @@ export class FetchGateway {
           throw new NetworkPolicyError('无效的重定向目标地址');
         }
         if (originKey(resolved) !== originKey(urlObj)) {
+          // Keep ONLY safe general headers across cross-origin redirects;
+          // strip Authorization, Cookie, Referer, and ALL custom plugin headers.
           for (const k of Object.keys(currentHeaders)) {
-            if (k.toLowerCase() === 'authorization' || k.toLowerCase() === 'cookie') {
+            if (!CROSS_ORIGIN_SAFE_HEADERS.has(k.toLowerCase())) {
               delete currentHeaders[k];
             }
           }
@@ -220,16 +228,31 @@ export class FetchGateway {
     }
   }
 
-  async _runTransportOverride(urlObj, addresses, method, headers, body, timeoutMs, signal) {
-    const resp = await this.transportOverride({
-      url: urlObj,
-      addresses,
-      method,
-      headers,
-      body,
-      timeoutMs,
-      signal,
+  async _runTransportOverride(urlObj, addresses, method, headers, body, remainingMs, deadlineMs, totalTimeoutMs, signal) {
+    let timer = null;
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`请求总耗时超过 ${totalTimeoutMs} ms 上限`)), Math.max(1, remainingMs));
     });
+    let resp;
+    try {
+      resp = await Promise.race([
+        this.transportOverride({
+          url: urlObj,
+          addresses,
+          method,
+          headers,
+          body,
+          timeoutMs: remainingMs,
+          signal,
+        }),
+        timeoutPromise,
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    if (Date.now() > deadlineMs) {
+      throw new Error(`请求总耗时超过 ${totalTimeoutMs} ms 上限`);
+    }
     const buf = Buffer.isBuffer(resp.body) ? resp.body : Buffer.from(resp.body || '');
     if (buf.length > this.maxResponseBytes) {
       throw new FetchResponseTooLargeError(
@@ -241,10 +264,14 @@ export class FetchGateway {
     return { ...resp, body: buf };
   }
 
-  _httpRequest(urlObj, addresses, method, headers, body, timeoutMs, signal) {
+  _httpRequest(urlObj, addresses, method, headers, body, remainingMs, deadlineMs, totalTimeoutMs, signal) {
     return new Promise((resolve, reject) => {
       if (signal.aborted) {
         reject(new Error('请求已取消'));
+        return;
+      }
+      if (remainingMs <= 0) {
+        reject(new Error(`请求总耗时超过 ${totalTimeoutMs} ms 上限`));
         return;
       }
       const mod = urlObj.protocol === 'https:' ? https : http;
@@ -252,9 +279,11 @@ export class FetchGateway {
       const family = pinnedIp.includes(':') ? 6 : 4;
       let reserved = 0;
       let settled = false;
+      let deadlineTimer = null;
       const finish = (err, val) => {
         if (settled) return;
         settled = true;
+        if (deadlineTimer) clearTimeout(deadlineTimer);
         signal.removeEventListener('abort', onAbort);
         if (reserved > 0) {
           this.inFlightBudget.release(reserved);
@@ -269,7 +298,7 @@ export class FetchGateway {
         {
           method,
           headers,
-          timeout: timeoutMs,
+          timeout: remainingMs,
           lookup: (_hostname, _opts, cb) => {
             if (typeof _opts === 'function') {
               _opts(null, pinnedIp, family);
@@ -292,6 +321,11 @@ export class FetchGateway {
           const chunks = [];
           let total = 0;
           res.on('data', (chunk) => {
+            if (Date.now() > deadlineMs) {
+              res.destroy();
+              finish(new Error(`请求总耗时超过 ${totalTimeoutMs} ms 上限`));
+              return;
+            }
             total += chunk.length;
             if (total > this.maxResponseBytes) {
               res.destroy();
@@ -336,6 +370,11 @@ export class FetchGateway {
         },
       );
 
+      deadlineTimer = setTimeout(() => {
+        req.destroy(new Error(`请求总耗时超过 ${totalTimeoutMs} ms 上限`));
+        finish(new Error(`请求总耗时超过 ${totalTimeoutMs} ms 上限`));
+      }, Math.max(1, remainingMs));
+
       const onAbort = () => {
         req.destroy(new Error('请求已取消'));
         finish(new Error('请求已取消'));
@@ -343,7 +382,7 @@ export class FetchGateway {
       signal.addEventListener('abort', onAbort, { once: true });
 
       req.on('timeout', () => {
-        req.destroy(new Error('请求超时'));
+        req.destroy(new Error(`请求总耗时超过 ${totalTimeoutMs} ms 上限`));
       });
       req.on('error', (err) => finish(err));
       if (body && method !== 'GET' && method !== 'HEAD') {

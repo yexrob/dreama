@@ -80,6 +80,27 @@ class PlaybackMediaSourceFactoryTest {
         val prog = factory.plan(PlaybackInfo(url = "https://cdn.example.com/video.mp4", title = "MP4"))
         assertEquals(DirectStreamType.PROGRESSIVE, (prog.stream as ResolvedStreamPlan.DirectUrl).streamType)
 
+        // Item #9: Cross-origin subtitle MUST NOT inherit PlaybackInfo.headers (only keeps its own sub.headers)
+        val crossSubPlan = factory.plan(
+            PlaybackInfo(
+                url = "https://stream.example.com/video.mp4",
+                headers = mapOf("Authorization" to "Bearer stream-secret", "Referer" to "https://stream.example.com/"),
+                subtitles = listOf(
+                    SubtitleTrack(
+                        id = "cross-1",
+                        label = "外站字幕",
+                        url = "https://subs.other-cdn.example.net/en.vtt",
+                        format = SubtitleFormat.VTT,
+                        headers = mapOf("X-Sub-Only" to "yes"),
+                    ),
+                ),
+            ),
+        )
+        val crossSub = crossSubPlan.subtitles.single()
+        assertNull("Cross-origin subtitle must NOT inherit Authorization", crossSub.effectiveHeaders["Authorization"])
+        assertNull("Cross-origin subtitle must NOT inherit Referer", crossSub.effectiveHeaders["Referer"])
+        assertEquals("yes", crossSub.effectiveHeaders["X-Sub-Only"])
+
         val dashUrl = factory.plan(
             PlaybackInfo(url = "https://cdn.example.com/play?id=1", title = "DASH", mimeType = "application/dash+xml"),
         )

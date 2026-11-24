@@ -14,26 +14,23 @@ import kotlinx.serialization.json.put
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
-import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.CRC32
-import java.util.zip.ZipInputStream
+import java.util.zip.DataFormatException
+import java.util.zip.Inflater
 
 /**
  * Unpacked in-memory representation of a `.d3plugin` archive.
  *
- * Per protocol §11.4 (S9), [inspect] parses BOTH the Zip Central Directory AND
- * every Local File Header sequentially, rejecting archives with:
- * - Size above 8 MB (§11.4)
- * - Missing/corrupt EOCD or trailing data after EOCD
- * - Duplicate filenames (raw or normalized) or zip-slip paths
- * - Any mismatch between Central Directory entries and Local File Headers
- *   (entry count, filename bytes, compression method, CRC-32, sizes, or hidden
- *   unindexed local headers)
+ * Per protocol §11.4 (S9), [inspect] parses the Zip Central Directory AND walks
+ * continuously from byte offset `0` to `cdOffset` with ZERO gaps and ZERO
+ * unindexed Local File Headers, matching every LFH 1-to-1 by exact byte offset
+ * against the Central Directory and decompressing ONLY from Central Directory
+ * offsets/sizes (never via `ZipInputStream`).
  */
 data class PluginPackageArchive(
     val manifestJson: String,
@@ -53,12 +50,18 @@ data class PluginPackageArchive(
         val localHeaderOffset: Int,
     )
 
+    private data class ParsedCentralDirectory(
+        val cdOffset: Int,
+        val entriesByOffset: Map<Int, CentralDirEntry>,
+    )
+
     companion object {
         const val MAX_PACKAGE_BYTES = 8 * 1024 * 1024
         private const val MAX_ENTRIES = 64
         private const val MAX_UNPACKED_BYTES = 16 * 1024 * 1024
 
         private const val SIG_LFH = 0x04034b50L
+        private const val SIG_DD = 0x08074b50L
         private const val SIG_CDH = 0x02014b50L
         private const val SIG_EOCD = 0x06054b50L
 
@@ -70,71 +73,125 @@ data class PluginPackageArchive(
                 throw PackageInstallException("插件包不是有效的 zip 文件")
             }
 
-            // 1. Parse End of Central Directory + Central Directory and validate every referenced Local File Header
-            val cdEntries = parseAndVerifyCentralDirectory(zipBytes)
-            val cdByRawName = LinkedHashMap<String, CentralDirEntry>(cdEntries.size)
-            for (cd in cdEntries) {
-                cdByRawName[cd.rawName] = cd
-            }
+            // 1. Parse End of Central Directory + Central Directory strictly (zero trailing bytes)
+            val parsedCd = parseCentralDirectory(zipBytes)
+            val cdOffset = parsedCd.cdOffset
+            val cdByOffset = parsedCd.entriesByOffset
 
-            // 2. Walk Local File Headers sequentially via ZipInputStream and cross-check 1-to-1 against Central Directory
+            // 2. Walk EVERY Local File Header continuously from byte 0 to cdOffset with zero gaps
             var manifestJson: String? = null
             var mainJs: String? = null
             var iconPng: ByteArray? = null
             val locales = LinkedHashMap<String, String>()
-            val seenRawNames = LinkedHashSet<String>()
-            var totalBytes = 0L
+            var lfhPos = 0
+            var walkedCount = 0
+            var totalUnpacked = 0L
 
-            try {
-                ZipInputStream(ByteArrayInputStream(zipBytes)).use { zis ->
-                    while (true) {
-                        val entry = zis.nextEntry ?: break
-                        val rawName = entry.name
-                        if (!seenRawNames.add(rawName)) {
-                            throw PackageInstallException("插件包包含重复的 zip 条目：$rawName")
-                        }
-                        val cd = cdByRawName[rawName]
-                            ?: throw PackageInstallException("插件包 zip 中央目录与本地文件头不一致：未登记条目 $rawName")
+            while (lfhPos < cdOffset) {
+                if (lfhPos + 30 > cdOffset || readU32(zipBytes, lfhPos) != SIG_LFH) {
+                    throw PackageInstallException("插件包 zip 本地文件头流存在非法间隙或损坏字节")
+                }
+                val cd = cdByOffset[lfhPos]
+                    ?: throw PackageInstallException("插件包 zip 存在未在中央目录登记的本地文件头（偏移 $lfhPos）")
 
-                        val content = readBounded(zis, MAX_UNPACKED_BYTES - totalBytes)
-                        totalBytes += content.size
+                val lfhFlags = readU16(zipBytes, lfhPos + 6)
+                val lfhMethod = readU16(zipBytes, lfhPos + 8)
+                val lfhCrc = readU32(zipBytes, lfhPos + 14)
+                val lfhCompSize = readU32(zipBytes, lfhPos + 18)
+                val lfhUncompSize = readU32(zipBytes, lfhPos + 22)
+                val lfhNameLen = readU16(zipBytes, lfhPos + 26)
+                val lfhExtraLen = readU16(zipBytes, lfhPos + 28)
 
-                        if (entry.isDirectory) {
-                            if (content.isNotEmpty() || cd.uncompSize != 0L) {
-                                throw PackageInstallException("插件包 zip 目录条目数据异常：$rawName")
-                            }
-                            continue
-                        }
+                val dataStartLong = lfhPos.toLong() + 30L + lfhNameLen.toLong() + lfhExtraLen.toLong()
+                if (dataStartLong > cdOffset.toLong()) {
+                    throw PackageInstallException("插件包 zip 本地文件头越界：${cd.rawName}")
+                }
+                val dataStart = dataStartLong.toInt()
+                val lfhNameBytes = zipBytes.copyOfRange(lfhPos + 30, lfhPos + 30 + lfhNameLen)
+                if (!lfhNameBytes.contentEquals(cd.rawNameBytes)) {
+                    throw PackageInstallException("插件包 zip 中央目录与本地文件头文件名不一致：${cd.rawName}")
+                }
+                if (lfhMethod != cd.method) {
+                    throw PackageInstallException("插件包 zip 中央目录与本地文件头压缩方式不一致：${cd.rawName}")
+                }
 
-                        if (content.size.toLong() != cd.uncompSize) {
-                            throw PackageInstallException("插件包 zip 中央目录与实际内容大小不一致：$rawName")
-                        }
-                        val crc = CRC32().apply { update(content) }.value
-                        if (crc != cd.crc32) {
-                            throw PackageInstallException("插件包 zip 校验和不一致：$rawName")
-                        }
+                val hasDataDescriptor = (lfhFlags and 0x08) != 0
+                if (!hasDataDescriptor) {
+                    if (lfhCrc != cd.crc32 || lfhCompSize != cd.compSize || lfhUncompSize != cd.uncompSize) {
+                        throw PackageInstallException("插件包 zip 中央目录与本地文件头校验信息不一致：${cd.rawName}")
+                    }
+                }
 
-                        val norm = cd.normalizedName
-                        when {
-                            norm == "manifest.json" -> manifestJson = String(content, Charsets.UTF_8)
-                            norm == "main.js" -> mainJs = String(content, Charsets.UTF_8)
-                            norm == "icon.png" -> iconPng = content
-                            norm.startsWith("locales/") && norm.endsWith(".json") -> {
-                                val tag = norm.removePrefix("locales/").removeSuffix(".json")
-                                if (tag.isNotEmpty() && !tag.contains('/')) {
-                                    locales[tag] = String(content, Charsets.UTF_8)
-                                }
+                val dataEndLong = dataStartLong + cd.compSize
+                if (dataEndLong > cdOffset.toLong()) {
+                    throw PackageInstallException("插件包 zip 条目压缩数据越界：${cd.rawName}")
+                }
+                val dataEnd = dataEndLong.toInt()
+
+                var nextLfhPos = dataEnd
+                if (hasDataDescriptor) {
+                    if (nextLfhPos + 12 > cdOffset) {
+                        throw PackageInstallException("插件包 zip 数据描述符不完整：${cd.rawName}")
+                    }
+                    if (readU32(zipBytes, nextLfhPos) == SIG_DD) {
+                        nextLfhPos += 4
+                    }
+                    if (nextLfhPos + 12 > cdOffset) {
+                        throw PackageInstallException("插件包 zip 数据描述符不完整：${cd.rawName}")
+                    }
+                    val ddCrc = readU32(zipBytes, nextLfhPos)
+                    val ddComp = readU32(zipBytes, nextLfhPos + 4)
+                    val ddUncomp = readU32(zipBytes, nextLfhPos + 8)
+                    if (ddCrc != cd.crc32 || ddComp != cd.compSize || ddUncomp != cd.uncompSize) {
+                        throw PackageInstallException("插件包 zip 数据描述符与中央目录不一致：${cd.rawName}")
+                    }
+                    nextLfhPos += 12
+                }
+
+                val remaining = MAX_UNPACKED_BYTES - totalUnpacked
+                if (cd.uncompSize > remaining) {
+                    throw PackageInstallException("插件包解压后超过大小限制")
+                }
+
+                // Decompress strictly from Central Directory offset/size
+                val content = when (cd.method) {
+                    0 -> zipBytes.copyOfRange(dataStart, dataEnd)
+                    8 -> inflateRawBounded(zipBytes, dataStart, cd.compSize.toInt(), remaining, cd.rawName)
+                    else -> throw PackageInstallException("不支持的 zip 压缩方式：${cd.method}")
+                }
+                totalUnpacked += content.size
+
+                if (cd.rawName.endsWith("/")) {
+                    if (content.isNotEmpty() || cd.uncompSize != 0L) {
+                        throw PackageInstallException("插件包 zip 目录条目数据异常：${cd.rawName}")
+                    }
+                } else {
+                    if (content.size.toLong() != cd.uncompSize) {
+                        throw PackageInstallException("插件包 zip 中央目录与实际内容大小不一致：${cd.rawName}")
+                    }
+                    val crc = CRC32().apply { update(content) }.value
+                    if (crc != cd.crc32) {
+                        throw PackageInstallException("插件包 zip 校验和不一致：${cd.rawName}")
+                    }
+                    val norm = cd.normalizedName
+                    when {
+                        norm == "manifest.json" -> manifestJson = String(content, Charsets.UTF_8)
+                        norm == "main.js" -> mainJs = String(content, Charsets.UTF_8)
+                        norm == "icon.png" -> iconPng = content
+                        norm.startsWith("locales/") && norm.endsWith(".json") -> {
+                            val tag = norm.removePrefix("locales/").removeSuffix(".json")
+                            if (tag.isNotEmpty() && !tag.contains('/')) {
+                                locales[tag] = String(content, Charsets.UTF_8)
                             }
                         }
                     }
                 }
-            } catch (e: PackageInstallException) {
-                throw e
-            } catch (e: Exception) {
-                throw PackageInstallException("无法读取插件包 zip 内容：${e.message}", e)
+
+                walkedCount += 1
+                lfhPos = nextLfhPos
             }
 
-            if (seenRawNames.size != cdByRawName.size) {
+            if (walkedCount != cdByOffset.size) {
                 throw PackageInstallException("插件包 zip 中央目录与本地文件头条目数量不一致")
             }
 
@@ -152,7 +209,7 @@ data class PluginPackageArchive(
             )
         }
 
-        private fun parseAndVerifyCentralDirectory(bytes: ByteArray): List<CentralDirEntry> {
+        private fun parseCentralDirectory(bytes: ByteArray): ParsedCentralDirectory {
             val minOffset = maxOf(0, bytes.size - 22 - 65535)
             var eocdOffset = -1
             for (pos in (bytes.size - 22) downTo minOffset) {
@@ -188,7 +245,7 @@ data class PluginPackageArchive(
                 throw PackageInstallException("插件包 zip 中央目录偏移与长度异常")
             }
 
-            val entries = ArrayList<CentralDirEntry>(totalEntries)
+            val entriesByOffset = LinkedHashMap<Int, CentralDirEntry>(totalEntries)
             val seenRaw = HashSet<String>()
             val seenNorm = HashSet<String>()
             var pos = cdOffset.toInt()
@@ -231,38 +288,12 @@ data class PluginPackageArchive(
                 if (lfhOffset < 0 || lfhOffset + 30 > cdOffset) {
                     throw PackageInstallException("插件包 zip 本地文件头偏移越界：$rawName")
                 }
-
-                // Cross-check referenced Local File Header directly
                 val lfhPos = lfhOffset.toInt()
-                if (readU32(bytes, lfhPos) != SIG_LFH) {
-                    throw PackageInstallException("插件包 zip 本地文件头签名无效：$rawName")
-                }
-                val lfhFlags = readU16(bytes, lfhPos + 6)
-                val lfhMethod = readU16(bytes, lfhPos + 8)
-                val lfhCrc = readU32(bytes, lfhPos + 14)
-                val lfhCompSize = readU32(bytes, lfhPos + 18)
-                val lfhUncompSize = readU32(bytes, lfhPos + 22)
-                val lfhNameLen = readU16(bytes, lfhPos + 26)
-                val lfhExtraLen = readU16(bytes, lfhPos + 28)
-
-                if (lfhPos + 30 + lfhNameLen + lfhExtraLen > cdOffset) {
-                    throw PackageInstallException("插件包 zip 本地文件头越界：$rawName")
-                }
-                val lfhRawNameBytes = bytes.copyOfRange(lfhPos + 30, lfhPos + 30 + lfhNameLen)
-                if (!lfhRawNameBytes.contentEquals(rawNameBytes)) {
-                    throw PackageInstallException("插件包 zip 中央目录与本地文件头文件名不一致：$rawName")
-                }
-                if (lfhMethod != method) {
-                    throw PackageInstallException("插件包 zip 中央目录与本地文件头压缩方式不一致：$rawName")
-                }
-                val hasDataDescriptor = (lfhFlags and 0x08) != 0
-                if (!hasDataDescriptor) {
-                    if (lfhCrc != crc32 || lfhCompSize != compSize || lfhUncompSize != uncompSize) {
-                        throw PackageInstallException("插件包 zip 中央目录与本地文件头校验信息不一致：$rawName")
-                    }
+                if (entriesByOffset.containsKey(lfhPos)) {
+                    throw PackageInstallException("插件包 zip 多个中央目录条目指向同一本地文件头：$rawName")
                 }
 
-                entries += CentralDirEntry(
+                entriesByOffset[lfhPos] = CentralDirEntry(
                     rawName = rawName,
                     rawNameBytes = rawNameBytes,
                     normalizedName = normName,
@@ -279,7 +310,43 @@ data class PluginPackageArchive(
             if (pos != eocdOffset) {
                 throw PackageInstallException("插件包 zip 中央目录存在多余未解析字节")
             }
-            return entries
+            return ParsedCentralDirectory(cdOffset = cdOffset.toInt(), entriesByOffset = entriesByOffset)
+        }
+
+        private fun inflateRawBounded(
+            bytes: ByteArray,
+            offset: Int,
+            length: Int,
+            maxOutputBytes: Long,
+            entryName: String,
+        ): ByteArray {
+            val inflater = Inflater(/* nowrap = */ true)
+            val out = ByteArrayOutputStream()
+            val buf = ByteArray(8192)
+            var total = 0L
+            try {
+                inflater.setInput(bytes, offset, length)
+                while (!inflater.finished()) {
+                    val count = inflater.inflate(buf)
+                    if (count > 0) {
+                        total += count
+                        if (total > maxOutputBytes) {
+                            throw PackageInstallException("插件包解压后超过大小限制")
+                        }
+                        out.write(buf, 0, count)
+                    } else if (inflater.needsInput() || inflater.needsDictionary()) {
+                        break
+                    }
+                }
+                if (!inflater.finished() || inflater.remaining != 0) {
+                    throw PackageInstallException("插件包 zip 压缩数据损坏或存在尾随字节：$entryName")
+                }
+                return out.toByteArray()
+            } catch (e: DataFormatException) {
+                throw PackageInstallException("无法解压插件包条目 $entryName：${e.message}", e)
+            } finally {
+                inflater.end()
+            }
         }
 
         private fun readU16(bytes: ByteArray, offset: Int): Int =
@@ -297,22 +364,6 @@ data class PluginPackageArchive(
                 throw PackageInstallException("插件包包含非法路径：$raw")
             }
             return cleaned
-        }
-
-        private fun readBounded(stream: ZipInputStream, remainingBytes: Long): ByteArray {
-            val out = ByteArrayOutputStream()
-            val buf = ByteArray(8192)
-            var count = 0L
-            while (true) {
-                val read = stream.read(buf)
-                if (read < 0) break
-                count += read
-                if (count > remainingBytes) {
-                    throw PackageInstallException("插件包解压后超过大小限制")
-                }
-                out.write(buf, 0, read)
-            }
-            return out.toByteArray()
         }
     }
 }
@@ -338,6 +389,23 @@ data class InstallResult(
     val isUpdate: Boolean,
     val needsPermissionReconfirm: Boolean,
     val replacedDifferentSource: Boolean = false,
+)
+
+/**
+ * Pre-install confirmation summary returned by [PluginPackageManager.previewPackage]
+ * so the install confirmation UI can show requested permissions, source-change
+ * replacement warnings, and the explicit wildcard-LAN access warning (§7, §11.4).
+ */
+data class PluginInstallPreview(
+    val manifest: PluginManifest,
+    val sha256: String,
+    val sizeBytes: Int,
+    val sourceOrigin: String,
+    val isUpdate: Boolean,
+    val requiresReplacementConfirmation: Boolean,
+    val needsPermissionReconfirm: Boolean,
+    val allowsWildcardLanAccess: Boolean,
+    val permissionWarnings: List<String>,
 )
 
 /**
@@ -484,6 +552,54 @@ class PluginPackageManager(
         instanceLocks.computeIfAbsent(instanceId) { Mutex() }
 
     /**
+     * Inspects a `.d3plugin` archive before installation and returns a
+     * [PluginInstallPreview] for the install confirmation UI (including
+     * [PluginInstallPreview.allowsWildcardLanAccess] and human-readable
+     * permission warnings).
+     */
+    suspend fun previewPackage(
+        zipBytes: ByteArray,
+        sourceUrl: String? = null,
+        repoUrl: String? = null,
+    ): PluginInstallPreview {
+        if (zipBytes.size > PluginPackageArchive.MAX_PACKAGE_BYTES) {
+            throw PackageInstallException("插件包超过大小限制（上限 8 MB）")
+        }
+        val actualSha = PluginRepositoryClient.sha256Hex(zipBytes)
+        val archive = PluginPackageArchive.inspect(zipBytes)
+        val manifest = ManifestParser.parseAndValidate(archive.manifestJson)
+        val newSourceOrigin = canonicalSourceOrigin(repoUrl = repoUrl, sourceUrl = sourceUrl)
+        val existing = store.getPackage(manifest.id)
+        val differentSource = existing != null && isDifferentSource(existing.sourceOrigin, newSourceOrigin)
+        val isUpdate = existing != null && !differentSource
+        val needsReconfirm = if (isUpdate) {
+            val prevApproved = PluginPermissions.fromJsonString(existing.approvedPermissionsJson)
+            manifest.permissions.isExpandedFrom(prevApproved) || existing.needsPermissionReconfirm
+        } else {
+            false
+        }
+        val warnings = buildList {
+            if (manifest.permissions.allowsWildcardLanAccess) {
+                add(WILDCARD_LAN_WARNING)
+            }
+            if (differentSource) {
+                add("已安装同 ID 插件但来源不同，继续安装将替换原插件并清除其所有配置、登录信息和本地数据。")
+            }
+        }
+        return PluginInstallPreview(
+            manifest = manifest,
+            sha256 = actualSha,
+            sizeBytes = zipBytes.size,
+            sourceOrigin = newSourceOrigin,
+            isUpdate = isUpdate,
+            requiresReplacementConfirmation = differentSource,
+            needsPermissionReconfirm = needsReconfirm,
+            allowsWildcardLanAccess = manifest.permissions.allowsWildcardLanAccess,
+            permissionWarnings = warnings,
+        )
+    }
+
+    /**
      * Installs, upgrades (same source), or replaces (different source with
      * explicit [confirmReplaceFromDifferentSource] = true) a `.d3plugin` archive.
      */
@@ -524,7 +640,7 @@ class PluginPackageManager(
         val existing = store.getPackage(manifest.id)
         val now = clockMs()
 
-        val differentSource = existing != null && existing.sourceOrigin != newSourceOrigin
+        val differentSource = existing != null && isDifferentSource(existing.sourceOrigin, newSourceOrigin)
         if (differentSource && !confirmReplaceFromDifferentSource) {
             throw PluginSourceMismatchException(
                 pluginId = manifest.id,
@@ -773,10 +889,6 @@ class PluginPackageManager(
             val localizedManifest = locale.localizeManifest(manifest)
             val config = getInstanceConfig(instanceId)
 
-            val instDir = File(instancesDir, instanceId)
-            val storage = InstanceStorage(File(instDir, "storage.enc"), secretBox)
-            val cookieJar = PluginCookieJar(File(instDir, "cookies.enc"), secretBox)
-
             val passwordKeys = manifest.passwordConfigKeys()
             val logger = PluginLogger(
                 pluginId = manifest.id,
@@ -784,6 +896,13 @@ class PluginPackageManager(
                 knownSecretsProvider = {
                     passwordKeys.mapNotNull { k -> (config[k] as? JsonPrimitive)?.content }
                 },
+            )
+            val instDir = File(instancesDir, instanceId)
+            val storage = InstanceStorage(File(instDir, "storage.enc"), secretBox)
+            val cookieJar = PluginCookieJar(
+                file = File(instDir, "cookies.enc"),
+                secretBox = secretBox,
+                onWarning = { msg -> logger.warn(msg) },
             )
             val userHosts = NetworkPolicy.extractUserHosts(manifest, config)
             val policy = if (dnsResolver != null) {
@@ -910,19 +1029,38 @@ class PluginPackageManager(
     }
 
     companion object {
+        const val LOCAL_FILE_ORIGIN = "local-file"
+        const val WILDCARD_LAN_WARNING = "可访问你局域网里的任意设备"
+
+        /**
+         * Returns true when installing from [newSourceOrigin] over an already
+         * installed plugin from [existingSourceOrigin] MUST be treated as a
+         * replacement (requiring explicit confirmation and wiping all instances,
+         * configs, storage, and cookies).
+         *
+         * Per §11.4 and Round 3 hardening: local-file installs have no stable
+         * source identity independent of content, so installing the same `id`
+         * from a local file ALWAYS requires replacement confirmation and never
+         * inherits existing state.
+         */
+        fun isDifferentSource(existingSourceOrigin: String, newSourceOrigin: String): Boolean {
+            if (newSourceOrigin == LOCAL_FILE_ORIGIN || existingSourceOrigin == LOCAL_FILE_ORIGIN) {
+                return true
+            }
+            return existingSourceOrigin != newSourceOrigin
+        }
+
         /**
          * Computes canonical source identity for `(pluginId, sourceOrigin)` (§11.4):
-         * - Repository installs identify by normalized repository index URL
-         * - Direct HTTP(S) installs identify by URL origin (`scheme://host:port`)
-         * - Local file installs identify as `"local-file"`
+         * - Repository installs identify by normalized repository index URL (query/fragment stripped)
+         * - Direct HTTP(S) URL installs identify by full normalized URL stripped of query & fragment
+         * - Local file installs identify as [LOCAL_FILE_ORIGIN] (never treated as same-source update)
          */
         fun canonicalSourceOrigin(repoUrl: String?, sourceUrl: String?): String {
             if (!repoUrl.isNullOrBlank()) {
                 val parsed = repoUrl.trim().toHttpUrlOrNull()
                 return if (parsed != null) {
-                    val portPart = if (parsed.port == HttpUrl.defaultPort(parsed.scheme)) "" else ":${parsed.port}"
-                    val path = parsed.encodedPath.trimEnd('/').ifEmpty { "/" }
-                    "repo:${parsed.scheme}://${NetworkPolicy.canonicalizeHost(parsed.host)}$portPart$path"
+                    "repo:${canonicalUrlWithoutQueryOrFragment(parsed)}"
                 } else {
                     "repo:${repoUrl.trim()}"
                 }
@@ -931,14 +1069,22 @@ class PluginPackageManager(
                 val trimmed = sourceUrl.trim()
                 val parsed = trimmed.toHttpUrlOrNull()
                 if (parsed != null) {
-                    return "url:${NetworkPolicy.originKey(parsed)}"
+                    return "url:${canonicalUrlWithoutQueryOrFragment(parsed)}"
                 }
                 if (trimmed.startsWith("file:", ignoreCase = true)) {
-                    return "local-file"
+                    return LOCAL_FILE_ORIGIN
                 }
                 return "other:$trimmed"
             }
-            return "local-file"
+            return LOCAL_FILE_ORIGIN
+        }
+
+        private fun canonicalUrlWithoutQueryOrFragment(url: HttpUrl): String {
+            val portPart = if (url.port == HttpUrl.defaultPort(url.scheme)) "" else ":${url.port}"
+            val host = NetworkPolicy.canonicalizeHost(url.host)
+            val hostFormatted = if (host.contains(':')) "[$host]" else host
+            val path = url.encodedPath.trimEnd('/').ifEmpty { "/" }
+            return "${url.scheme.lowercase()}://$hostFormatted$portPart$path"
         }
     }
 }

@@ -21,6 +21,7 @@ import okhttp3.mockwebserver.RecordedRequest
 import okio.Buffer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
@@ -421,7 +422,8 @@ class PackageManagerAndMigrationTest {
                 """.trimIndent(),
                 minimalJs,
             )
-            val r1 = mgr.installFromBytes(v1Zip)
+            val sameRepo = "https://repo.example.com/index.json"
+            val r1 = mgr.installFromBytes(v1Zip, repoUrl = sameRepo)
             assertFalse(r1.isUpdate)
             assertFalse(r1.needsPermissionReconfirm)
 
@@ -453,7 +455,7 @@ class PackageManagerAndMigrationTest {
 
             // Same-source downgrade / same version rejected
             try {
-                mgr.installFromBytes(v1Zip)
+                mgr.installFromBytes(v1Zip, repoUrl = sameRepo)
                 fail("Same version update must be rejected")
             } catch (_: PackageInstallException) {
             }
@@ -474,7 +476,7 @@ class PackageManagerAndMigrationTest {
                 """.trimIndent(),
                 minimalJs,
             )
-            val r2 = mgr.installFromBytes(v2Zip)
+            val r2 = mgr.installFromBytes(v2Zip, repoUrl = sameRepo)
             assertTrue(r2.isUpdate)
             assertTrue(r2.needsPermissionReconfirm)
 
@@ -505,6 +507,166 @@ class PackageManagerAndMigrationTest {
         } finally {
             mgr.shutdownAll()
             rootDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun passesAllSharedZipSecurityVectorsIncludingDualZipPoc() {
+        // Item #1: exact same zip-vectors.json (including 407-byte dual.zip PoC and 5 variants)
+        // verified identically on Android PluginPackageArchive.inspect and Node inspectArchiveBuffer
+        val repoRoot = ManifestAndPermissionTest.locateRepoRoot()
+        val raw = File(repoRoot, "docs/specs/plugin-schema/zip-vectors.json").readText()
+        val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+        val cases = json.parseToJsonElement(raw).let { it as kotlinx.serialization.json.JsonObject }["cases"]!!
+            .let { it as kotlinx.serialization.json.JsonArray }
+        assertTrue(cases.size >= 8)
+
+        for (el in cases) {
+            val obj = el as kotlinx.serialization.json.JsonObject
+            val name = (obj["name"] as JsonPrimitive).content
+            val valid = (obj["valid"] as JsonPrimitive).content.toBoolean()
+            val bytes = PluginCrypto.base64Decode((obj["base64"] as JsonPrimitive).content)
+            if (valid) {
+                val archive = PluginPackageArchive.inspect(bytes)
+                val expectedPrefix = (obj["expectedMainJsPrefix"] as? JsonPrimitive)?.content
+                if (expectedPrefix != null) {
+                    assertTrue("Valid zip '$name' mainJs mismatch", archive.mainJs.startsWith(expectedPrefix))
+                }
+            } else {
+                try {
+                    PluginPackageArchive.inspect(bytes)
+                    fail("Crafted malicious zip vector '$name' MUST be rejected by PluginPackageArchive.inspect")
+                } catch (_: PackageInstallException) {
+                }
+            }
+        }
+    }
+
+    @Test
+    fun localFileReinstallAlwaysReplacesUrlUsesFullPathAndPreviewFlagsWildcardLan(): Unit = runBlocking {
+        val rootDir = Files.createTempDirectory("d3-origin-preview").toFile()
+        val store = InMemoryPluginStore()
+        val secretBox = SoftwareAesSecretBox()
+        val mgr = PluginPackageManager(rootDir = rootDir, store = store, secretBox = secretBox)
+        val minimalJs = """
+            export default {
+              async home(ctx) {
+                await ctx.storage.set('secret', 'from-old-file');
+                return [];
+              },
+              browse() { return { items: [] }; },
+              detail() { return { id: '1', kind: 'video', title: '1' }; },
+              playback() { return { url: 'https://cdn.example.com/a.mp4' }; },
+            };
+        """.trimIndent()
+        val v1Zip = buildPluginZip(
+            """{"api":1,"id":"com.example.localid","name":"Local","version":"1.0.0","permissions":{"hosts":["*.home.arpa"],"lan":true}}""",
+            minimalJs,
+        )
+        val v2Zip = buildPluginZip(
+            """{"api":1,"id":"com.example.localid","name":"Local","version":"2.0.0","permissions":{"hosts":["nas.home.arpa"],"lan":true}}""",
+            minimalJs,
+        )
+
+        try {
+            // Item #12: previewPackage sets allowsWildcardLanAccess=true + explicit Chinese warning for lan:true + wildcard hosts
+            val previewWild = mgr.previewPackage(v1Zip, sourceUrl = "file:///sdcard/a.d3plugin")
+            assertTrue(previewWild.allowsWildcardLanAccess)
+            assertTrue(previewWild.permissionWarnings.contains(PluginPackageManager.WILDCARD_LAN_WARNING))
+
+            val previewExact = mgr.previewPackage(v2Zip, sourceUrl = "file:///sdcard/b.d3plugin")
+            assertFalse(previewExact.allowsWildcardLanAccess)
+            assertFalse(previewExact.permissionWarnings.contains(PluginPackageManager.WILDCARD_LAN_WARNING))
+
+            // Item #6a: Installing same id from a local file ALWAYS requires replacement confirmation and wipes data!
+            mgr.installFromBytes(v1Zip, sourceUrl = "file:///sdcard/a.d3plugin")
+            val inst = mgr.createInstance("com.example.localid", "Inst")
+            mgr.openSource(inst.instanceId).home()
+            assertEquals(1, store.listInstancesForPlugin("com.example.localid").size)
+
+            val replacePreview = mgr.previewPackage(v2Zip, sourceUrl = "file:///sdcard/b.d3plugin")
+            assertTrue("Local file install over same id must flag requiresReplacementConfirmation", replacePreview.requiresReplacementConfirmation)
+            assertFalse(replacePreview.isUpdate)
+
+            try {
+                mgr.installFromBytes(v2Zip, sourceUrl = "file:///sdcard/b.d3plugin")
+                fail("Local file install over same id must throw PluginSourceMismatchException without confirmation")
+            } catch (_: PluginSourceMismatchException) {
+            }
+
+            val replaced = mgr.installFromBytes(
+                v2Zip,
+                sourceUrl = "file:///sdcard/b.d3plugin",
+                confirmReplaceFromDifferentSource = true,
+            )
+            assertTrue(replaced.replacedDifferentSource)
+            assertFalse(replaced.isUpdate)
+            assertTrue("Replacement from local file must wipe old instances & data", store.listInstancesForPlugin("com.example.localid").isEmpty())
+
+            // Item #6b: Direct URL installs identify by full URL minus query/fragment (same host + different path != same source!)
+            val o1 = PluginPackageManager.canonicalSourceOrigin(null, "https://cdn.example.com/a/plugin.d3plugin?token=1#v1")
+            val o2 = PluginPackageManager.canonicalSourceOrigin(null, "https://cdn.example.com/a/plugin.d3plugin?token=2#v2")
+            val o3 = PluginPackageManager.canonicalSourceOrigin(null, "https://cdn.example.com/b/plugin.d3plugin")
+            assertEquals("Same URL path with different query/fragment must match", o1, o2)
+            assertNotEquals("Same host with different path must NOT match as same source", o1, o3)
+
+            mgr.uninstall("com.example.localid")
+            mgr.installFromBytes(v1Zip, sourceUrl = "https://cdn.example.com/a/plugin.d3plugin?v=1")
+            // Same host, DIFFERENT path -> must reject as different source!
+            try {
+                mgr.installFromBytes(v2Zip, sourceUrl = "https://cdn.example.com/b/plugin.d3plugin?v=2")
+                fail("Different URL path on same host must throw PluginSourceMismatchException")
+            } catch (_: PluginSourceMismatchException) {
+            }
+            // Same URL path with different query -> allowed as same-source update!
+            val updated = mgr.installFromBytes(v2Zip, sourceUrl = "https://cdn.example.com/a/plugin.d3plugin?v=2#latest")
+            assertTrue(updated.isUpdate)
+            assertFalse(updated.replacedDifferentSource)
+        } finally {
+            mgr.shutdownAll()
+            rootDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun repositoryClientEnforcesSingleTotalTimeoutAcrossAllRedirectHops(): Unit = runBlocking {
+        // Item #7: total download timeout across redirect chain (not per-hop 30s * 10 = 300s)
+        val server = MockWebServer()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                Thread.sleep(160)
+                return when (request.path) {
+                    "/hop1" -> MockResponse().setResponseCode(302).addHeader("Location", "/hop2")
+                    "/hop2" -> MockResponse().setResponseCode(302).addHeader("Location", "/hop3")
+                    "/hop3" -> MockResponse().setResponseCode(302).addHeader("Location", "/hop4")
+                    "/hop4" -> MockResponse().setResponseCode(200).setBody("""{"name":"Slow","plugins":[]}""")
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+        }
+        server.start()
+        try {
+            val client = OkHttpClient.Builder()
+                .proxy(JavaProxy.NO_PROXY)
+                .socketFactory(LocalRedirectSocketFactory("192.168.1.50", server.port))
+                .build()
+            val repoClient = PluginRepositoryClient(
+                httpClient = client,
+                devPolicyFactory = { host ->
+                    NetworkPolicy.forDevServer(host) { listOf(InetAddress.getByName("192.168.1.50")) }
+                },
+                totalTimeoutMs = 350L,
+            )
+            val start = System.currentTimeMillis()
+            try {
+                repoClient.downloadDevPackage("http://192.168.1.50:${server.port}/hop1")
+                fail("Expected total download timeout across 4 slow hops")
+            } catch (_: RepositoryVerificationException) {
+            }
+            val elapsed = System.currentTimeMillis() - start
+            assertTrue("Total timeout should abort before completing all 4 hops (elapsed=${elapsed}ms)", elapsed < 1000L)
+        } finally {
+            server.shutdown()
         }
     }
 

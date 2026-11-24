@@ -121,8 +121,14 @@ class ManifestAndPermissionTest {
 
     @Test
     fun passesAllSharedNetworkPolicyVectorsFromCanonicalJson() {
+        // Small item #12: test vector JSONs must NOT be bundled into APK resources!
+        assertEquals(
+            "network-policy-vectors.json must not be bundled into APK resources",
+            null,
+            JsonSchemaValidator::class.java.classLoader?.getResource("plugin-schema/network-policy-vectors.json"),
+        )
         // B1 & S9 (§11.3): exact same vector file run by BOTH Android host and Node plugin-kit
-        val raw = JsonSchemaValidator.loadBundledResourceText("network-policy-vectors.json")
+        val raw = File(repoRoot, "docs/specs/plugin-schema/network-policy-vectors.json").readText()
         val root = json.parseToJsonElement(raw).jsonObject
         val dnsJson = root["dns"]!!.jsonObject
         val dnsMap: Map<String, List<InetAddress>> = dnsJson.entries.associate { (host, arr) ->
@@ -298,6 +304,98 @@ class ManifestAndPermissionTest {
                 fail("Expected oversized response to fail")
             } catch (_: FetchResponseTooLargeException) {
             }
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun fetchGatewayStripsCustomHeadersOnCrossOriginRedirectAndEnforcesTotalTimeoutAcrossHops() {
+        val server = MockWebServer()
+        var targetHeaders: okhttp3.Headers? = null
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                "/cross-start" -> MockResponse()
+                    .setResponseCode(302)
+                    .addHeader("Location", "http://93.184.216.35:${server.port}/cross-end")
+                "/cross-end" -> {
+                    targetHeaders = request.headers
+                    MockResponse().setResponseCode(200).setBody("OK")
+                }
+                "/slow-hop-1" -> {
+                    Thread.sleep(160)
+                    MockResponse().setResponseCode(302).addHeader("Location", "/slow-hop-2")
+                }
+                "/slow-hop-2" -> {
+                    Thread.sleep(160)
+                    MockResponse().setResponseCode(302).addHeader("Location", "/slow-hop-3")
+                }
+                "/slow-hop-3" -> {
+                    Thread.sleep(160)
+                    MockResponse().setResponseCode(200).setBody("TOO_LATE")
+                }
+                else -> MockResponse().setResponseCode(404)
+            }
+        }
+        server.start()
+        try {
+            val policy = NetworkPolicy(
+                permissions = PluginPermissions(hosts = emptyList(), userHosts = true, lan = true),
+                userConfiguredHosts = setOf("192.168.1.50", "93.184.216.35"),
+                dnsResolver = { host -> listOf(InetAddress.getByName(host)) },
+            )
+            val tmpFile = File.createTempFile("cookies-cross", ".enc").apply { deleteOnExit() }
+            val jar = PluginCookieJar(tmpFile, SoftwareAesSecretBox())
+            val client = OkHttpClient.Builder()
+                .proxy(Proxy.NO_PROXY)
+                .socketFactory(MultiIpRedirectSocketFactory(setOf("192.168.1.50", "93.184.216.35"), server.port))
+                .build()
+            val gw = PluginFetchGateway(policy, jar, baseClient = client)
+
+            // Item #9: cross-origin redirect keeps ONLY safe general headers (Accept, Accept-Language, User-Agent, Range)
+            // and strips Authorization, Cookie, Referer, and ALL custom plugin headers.
+            val resp = gw.executeBlocking(
+                FetchRequest(
+                    url = "http://192.168.1.50:${server.port}/cross-start",
+                    headers = mapOf(
+                        "Authorization" to "Bearer secret",
+                        "Cookie" to "sid=topsecret",
+                        "Referer" to "https://private.internal/page",
+                        "X-Plugin-Secret" to "leak-me",
+                        "X-Custom-Header" to "also-strip",
+                        "Accept" to "application/json",
+                        "Accept-Language" to "zh-CN",
+                        "User-Agent" to "depth3d-custom/1",
+                        "Range" to "bytes=0-10",
+                    ),
+                ),
+            )
+            assertEquals(200, resp.status)
+            val hdrs = targetHeaders!!
+            assertEquals(null, hdrs["Authorization"])
+            assertEquals(null, hdrs["Cookie"])
+            assertEquals(null, hdrs["Referer"])
+            assertEquals(null, hdrs["X-Plugin-Secret"])
+            assertEquals(null, hdrs["X-Custom-Header"])
+            assertEquals("application/json", hdrs["Accept"])
+            assertEquals("zh-CN", hdrs["Accept-Language"])
+            assertEquals("depth3d-custom/1", hdrs["User-Agent"])
+            assertEquals("bytes=0-10", hdrs["Range"])
+
+            // Item #8: fetch timeout applies as a single TOTAL deadline across ALL redirect hops
+            val startMs = System.currentTimeMillis()
+            try {
+                gw.executeBlocking(
+                    FetchRequest(
+                        url = "http://192.168.1.50:${server.port}/slow-hop-1",
+                        timeoutMs = 280L,
+                    ),
+                )
+                fail("Expected total timeout across slow redirect hops")
+            } catch (_: IOException) {
+            }
+            val elapsedMs = System.currentTimeMillis() - startMs
+            assertTrue("Total timeout across redirects should fail quickly, elapsed=${elapsedMs}ms", elapsedMs < 900L)
         } finally {
             server.shutdown()
         }

@@ -56,6 +56,7 @@ class PluginRepositoryClient(
     private val maxPackageBytes: Int = MAX_PACKAGE_BYTES,
     private val publicPolicy: NetworkPolicy = NetworkPolicy.forPublicRepository(),
     private val devPolicyFactory: (String) -> NetworkPolicy = { host -> NetworkPolicy.forDevServer(host) },
+    private val totalTimeoutMs: Long = TimeUnit.SECONDS.toMillis(DEFAULT_TOTAL_TIMEOUT_SEC),
 ) {
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -168,6 +169,7 @@ class PluginRepositoryClient(
     }
 
     private fun downloadBytes(url: String, maxBytes: Int, policy: NetworkPolicy): ByteArray {
+        val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(totalTimeoutMs)
         val executor = SafePluginHttpExecutor(
             networkPolicy = policy,
             baseClient = httpClient,
@@ -177,6 +179,7 @@ class PluginRepositoryClient(
                 rawUrl = url,
                 pluginHeaders = emptyMap(),
                 trustedOrigins = emptySet(),
+                totalTimeoutMs = totalTimeoutMs,
             )
         } catch (e: RepositoryVerificationException) {
             throw e
@@ -197,6 +200,9 @@ class PluginRepositoryClient(
             var total = 0L
             r.body.byteStream().use { stream ->
                 while (true) {
+                    if (System.nanoTime() >= deadlineNanos) {
+                        throw RepositoryVerificationException("下载总耗时超过 ${totalTimeoutMs / 1000} 秒上限")
+                    }
                     val read = stream.read(buf)
                     if (read < 0) break
                     total += read

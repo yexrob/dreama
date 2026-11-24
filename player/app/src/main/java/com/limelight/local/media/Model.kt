@@ -45,6 +45,11 @@ enum class StereoHint { MONO, SBS, OU, VR180, VR360, MVHEVC }
  * Something to draw for an item. A source with no artwork points at the
  * video itself and the app grabs a frame; [cacheKey] must change when the
  * file does, since frames are cached on disk under it.
+ *
+ * **Plugin security note (§11.3)**: For [SourceKind.PLUGIN] sources, [url] and
+ * [headers] are read-only metadata/cache keys ONLY. UI callers MUST NOT pass
+ * them to an unguarded HTTP client or image loader; load bytes exclusively
+ * through `PluginImages.loadBytes(source, artwork)`.
  */
 data class Artwork(
     val url: String,
@@ -153,8 +158,20 @@ data class AudioTrackOption(
     val lang: String? = null,
 )
 
+/**
+ * Playback descriptor returned by [MediaSource.playback].
+ *
+ * **Plugin security note (§11.3)**: For [SourceKind.PLUGIN] sources, [url] and
+ * [headers] are read-only metadata/display-only fields. Player code MUST NEVER
+ * pass `url` or `headers` to `DefaultHttpDataSource` or any raw HTTP client —
+ * always construct Media3 `MediaSource` via `PluginPlayback.createMediaSource`
+ * or `PluginPlayback.createSessionController` so every request, manifest,
+ * segment, backup URL, redirect hop, and subtitle enforces `NetworkPolicy`.
+ */
 data class PlaybackInfo(
+    /** Display/metadata only for [SourceKind.PLUGIN]; never pass directly to `DefaultHttpDataSource`. */
     val url: String,
+    /** Read-only for [SourceKind.PLUGIN]; scoped strictly to trusted origins inside `PluginPlayback`. */
     val headers: Map<String, String> = emptyMap(),
     val title: String? = null,
     val startPositionMs: Long = 0,

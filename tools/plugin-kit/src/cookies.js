@@ -1,9 +1,34 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { canonicalizeHost } from './network-policy.js';
+import { canonicalizeHost, parseAnyIpLiteral } from './network-policy.js';
 
 /** §11.1 (S5): maximum total serialized cookie jar size is 256 KB. */
 export const MAX_COOKIE_JAR_BYTES = 256 * 1024;
+const MAX_COOKIE_DATE = 253_402_300_799_999;
+
+const MULTI_LABEL_PUBLIC_SUFFIXES = new Set([
+  'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'me.uk', 'ltd.uk', 'net.uk',
+  'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'edu.cn', 'ac.cn',
+  'com.au', 'net.au', 'org.au', 'edu.au', 'gov.au',
+  'co.jp', 'ne.jp', 'or.jp', 'ac.jp', 'go.jp',
+  'com.hk', 'org.hk', 'edu.hk', 'gov.hk',
+  'com.tw', 'org.tw', 'edu.tw', 'gov.tw',
+  'com.sg', 'com.br', 'com.mx', 'co.kr', 'co.nz', 'co.in',
+  'github.io', 'pages.dev', 'vercel.app', 'netlify.app', 'herokuapp.com',
+]);
+
+export function isPublicSuffix(canonicalDomain) {
+  if (!canonicalDomain) return true;
+  if (parseAnyIpLiteral(canonicalDomain)) return false;
+  if (!canonicalDomain.includes('.')) return true;
+  return MULTI_LABEL_PUBLIC_SUFFIXES.has(canonicalDomain);
+}
+
+export function domainMatches(canonicalHost, canonicalDomain) {
+  if (canonicalHost === canonicalDomain) return true;
+  if (parseAnyIpLiteral(canonicalHost)) return false;
+  return canonicalHost.endsWith(`.${canonicalDomain}`);
+}
 
 export class CookieJarQuotaExceededError extends Error {
   constructor(message) {
@@ -17,37 +42,55 @@ export class PluginCookieJar {
     this.clockMs = clockMs;
     this.maxBytes = opts.maxBytes ?? MAX_COOKIE_JAR_BYTES;
     this.filePath = opts.filePath ?? null;
+    this.onWarning = opts.onWarning ?? (() => {});
     this.store = new Map();
     this.dirty = false;
     this.diskWriteCount = 0;
+    this.estimatedBytes = 2; // "[]"
 
     if (this.filePath && fs.existsSync(this.filePath)) {
       const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
       if (Array.isArray(parsed)) {
         for (const c of parsed) {
           if (c && c.name && c.domain && c.path) {
-            this.store.set(`${c.name}\0${c.domain}\0${c.path}`, c);
+            const norm = { ...c, domain: canonicalizeHost(c.domain) };
+            this.store.set(`${norm.name}\0${norm.domain}\0${norm.path}`, norm);
           }
         }
+        this.estimatedBytes = this._exactSerializedBytes();
       }
     }
   }
 
-  setCookie(rawUrl, setCookieHeader) {
+  setCookie(rawUrl, setCookieHeader, strictSyntax = true) {
     const url = new URL(rawUrl);
     const reqHost = canonicalizeHost(url.hostname);
-    const parts = String(setCookieHeader).split(';').map((s) => s.trim()).filter(Boolean);
-    if (parts.length === 0) throw new Error('Invalid Set-Cookie header');
+    const reqIsIp = Boolean(parseAnyIpLiteral(reqHost));
+    const parts = String(setCookieHeader).trim().split(';').map((s) => s.trim()).filter(Boolean);
+    if (parts.length === 0) {
+      if (strictSyntax) throw new Error('Invalid Set-Cookie header');
+      return;
+    }
     const eq = parts[0].indexOf('=');
-    if (eq <= 0) throw new Error('Invalid cookie name=value');
+    if (eq <= 0) {
+      if (strictSyntax) throw new Error('Invalid cookie name=value');
+      return;
+    }
     const name = parts[0].slice(0, eq).trim();
     const value = parts[0].slice(eq + 1).trim();
+    if (!name) {
+      if (strictSyntax) throw new Error('Invalid cookie name=value');
+      return;
+    }
 
     let domain = reqHost;
     let hostOnly = true;
     let cookiePath = this._defaultPath(url.pathname);
     let secure = false;
-    let expiresAt = Number.MAX_SAFE_INTEGER;
+    let httpOnly = false;
+    let hasMaxAge = false;
+    let maxAgeExpiresAt = null;
+    let parsedExpiresAt = null;
 
     for (const attr of parts.slice(1)) {
       const aeq = attr.indexOf('=');
@@ -56,49 +99,80 @@ export class PluginCookieJar {
       if (k === 'domain' && v) {
         const d = canonicalizeHost(v.replace(/^\.+/, ''));
         if (!d) continue;
-        if (reqHost === d || reqHost.endsWith(`.${d}`)) {
+        if (isPublicSuffix(d)) {
+          this.onWarning(`Cookie '${name}' 的 Domain='${v}' 属于公共后缀，已忽略`);
+          return;
+        }
+        if (reqIsIp || parseAnyIpLiteral(d)) {
+          if (reqHost === d) {
+            domain = reqHost;
+            hostOnly = true;
+          } else {
+            this.onWarning(`Cookie '${name}' 的 Domain='${v}' 与请求 IP 主机 '${reqHost}' 不匹配，已忽略`);
+            return;
+          }
+        } else if (domainMatches(reqHost, d)) {
           domain = d;
           hostOnly = false;
         } else {
-          // RFC 6265 §5.3: reject cookie whose Domain does not domain-match request host
+          // RFC 6265 §5.3: ignore cookie whose Domain does not domain-match request host and log WARN
+          this.onWarning(`Cookie '${name}' 的 Domain='${v}' 与请求主机 '${reqHost}' 不匹配，已忽略`);
           return;
         }
       } else if (k === 'path' && v.startsWith('/')) {
         cookiePath = v;
       } else if (k === 'secure') {
         secure = true;
+      } else if (k === 'httponly') {
+        httpOnly = true;
       } else if (k === 'max-age') {
-        const sec = Number(v);
-        if (Number.isFinite(sec)) expiresAt = sec <= 0 ? 0 : this.clockMs() + sec * 1000;
+        // RFC 6265 §5.2.2: Max-Age ALWAYS takes precedence over Expires
+        if (/^-?\d+$/.test(v)) {
+          const sec = Number.parseInt(v, 10);
+          hasMaxAge = true;
+          maxAgeExpiresAt = sec <= 0 ? 0 : Math.min(this.clockMs() + sec * 1000, MAX_COOKIE_DATE);
+        }
       } else if (k === 'expires') {
         const ts = Date.parse(v);
-        if (Number.isFinite(ts)) expiresAt = ts;
+        if (Number.isFinite(ts)) parsedExpiresAt = ts;
       }
     }
 
+    const expiresAt = hasMaxAge && maxAgeExpiresAt !== null
+      ? maxAgeExpiresAt
+      : (parsedExpiresAt !== null ? parsedExpiresAt : MAX_COOKIE_DATE);
+
     const now = this.clockMs();
     const key = `${name}\0${domain}\0${cookiePath}`;
+    const old = this.store.get(key);
+    const oldCost = old ? this._estimateEntryBytes(old) : 0;
+
     if (expiresAt <= now) {
       if (this.store.delete(key)) {
+        this.estimatedBytes = Math.max(2, this.estimatedBytes - oldCost);
         this.dirty = true;
       }
       return;
     }
 
-    const prev = this.store.get(key);
-    const next = { name, value, domain, hostOnly, path: cookiePath, secure, expiresAt };
-    this.store.set(key, next);
-    const size = this._serializedByteLength();
-    if (size > this.maxBytes) {
-      // Prune expired cookies once and re-check
+    const next = { name, value, domain, hostOnly, path: cookiePath, secure, httpOnly, expiresAt };
+    const newCost = this._estimateEntryBytes(next);
+    const projected = this.estimatedBytes - oldCost + newCost;
+    if (projected > this.maxBytes) {
       this._pruneExpired(now);
-      if (this._serializedByteLength() > this.maxBytes) {
-        if (prev !== undefined) this.store.set(key, prev);
+      this.store.set(key, next);
+      const exactSize = this._exactSerializedBytes();
+      if (exactSize > this.maxBytes) {
+        if (old !== undefined) this.store.set(key, old);
         else this.store.delete(key);
         throw new CookieJarQuotaExceededError(
-          `Cookie 存储超过上限（${Math.round(this.maxBytes / 1024)} KB）`,
+          `插件 Cookie 罐超过大小上限（${Math.round(this.maxBytes / 1024)} KB）`,
         );
       }
+      this.estimatedBytes = exactSize;
+    } else {
+      this.store.set(key, next);
+      this.estimatedBytes = projected;
     }
     this.dirty = true;
   }
@@ -106,10 +180,9 @@ export class PluginCookieJar {
   saveFromHeaders(rawUrl, setCookieValues) {
     for (const hdr of setCookieValues || []) {
       try {
-        this.setCookie(rawUrl, hdr);
+        this.setCookie(rawUrl, hdr, false);
       } catch (e) {
         if (e instanceof CookieJarQuotaExceededError) throw e;
-        // ignore malformed cookie from remote server
       }
     }
   }
@@ -122,14 +195,13 @@ export class PluginCookieJar {
     for (const [key, c] of this.store.entries()) {
       if (c.expiresAt <= now) {
         this.store.delete(key);
+        this.estimatedBytes = Math.max(2, this.estimatedBytes - this._estimateEntryBytes(c));
         this.dirty = true;
         continue;
       }
       if (c.secure && url.protocol !== 'https:') continue;
-      const domainMatch = c.hostOnly
-        ? host === c.domain
-        : (host === c.domain || host.endsWith(`.${c.domain}`));
-      if (!domainMatch) continue;
+      const dMatch = c.hostOnly ? host === c.domain : domainMatches(host, c.domain);
+      if (!dMatch) continue;
       const pathMatch = url.pathname === c.path ||
         (url.pathname.startsWith(c.path) && (c.path.endsWith('/') || url.pathname[c.path.length] === '/'));
       if (!pathMatch) continue;
@@ -140,14 +212,22 @@ export class PluginCookieJar {
 
   clear() {
     this.store.clear();
+    this.estimatedBytes = 2;
     this.dirty = true;
   }
 
   /** Coalesced persistence (§11.1, S5): flush dirty state once per call end. */
   flush() {
     if (!this.dirty || !this.filePath) return;
+    const raw = Buffer.from(JSON.stringify([...this.store.values()]), 'utf8');
+    if (raw.length > this.maxBytes) {
+      throw new CookieJarQuotaExceededError(
+        `插件 Cookie 罐超过大小上限（${Math.round(this.maxBytes / 1024)} KB）`,
+      );
+    }
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-    fs.writeFileSync(this.filePath, JSON.stringify([...this.store.values()]), 'utf8');
+    fs.writeFileSync(this.filePath, raw);
+    this.estimatedBytes = raw.length;
     this.dirty = false;
     this.diskWriteCount += 1;
   }
@@ -156,18 +236,23 @@ export class PluginCookieJar {
     for (const [key, c] of this.store.entries()) {
       if (c.expiresAt <= now) {
         this.store.delete(key);
+        this.estimatedBytes = Math.max(2, this.estimatedBytes - this._estimateEntryBytes(c));
         this.dirty = true;
       }
     }
   }
 
-  _serializedByteLength() {
-    let bytes = 2; // []
-    for (const c of this.store.values()) {
-      bytes += 80 + Buffer.byteLength(c.name, 'utf8') + Buffer.byteLength(c.value, 'utf8') +
-        Buffer.byteLength(c.domain, 'utf8') + Buffer.byteLength(c.path, 'utf8');
-    }
-    return bytes;
+  /** Matches Android PluginCookieJar.estimateEntryBytes exactly. */
+  _estimateEntryBytes(c) {
+    return 140 +
+      Buffer.byteLength(c.name, 'utf8') * 2 +
+      Buffer.byteLength(c.value, 'utf8') * 2 +
+      Buffer.byteLength(c.domain, 'utf8') +
+      Buffer.byteLength(c.path, 'utf8');
+  }
+
+  _exactSerializedBytes() {
+    return Buffer.byteLength(JSON.stringify([...this.store.values()]), 'utf8');
   }
 
   _defaultPath(pathname) {

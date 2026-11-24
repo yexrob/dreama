@@ -654,7 +654,10 @@ test('jellyfin plugin passes static check and full real-recorded Jellyfin 12.4 R
   const ids = JF_FIXTURES._meta.ids;
   const expectedToken = JF_FIXTURES.authSuccess.AccessToken;
   const recordedCalls = [];
+  const recordedAuthHeaders = [];
   const playbackBodies = [];
+  const progressBodies = [];
+  let forceExpired = false;
 
   const mockTransport = async ({ url, method, headers, body }) => {
     const p = url.pathname;
@@ -667,12 +670,14 @@ test('jellyfin plugin passes static check and full real-recorded Jellyfin 12.4 R
       body: Buffer.from(JSON.stringify(data), 'utf8'),
     });
 
+    if (p === '/System/Info/Public') return jsonResp(200, JF_FIXTURES.systemInfoPublic);
     if (p === '/Users/AuthenticateByName' && method === 'POST') {
       const reqBody = JSON.parse(body.toString('utf8'));
       if (reqBody.Pw === 'bad-pass') return jsonResp(401, { message: 'Unauthorized' });
       return jsonResp(200, JF_FIXTURES.authSuccess);
     }
-    if (!String(headers.Authorization || '').includes(`Token="${expectedToken}"`)) {
+    recordedAuthHeaders.push(String(headers.Authorization || ''));
+    if (forceExpired || !String(headers.Authorization || '').includes(`Token="${expectedToken}"`)) {
       return jsonResp(401, { message: 'Invalid token' });
     }
     if (p === '/UserItems/Resume') return jsonResp(200, JF_FIXTURES.resume);
@@ -697,7 +702,11 @@ test('jellyfin plugin passes static check and full real-recorded Jellyfin 12.4 R
     if (p === `/Shows/${ids.seriesId}/Seasons`) return jsonResp(200, JF_FIXTURES.seriesSeasons);
     if (p === `/Shows/${ids.seriesId}/Episodes`) return jsonResp(200, JF_FIXTURES.seasonEpisodes);
     if (p === '/Search/Hints') return jsonResp(200, JF_FIXTURES.searchHints);
-    if (p.startsWith('/Sessions/Playing') || p.startsWith('/UserFavoriteItems/') || p.startsWith('/UserPlayedItems/') || p === '/Sessions/Logout') {
+    if (p.startsWith('/Sessions/Playing')) {
+      progressBodies.push({ path: p, body: JSON.parse(body.toString('utf8')) });
+      return { status: 204, headers: {}, setCookies: [], body: Buffer.alloc(0) };
+    }
+    if (p.startsWith('/UserFavoriteItems/') || p.startsWith('/UserPlayedItems/') || p === '/Sessions/Logout') {
       return { status: 204, headers: {}, setCookies: [], body: Buffer.alloc(0) };
     }
     return jsonResp(404, { message: `Unhandled mock path: ${p}` });
@@ -771,18 +780,426 @@ test('jellyfin plugin passes static check and full real-recorded Jellyfin 12.4 R
     assert.ok(hints.length >= 1);
 
     await host.invoke('reportProgress', { itemId: ids.h264MovieId, positionMs: 1500, durationMs: 4000, event: 'progress', session: pbH264.session });
+    await host.invoke('reportProgress', { itemId: ids.hevcMovieId, positionMs: 2500, durationMs: 4000, event: 'stop', session: pb480.session });
     await host.invoke('setFavorite', { itemId: ids.h264MovieId, favorite: true });
     await host.invoke('setPlayed', { itemId: ids.h264MovieId, played: true });
+    // Verify full MediaBrowser Authorization header format & PlayMethod in progress bodies
+    const authRe = new RegExp(`^MediaBrowser Client="depth3d", Device="[^"]+", DeviceId="depth3d-[0-9a-f]{16}", Version="[^"]+", Token="${expectedToken}"$`);
+    assert.ok(recordedAuthHeaders.every((h) => authRe.test(h)));
+    assert.equal(progressBodies[0].body.PlayMethod, 'DirectPlay');
+    assert.equal(progressBodies[1].body.PlayMethod, 'Transcode');
     // S10: ZERO ms_* keys written to ctx.storage
     assert.deepEqual(storage.keys().sort(), ['deviceId', 'session']);
 
+    // 401 on expired token -> NeedsAuth and session cleared
+    forceExpired = true;
+    await assert.rejects(() => host.invoke('categories'), (e) => e instanceof PluginCallError && e.code === 'NeedsAuth');
+    assert.equal(storage.get('session'), null);
+    forceExpired = false;
+    await host.invoke('login');
+
     await host.invoke('logout');
+    assert.ok(recordedCalls.some((c) => c.path === '/System/Info/Public'));
     assert.ok(recordedCalls.some((c) => c.path === '/UserViews'));
     assert.ok(recordedCalls.some((c) => c.path === '/UserItems/Resume'));
     assert.ok(recordedCalls.some((c) => c.path === `/UserFavoriteItems/${ids.h264MovieId}`));
     assert.ok(recordedCalls.some((c) => c.path === `/UserPlayedItems/${ids.h264MovieId}`));
   } finally {
     await host.dispose();
+  }
+});
+
+test('Round 3: shared zip-vectors.json (incl. dual.zip PoC) and shared dom-vectors.json pass 100% on Node', async () => {
+  const zipVectors = JSON.parse(fs.readFileSync(path.join(SCHEMA_DIR, 'zip-vectors.json'), 'utf8'));
+  assert.ok(zipVectors.cases.length >= 8);
+  for (const tc of zipVectors.cases) {
+    const buf = Buffer.from(tc.base64, 'base64');
+    if (tc.valid) {
+      const inspected = await inspectArchiveBuffer(buf);
+      if (tc.expectedMainJsPrefix) {
+        assert.ok(inspected.mainJs.startsWith(tc.expectedMainJsPrefix), `Zip vector ${tc.name} mainJs mismatch`);
+      }
+    } else {
+      await assert.rejects(
+        () => inspectArchiveBuffer(buf),
+        Error,
+        `Malicious zip vector "${tc.name}" MUST be rejected`,
+      );
+    }
+  }
+
+  const domVectors = JSON.parse(fs.readFileSync(path.join(SCHEMA_DIR, 'dom-vectors.json'), 'utf8'));
+  assert.ok(domVectors.cases.length >= 4);
+  const host = new QuickJsPluginHost({
+    manifest: { api: 1, id: 'dev.depth3d.domvec', name: 'DomVec', version: '1.0.0' },
+    mainJs: `export default {
+      home() { return []; },
+      browse(ctx, arg) {
+        const doc = arg.mode === 'xml' ? ctx.parse.xml(arg.input) : ctx.parse.html(arg.input);
+        return arg.assertions.map((a) => {
+          if (a.op === 'rootTag') return doc.tag;
+          if (a.op === 'rootChildrenTags') return doc.children.map((c) => c.tag);
+          if (a.op === 'firstTag') return doc.querySelector(a.selector)?.tag ?? null;
+          if (a.op === 'firstText') return doc.querySelector(a.selector)?.text ?? null;
+          if (a.op === 'firstAttr') return doc.querySelector(a.selector)?.attr(a.attr);
+          if (a.op === 'allTexts') return doc.querySelectorAll(a.selector).map((n) => n.text);
+          if (a.op === 'allTags') return doc.querySelectorAll(a.selector).map((n) => n.tag);
+          if (a.op === 'allAttrs') return doc.querySelectorAll(a.selector).map((n) => n.attr(a.attr));
+          if (a.op === 'childrenTags') return doc.querySelector(a.selector).children.map((c) => c.tag);
+          return null;
+        });
+      },
+      detail() { return { id: '1', kind: 'video', title: '1' }; },
+      playback() { return { url: 'https://cdn.example.com/a.mp4' }; },
+    };`,
+    logSink: () => {},
+  });
+  try {
+    for (const tc of domVectors.cases) {
+      const actual = await host.invoke('browse', {
+        mode: tc.mode,
+        input: tc.input,
+        assertions: tc.assertions,
+      });
+      for (let i = 0; i < tc.assertions.length; i++) {
+        assert.deepEqual(actual[i], tc.assertions[i].expected, `DOM vector ${tc.name} assertion #${i}`);
+      }
+    }
+  } finally {
+    await host.dispose();
+  }
+});
+
+test('Round 3: host memory caps, tool/host parity, redirect safe-headers, cookie warnings, unawaited Promise check, immutable globals', async () => {
+  const warnings = [];
+  let redirectTargetHeaders = null;
+  const sixMb = Buffer.alloc(6 * 1024 * 1024, 0x5A);
+
+  const manifest = {
+    api: 1,
+    id: 'dev.depth3d.r3parity',
+    name: 'R3Parity',
+    version: '1.0.0',
+    permissions: { hosts: ['api.example.com', 'other.example.net'], userHosts: false, lan: false },
+  };
+  const mainJs = `
+    export default {
+      home() { return []; },
+      async browse(ctx, arg) {
+        const m = arg.categoryId;
+        if (m === 'log-flood') {
+          const big = 'A'.repeat(100000);
+          for (let i = 0; i < 200; i++) ctx.log.info(i + ':' + big);
+          return { ok: true };
+        }
+        if (m === 'storage-oversize') {
+          await ctx.storage.set('huge', 'B'.repeat(2 * 1024 * 1024));
+          return { ok: true };
+        }
+        if (m === 'return-oversize') {
+          return 'R'.repeat(9 * 1024 * 1024);
+        }
+        if (m === 'dom-node-flood') {
+          ctx.parse.html('<a></a>'.repeat(210000));
+          return { ok: true };
+        }
+        if (m === 'timer-flood') {
+          for (let i = 0; i < 257; i++) setTimeout(() => {}, 5000);
+          return { ok: true };
+        }
+        if (m === 'response-second-read') {
+          const r = await ctx.fetch('https://api.example.com/small');
+          const t = r.text();
+          let secondErr = '';
+          try { r.bytes(); } catch (e) { secondErr = e.name + ':' + e.message; }
+          return { t, secondErr };
+        }
+        if (m === 'seq-18mb') {
+          let sum = 0;
+          for (let i = 0; i < 3; i++) {
+            const r = await ctx.fetch('https://api.example.com/6mb');
+            sum += r.bytes().byteLength;
+          }
+          return { sum };
+        }
+        if (m === 'plain-timeout') {
+          throw new Error('upstream timeout while parsing');
+        }
+        if (m === 'explicit-unavail') {
+          throw new ctx.Error('Unavailable', '上游维护中');
+        }
+        if (m === 'cross-redir') {
+          const r = await ctx.fetch('https://api.example.com/cross-start', {
+            headers: {
+              Authorization: 'Bearer secret',
+              Cookie: 'sid=1',
+              Referer: 'https://api.example.com/p',
+              'X-Plugin-Custom': 'strip-me',
+              Accept: 'application/json',
+              'Accept-Language': 'zh-CN',
+              'User-Agent': 'depth3d-test/1',
+              Range: 'bytes=0-5',
+            },
+          });
+          return { status: r.status };
+        }
+        if (m === 'slow-redir') {
+          await ctx.fetch('https://api.example.com/slow-1', { timeoutMs: 250 });
+          return { ok: true };
+        }
+        if (m === 'unawaited-storage') {
+          ctx.storage.set('forgot', 'value');
+          return { ok: true };
+        }
+        if (m === 'immutable-globals') {
+          return ['__d3_invoke', '__d3_invoke_optional', '__d3_exports', '__d3_eval_probe'].map((n) => {
+            const d = Object.getOwnPropertyDescriptor(globalThis, n);
+            let wf = false;
+            try { globalThis[n] = 1; } catch { wf = true; }
+            let df = false;
+            try { delete globalThis[n]; } catch { df = true; }
+            return { n, writable: d.writable, configurable: d.configurable, wf, df };
+          });
+        }
+        return { items: [] };
+      },
+      detail() { return { id: '1', kind: 'video', title: '1' }; },
+      playback() { return { url: 'https://cdn.example.com/a.mp4' }; },
+    };
+  `;
+
+  const host = new QuickJsPluginHost({
+    manifest,
+    mainJs,
+    dnsResolver: async () => ['93.184.216.34'],
+    transportOverride: async ({ url, headers }) => {
+      if (url.pathname === '/small') return { status: 200, headers: {}, setCookies: [], body: Buffer.from('hello-once') };
+      if (url.pathname === '/6mb') return { status: 200, headers: {}, setCookies: [], body: sixMb };
+      if (url.pathname === '/cross-start') {
+        return { status: 302, headers: { location: 'https://other.example.net/cross-end' }, setCookies: [], body: Buffer.alloc(0) };
+      }
+      if (url.pathname === '/cross-end') {
+        redirectTargetHeaders = { ...headers };
+        return { status: 200, headers: {}, setCookies: [], body: Buffer.from('ok') };
+      }
+      if (url.pathname.startsWith('/slow-')) {
+        await new Promise((r) => setTimeout(r, 150));
+        const n = Number(url.pathname.slice('/slow-'.length));
+        if (n < 4) return { status: 302, headers: { location: `https://api.example.com/slow-${n + 1}` }, setCookies: [], body: Buffer.alloc(0) };
+        return { status: 200, headers: {}, setCookies: [], body: Buffer.from('late') };
+      }
+      return { status: 404, headers: {}, setCookies: [], body: Buffer.alloc(0) };
+    },
+    logSink: (level, line) => {
+      if (level === 'WARN') warnings.push(line);
+    },
+  });
+
+  try {
+    // Item #3a: ctx.log 4 KB / 256 KB buffer cap
+    await host.invoke('browse', { categoryId: 'log-flood' });
+    assert.ok(host.logger.entries.length <= 200);
+    assert.ok(host.logger.totalBufferedBytes <= 256 * 1024);
+    for (const e of host.logger.entries) {
+      assert.ok(Buffer.byteLength(e.message, 'utf8') <= 4 * 1024);
+    }
+
+    // Item #3b: storage.set pre-parse quota check
+    await assert.rejects(() => host.invoke('browse', { categoryId: 'storage-oversize' }), (e) => e instanceof PluginCallError && e.code === 'Internal');
+    assert.equal(host.storage.get('huge'), null);
+
+    // Item #3c: > 8 MB return value -> Internal
+    await assert.rejects(() => host.invoke('browse', { categoryId: 'return-oversize' }), (e) => e instanceof PluginCallError && e.code === 'Internal');
+
+    // Item #3d: ctx.parse > 200k nodes rejected
+    await assert.rejects(() => host.invoke('browse', { categoryId: 'dom-node-flood' }), (e) => e instanceof PluginCallError && e.code === 'Internal');
+
+    // Item #3e: setTimeout > 256 concurrent timers rejected
+    await assert.rejects(() => host.invoke('browse', { categoryId: 'timer-flood' }), (e) => e instanceof PluginCallError && e.code === 'Internal');
+
+    // Item #8a: Response single-consume throws TypeError on second read
+    const sr = await host.invoke('browse', { categoryId: 'response-second-read' });
+    assert.equal(sr.t, 'hello-once');
+    assert.ok(sr.secondErr.includes('TypeError'));
+
+    // Item #8b: Sequential 3 x 6 MB = 18 MB (> 16 MB in-flight budget) succeeds because read releases budget
+    const seq = await host.invoke('browse', { categoryId: 'seq-18mb' });
+    assert.equal(seq.sum, 18 * 1024 * 1024);
+    assert.equal(host.fetchGateway.inFlightBudget.used, 0);
+
+    // Item #8c & #8d: Plain Error('...timeout...') -> Internal; explicit Unavailable does NOT rebuild VM!
+    const beforeCreations = host.creationCount;
+    await assert.rejects(() => host.invoke('browse', { categoryId: 'plain-timeout' }), (e) => e instanceof PluginCallError && e.code === 'Internal');
+    assert.equal(host.creationCount, beforeCreations);
+    await assert.rejects(() => host.invoke('browse', { categoryId: 'explicit-unavail' }), (e) => e instanceof PluginCallError && e.code === 'Unavailable');
+    assert.equal(host.creationCount, beforeCreations, 'Explicit ctx.Error(Unavailable) must NOT rebuild VM');
+
+    // Item #9: Cross-origin redirect strips Authorization, Cookie, Referer, X-Plugin-Custom; keeps ONLY safe general headers
+    const cr = await host.invoke('browse', { categoryId: 'cross-redir' });
+    assert.equal(cr.status, 200);
+    assert.equal(redirectTargetHeaders.Authorization, undefined);
+    assert.equal(redirectTargetHeaders.Cookie, undefined);
+    assert.equal(redirectTargetHeaders.Referer, undefined);
+    assert.equal(redirectTargetHeaders['X-Plugin-Custom'], undefined);
+    assert.equal(redirectTargetHeaders.Accept, 'application/json');
+    assert.equal(redirectTargetHeaders['Accept-Language'], 'zh-CN');
+    assert.equal(redirectTargetHeaders['User-Agent'], 'depth3d-test/1');
+    assert.equal(redirectTargetHeaders.Range, 'bytes=0-5');
+
+    // Item #8e: Total timeout across slow redirect hops
+    const t0 = Date.now();
+    await assert.rejects(() => host.invoke('browse', { categoryId: 'slow-redir' }));
+    assert.ok(Date.now() - t0 < 800, 'Slow redirect chain must abort at total timeoutMs');
+
+    // Item #8f: Cookie parity (Max-Age > Expires, PSL & Domain mismatch -> WARN, IPv6 literal)
+    warnings.length = 0;
+    host.cookieJar.setCookie('https://api.example.com/', 'm=1; Max-Age=0; Expires=Wed, 21 Oct 2099 07:28:00 GMT');
+    assert.equal(host.cookieJar.getHeaderForUrl('https://api.example.com/'), '');
+    host.cookieJar.setCookie('https://api.example.com/', 'p1=x; Domain=com');
+    host.cookieJar.setCookie('https://shop.co.uk/', 'p2=x; Domain=co.uk');
+    host.cookieJar.setCookie('https://api.example.com/', 'm2=x; Domain=evil.com');
+    assert.equal(warnings.length, 3);
+    host.cookieJar.setCookie('http://[fd12:3456:789a::1]:8096/', 'v6=ok; Path=/');
+    assert.equal(host.cookieJar.getHeaderForUrl('http://[fd12:3456:789a::0001]:8096/Items'), 'v6=ok');
+
+    // Item #8g: Unawaited ctx.storage.set fails with diagnostic naming call site
+    await assert.rejects(
+      () => host.invoke('browse', { categoryId: 'unawaited-storage' }),
+      (e) => e instanceof PluginCallError && e.message.includes('ctx.storage.set'),
+    );
+
+    // Item #12: __d3_invoke etc. non-writable & non-configurable
+    const globals = await host.invoke('browse', { categoryId: 'immutable-globals' });
+    assert.equal(globals.length, 4);
+    for (const g of globals) {
+      assert.equal(g.writable, false);
+      assert.equal(g.configurable, false);
+      assert.equal(g.wf, true);
+      assert.equal(g.df, true);
+    }
+  } finally {
+    await host.dispose();
+  }
+
+  // Also verify d3plugin check fails on a plugin with unawaited ctx.storage.set
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'd3-unawaited-'));
+  try {
+    fs.writeFileSync(
+      path.join(tmpDir, 'manifest.json'),
+      JSON.stringify({ api: 1, id: 'com.example.unawaited', name: 'Unawaited', version: '1.0.0' }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.js'),
+      `export default {
+        async home(ctx) { ctx.storage.set('leaked', 1); return []; },
+        browse() { return { items: [] }; },
+        detail() { return { id: '1', kind: 'video', title: '1' }; },
+        playback() { return { url: 'https://cdn.example.com/a.mp4' }; },
+      };`,
+    );
+    const report = await checkPlugin(tmpDir);
+    assert.equal(report.ok, false);
+    assert.ok(report.errors.some((e) => e.includes('ctx.storage.set')));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Round 3: Jellyfin version routing (10.7/10.8), partial home() survival, cross-origin URLs, device capability transcode', async () => {
+  const loaded = await loadPluginSource(JF_PLUGIN_DIR);
+  const ids = JF_FIXTURES._meta.ids;
+  const userId = ids.userId;
+
+  // 1. Version 10.7.7 -> Unsupported
+  const h107 = new QuickJsPluginHost({
+    manifest: loaded.manifest,
+    mainJs: loaded.mainJs,
+    locale: loaded.locale,
+    config: { server: 'http://192.168.1.50:8096', username: 'u', password: 'p' },
+    dnsResolver: async () => ['192.168.1.50'],
+    transportOverride: async ({ url }) => {
+      if (url.pathname === '/System/Info/Public') {
+        return { status: 200, headers: {}, setCookies: [], body: Buffer.from(JSON.stringify({ Version: '10.7.7' })) };
+      }
+      return { status: 404, headers: {}, setCookies: [], body: Buffer.alloc(0) };
+    },
+    logSink: () => {},
+  });
+  try {
+    await assert.rejects(() => h107.invoke('login'), (e) => e instanceof PluginCallError && e.code === 'Unsupported');
+  } finally {
+    await h107.dispose();
+  }
+
+  // 2. Version 10.8.13 -> legacy /Users/{uid}/... routes, partial home failure, cross-origin DeliveryUrl/TranscodingUrl, device cap fallback
+  const seen = [];
+  const h108 = new QuickJsPluginHost({
+    manifest: loaded.manifest,
+    mainJs: loaded.mainJs,
+    locale: loaded.locale,
+    config: { server: 'http://192.168.1.50:8096', username: 'd3tester', password: 'p' },
+    device: { appVersion: '1.0.0', locale: 'zh-CN', model: 'Headset', maxWidth: 1920, maxHeight: 1080, codecs: ['avc', 'hevc'], hdr: false },
+    dnsResolver: async () => ['192.168.1.50'],
+    transportOverride: async ({ url, method }) => {
+      const p = url.pathname;
+      seen.push(`${method} ${p}`);
+      const ok = (d) => ({ status: 200, headers: { 'content-type': 'application/json' }, setCookies: [], body: Buffer.from(JSON.stringify(d)) });
+      if (p === '/System/Info/Public') return ok({ Version: '10.8.13' });
+      if (p === '/Users/AuthenticateByName') return ok(JF_FIXTURES.authSuccess);
+      if (p === `/Users/${userId}/Views`) return ok(JF_FIXTURES.views);
+      if (p === `/Users/${userId}/Items/Resume`) return ok(JF_FIXTURES.resume);
+      if (p === '/Shows/NextUp') return { status: 500, headers: {}, setCookies: [], body: Buffer.from('boom') };
+      if (p === `/Users/${userId}/Items/Latest`) return ok(JF_FIXTURES.latestByParent[url.searchParams.get('ParentId')] || []);
+      if (p === '/Items/cross-item/PlaybackInfo') {
+        return ok({
+          PlaySessionId: 's-cross',
+          MediaSources: [{
+            Id: 'ms-cross',
+            SupportsDirectPlay: false,
+            TranscodingUrl: 'https://other-cdn.example.net/live/master.m3u8?ApiKey=secret',
+            RunTimeTicks: 500000000,
+            MediaStreams: [
+              { Type: 'Video', Index: 0, Codec: 'h264', Width: 1920, Height: 1080 },
+              { Type: 'Subtitle', Index: 1, Codec: 'vtt', Language: 'zh', DeliveryUrl: 'https://subs.example.net/1.vtt?api_key=secret' },
+            ],
+          }],
+        });
+      }
+      if (p === '/Items/4k-av1/PlaybackInfo') {
+        return ok({
+          PlaySessionId: 's-cap',
+          MediaSources: [{
+            Id: 'ms-cap',
+            SupportsDirectPlay: true,
+            RunTimeTicks: 500000000,
+            MediaStreams: [{ Type: 'Video', Index: 0, Codec: 'av1', Width: 3840, Height: 2160 }],
+          }],
+        });
+      }
+      return { status: 204, headers: {}, setCookies: [], body: Buffer.alloc(0) };
+    },
+    logSink: () => {},
+  });
+  try {
+    await h108.invoke('login');
+    const shelves = await h108.invoke('home');
+    assert.ok(shelves.some((s) => s.style === 'continue'));
+    assert.ok(shelves.some((s) => s.id === `jf-latest-${ids.moviesViewId}`));
+    assert.ok(seen.includes(`GET /Users/${userId}/Views`));
+    assert.ok(seen.includes(`GET /Users/${userId}/Items/Resume`));
+    assert.ok(seen.includes(`GET /Users/${userId}/Items/Latest`));
+
+    const pbCross = await h108.invoke('playback', { itemId: 'cross-item' });
+    assert.equal(pbCross.url, 'https://other-cdn.example.net/live/master.m3u8');
+    assert.equal(pbCross.headers.Authorization, undefined);
+    assert.equal(pbCross.subtitles[0].url, 'https://subs.example.net/1.vtt');
+    assert.equal(pbCross.subtitles[0].headers, undefined);
+
+    const pbCap = await h108.invoke('playback', { itemId: '4k-av1' });
+    assert.equal(pbCap.mime, 'application/x-mpegURL');
+    assert.ok(pbCap.url.includes('/master.m3u8'));
+  } finally {
+    await h108.dispose();
   }
 });
 

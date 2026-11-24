@@ -259,6 +259,15 @@ class PluginRuntime(
             if (rawResult.isNullOrEmpty() || rawResult == "undefined") {
                 JsonNull
             } else {
+                if (rawResult.length > MAX_RETURN_BYTES ||
+                    rawResult.toByteArray(Charsets.UTF_8).size > MAX_RETURN_BYTES
+                ) {
+                    throw PluginErrorMapper.toException(
+                        PluginErrorPayload(PluginErrorCode.INTERNAL),
+                        itemId = itemIdForErrors,
+                        context = androidContext,
+                    )
+                }
                 json.parseToJsonElement(rawResult)
             }
         } catch (t: Throwable) {
@@ -474,8 +483,10 @@ class PluginRuntime(
         itemId: String?,
     ): Nothing {
         // 1. Timeout or interrupted -> cancel OkHttp + destroy & rebuild next time, map to Unavailable (§7 & S3)
+        // Note: plain plugin `throw new Error("...timeout...")` or `throw new Error("interrupted")` MUST map to Internal,
+        // NOT Unavailable; only genuine host timeout/QuickJS interruption triggers Unavailable & VM rebuild.
         if (t is TimeoutCancellationException || t is QuickJsInterruptedException ||
-            (t is QuickJsException && t.message?.contains("interrupted", ignoreCase = true) == true)
+            (t is QuickJsException && t.message?.contains("InternalError: interrupted", ignoreCase = true) == true)
         ) {
             logger.warn("Method '$method' timed out; cancelling active requests and rebuilding runtime")
             fetchGateway.cancelAllActive()
@@ -596,8 +607,16 @@ class PluginRuntime(
                 requireToken(expectedToken, args)
                 PluginErrorMapper.WIRE_MARKER
             }
+            function("isStrictAwaitTracking") { args ->
+                requireToken(expectedToken, args)
+                false
+            }
+            function("reportUnawaitedOps") { args ->
+                requireToken(expectedToken, args)
+                Unit
+            }
 
-            // §11.1 / S3: true cancellable timers & immediate settle cleanup
+            // §11.1 / S3: true cancellable timers & immediate settle cleanup (max 256 active timers)
             asyncFunction("sleep") { args ->
                 requireToken(expectedToken, args)
                 val timerId = (args.getOrNull(1) as? Number)?.toInt() ?: return@asyncFunction false
@@ -605,6 +624,9 @@ class PluginRuntime(
                 val gen = (args.getOrNull(3) as? Number)?.toInt() ?: -1
                 if (gen != callGeneration.get()) return@asyncFunction false
                 val scope = activeCallScope ?: return@asyncFunction false
+                if (activeTimers.size >= MAX_ACTIVE_TIMERS) {
+                    throw IllegalStateException("同时活跃的定时器数量超过上限（最多 $MAX_ACTIVE_TIMERS 个）")
+                }
 
                 val done = CompletableDeferred<Boolean>()
                 val job = scope.launch {
@@ -730,8 +752,8 @@ class PluginRuntime(
                 val key = args.getOrNull(1)?.toString()
                     ?: throw IllegalArgumentException("storage.set requires key")
                 val valJson = args.getOrNull(2)?.toString() ?: "null"
-                val parsed = json.parseToJsonElement(valJson)
-                guardStorage { withContext(Dispatchers.IO) { storage.set(key, parsed) } }
+                // Check UTF-8 byte quota BEFORE parsing JSON to protect host heap
+                guardStorage { withContext(Dispatchers.IO) { storage.setRawJson(key, valJson) } }
                 Unit
             }
             asyncFunction("storageRemove") { args ->
@@ -894,11 +916,12 @@ class PluginRuntime(
                 domParser.attrsJson((args.getOrNull(1) as? Number)?.toInt() ?: 0)
             }
 
-            // ctx.log
+            // ctx.log (truncate to 4 KB BEFORE regex redaction to protect host CPU & heap)
             function("log") { args ->
                 requireToken(expectedToken, args)
                 val levelName = args.getOrNull(1)?.toString()?.uppercase(Locale.ROOT) ?: "INFO"
-                val msg = args.getOrNull(2)?.toString() ?: ""
+                val rawMsg = args.getOrNull(2)?.toString() ?: ""
+                val msg = PluginLogger.truncateUtf8(rawMsg, PluginLogger.MAX_MESSAGE_BYTES)
                 val level = PluginLogLevel.entries.firstOrNull { it.name == levelName } ?: PluginLogLevel.INFO
                 logger.log(level, msg)
                 Unit
@@ -926,6 +949,8 @@ class PluginRuntime(
         /** §11.1: QuickJS heap limit is 64 MB. */
         const val DEFAULT_MEMORY_LIMIT_BYTES = 64L * 1024 * 1024
         const val MAX_STACK_BYTES = 512L * 1024
+        const val MAX_RETURN_BYTES = 8 * 1024 * 1024
+        const val MAX_ACTIVE_TIMERS = 256
         const val DEFAULT_CALL_TIMEOUT_MS = 15_000L
         const val PLAYBACK_CALL_TIMEOUT_MS = 30_000L
         private const val DISPOSE_TIMEOUT_MS = 2_000L

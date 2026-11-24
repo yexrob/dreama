@@ -77,6 +77,14 @@ data class PluginPermissions(
     val lan: Boolean = false,
 ) {
     /**
+     * True when `lan == true` AND `hosts` contains any wildcard pattern (e.g.
+     * `*.home.arpa`, `*.lan.example.com`). Install confirmation UI MUST surface an explicit
+     * warning ("可访问你局域网里的任意设备") whenever this flag is true.
+     */
+    val allowsWildcardLanAccess: Boolean
+        get() = lan && hosts.any { it.trim().startsWith("*.") }
+
+    /**
      * Returns true when this permission set grants strictly more capability
      * than [previous] (requiring explicit user re-confirmation on plugin update
      * per protocol §7).

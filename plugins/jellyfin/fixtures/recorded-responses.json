@@ -12,6 +12,14 @@
       "episodeId": "1f867ee02fdeed20cfe3a5966b1dad8e"
     }
   },
+  "systemInfoPublic": {
+    "LocalAddress": "http://127.0.0.1:8096",
+    "ServerName": "depth3d-test",
+    "Version": "12.4.0",
+    "ProductName": "Jellyfin Server",
+    "Id": "ef938c7779f046e0bd5e4d88c3e47d38",
+    "StartupWizardCompleted": true
+  },
   "authSuccess": {
     "User": {
       "Name": "d3tester",

@@ -1,5 +1,6 @@
 package com.limelight.local.plugin
 
+import android.content.Context
 import android.net.Uri
 import androidx.annotation.OptIn
 import androidx.media3.common.C
@@ -43,15 +44,70 @@ import okhttp3.Request
 import okhttp3.Response
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.EOFException
 import java.io.IOException
 import java.io.InputStream
 import java.net.InetAddress
 import java.net.Proxy
+import java.net.SocketTimeoutException
 import java.net.URI
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
-sealed interface ResolvedStreamPlan {
+/**
+ * The ONLY public playback entry point for plugin sources (§11.3).
+ *
+ * Player code (`LocalPlayerXR` / future plugin playback wiring) MUST build
+ * Media3 [ExoMediaSource]s exclusively through [PluginPlayback] so every
+ * manifest, segment, backup URL, redirect hop, and subtitle request is forced
+ * through [SafePluginHttpDataSource], [FailoverUrlDataSource], and the
+ * instance's [NetworkPolicy]. Callers must NEVER read `PlaybackInfo.url` /
+ * `PlaybackInfo.headers` to construct a raw `DefaultHttpDataSource`.
+ */
+@OptIn(UnstableApi::class)
+object PluginPlayback {
+    fun createMediaSource(
+        context: Context? = null,
+        source: PluginMediaSource,
+        playbackInfo: PlaybackInfo,
+        selectedQualityId: String? = null,
+        selectedAudioId: String? = null,
+        fallbackDurationMs: Long? = null,
+    ): ExoMediaSource {
+        // context reserved for future local cache / Media3 integration; all network I/O
+        // goes strictly through source's policy-bound factory.
+        val factory = source.createPlaybackFactory()
+        return factory.createMediaSource(
+            info = playbackInfo,
+            selectedQualityId = selectedQualityId,
+            selectedAudioId = selectedAudioId,
+            fallbackDurationMs = fallbackDurationMs,
+        )
+    }
+
+    fun createSessionController(
+        source: PluginMediaSource,
+        clockMs: () -> Long = System::currentTimeMillis,
+    ): PlaybackSessionController = source.createPlaybackSessionController(clockMs = clockMs)
+}
+
+/**
+ * The ONLY public image loading entry point for plugin artwork (`poster`,
+ * `thumb`, `backdrop`, `avatar`) (§11.3).
+ *
+ * Wall UI code MUST load plugin [Artwork] exclusively through [PluginImages]
+ * so every image URL and redirect hop is enforced against the instance's
+ * [NetworkPolicy] with DNS pinning, HTTPS downgrade blocking, and cross-origin
+ * header stripping.
+ */
+object PluginImages {
+    suspend fun loadBytes(
+        source: PluginMediaSource,
+        artwork: Artwork,
+    ): ByteArray = source.createImageFetcher().fetchBytes(artwork)
+}
+
+internal sealed interface ResolvedStreamPlan {
     data class DirectUrl(
         val url: String,
         val streamType: DirectStreamType,
@@ -86,9 +142,9 @@ sealed interface ResolvedStreamPlan {
     ) : ResolvedStreamPlan
 }
 
-enum class DirectStreamType { PROGRESSIVE, HLS, DASH }
+internal enum class DirectStreamType { PROGRESSIVE, HLS, DASH }
 
-data class ResolvedSubtitlePlan(
+internal data class ResolvedSubtitlePlan(
     val track: SubtitleTrack,
     val effectiveHeaders: Map<String, String>,
     val trustedOrigins: Set<String>,
@@ -96,7 +152,7 @@ data class ResolvedSubtitlePlan(
     val requiresJsonToVttConversion: Boolean,
 )
 
-data class PlaybackPlan(
+internal data class PlaybackPlan(
     val info: PlaybackInfo,
     val stream: ResolvedStreamPlan,
     val subtitles: List<ResolvedSubtitlePlan>,
@@ -258,7 +314,7 @@ object JsonSubtitleConverter {
  *   resource; strips `Authorization`, `Cookie`, and all plugin custom headers on
  *   any untrusted origin or cross-origin redirect
  */
-class SafePluginHttpExecutor(
+internal class SafePluginHttpExecutor(
     private val networkPolicy: NetworkPolicy,
     baseClient: OkHttpClient = DEFAULT_CLIENT,
     private val userAgent: String = PlaybackMediaSourceFactory.DEFAULT_USER_AGENT,
@@ -275,13 +331,22 @@ class SafePluginHttpExecutor(
         pluginHeaders: Map<String, String>,
         trustedOrigins: Set<String>,
         rangeHeader: String? = null,
+        totalTimeoutMs: Long? = null,
     ): Response {
         var currentUrl = rawUrl
         var prevScheme: String? = null
         var hops = 0
-        var activePluginHeaders = LinkedHashMap(pluginHeaders)
+        val activePluginHeaders = LinkedHashMap(pluginHeaders)
+        val deadlineNanos = totalTimeoutMs?.let { System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(it) }
 
         while (true) {
+            val remainingMs = deadlineNanos?.let {
+                val rem = TimeUnit.NANOSECONDS.toMillis(it - System.nanoTime())
+                if (rem <= 0L) {
+                    throw SocketTimeoutException("下载总耗时超过 ${totalTimeoutMs / 1000} 秒上限")
+                }
+                rem
+            }
             val validated = try {
                 networkPolicy.validateResourceUrl(currentUrl, previousScheme = prevScheme)
             } catch (e: NetworkPolicyException) {
@@ -299,7 +364,14 @@ class SafePluginHttpExecutor(
                     return networkPolicy.validateResourceUrl("https://$hostname/").resolvedAddresses
                 }
             }
-            val hopClient = client.newBuilder().dns(pinnedDns).build()
+            val hopClientBuilder = client.newBuilder().dns(pinnedDns)
+            if (remainingMs != null) {
+                hopClientBuilder
+                    .connectTimeout(minOf(remainingMs, 10_000L), TimeUnit.MILLISECONDS)
+                    .readTimeout(remainingMs, TimeUnit.MILLISECONDS)
+                    .callTimeout(remainingMs, TimeUnit.MILLISECONDS)
+            }
+            val hopClient = hopClientBuilder.build()
 
             val reqBuilder = Request.Builder().url(validated.url).get()
             var hasUa = false
@@ -354,7 +426,7 @@ class SafePluginHttpExecutor(
  * to plugin-declared origins (§11.3, B1).
  */
 @OptIn(UnstableApi::class)
-class SafePluginHttpDataSource(
+internal class SafePluginHttpDataSource(
     private val executor: SafePluginHttpExecutor,
     private val pluginHeaders: Map<String, String>,
     private val trustedOrigins: Set<String>,
@@ -385,12 +457,27 @@ class SafePluginHttpDataSource(
                 Util.EMPTY_BYTE_ARRAY,
             )
         }
+        val stream = resp.body.byteStream()
+        var contentLength = resp.body.contentLength()
+        // If we asked for Range starting > 0 but the server ignored Range and returned 200 OK,
+        // skip the prefix bytes so mid-stream failover resume stays byte-accurate.
+        if (dataSpec.position > 0L && resp.code == 200) {
+            try {
+                skipFully(stream, dataSpec.position)
+                if (contentLength >= 0L) {
+                    contentLength = (contentLength - dataSpec.position).coerceAtLeast(0L)
+                }
+            } catch (e: IOException) {
+                runCatching { stream.close() }
+                runCatching { resp.close() }
+                throw e
+            }
+        }
         response = resp
-        inputStream = resp.body.byteStream()
+        inputStream = stream
         openedUri = runCatching { Uri.parse(resp.request.url.toString()) }.getOrNull() ?: dataSpec.uri
-        val contentLength = resp.body.contentLength()
         bytesToRead = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
-            dataSpec.length
+            if (contentLength >= 0L) minOf(dataSpec.length, contentLength) else dataSpec.length
         } else if (contentLength >= 0L) {
             contentLength
         } else {
@@ -408,7 +495,11 @@ class SafePluginHttpDataSource(
             if (remaining <= 0L) return C.RESULT_END_OF_INPUT
             val capped = minOf(length.toLong(), remaining).toInt()
             val n = inputStream?.read(buffer, offset, capped) ?: return C.RESULT_END_OF_INPUT
-            if (n < 0) return C.RESULT_END_OF_INPUT
+            if (n < 0) {
+                // Server closed the stream before delivering declared Content-Length -> signal I/O error
+                // so DASH / FailoverUrlDataSource can fail over to a backup URL mid-stream!
+                throw EOFException("Unexpected EOF after $bytesRead of $bytesToRead bytes")
+            }
             bytesRead += n
             bytesTransferred(n)
             return n
@@ -441,6 +532,16 @@ class SafePluginHttpDataSource(
         }
     }
 
+    private fun skipFully(stream: InputStream, bytesToSkip: Long) {
+        var remaining = bytesToSkip
+        val buf = ByteArray(8192)
+        while (remaining > 0L) {
+            val n = stream.read(buf, 0, minOf(buf.size.toLong(), remaining).toInt())
+            if (n < 0) throw EOFException("Unexpected EOF while skipping to resume offset $bytesToSkip")
+            remaining -= n
+        }
+    }
+
     private fun buildRangeHeader(position: Long, length: Long): String? {
         if (position == 0L && length == C.LENGTH_UNSET.toLong()) return null
         return if (length == C.LENGTH_UNSET.toLong()) {
@@ -456,7 +557,7 @@ class SafePluginHttpDataSource(
  * pinning, redirect-hop validation, HTTPS downgrade block, and cross-origin
  * header stripping for plugin artwork (`poster`, `thumb`, `backdrop`, `avatar`).
  */
-class PluginImageFetcher(
+internal class PluginImageFetcher(
     networkPolicy: NetworkPolicy,
     baseClient: OkHttpClient = OkHttpClient(),
     private val maxImageBytes: Int = MAX_IMAGE_BYTES,
@@ -502,7 +603,7 @@ class PluginImageFetcher(
  * Stateful candidate-URL failover selector used by [FailoverUrlDataSource]
  * (for plain separated progressive video/audio tracks without DASH byte ranges).
  */
-class FailoverUrlSelector(
+internal class FailoverUrlSelector(
     urls: List<String>,
 ) {
     private val candidates: List<String> = urls.distinct().also {
@@ -511,16 +612,20 @@ class FailoverUrlSelector(
     @Volatile
     private var preferredIndex: Int = 0
 
-    fun <T> executeWithFailover(attempt: (url: String) -> T): T {
+    fun <T> executeWithFailover(
+        excludeIndices: Set<Int> = emptySet(),
+        attempt: (index: Int, url: String) -> T,
+    ): Pair<Int, T> {
         val start = preferredIndex
         var lastError: IOException? = null
         for (offset in candidates.indices) {
             val idx = (start + offset) % candidates.size
+            if (idx in excludeIndices) continue
             val candidate = candidates[idx]
             try {
-                val result = attempt(candidate)
+                val result = attempt(idx, candidate)
                 preferredIndex = idx
-                return result
+                return idx to result
             } catch (e: IOException) {
                 lastError = e
             }
@@ -528,22 +633,38 @@ class FailoverUrlSelector(
         throw lastError ?: IOException("All candidate URLs failed")
     }
 
+    fun <T> executeWithFailover(attempt: (url: String) -> T): T =
+        executeWithFailover(emptySet()) { _, url -> attempt(url) }.second
+
     fun currentPreferredUrl(): String = candidates[preferredIndex]
     fun allCandidates(): List<String> = candidates
 }
 
+/**
+ * Failover [DataSource] supporting BOTH open-time failure failover AND
+ * mid-stream disconnect/EOF failover (reopening the next candidate URL at
+ * `baseDataSpec.position + bytesReadFromBase` using a `Range` request).
+ */
 @OptIn(UnstableApi::class)
-class FailoverUrlDataSource(
+internal class FailoverUrlDataSource(
     private val upstreamFactory: DataSource.Factory,
     private val selector: FailoverUrlSelector,
 ) : BaseDataSource(/* isNetwork = */ true) {
 
     private var activeDelegate: DataSource? = null
     private var activeUri: Uri? = null
+    private var activeCandidateIndex: Int = -1
+    private var baseDataSpec: DataSpec? = null
+    private var bytesReadFromBase: Long = 0L
+    private val failedIndices = LinkedHashSet<Int>()
 
     override fun open(dataSpec: DataSpec): Long {
         transferInitializing(dataSpec)
-        val (delegate, uri, length) = selector.executeWithFailover { candidateUrl ->
+        failedIndices.clear()
+        bytesReadFromBase = 0L
+        baseDataSpec = dataSpec
+
+        val (chosenIdx, opened) = selector.executeWithFailover(failedIndices) { idx, candidateUrl ->
             val targetUri = Uri.parse(candidateUrl)
             val delegate = upstreamFactory.createDataSource()
             try {
@@ -551,21 +672,74 @@ class FailoverUrlDataSource(
                 val len = delegate.open(rewritten)
                 Triple(delegate, targetUri, len)
             } catch (e: IOException) {
+                failedIndices += idx
                 runCatching { delegate.close() }
                 throw e
             }
         }
-        activeDelegate = delegate
-        activeUri = uri
+        activeCandidateIndex = chosenIdx
+        activeDelegate = opened.first
+        activeUri = opened.second
         transferStarted(dataSpec)
-        return length
+        return opened.third
     }
 
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
-        val delegate = activeDelegate ?: return C.RESULT_END_OF_INPUT
-        val read = delegate.read(buffer, offset, length)
-        if (read > 0) bytesTransferred(read)
-        return read
+        if (length == 0) return 0
+        while (true) {
+            val delegate = activeDelegate ?: return C.RESULT_END_OF_INPUT
+            try {
+                val read = delegate.read(buffer, offset, length)
+                if (read > 0) {
+                    bytesReadFromBase += read
+                    bytesTransferred(read)
+                }
+                return read
+            } catch (e: IOException) {
+                if (activeCandidateIndex >= 0) {
+                    failedIndices += activeCandidateIndex
+                }
+                runCatching { delegate.close() }
+                activeDelegate = null
+                activeUri = null
+
+                val spec = baseDataSpec ?: throw e
+                val resumePosition = spec.position + bytesReadFromBase
+                val remainingLength = if (spec.length != C.LENGTH_UNSET.toLong()) {
+                    val rem = spec.length - bytesReadFromBase
+                    if (rem <= 0L) return C.RESULT_END_OF_INPUT
+                    rem
+                } else {
+                    C.LENGTH_UNSET.toLong()
+                }
+
+                // Attempt mid-stream failover to next untried candidate URL at exact byte offset
+                val (nextIdx, reopened) = try {
+                    selector.executeWithFailover(failedIndices) { idx, candidateUrl ->
+                        val targetUri = Uri.parse(candidateUrl)
+                        val nextDelegate = upstreamFactory.createDataSource()
+                        try {
+                            val resumeSpec = spec.buildUpon()
+                                .setUri(targetUri)
+                                .setPosition(resumePosition)
+                                .setLength(remainingLength)
+                                .build()
+                            nextDelegate.open(resumeSpec)
+                            nextDelegate to targetUri
+                        } catch (openErr: IOException) {
+                            failedIndices += idx
+                            runCatching { nextDelegate.close() }
+                            throw openErr
+                        }
+                    }
+                } catch (_: IOException) {
+                    throw e
+                }
+                activeCandidateIndex = nextIdx
+                activeDelegate = reopened.first
+                activeUri = reopened.second
+            }
+        }
     }
 
     override fun getUri(): Uri? = activeUri ?: activeDelegate?.uri
@@ -575,20 +749,27 @@ class FailoverUrlDataSource(
 
     override fun close() {
         val delegate = activeDelegate
+        val wasOpened = baseDataSpec != null
         activeDelegate = null
         activeUri = null
+        activeCandidateIndex = -1
+        baseDataSpec = null
+        bytesReadFromBase = 0L
+        failedIndices.clear()
         if (delegate != null) {
             try {
                 delegate.close()
             } finally {
                 transferEnded()
             }
+        } else if (wasOpened) {
+            transferEnded()
         }
     }
 }
 
 @OptIn(UnstableApi::class)
-class JsonSubtitleVttDataSource(
+internal class JsonSubtitleVttDataSource(
     private val upstreamFactory: DataSource.Factory,
 ) : BaseDataSource(/* isNetwork = */ true) {
     private var converted: ByteArray? = null
@@ -649,7 +830,7 @@ class JsonSubtitleVttDataSource(
  * request and redirect hop (§11.3, B1, B3, S6).
  */
 @OptIn(UnstableApi::class)
-class PlaybackMediaSourceFactory(
+internal class PlaybackMediaSourceFactory(
     private val networkPolicy: NetworkPolicy,
     private val deviceCodecs: List<String> = listOf("avc", "hevc"),
     private val okHttpClient: OkHttpClient = OkHttpClient(),
@@ -695,10 +876,23 @@ class PlaybackMediaSourceFactory(
             else -> throw SourceUnsupportedException("这个内容没有可用的播放地址，请尝试切换清晰度或片源。")
         }
 
+        val mainStreamOrigins: Set<String> = when (streamPlan) {
+            is ResolvedStreamPlan.DirectUrl -> streamPlan.trustedOrigins
+            is ResolvedStreamPlan.SynthesizedDashMpd -> streamPlan.trustedOrigins
+            is ResolvedStreamPlan.MergedProgressiveTracks -> streamPlan.trustedOrigins
+            is ResolvedStreamPlan.InlineMpd -> streamPlan.trustedOrigins
+        }
+
         val subtitlePlans = info.subtitles.map { sub ->
             val validatedSub = networkPolicy.validateResourceUrlPrecheck(sub.url)
-            // §11.2: subtitle headers overlay on top of PlaybackInfo.headers (same-name override)
-            val mergedHeaders = LinkedHashMap<String, String>(info.headers)
+            val subOrigin = NetworkPolicy.originKey(validatedSub)
+            // §11.2 + §11.3: ONLY inherit PlaybackInfo.headers when the subtitle shares
+            // the same origin as the main stream; cross-origin subtitles receive ONLY
+            // their own track-declared `sub.headers`.
+            val mergedHeaders = LinkedHashMap<String, String>()
+            if (subOrigin in mainStreamOrigins) {
+                mergedHeaders.putAll(info.headers)
+            }
             mergedHeaders.putAll(sub.headers)
             val (mime, needsJsonConv) = when (sub.format) {
                 SubtitleFormat.SRT -> MimeTypes.APPLICATION_SUBRIP to false
@@ -709,7 +903,7 @@ class PlaybackMediaSourceFactory(
             ResolvedSubtitlePlan(
                 track = sub,
                 effectiveHeaders = mergedHeaders,
-                trustedOrigins = setOf(NetworkPolicy.originKey(validatedSub)),
+                trustedOrigins = setOf(subOrigin),
                 media3MimeType = mime,
                 requiresJsonToVttConversion = needsJsonConv,
             )
@@ -990,9 +1184,10 @@ class PlaybackMediaSourceFactory(
     }
 }
 
-data class ResolvedPlaybackSession(
+@ConsistentCopyVisibility
+data class ResolvedPlaybackSession internal constructor(
     val info: PlaybackInfo,
-    val plan: PlaybackPlan,
+    internal val plan: PlaybackPlan,
     val resumePositionMs: Long,
     val selectedQualityId: String?,
     val selectedAudioId: String?,
@@ -1002,14 +1197,18 @@ data class ResolvedPlaybackSession(
  * Manages playback URL expiration (`expiresAt` with §11.2 60-second lead time
  * and short-TTL non-looping guard), automatic re-fetching on expiry or HTTP
  * 401/403/410 failure, and quality/audio switching.
+ *
+ * Obtain instances via [PluginPlayback.createSessionController] and build
+ * Media3 sources via [createMediaSource].
  */
-class PlaybackSessionController(
+@OptIn(UnstableApi::class)
+class PlaybackSessionController internal constructor(
     private val fetchPlayback: suspend (itemId: String, quality: String?, audio: String?) -> PlaybackInfo,
     private val factory: PlaybackMediaSourceFactory,
     private val clockMs: () -> Long = System::currentTimeMillis,
     private val refreshLeadMs: Long = DEFAULT_REFRESH_LEAD_MS,
 ) {
-    constructor(
+    internal constructor(
         source: PluginMediaSource,
         factory: PlaybackMediaSourceFactory = source.createPlaybackFactory(),
         clockMs: () -> Long = System::currentTimeMillis,
@@ -1020,6 +1219,10 @@ class PlaybackSessionController(
         clockMs = clockMs,
         refreshLeadMs = refreshLeadMs,
     )
+
+    /** Builds a policy-enforced Media3 [ExoMediaSource] from a resolved session. */
+    fun createMediaSource(session: ResolvedPlaybackSession): ExoMediaSource =
+        factory.createMediaSource(session.plan)
 
     @Volatile
     private var currentItemId: String? = null

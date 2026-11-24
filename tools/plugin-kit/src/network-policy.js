@@ -14,11 +14,20 @@ export function canonicalizeHost(raw) {
   }
   const zoneIdx = h.indexOf('%');
   if (zoneIdx >= 0) h = h.slice(0, zoneIdx);
-  return h.replace(/\.+$/, '');
+  h = h.replace(/\.+$/, '');
+  if (h.includes(':')) {
+    const ip6 = parseIpv6BytesRaw(h);
+    if (ip6) return formatIpBytes(ip6);
+  }
+  return h;
 }
 
 export function canonicalizePattern(raw) {
-  return String(raw || '').trim().toLowerCase().replace(/\.+$/, '');
+  const low = String(raw || '').trim().toLowerCase();
+  if (low.startsWith('*.')) {
+    return `*.${canonicalizeHost(low.slice(2))}`;
+  }
+  return canonicalizeHost(low);
 }
 
 export function originKey(urlObj) {
@@ -100,8 +109,12 @@ export function parseFlexibleIpv4Bytes(rawHost) {
  * Parses any IPv6 literal (including embedded dotted IPv4 tails like
  * `::127.0.0.1`, `::ffff:10.0.0.1`, `64:ff9b::192.168.1.1`) into a 16-byte Uint8Array.
  */
-export function parseIpv6Bytes(rawHost) {
-  let host = canonicalizeHost(rawHost);
+function parseIpv6BytesRaw(raw) {
+  let host = String(raw || '').trim().toLowerCase();
+  if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1);
+  const zoneIdx = host.indexOf('%');
+  if (zoneIdx >= 0) host = host.slice(0, zoneIdx);
+  host = host.replace(/\.+$/, '');
   if (!host.includes(':')) return null;
 
   // Handle optional embedded dotted IPv4 tail
@@ -148,6 +161,10 @@ export function parseIpv6Bytes(rawHost) {
     out[i * 2 + 1] = groups[i] & 0xFF;
   }
   return out;
+}
+
+export function parseIpv6Bytes(rawHost) {
+  return parseIpv6BytesRaw(rawHost);
 }
 
 export function parseAnyIpLiteral(rawHost) {
@@ -207,6 +224,7 @@ export function isAlwaysBlockedBytes(bytes) {
     if (b0 === 169 && b1 === 254) return true; // 169.254/16 link-local / cloud metadata
     if (b0 === 192 && b1 === 0 && b2 === 0) return true; // 192.0.0/24 IETF protocol assignments
     if (b0 === 192 && b1 === 0 && b2 === 2) return true; // TEST-NET-1
+    if (b0 === 192 && b1 === 88 && b2 === 99) return true; // 192.88.99/24 6to4 relay anycast
     if (b0 === 198 && b1 === 51 && b2 === 100) return true; // TEST-NET-2
     if (b0 === 203 && b1 === 0 && b2 === 113) return true; // TEST-NET-3
     if (b0 >= 224) return true; // 224/4 multicast, 240/4 reserved, 255.255.255.255 broadcast
@@ -219,6 +237,8 @@ export function isAlwaysBlockedBytes(bytes) {
     if (first15Zero && (bytes[15] === 0 || bytes[15] === 1)) return true;
     // fe80::/10 link-local
     if (bytes[0] === 0xFE && (bytes[1] & 0xC0) === 0x80) return true;
+    // fec0::/10 deprecated site-local (RFC 3879)
+    if (bytes[0] === 0xFE && (bytes[1] & 0xC0) === 0xC0) return true;
     // ff00::/8 multicast
     if (bytes[0] === 0xFF) return true;
     // 100::/64 discard
@@ -226,8 +246,18 @@ export function isAlwaysBlockedBytes(bytes) {
         bytes[2] === 0 && bytes[3] === 0 && bytes[4] === 0 && bytes[5] === 0 && bytes[6] === 0 && bytes[7] === 0) {
       return true;
     }
+    // 2001::/32 Teredo (RFC 4380)
+    if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0x00 && bytes[3] === 0x00) return true;
     // 2001:db8::/32 documentation
     if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0x0D && bytes[3] === 0xB8) return true;
+    // ::ffff:0:0/96 ALL IPv4-mapped IPv6
+    let z10 = true;
+    for (let i = 0; i < 10; i++) if (bytes[i] !== 0) { z10 = false; break; }
+    if (z10 && bytes[10] === 0xFF && bytes[11] === 0xFF) return true;
+    // ::ffff:0:0:0/96 IPv4-translated SIIT
+    let z8 = true;
+    for (let i = 0; i < 8; i++) if (bytes[i] !== 0) { z8 = false; break; }
+    if (z8 && bytes[8] === 0xFF && bytes[9] === 0xFF && bytes[10] === 0 && bytes[11] === 0) return true;
 
     const embedded = extractEmbeddedIpv4(bytes);
     if (embedded) return isAlwaysBlockedBytes(embedded);
@@ -237,6 +267,7 @@ export function isAlwaysBlockedBytes(bytes) {
 }
 
 export function isPrivateBytes(bytes) {
+  if (isAlwaysBlockedBytes(bytes)) return false;
   if (bytes.length === 4) {
     const [b0, b1] = bytes;
     if (b0 === 10) return true; // 10/8
@@ -248,6 +279,11 @@ export function isPrivateBytes(bytes) {
   }
   if (bytes.length === 16) {
     if ((bytes[0] & 0xFE) === 0xFC) return true; // fc00::/7 ULA
+    // NAT64 local-use 64:ff9b:1::/48 (RFC 8215)
+    if (bytes[0] === 0x00 && bytes[1] === 0x64 && bytes[2] === 0xFF && bytes[3] === 0x9B &&
+        bytes[4] === 0x00 && bytes[5] === 0x01) {
+      return true;
+    }
     const embedded = extractEmbeddedIpv4(bytes);
     if (embedded) return isPrivateBytes(embedded);
     return false;

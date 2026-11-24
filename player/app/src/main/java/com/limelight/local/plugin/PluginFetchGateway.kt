@@ -17,6 +17,7 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.InetAddress
 import java.net.Proxy
+import java.net.SocketTimeoutException
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -136,6 +137,7 @@ class PluginFetchGateway(
         }
 
         val timeout = (req.timeoutMs ?: defaultTimeoutMs).coerceIn(100L, MAX_TIMEOUT_MS)
+        val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeout)
 
         var currentUrl = req.url
         var prevScheme: String? = null
@@ -146,6 +148,10 @@ class PluginFetchGateway(
         var hops = 0
 
         while (true) {
+            val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime())
+            if (remainingMs <= 0L) {
+                throw SocketTimeoutException("请求总耗时超过 ${timeout} ms 上限")
+            }
             val validated = policy.validateFetchUrl(currentUrl, previousScheme = prevScheme)
             val pinnedDns = object : Dns {
                 override fun lookup(hostname: String): List<InetAddress> {
@@ -157,10 +163,10 @@ class PluginFetchGateway(
             }
             val hopClient = client.newBuilder()
                 .dns(pinnedDns)
-                .connectTimeout(timeout, TimeUnit.MILLISECONDS)
-                .readTimeout(timeout, TimeUnit.MILLISECONDS)
-                .writeTimeout(timeout, TimeUnit.MILLISECONDS)
-                .callTimeout(timeout, TimeUnit.MILLISECONDS)
+                .connectTimeout(remainingMs, TimeUnit.MILLISECONDS)
+                .readTimeout(remainingMs, TimeUnit.MILLISECONDS)
+                .writeTimeout(remainingMs, TimeUnit.MILLISECONDS)
+                .callTimeout(remainingMs, TimeUnit.MILLISECONDS)
                 .build()
 
             // §11.1: merge jar cookies with explicit Cookie header (explicit takes precedence on collision)
@@ -201,10 +207,10 @@ class PluginFetchGateway(
             activeCalls[callId] = call
             try {
                 call.execute().use { resp ->
-                    // Save Set-Cookie headers from every hop into instance cookie jar
-                    val setCookies = Cookie.parseAll(validated.url, resp.headers)
-                    if (setCookies.isNotEmpty()) {
-                        cookieJar.saveFromResponse(validated.url, setCookies)
+                    // Save Set-Cookie headers from every hop with unified RFC 6265 validation & WARN logging
+                    val rawSetCookies = resp.headers.values("Set-Cookie")
+                    if (rawSetCookies.isNotEmpty()) {
+                        cookieJar.saveFromSetCookieHeaders(validated.url.toString(), rawSetCookies)
                     }
 
                     val code = resp.code
@@ -212,7 +218,7 @@ class PluginFetchGateway(
                     if (code in REDIRECT_CODES && location != null) {
                         when (redirectMode) {
                             "error" -> throw IOException("请求触发重定向且 redirect=error（状态码 $code）")
-                            "manual" -> return buildResponse(resp, validated.url.toString())
+                            "manual" -> return buildResponse(resp, validated.url.toString(), deadlineNanos, timeout)
                             "follow" -> {
                                 hops += 1
                                 if (hops > maxRedirects) {
@@ -221,9 +227,10 @@ class PluginFetchGateway(
                                 val resolved = validated.url.resolve(location)
                                     ?: throw NetworkPolicyException("无效的重定向目标地址")
                                 if (NetworkPolicy.originKey(validated.url) != NetworkPolicy.originKey(resolved)) {
-                                    currentHeaders.keys.removeAll {
-                                        it.equals("Authorization", ignoreCase = true) ||
-                                            it.equals("Cookie", ignoreCase = true)
+                                    // Keep ONLY safe general headers across cross-origin redirects;
+                                    // strip Authorization, Cookie, Referer, and ALL custom plugin headers.
+                                    currentHeaders.keys.retainAll { headerName ->
+                                        headerName.lowercase(Locale.ROOT) in CROSS_ORIGIN_SAFE_HEADERS
                                     }
                                 }
                                 if (code == 303 || ((code == 301 || code == 302) && currentMethod == "POST")) {
@@ -241,7 +248,7 @@ class PluginFetchGateway(
                             }
                         }
                     }
-                    return buildResponse(resp, validated.url.toString())
+                    return buildResponse(resp, validated.url.toString(), deadlineNanos, timeout)
                 }
             } finally {
                 activeCalls.remove(callId)
@@ -263,7 +270,12 @@ class PluginFetchGateway(
 
     fun activeCallCount(): Int = activeCalls.size
 
-    private fun buildResponse(resp: okhttp3.Response, finalUrl: String): FetchResponse {
+    private fun buildResponse(
+        resp: okhttp3.Response,
+        finalUrl: String,
+        deadlineNanos: Long,
+        totalTimeoutMs: Long,
+    ): FetchResponse {
         val headerMap = LinkedHashMap<String, String>()
         for (i in 0 until resp.headers.size) {
             val k = resp.headers.name(i).lowercase(Locale.ROOT)
@@ -288,6 +300,9 @@ class PluginFetchGateway(
         try {
             resp.body.byteStream().use { stream ->
                 while (true) {
+                    if (System.nanoTime() >= deadlineNanos) {
+                        throw SocketTimeoutException("请求总耗时超过 ${totalTimeoutMs} ms 上限")
+                    }
                     val read = stream.read(buf)
                     if (read < 0) break
                     total += read
@@ -328,6 +343,7 @@ class PluginFetchGateway(
         const val MAX_TIMEOUT_MS = 30_000L
         private val REDIRECT_CODES = setOf(301, 302, 303, 307, 308)
         private val ALLOWED_METHODS = setOf("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
+        private val CROSS_ORIGIN_SAFE_HEADERS = setOf("accept", "accept-language", "user-agent", "range")
         private val DEFAULT_CLIENT = OkHttpClient.Builder()
             .proxy(Proxy.NO_PROXY)
             .connectTimeout(10, TimeUnit.SECONDS)

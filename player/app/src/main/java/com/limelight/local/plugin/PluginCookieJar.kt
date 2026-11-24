@@ -14,6 +14,9 @@ import okhttp3.CookieJar
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.write
 
@@ -24,8 +27,13 @@ class CookieJarQuotaExceededException(message: String) : IllegalStateException(m
  * (§5, §11.1, S5):
  * - Capped at 256 KB serialized JSON size
  * - Coalesces disk writes (`dirty` flag flushed once per plugin invocation via
- *   [flush], or immediately when [autoFlush] is true) so thousands of cookie
- *   updates complete in milliseconds without rewriting the file every time
+ *   [flush], or immediately when [autoFlush] is true)
+ * - Unified RFC 6265 parser matching `tools/plugin-kit/src/cookies.js`:
+ *   - `Max-Age` ALWAYS takes precedence over `Expires` regardless of attribute order
+ *   - Rejects public-suffix `Domain` attributes and domain-mismatched cookies,
+ *     ignoring the cookie and emitting a WARN via [onWarning]
+ *   - Handles IPv4 and canonical IPv6 literal hosts consistently (exact host match only)
+ *   - Identical entry byte estimation (`140 + 2*name + 2*value + domain + path`)
  * - Preserves original file and throws [StorageCorruptedException] if
  *   decryption fails
  */
@@ -35,10 +43,11 @@ class PluginCookieJar(
     private val clockMs: () -> Long = System::currentTimeMillis,
     private val maxBytes: Int = MAX_COOKIE_JAR_BYTES,
     private val autoFlush: Boolean = false,
+    private val onWarning: (String) -> Unit = {},
 ) : CookieJar {
     private val json = Json { ignoreUnknownKeys = true }
     private val lock = ReentrantReadWriteLock()
-    private val store = LinkedHashMap<CookieKey, Cookie>()
+    private val store = LinkedHashMap<CookieKey, StoredCookie>()
     private var loaded = false
     private var loadFailure: StorageCorruptedException? = null
     private var dirty = false
@@ -55,7 +64,134 @@ class PluginCookieJar(
         val path: String,
     )
 
+    private data class StoredCookie(
+        val name: String,
+        val value: String,
+        val domain: String,
+        val hostOnly: Boolean,
+        val path: String,
+        val secure: Boolean,
+        val httpOnly: Boolean,
+        val expiresAt: Long,
+    ) {
+        fun matches(url: HttpUrl): Boolean {
+            if (secure && !url.isHttps) return false
+            val host = NetworkPolicy.canonicalizeHost(url.host)
+            val domainMatch = if (hostOnly) {
+                host == domain
+            } else {
+                domainMatches(host, domain)
+            }
+            if (!domainMatch) return false
+            val reqPath = url.encodedPath
+            return reqPath == path ||
+                (reqPath.startsWith(path) && (path.endsWith("/") || reqPath.getOrNull(path.length) == '/'))
+        }
+
+        fun toOkHttpCookie(): Cookie {
+            val b = Cookie.Builder()
+                .name(name)
+                .value(value)
+                .path(path)
+                .expiresAt(expiresAt.coerceAtMost(MAX_OKHTTP_DATE))
+            if (hostOnly) b.hostOnlyDomain(domain) else b.domain(domain)
+            if (secure) b.secure()
+            if (httpOnly) b.httpOnly()
+            return b.build()
+        }
+    }
+
     override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+        if (cookies.isEmpty()) return
+        val converted = cookies.map { c ->
+            StoredCookie(
+                name = c.name,
+                value = c.value,
+                domain = NetworkPolicy.canonicalizeHost(c.domain),
+                hostOnly = c.hostOnly,
+                path = c.path,
+                secure = c.secure,
+                httpOnly = c.httpOnly,
+                expiresAt = c.expiresAt,
+            )
+        }
+        saveStoredCookies(converted)
+    }
+
+    fun saveFromSetCookieHeaders(rawUrl: String, headers: List<String>) {
+        if (headers.isEmpty()) return
+        val url = rawUrl.trim().toHttpUrlOrNull() ?: return
+        val parsed = ArrayList<StoredCookie>(headers.size)
+        for (hdr in headers) {
+            val cookie = parseSetCookie(url, hdr, strictSyntax = false)
+            if (cookie != null) parsed += cookie
+        }
+        if (parsed.isNotEmpty()) {
+            saveStoredCookies(parsed)
+        }
+    }
+
+    override fun loadForRequest(url: HttpUrl): List<Cookie> =
+        loadStoredForRequest(url).map { it.toOkHttpCookie() }
+
+    private fun loadStoredForRequest(url: HttpUrl): List<StoredCookie> = lock.write {
+        ensureLoadedLocked()
+        val now = clockMs()
+        var evicted = false
+        val iter = store.entries.iterator()
+        val matched = ArrayList<StoredCookie>()
+        while (iter.hasNext()) {
+            val c = iter.next().value
+            if (c.expiresAt <= now) {
+                iter.remove()
+                estimatedBytes = (estimatedBytes - estimateEntryBytes(c)).coerceAtLeast(2)
+                evicted = true
+            } else if (c.matches(url)) {
+                matched += c
+            }
+        }
+        if (evicted) {
+            dirty = true
+            if (autoFlush) flushLocked()
+        }
+        matched
+    }
+
+    fun getHeaderForUrl(rawUrl: String): String {
+        val url = rawUrl.trim().toHttpUrlOrNull()
+            ?: throw IllegalArgumentException("Invalid cookie URL: $rawUrl")
+        val cookies = loadStoredForRequest(url)
+        return cookies.joinToString("; ") { "${it.name}=${it.value}" }
+    }
+
+    fun setCookie(rawUrl: String, setCookieHeader: String) {
+        val url = rawUrl.trim().toHttpUrlOrNull()
+            ?: throw IllegalArgumentException("Invalid cookie URL: $rawUrl")
+        val cookie = parseSetCookie(url, setCookieHeader, strictSyntax = true) ?: return
+        saveStoredCookies(listOf(cookie))
+    }
+
+    fun clear() = lock.write {
+        store.clear()
+        loaded = true
+        loadFailure = null
+        dirty = false
+        estimatedBytes = 2
+        if (file.exists()) {
+            file.delete()
+        }
+    }
+
+    /**
+     * Persists pending cookie mutations in a single atomic encrypted write.
+     */
+    fun flush() = lock.write {
+        if (dirty && loadFailure == null) {
+            flushLocked()
+        }
+    }
+
+    private fun saveStoredCookies(cookies: List<StoredCookie>) {
         if (cookies.isEmpty()) return
         lock.write {
             ensureLoadedLocked()
@@ -74,7 +210,6 @@ class PluginCookieJar(
                     val newCost = estimateEntryBytes(cookie)
                     val projected = estimatedBytes - oldCost + newCost
                     if (projected > maxBytes) {
-                        // Compute exact serialized byte count before rejecting
                         val prev = store.put(key, cookie)
                         val exactSize = serializeLocked().size
                         if (exactSize > maxBytes) {
@@ -98,62 +233,108 @@ class PluginCookieJar(
         }
     }
 
-    override fun loadForRequest(url: HttpUrl): List<Cookie> = lock.write {
-        ensureLoadedLocked()
-        val now = clockMs()
-        var evicted = false
-        val iter = store.entries.iterator()
-        val matched = ArrayList<Cookie>()
-        while (iter.hasNext()) {
-            val c = iter.next().value
-            if (c.expiresAt <= now) {
-                iter.remove()
-                estimatedBytes = (estimatedBytes - estimateEntryBytes(c)).coerceAtLeast(2)
-                evicted = true
-            } else if (c.matches(url)) {
-                matched += c
+    private fun parseSetCookie(url: HttpUrl, rawHeader: String, strictSyntax: Boolean): StoredCookie? {
+        val parts = rawHeader.trim().split(';').map { it.trim() }.filter { it.isNotEmpty() }
+        if (parts.isEmpty()) {
+            if (strictSyntax) throw IllegalArgumentException("Invalid Set-Cookie header")
+            return null
+        }
+        val eq = parts[0].indexOf('=')
+        if (eq <= 0) {
+            if (strictSyntax) throw IllegalArgumentException("Invalid cookie name=value")
+            return null
+        }
+        val name = parts[0].substring(0, eq).trim()
+        val value = parts[0].substring(eq + 1).trim()
+        if (name.isEmpty()) {
+            if (strictSyntax) throw IllegalArgumentException("Invalid cookie name=value")
+            return null
+        }
+
+        val reqHost = NetworkPolicy.canonicalizeHost(url.host)
+        val reqIsIp = NetworkPolicy.parseAnyIpLiteral(reqHost) != null
+
+        var domain = reqHost
+        var hostOnly = true
+        var cookiePath = defaultPath(url.encodedPath)
+        var secure = false
+        var httpOnly = false
+        var hasMaxAge = false
+        var maxAgeExpiresAt: Long? = null
+        var parsedExpiresAt: Long? = null
+
+        for (attr in parts.drop(1)) {
+            val aeq = attr.indexOf('=')
+            val k = (if (aeq >= 0) attr.substring(0, aeq) else attr).trim().lowercase(Locale.ROOT)
+            val v = if (aeq >= 0) attr.substring(aeq + 1).trim() else ""
+            when (k) {
+                "domain" -> {
+                    if (v.isEmpty()) continue
+                    val rawDomain = v.trimStart('.')
+                    val d = NetworkPolicy.canonicalizeHost(rawDomain)
+                    if (d.isEmpty()) continue
+                    if (isPublicSuffix(d)) {
+                        onWarning("Cookie '$name' 的 Domain='$v' 属于公共后缀，已忽略")
+                        return null
+                    }
+                    if (reqIsIp || NetworkPolicy.parseAnyIpLiteral(d) != null) {
+                        if (reqHost == d) {
+                            domain = reqHost
+                            hostOnly = true
+                        } else {
+                            onWarning("Cookie '$name' 的 Domain='$v' 与请求 IP 主机 '$reqHost' 不匹配，已忽略")
+                            return null
+                        }
+                    } else if (domainMatches(reqHost, d)) {
+                        domain = d
+                        hostOnly = false
+                    } else {
+                        onWarning("Cookie '$name' 的 Domain='$v' 与请求主机 '$reqHost' 不匹配，已忽略")
+                        return null
+                    }
+                }
+                "path" -> {
+                    if (v.startsWith("/")) cookiePath = v
+                }
+                "secure" -> secure = true
+                "httponly" -> httpOnly = true
+                "max-age" -> {
+                    // RFC 6265 §5.2.2: Max-Age ALWAYS takes precedence over Expires
+                    val sec = v.toLongOrNull()
+                    if (sec != null) {
+                        hasMaxAge = true
+                        maxAgeExpiresAt = if (sec <= 0L) {
+                            0L
+                        } else {
+                            val now = clockMs()
+                            val delta = if (sec > Long.MAX_VALUE / 1000L) MAX_OKHTTP_DATE - now else sec * 1000L
+                            (now + delta).coerceAtMost(MAX_OKHTTP_DATE)
+                        }
+                    }
+                }
+                "expires" -> {
+                    val ts = parseHttpDate(v)
+                    if (ts != null) parsedExpiresAt = ts
+                }
             }
         }
-        if (evicted) {
-            dirty = true
-            if (autoFlush) flushLocked()
+
+        val finalExpiresAt = when {
+            hasMaxAge && maxAgeExpiresAt != null -> maxAgeExpiresAt
+            parsedExpiresAt != null -> parsedExpiresAt
+            else -> MAX_OKHTTP_DATE
         }
-        matched
-    }
 
-    fun getHeaderForUrl(rawUrl: String): String {
-        val url = rawUrl.trim().toHttpUrlOrNull()
-            ?: throw IllegalArgumentException("Invalid cookie URL: $rawUrl")
-        val cookies = loadForRequest(url)
-        return cookies.joinToString("; ") { "${it.name}=${it.value}" }
-    }
-
-    fun setCookie(rawUrl: String, setCookieHeader: String) {
-        val url = rawUrl.trim().toHttpUrlOrNull()
-            ?: throw IllegalArgumentException("Invalid cookie URL: $rawUrl")
-        val cookie = Cookie.parse(url, setCookieHeader.trim())
-            ?: throw IllegalArgumentException("Invalid Set-Cookie header")
-        saveFromResponse(url, listOf(cookie))
-    }
-
-    fun clear() = lock.write {
-        store.clear()
-        loaded = true
-        loadFailure = null
-        dirty = false
-        estimatedBytes = 2
-        if (file.exists()) {
-            file.delete()
-        }
-    }
-
-    /**
-     * Persists pending cookie mutations in a single atomic encrypted write.
-     */
-    fun flush() = lock.write {
-        if (dirty && loadFailure == null) {
-            flushLocked()
-        }
+        return StoredCookie(
+            name = name,
+            value = value,
+            domain = domain,
+            hostOnly = hostOnly,
+            path = cookiePath,
+            secure = secure,
+            httpOnly = httpOnly,
+            expiresAt = finalExpiresAt,
+        )
     }
 
     private fun flushLocked() {
@@ -216,22 +397,23 @@ class PluginCookieJar(
                 val obj = el as? JsonObject ?: continue
                 val name = (obj["name"] as? JsonPrimitive)?.content ?: continue
                 val value = (obj["value"] as? JsonPrimitive)?.content ?: continue
-                val domain = (obj["domain"] as? JsonPrimitive)?.content ?: continue
+                val domain = NetworkPolicy.canonicalizeHost((obj["domain"] as? JsonPrimitive)?.content ?: continue)
                 val path = (obj["path"] as? JsonPrimitive)?.content ?: "/"
                 val expiresAt = (obj["expiresAt"] as? JsonPrimitive)?.longOrNull ?: continue
                 if (expiresAt <= now) continue
                 val secure = (obj["secure"] as? JsonPrimitive)?.booleanOrNull ?: false
                 val httpOnly = (obj["httpOnly"] as? JsonPrimitive)?.booleanOrNull ?: false
                 val hostOnly = (obj["hostOnly"] as? JsonPrimitive)?.booleanOrNull ?: false
-                val builder = Cookie.Builder()
-                    .name(name)
-                    .value(value)
-                    .path(path)
-                    .expiresAt(expiresAt)
-                if (hostOnly) builder.hostOnlyDomain(domain) else builder.domain(domain)
-                if (secure) builder.secure()
-                if (httpOnly) builder.httpOnly()
-                val c = builder.build()
+                val c = StoredCookie(
+                    name = name,
+                    value = value,
+                    domain = domain,
+                    hostOnly = hostOnly,
+                    path = path,
+                    secure = secure,
+                    httpOnly = httpOnly,
+                    expiresAt = expiresAt,
+                )
                 store[CookieKey(c.name, c.domain, c.path)] = c
             }
             estimatedBytes = plain.size
@@ -246,7 +428,7 @@ class PluginCookieJar(
         }
     }
 
-    private fun estimateEntryBytes(c: Cookie): Int =
+    private fun estimateEntryBytes(c: StoredCookie): Int =
         140 +
             c.name.toByteArray(Charsets.UTF_8).size * 2 +
             c.value.toByteArray(Charsets.UTF_8).size * 2 +
@@ -256,6 +438,63 @@ class PluginCookieJar(
     companion object {
         /** §11.1: cookie jar cap is 256 KB. */
         const val MAX_COOKIE_JAR_BYTES = 256 * 1024
+        private const val MAX_OKHTTP_DATE = 253_402_300_799_999L
+
+        private val MULTI_LABEL_PUBLIC_SUFFIXES = setOf(
+            "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "ltd.uk", "net.uk",
+            "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
+            "com.au", "net.au", "org.au", "edu.au", "gov.au",
+            "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp",
+            "com.hk", "org.hk", "edu.hk", "gov.hk",
+            "com.tw", "org.tw", "edu.tw", "gov.tw",
+            "com.sg", "com.br", "com.mx", "co.kr", "co.nz", "co.in",
+            "github.io", "pages.dev", "vercel.app", "netlify.app", "herokuapp.com",
+        )
+
+        private val HTTP_DATE_FORMATS = arrayOf(
+            "EEE, dd MMM yyyy HH:mm:ss zzz",
+            "EEE, dd-MMM-yyyy HH:mm:ss zzz",
+            "EEE, dd-MMM-yy HH:mm:ss zzz",
+            "EEEE, dd-MMM-yy HH:mm:ss zzz",
+            "EEE MMM d HH:mm:ss yyyy",
+            "EEE, d MMM yyyy HH:mm:ss zzz",
+        )
+
+        fun isPublicSuffix(canonicalDomain: String): Boolean {
+            if (canonicalDomain.isEmpty()) return true
+            if (NetworkPolicy.parseAnyIpLiteral(canonicalDomain) != null) return false
+            if (!canonicalDomain.contains('.')) return true // single-label TLD (com, org, cn, localhost, etc.)
+            return canonicalDomain in MULTI_LABEL_PUBLIC_SUFFIXES
+        }
+
+        fun domainMatches(canonicalHost: String, canonicalDomain: String): Boolean {
+            if (canonicalHost == canonicalDomain) return true
+            if (NetworkPolicy.parseAnyIpLiteral(canonicalHost) != null) return false
+            return canonicalHost.endsWith(".$canonicalDomain")
+        }
+
+        private fun defaultPath(encodedPath: String): String {
+            if (encodedPath.isEmpty() || !encodedPath.startsWith("/")) return "/"
+            val lastSlash = encodedPath.lastIndexOf('/')
+            return if (lastSlash <= 0) "/" else encodedPath.substring(0, lastSlash)
+        }
+
+        private fun parseHttpDate(raw: String): Long? {
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty()) return null
+            for (pattern in HTTP_DATE_FORMATS) {
+                try {
+                    val sdf = SimpleDateFormat(pattern, Locale.US).apply {
+                        isLenient = false
+                        timeZone = TimeZone.getTimeZone("GMT")
+                    }
+                    val date = sdf.parse(trimmed)
+                    if (date != null) return date.time
+                } catch (_: Exception) {
+                }
+            }
+            return null
+        }
 
         /**
          * §11.1: Merges an explicit `Cookie` request header on top of cookies

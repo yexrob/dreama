@@ -7,7 +7,7 @@ import { PluginCookieJar } from './cookies.js';
 import { PluginDomParser } from './dom.js';
 import { FetchGateway } from './fetch-gateway.js';
 import { PluginLocale } from './locale.js';
-import { PluginLogger } from './logger.js';
+import { MAX_LOG_MESSAGE_BYTES, PluginLogger, truncateUtf8 } from './logger.js';
 import { NetworkPolicy, extractUserHosts } from './network-policy.js';
 import { SCHEMA_DIR } from './schema.js';
 import { PluginStorage } from './storage.js';
@@ -15,6 +15,8 @@ import { PluginStorage } from './storage.js';
 const ERR_MARKER = '__D3_PLUGIN_ERR__:';
 /** §11.1 (B2): 64 MB QuickJS heap limit, matching Android PluginRuntime.kt. */
 export const DEFAULT_MEMORY_LIMIT = 64 * 1024 * 1024;
+export const MAX_RETURN_BYTES = 8 * 1024 * 1024;
+export const MAX_ACTIVE_TIMERS = 256;
 export const DEFAULT_TIMEOUT_MS = 15_000;
 export const PLAYBACK_TIMEOUT_MS = 30_000;
 
@@ -30,6 +32,13 @@ export class PluginCallError extends Error {
     this.name = 'PluginCallError';
     this.code = code || 'Internal';
     this.retryAfterSec = retryAfterSec;
+  }
+}
+
+class HostExecutionTimeoutError extends Error {
+  constructor(message = 'Host execution timeout') {
+    super(message);
+    this.name = 'HostExecutionTimeoutError';
   }
 }
 
@@ -74,7 +83,7 @@ export class QuickJsPluginHost {
     config = {},
     instanceId = 'dev-instance',
     storage = new PluginStorage(),
-    cookieJar = new PluginCookieJar(),
+    cookieJar = null,
     locale = new PluginLocale(),
     device = {
       appVersion: '1.0.0',
@@ -91,22 +100,36 @@ export class QuickJsPluginHost {
     memoryLimitBytes = DEFAULT_MEMORY_LIMIT,
     defaultTimeoutMs = DEFAULT_TIMEOUT_MS,
     playbackTimeoutMs = PLAYBACK_TIMEOUT_MS,
+    strictAwait = true,
   }) {
     this.manifest = manifest;
     this.mainJs = mainJs;
     this.config = this._applyDefaults(manifest, config);
     this.instanceId = instanceId;
     this.storage = storage;
-    this.cookieJar = cookieJar;
     this.locale = locale;
     this.device = device;
     this.memoryLimitBytes = memoryLimitBytes;
     this.defaultTimeoutMs = defaultTimeoutMs;
     this.playbackTimeoutMs = playbackTimeoutMs;
+    this.strictAwait = Boolean(strictAwait);
 
     const secretKeys = (manifest.config || []).filter((f) => f.type === 'password').map((f) => f.key);
     const knownSecrets = secretKeys.map((k) => this.config[k]).filter((v) => typeof v === 'string');
     this.logger = new PluginLogger(manifest.id, instanceId, knownSecrets, logSink);
+
+    if (cookieJar) {
+      this.cookieJar = cookieJar;
+      const prevWarn = cookieJar.onWarning;
+      cookieJar.onWarning = (msg) => {
+        this.logger.log('WARN', msg);
+        if (typeof prevWarn === 'function') prevWarn(msg);
+      };
+    } else {
+      this.cookieJar = new PluginCookieJar(() => Date.now(), {
+        onWarning: (msg) => this.logger.log('WARN', msg),
+      });
+    }
 
     const userHosts = extractUserHosts(manifest, this.config);
     this.networkPolicy = new NetworkPolicy(manifest.permissions || {}, userHosts, dnsResolver);
@@ -120,6 +143,9 @@ export class QuickJsPluginHost {
     this.creationCount = 0;
     this.callGen = 0;
     this.deadlineMs = Infinity;
+    this._lastCallTimedOut = false;
+    this._interruptTriggered = false;
+    this._unawaitedOps = [];
     /** Map<timerId, { timer: NodeJS.Timeout, resolve: (val: boolean) => void }> */
     this.activeTimers = new Map();
     /** Set<QuickJSDeferredPromise> tracked so _destroyVm disposes any unsettled handles cleanly */
@@ -157,7 +183,13 @@ export class QuickJsPluginHost {
     const rt = QuickJS.newRuntime();
     rt.setMemoryLimit(this.memoryLimitBytes);
     rt.setMaxStackSize(512 * 1024);
-    rt.setInterruptHandler(() => Date.now() > this.deadlineMs);
+    rt.setInterruptHandler(() => {
+      if (Date.now() > this.deadlineMs) {
+        this._interruptTriggered = true;
+        return true;
+      }
+      return false;
+    });
     rt.setModuleLoader((moduleName) => {
       if (moduleName === 'plugin/main.js' || moduleName === './main.js' || moduleName === 'main.js') {
         return this.mainJs;
@@ -174,6 +206,9 @@ export class QuickJsPluginHost {
     try {
       this._bindHostObject(vm, this.bridgeToken);
       this.deadlineMs = Date.now() + timeoutMs;
+      this._interruptTriggered = false;
+      this._lastCallTimedOut = false;
+      this._unawaitedOps = [];
       const bootHandle = this._unwrapOrThrow(vm, vm.evalCode(BOOTSTRAP_JS, '__d3_bootstrap.js'));
       bootHandle.dispose();
       const sealHandle = this._unwrapOrThrow(
@@ -193,6 +228,7 @@ export class QuickJsPluginHost {
       // Run optional init(ctx) — if it fails, destroy VM so next call retries init (§11.1)
       const gen = ++this.callGen;
       await this._evalAsyncExpr(`__d3_invoke_optional('init', 'null', false, ${gen})`, timeoutMs);
+      this._checkUnawaitedOps('init');
       this.initialized = true;
     } catch (err) {
       this._destroyVm();
@@ -221,17 +257,27 @@ export class QuickJsPluginHost {
       const gen = ++this.callGen;
       this.domParser.clear();
       this._releaseResponseBodies();
+      this._lastCallTimedOut = false;
+      this._interruptTriggered = false;
+      this._unawaitedOps = [];
       const hasArg = arg !== undefined;
       const argJson = hasArg ? JSON.stringify(arg) : 'null';
       const expr = `__d3_invoke(${JSON.stringify(method)}, ${JSON.stringify(argJson)}, ${hasArg}, ${gen})`;
 
       try {
         const raw = await this._evalAsyncExpr(expr, timeoutMs);
+        this._checkUnawaitedOps(method);
         if (raw === undefined || raw === null || raw === 'undefined') return undefined;
+        if (typeof raw === 'string' &&
+            (raw.length > MAX_RETURN_BYTES || Buffer.byteLength(raw, 'utf8') > MAX_RETURN_BYTES)) {
+          throw new PluginCallError('Internal', '插件返回值超过 8 MB 大小上限');
+        }
         return JSON.parse(raw);
       } catch (err) {
         const mapped = this._mapHostError(err);
-        if (mapped.code === 'Unavailable' || this._isOom(err)) {
+        // Only destroy & rebuild VM on genuine host timeout/interrupt or OOM,
+        // NEVER when plugin explicitly throws new ctx.Error('Unavailable', ...)
+        if (this._lastCallTimedOut || this._isOom(err)) {
           this._destroyVm();
         }
         throw mapped;
@@ -248,11 +294,19 @@ export class QuickJsPluginHost {
       const gen = ++this.callGen;
       this.domParser.clear();
       this._releaseResponseBodies();
+      this._lastCallTimedOut = false;
+      this._interruptTriggered = false;
+      this._unawaitedOps = [];
       try {
         const raw = await this._evalAsyncExpr(`__d3_eval_probe(${JSON.stringify(code)}, ${gen})`, timeoutMs);
-        return raw === undefined || raw === 'undefined' ? undefined : JSON.parse(raw);
+        if (raw === undefined || raw === 'undefined') return undefined;
+        if (typeof raw === 'string' &&
+            (raw.length > MAX_RETURN_BYTES || Buffer.byteLength(raw, 'utf8') > MAX_RETURN_BYTES)) {
+          throw new PluginCallError('Internal', '插件返回值超过 8 MB 大小上限');
+        }
+        return JSON.parse(raw);
       } catch (err) {
-        if (this._isOom(err) || String(err?.message || err).toLowerCase().includes('timeout')) {
+        if (this._lastCallTimedOut || this._isOom(err)) {
           this._destroyVm();
         }
         throw err;
@@ -277,6 +331,24 @@ export class QuickJsPluginHost {
     });
   }
 
+  _checkUnawaitedOps(method) {
+    if (!this.strictAwait || this._unawaitedOps.length === 0) return;
+    const details = this._unawaitedOps.map((item) => {
+      const site = String(item.stack || '')
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l && !l.includes('__d3_bootstrap.js'))
+        .slice(0, 3)
+        .join(' <- ');
+      return `${item.op}${site ? ` (${site})` : ''}`;
+    });
+    this._unawaitedOps = [];
+    throw new PluginCallError(
+      'Internal',
+      `${method}() 存在未 await 的异步存储/Cookie 调用（§11.1 要求全部 await）：${details.join('; ')}`,
+    );
+  }
+
   _cleanupAfterCall() {
     this._clearActiveTimers();
     this.fetchGateway.cancelAllActive();
@@ -292,15 +364,40 @@ export class QuickJsPluginHost {
     this.callResponseBodies.clear();
   }
 
+  /**
+   * Disposes any orphan QuickJSContext accidentally instantiated inside
+   * `quickjs-emscripten`'s `executePendingJobs()` when `WebAssembly.Memory.grow()`
+   * detaches its temporary `ctxPtrOut` TypedArray view (prevents
+   * `Assertion failed: list_empty(&rt->gc_obj_list)` on `JS_FreeRuntime`).
+   */
+  _disposeStrayContexts() {
+    if (!this.rt?.contextMap) return;
+    for (const ctx of [...this.rt.contextMap.values()]) {
+      if (ctx !== this.vm && ctx !== this.rt.context) {
+        try {
+          if (ctx.alive) ctx.dispose();
+        } catch {}
+      }
+    }
+  }
+
   _destroyVm() {
     this._cleanupAfterCall();
     for (const deferred of [...this.pendingDeferreds]) {
       this.pendingDeferreds.delete(deferred);
       try { deferred.dispose(); } catch {}
     }
+    this._disposeStrayContexts();
     if (this.vm) {
       try { this.vm.dispose(); } catch {}
       this.vm = null;
+    }
+    if (this.rt?.contextMap) {
+      for (const ctx of [...this.rt.contextMap.values()]) {
+        if (ctx !== this.rt.context) {
+          try { if (ctx.alive) ctx.dispose(); } catch {}
+        }
+      }
     }
     if (this.rt) {
       try { this.rt.dispose(); } catch {}
@@ -331,10 +428,13 @@ export class QuickJsPluginHost {
     while (true) {
       const r = this.rt.executePendingJobs();
       if (r.error) {
-        const dumped = this.vm.dump(r.error);
+        const errCtx = r.error.context || this.vm;
+        const dumped = errCtx.dump(r.error);
         r.error.dispose();
+        this._disposeStrayContexts();
         throw dumped;
       }
+      this._disposeStrayContexts();
       if (r.value === 0) break;
     }
   }
@@ -344,22 +444,35 @@ export class QuickJsPluginHost {
     this.deadlineMs = Date.now() + timeoutMs;
 
     let timer = null;
+    let timedOut = false;
     try {
       const evalRes = vm.evalCode(expr, '__d3_call.js');
       const promiseHandle = this._unwrapOrThrow(vm, evalRes);
       const nativePromise = vm.resolvePromise(promiseHandle);
       promiseHandle.dispose();
+      // Ensure late resolution after a timeout disposes its QuickJSHandle cleanly
+      const guardedNative = nativePromise.then((res) => {
+        if (timedOut) {
+          try {
+            if (res.error) res.error.dispose();
+            else if (res.value) res.value.dispose();
+          } catch {}
+        }
+        return res;
+      });
       this._drainJobs();
 
       const timeoutPromise = new Promise((_, reject) => {
         timer = setTimeout(() => {
+          timedOut = true;
+          this._lastCallTimedOut = true;
           this.fetchGateway.cancelAllActive();
           this._clearActiveTimers();
-          reject(new Error('interrupted: execution timeout'));
+          reject(new HostExecutionTimeoutError('interrupted: execution timeout'));
         }, timeoutMs);
       });
 
-      const settled = await Promise.race([nativePromise, timeoutPromise]);
+      const settled = await Promise.race([guardedNative, timeoutPromise]);
       if (settled.error) {
         const errVal = vm.dump(settled.error);
         settled.error.dispose();
@@ -368,6 +481,11 @@ export class QuickJsPluginHost {
       const value = vm.dump(settled.value);
       settled.value.dispose();
       return value;
+    } catch (err) {
+      if (this._interruptTriggered) {
+        this._lastCallTimedOut = true;
+      }
+      throw err;
     } finally {
       if (timer) clearTimeout(timer);
       this.deadlineMs = Infinity;
@@ -390,12 +508,13 @@ export class QuickJsPluginHost {
 
   _mapHostError(err) {
     if (err instanceof PluginCallError) return err;
+    if (err instanceof HostExecutionTimeoutError || this._lastCallTimedOut || this._interruptTriggered) {
+      this._lastCallTimedOut = true;
+      return new PluginCallError('Unavailable', '插件调用超时，请重试。');
+    }
     const msg = String(err?.message || err || '');
     const wire = parseWireError(msg);
     if (wire) return wire;
-    if (msg.toLowerCase().includes('interrupted') || msg.toLowerCase().includes('timeout')) {
-      return new PluginCallError('Unavailable', '插件调用超时，请重试。');
-    }
     return new PluginCallError('Internal', msg || '插件内部错误');
   }
 
@@ -481,11 +600,24 @@ export class QuickJsPluginHost {
     addSync('getInstanceId', () => this.instanceId);
     addSync('getDeviceJson', () => JSON.stringify(this.device));
     addSync('getErrorMarker', () => ERR_MARKER);
+    addSync('isStrictAwaitTracking', () => this.strictAwait);
+    addSync('reportUnawaitedOps', (rawJson) => {
+      try {
+        const list = JSON.parse(String(rawJson || '[]'));
+        if (Array.isArray(list)) {
+          this._unawaitedOps.push(...list);
+        }
+      } catch {}
+    });
 
-    // §11.1 (S3): true host-side cancellable timer
-    addAsync('sleep', (timerId, ms, gen) => new Promise((resolve) => {
+    // §11.1 (S3): true host-side cancellable timer (max 256 active)
+    addAsync('sleep', (timerId, ms, gen) => new Promise((resolve, reject) => {
       if (gen !== this.callGen) {
         resolve(false);
+        return;
+      }
+      if (this.activeTimers.size >= MAX_ACTIVE_TIMERS) {
+        reject(new RangeError(`同时活跃的定时器数量超过上限（最多 ${MAX_ACTIVE_TIMERS} 个）`));
         return;
       }
       const clamped = Math.min(Math.max(Number(ms) || 0, 0), 60_000);
@@ -506,7 +638,7 @@ export class QuickJsPluginHost {
       }
     });
 
-    // §11.1 (B2): binary fetchMeta + fetchReadBytes (ArrayBuffer) + fetchReadText
+    // §11.1 (B2): binary fetchMeta + single-consume fetchReadBytes/fetchReadText
     addAsync('fetchMeta', async (reqJson, gen) => {
       const req = JSON.parse(reqJson);
       let body = null;
@@ -536,22 +668,30 @@ export class QuickJsPluginHost {
     });
 
     addSync('fetchReadBytes', (handleId) => {
-      const entry = this.callResponseBodies.get(Number(handleId));
-      return entry ? entry.buf : Buffer.alloc(0);
+      const id = Number(handleId);
+      const entry = this.callResponseBodies.get(id);
+      if (!entry) return Buffer.alloc(0);
+      this.callResponseBodies.delete(id);
+      this.fetchGateway.inFlightBudget.release(entry.bytes);
+      return entry.buf;
     });
 
     addSync('fetchReadText', (handleId) => {
-      const entry = this.callResponseBodies.get(Number(handleId));
-      return entry ? entry.buf.toString('utf8') : '';
+      const id = Number(handleId);
+      const entry = this.callResponseBodies.get(id);
+      if (!entry) return '';
+      this.callResponseBodies.delete(id);
+      this.fetchGateway.inFlightBudget.release(entry.bytes);
+      return entry.buf.toString('utf8');
     });
 
-    // §11.1 (S9): async ctx.storage.* returning Promises
+    // §11.1 (S9): async ctx.storage.* returning Promises (pre-parse byte quota check)
     addAsync('storageGet', async (k) => {
       const v = this.storage.get(k);
       return v === null ? null : JSON.stringify(v);
     });
     addAsync('storageSet', async (k, vJson) => {
-      this.storage.set(k, JSON.parse(vJson));
+      this.storage.setRawJson(k, vJson);
     });
     addAsync('storageRemove', async (k) => {
       this.storage.remove(k);
@@ -608,7 +748,9 @@ export class QuickJsPluginHost {
     addSync('domSelectAllIds', (id, sel) => JSON.stringify(this.domParser.selectAllIds(Number(id), String(sel))));
     addSync('domChildrenIds', (id) => JSON.stringify(this.domParser.childrenIds(Number(id))));
 
-    addSync('log', (level, msg) => { this.logger.log(level, msg); });
+    addSync('log', (level, msg) => {
+      this.logger.log(level, truncateUtf8(msg, MAX_LOG_MESSAGE_BYTES));
+    });
     addSync('translate', (key, varsJson) => {
       const vars = varsJson && varsJson !== 'null' ? JSON.parse(varsJson) : null;
       return this.locale.translate(key, vars);

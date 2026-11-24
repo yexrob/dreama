@@ -1,0 +1,64 @@
+{
+  "description": "Shared HTML & XML DOM parsing parity vectors enforced identically by Android PluginDomParser (Jsoup) and tools/plugin-kit PluginDomParser (linkedom DOMParser).",
+  "cases": [
+    {
+      "name": "xml_dash_mpd_self_closing_and_case",
+      "mode": "xml",
+      "input": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" xmlns:dvb=\"urn:dvb:dash:profile:dvb-dash:2014\" type=\"static\">\n  <Period id=\"0\">\n    <AdaptationSet id=\"0\" contentType=\"video\">\n      <Representation id=\"v1\" mimeType=\"video/mp4\" codecs=\"avc1.640028\">\n        <SegmentBase indexRange=\"821-1020\">\n          <Initialization range=\"0-820\"/>\n        </SegmentBase>\n        <BaseURL dvb:priority=\"1\">  https://primary.example/v.m4s \n  </BaseURL>\n        <BaseURL dvb:priority=\"2\">https://backup.example/v.m4s</BaseURL>\n      </Representation>\n    </AdaptationSet>\n  </Period>\n</MPD>",
+      "assertions": [
+        { "op": "rootTag", "expected": "#document" },
+        { "op": "rootChildrenTags", "expected": ["MPD"] },
+        { "op": "firstTag", "selector": "MPD", "expected": "MPD" },
+        { "op": "firstAttr", "selector": "MPD", "attr": "type", "expected": "static" },
+        { "op": "firstAttr", "selector": "MPD", "attr": "missingAttr", "expected": null },
+        { "op": "firstTag", "selector": "SegmentBase > Initialization", "expected": "Initialization" },
+        { "op": "firstAttr", "selector": "SegmentBase > Initialization", "attr": "range", "expected": "0-820" },
+        { "op": "allTexts", "selector": "Representation BaseURL", "expected": ["https://primary.example/v.m4s", "https://backup.example/v.m4s"] },
+        { "op": "allTags", "selector": "Representation BaseURL", "expected": ["BaseURL", "BaseURL"] },
+        { "op": "allAttrs", "selector": "Representation BaseURL", "attr": "dvb:priority", "expected": ["1", "2"] }
+      ]
+    },
+    {
+      "name": "xml_rss_cdata_and_link",
+      "mode": "xml",
+      "input": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\">\n  <channel>\n    <title>  Feed   Title  </title>\n    <item>\n      <title><![CDATA[Hello & <World>   2026]]></title>\n      <link>https://example.com/episodes/42</link>\n      <enclosure url=\"https://cdn.example.com/ep42.mp4\" type=\"video/mp4\"/>\n      <guid>ep-42</guid>\n    </item>\n  </channel>\n</rss>",
+      "assertions": [
+        { "op": "rootTag", "expected": "#document" },
+        { "op": "firstText", "selector": "channel > title", "expected": "Feed Title" },
+        { "op": "firstText", "selector": "item > title", "expected": "Hello & <World> 2026" },
+        { "op": "firstText", "selector": "item > link", "expected": "https://example.com/episodes/42" },
+        { "op": "firstAttr", "selector": "item > enclosure", "attr": "url", "expected": "https://cdn.example.com/ep42.mp4" },
+        { "op": "firstText", "selector": "item > guid", "expected": "ep-42" }
+      ]
+    },
+    {
+      "name": "html_full_doc_case_whitespace_and_attrs",
+      "mode": "html",
+      "input": "<!DOCTYPE html><html><head><title>Page</title></head><body><DIV class=\"card\" data-id=\"42\" disabled><A href=\"/watch/42\">  Episode\n   \t One  </A><SPAN class=\"meta\">HD</SPAN></DIV></body></html>",
+      "assertions": [
+        { "op": "rootTag", "expected": "#document" },
+        { "op": "rootChildrenTags", "expected": ["html"] },
+        { "op": "firstTag", "selector": "div.card", "expected": "div" },
+        { "op": "firstAttr", "selector": "div.card", "attr": "data-id", "expected": "42" },
+        { "op": "firstAttr", "selector": "div.card", "attr": "disabled", "expected": "" },
+        { "op": "firstAttr", "selector": "div.card", "attr": "nonexistent", "expected": null },
+        { "op": "firstTag", "selector": "div.card > a", "expected": "a" },
+        { "op": "firstText", "selector": "div.card > a", "expected": "Episode One" },
+        { "op": "firstText", "selector": "div.card", "expected": "Episode One HD" },
+        { "op": "childrenTags", "selector": "div.card", "expected": ["a", "span"] }
+      ]
+    },
+    {
+      "name": "html_fragment_unified_root_and_selectors",
+      "mode": "html",
+      "input": "<ul class=\"list\"><li data-idx=\"1\">  Alpha \n Beta </li><li data-idx=\"2\">Gamma</li></ul>",
+      "assertions": [
+        { "op": "rootTag", "expected": "#document" },
+        { "op": "rootChildrenTags", "expected": ["html"] },
+        { "op": "allTexts", "selector": "ul.list > li", "expected": ["Alpha Beta", "Gamma"] },
+        { "op": "allAttrs", "selector": "ul.list > li", "attr": "data-idx", "expected": ["1", "2"] },
+        { "op": "firstAttr", "selector": "ul.list", "attr": "id", "expected": null }
+      ]
+    }
+  ]
+}

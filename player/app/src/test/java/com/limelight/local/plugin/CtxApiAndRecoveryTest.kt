@@ -723,4 +723,307 @@ class CtxApiAndRecoveryTest {
             tmpDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun passesAllSharedDomVectorsAndEnforcesHostMemoryCapsParityAndImmutableGlobals(): Unit = runBlocking {
+        val repoRoot = ManifestAndPermissionTest.locateRepoRoot()
+        val domVectorsRaw = File(repoRoot, "docs/specs/plugin-schema/dom-vectors.json").readText()
+        val domVectors = kotlinx.serialization.json.Json.parseToJsonElement(domVectorsRaw).jsonObject["cases"]!!.jsonArray
+        assertTrue(domVectors.size >= 4)
+
+        val tmpDir = Files.createTempDirectory("d3-round3-ctx").toFile()
+        val secretBox = SoftwareAesSecretBox()
+        val warnings = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val logger = PluginLogger(
+            pluginId = "dev.depth3d.r3",
+            instanceId = "inst-r3",
+            sink = { level, line -> if (level == PluginLogLevel.WARN) warnings += line },
+        )
+        val storage = InstanceStorage(File(tmpDir, "storage.enc"), secretBox)
+        val cookieJar = PluginCookieJar(
+            file = File(tmpDir, "cookies.enc"),
+            secretBox = secretBox,
+            clockMs = { 1_700_000_000_000L },
+            onWarning = { msg -> logger.warn(msg) },
+        )
+
+        // MockWebServer for single-consume response & sequential 3 x 6 MB budget release tests
+        val server = MockWebServer()
+        val sixMb = ByteArray(6 * 1024 * 1024) { 0x5A }
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                "/small" -> MockResponse().setResponseCode(200).setBody("hello-once")
+                "/6mb" -> MockResponse().setResponseCode(200).setBody(okio.Buffer().write(sixMb))
+                else -> MockResponse().setResponseCode(404)
+            }
+        }
+        server.start()
+
+        val okHttp = OkHttpClient.Builder()
+            .proxy(Proxy.NO_PROXY)
+            .socketFactory(LocalRedirectSocketFactory("192.168.1.50", server.port))
+            .build()
+        val manifest = PluginManifest(
+            api = 1,
+            id = "dev.depth3d.r3",
+            name = "R3",
+            version = "1.0.0",
+            permissions = PluginPermissions(hosts = emptyList(), userHosts = true, lan = true),
+        )
+        val policy = NetworkPolicy(
+            permissions = manifest.permissions,
+            userConfiguredHosts = setOf("192.168.1.50"),
+            dnsResolver = { listOf(InetAddress.getByName("192.168.1.50")) },
+        )
+        val fetchGw = PluginFetchGateway(policy, cookieJar, baseClient = okHttp)
+
+        val mainJs = """
+            export default {
+              home() { return []; },
+              async browse(ctx, arg) {
+                const mode = arg.categoryId;
+                if (mode === 'dom-case') {
+                  const doc = arg.mode === 'xml' ? ctx.parse.xml(arg.input) : ctx.parse.html(arg.input);
+                  const out = [];
+                  for (const a of arg.assertions) {
+                    if (a.op === 'rootTag') out.push(doc.tag);
+                    else if (a.op === 'rootChildrenTags') out.push(doc.children.map((c) => c.tag));
+                    else if (a.op === 'firstTag') out.push(doc.querySelector(a.selector)?.tag ?? null);
+                    else if (a.op === 'firstText') out.push(doc.querySelector(a.selector)?.text ?? null);
+                    else if (a.op === 'firstAttr') out.push(doc.querySelector(a.selector)?.attr(a.attr));
+                    else if (a.op === 'allTexts') out.push(doc.querySelectorAll(a.selector).map((n) => n.text));
+                    else if (a.op === 'allTags') out.push(doc.querySelectorAll(a.selector).map((n) => n.tag));
+                    else if (a.op === 'allAttrs') out.push(doc.querySelectorAll(a.selector).map((n) => n.attr(a.attr)));
+                    else if (a.op === 'childrenTags') out.push(doc.querySelector(a.selector).children.map((c) => c.tag));
+                  }
+                  return out;
+                }
+                if (mode === 'log-flood') {
+                  const big = 'A'.repeat(100000);
+                  for (let i = 0; i < 200; i++) ctx.log.info(i + ':' + big);
+                  return { ok: true };
+                }
+                if (mode === 'storage-oversize') {
+                  await ctx.storage.set('huge', 'B'.repeat(2 * 1024 * 1024));
+                  return { ok: true };
+                }
+                if (mode === 'return-oversize') {
+                  return 'R'.repeat(9 * 1024 * 1024);
+                }
+                if (mode === 'dom-node-flood') {
+                  ctx.parse.html('<a></a>'.repeat(210000));
+                  return { ok: true };
+                }
+                if (mode === 'timer-flood') {
+                  for (let i = 0; i < 257; i++) setTimeout(() => {}, 5000);
+                  return { ok: true };
+                }
+                if (mode === 'response-second-read') {
+                  const r = await ctx.fetch(arg.url);
+                  const t = r.text();
+                  let secondErr = '';
+                  try { r.bytes(); } catch (e) { secondErr = e.name + ':' + e.message; }
+                  let thirdErr = '';
+                  try { r.text(); } catch (e) { thirdErr = e.name + ':' + e.message; }
+                  return { t, secondErr, thirdErr };
+                }
+                if (mode === 'seq-18mb') {
+                  let sum = 0;
+                  for (let i = 0; i < 3; i++) {
+                    const r = await ctx.fetch(arg.url);
+                    sum += r.bytes().byteLength;
+                  }
+                  return { sum };
+                }
+                if (mode === 'plain-timeout-error') {
+                  throw new Error('upstream timeout while parsing');
+                }
+                if (mode === 'explicit-unavailable') {
+                  throw new ctx.Error('Unavailable', '上游维护中');
+                }
+                if (mode === 'immutable-globals') {
+                  const names = ['__d3_invoke', '__d3_invoke_optional', '__d3_exports', '__d3_eval_probe'];
+                  return names.map((n) => {
+                    const d = Object.getOwnPropertyDescriptor(globalThis, n);
+                    let writeFailed = false;
+                    try { globalThis[n] = () => 'pwned'; } catch { writeFailed = true; }
+                    let delFailed = false;
+                    try { delete globalThis[n]; } catch { delFailed = true; }
+                    return { name: n, writable: d.writable, configurable: d.configurable, writeFailed, delFailed };
+                  });
+                }
+                return { items: [] };
+              },
+              detail() { return { id: '1', kind: 'video', title: '1' }; },
+              playback() { return { url: 'https://cdn.example.com/a.mp4' }; },
+            };
+        """.trimIndent()
+
+        val runtime = PluginRuntime(
+            manifest = manifest,
+            instanceId = "inst-r3",
+            mainJsSource = mainJs,
+            config = emptyMap(),
+            fetchGateway = fetchGw,
+            storage = storage,
+            cookieJar = cookieJar,
+            logger = logger,
+        )
+
+        try {
+            // 1. Item #2: Shared DOM vectors (HTML + XML: DASH MPD, RSS CDATA & <link>, case, whitespace, attr)
+            for (caseEl in domVectors) {
+                val c = caseEl.jsonObject
+                val caseName = c["name"]!!.jsonPrimitive.content
+                val assertions = c["assertions"]!!.jsonArray
+                val arg = JsonObject(
+                    mapOf(
+                        "categoryId" to JsonPrimitive("dom-case"),
+                        "mode" to c["mode"]!!,
+                        "input" to c["input"]!!,
+                        "assertions" to assertions,
+                    ),
+                )
+                val actual = runtime.invoke("browse", arg).jsonArray
+                assertEquals(assertions.size, actual.size)
+                for (i in assertions.indices) {
+                    val expected = assertions[i].jsonObject["expected"]!!
+                    assertEquals("DOM vector '$caseName' assertion #$i", expected, actual[i])
+                }
+            }
+
+            // 2. Item #3a: ctx.log 200 x 100 KB -> each truncated <= 4 KB, total ring <= 256 KB
+            runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("log-flood"))))
+            val entries = logger.recentEntries()
+            assertTrue(entries.isNotEmpty())
+            assertTrue("Ring entries must be <= 200", entries.size <= PluginLogger.MAX_ENTRIES)
+            for (entry in entries) {
+                assertTrue(
+                    "Each log entry must be <= 4 KB, got ${entry.message.toByteArray().size}",
+                    entry.message.toByteArray(Charsets.UTF_8).size <= PluginLogger.MAX_MESSAGE_BYTES,
+                )
+            }
+            assertTrue(
+                "Total buffered log bytes must stay <= 256 KB, got ${logger.currentBufferedBytes()}",
+                logger.currentBufferedBytes() <= PluginLogger.MAX_BUFFER_BYTES,
+            )
+
+            // 3. Item #3b: storage.set > 1 MB rejected BEFORE JSON parse; storage untouched & disk/heap bounded
+            val storageFile = File(tmpDir, "storage.enc")
+            try {
+                runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("storage-oversize"))))
+                fail("Oversized storage.set must fail")
+            } catch (_: PluginInternalException) {
+            }
+            assertEquals(null, storage.get("huge"))
+            assertFalse("Oversized write must not persist a multi-MB file", storageFile.exists() && storageFile.length() > 1024)
+            // Direct proof that UTF-8 byte-length check runs BEFORE JSON parsing (malformed 2 MB JSON hits quota, not parse error)
+            try {
+                storage.setRawJson("bad", "{" + "x".repeat(2 * 1024 * 1024))
+                fail("Oversized malformed JSON must fail with StorageQuotaExceededException before parsing")
+            } catch (_: StorageQuotaExceededException) {
+            }
+
+            // 4. Item #3c: Return payload > 8 MB maps to Internal without parsing huge host JSON
+            val usedBeforeReturn = Runtime.getRuntime().let { it.totalMemory() - it.freeMemory() }
+            try {
+                runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("return-oversize"))))
+                fail("Oversized return value (> 8 MB) must map to PluginInternalException")
+            } catch (_: PluginInternalException) {
+            }
+            // Runtime remains healthy after rejecting oversized return
+            assertEquals(0, runtime.invoke("home").jsonArray.size)
+
+            // 5. Item #3d: ctx.parse > 200k nodes rejected BEFORE building 210k Jsoup nodes
+            try {
+                runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("dom-node-flood"))))
+                fail("DOM with 210k elements must be rejected")
+            } catch (_: PluginInternalException) {
+            }
+            val directDom = PluginDomParser()
+            try {
+                directDom.parseHtml("<a></a>".repeat(210_000))
+                fail("Direct PluginDomParser must reject 210k elements before building DOM tree")
+            } catch (_: DomLimitExceededException) {
+            }
+            assertEquals("Rejected DOM parse must retain 0 nodes in host parser", 0, directDom.currentTotalNodes())
+
+            // 6. Item #3e: setTimeout > 256 concurrent timers rejected immediately; runtime stays clean
+            try {
+                runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("timer-flood"))))
+                fail("257th concurrent setTimeout must be rejected")
+            } catch (_: PluginInternalException) {
+            }
+            assertEquals(0, runtime.invoke("home").jsonArray.size)
+            assertTrue(usedBeforeReturn >= 0L)
+
+            // 7. Item #8a: Single-consume Response body (second read throws TypeError)
+            val baseUrl = "http://192.168.1.50:${server.port}"
+            val secondRead = runtime.invoke(
+                "browse",
+                JsonObject(mapOf("categoryId" to JsonPrimitive("response-second-read"), "url" to JsonPrimitive("$baseUrl/small"))),
+            ).jsonObject
+            assertEquals("hello-once", secondRead["t"]!!.jsonPrimitive.content)
+            assertTrue(secondRead["secondErr"]!!.jsonPrimitive.content.contains("TypeError"))
+            assertTrue(secondRead["thirdErr"]!!.jsonPrimitive.content.contains("TypeError"))
+
+            // 8. Item #8b: Sequential 3 x 6 MB fetches succeed (18 MB > 16 MB in-flight cap) because budget releases on read
+            val seq = runtime.invoke(
+                "browse",
+                JsonObject(mapOf("categoryId" to JsonPrimitive("seq-18mb"), "url" to JsonPrimitive("$baseUrl/6mb"))),
+            ).jsonObject
+            assertEquals(18 * 1024 * 1024, seq["sum"]!!.jsonPrimitive.content.toInt())
+            assertEquals(0L, fetchGw.inFlightBudget.currentUsed())
+
+            // 9. Item #8c & #8d: Plain Error('...timeout...') -> Internal; explicit ctx.Error('Unavailable') does NOT rebuild VM
+            val creationsBefore = runtime.creationCount
+            try {
+                runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("plain-timeout-error"))))
+                fail("Plain Error('timeout') must map to PluginInternalException")
+            } catch (_: PluginInternalException) {
+            }
+            assertEquals("Plain timeout Error must not rebuild VM", creationsBefore, runtime.creationCount)
+
+            try {
+                runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("explicit-unavailable"))))
+                fail("Explicit Unavailable must throw SourceUnavailableException")
+            } catch (_: SourceUnavailableException) {
+            }
+            assertEquals("Explicit ctx.Error('Unavailable') must not rebuild VM", creationsBefore, runtime.creationCount)
+
+            // 10. Item #8e: Cookie jar parity (Max-Age > Expires, PSL rejection + WARN, Domain mismatch + WARN, IPv6 literal)
+            warnings.clear()
+            cookieJar.setCookie("https://api.example.com/", "m=1; Max-Age=0; Expires=Wed, 21 Oct 2099 07:28:00 GMT")
+            assertEquals("Max-Age=0 must override future Expires", "", cookieJar.getHeaderForUrl("https://api.example.com/"))
+
+            cookieJar.setCookie("https://api.example.com/", "psl1=bad; Domain=com")
+            cookieJar.setCookie("https://shop.co.uk/", "psl2=bad; Domain=co.uk")
+            cookieJar.setCookie("https://api.example.com/", "mismatch=bad; Domain=evil.com")
+            assertEquals("", cookieJar.getHeaderForUrl("https://api.example.com/"))
+            assertEquals("", cookieJar.getHeaderForUrl("https://shop.co.uk/"))
+            assertEquals("PSL & domain-mismatch cookies must emit 3 WARN logs", 3, warnings.size)
+
+            cookieJar.setCookie("http://[fd12:3456:789a::1]:8096/", "v6=ok; Path=/")
+            assertEquals(
+                "IPv6 literal host matching must canonicalize fd12:3456:789a::0001 == fd12:3456:789a::1",
+                "v6=ok",
+                cookieJar.getHeaderForUrl("http://[fd12:3456:789a::0001]:8096/Items"),
+            )
+
+            // 11. Item #12: __d3_invoke etc. are non-writable and non-configurable
+            val globals = runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive("immutable-globals")))).jsonArray
+            assertEquals(4, globals.size)
+            for (g in globals) {
+                val obj = g.jsonObject
+                assertFalse("${obj["name"]} must not be writable", obj["writable"]!!.jsonPrimitive.boolean)
+                assertFalse("${obj["name"]} must not be configurable", obj["configurable"]!!.jsonPrimitive.boolean)
+                assertTrue("${obj["name"]} write must fail in strict mode", obj["writeFailed"]!!.jsonPrimitive.boolean)
+                assertTrue("${obj["name"]} delete must fail in strict mode", obj["delFailed"]!!.jsonPrimitive.boolean)
+            }
+        } finally {
+            runtime.close()
+            server.shutdown()
+            tmpDir.deleteRecursively()
+        }
+    }
 }

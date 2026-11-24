@@ -1,19 +1,22 @@
-// depth3d Jellyfin Plugin (Modern Jellyfin 10.10 / 10.11 / 12.x REST API)
-// Supports authentication, home shelves (Resume / NextUp / Latest per library),
+// depth3d Jellyfin Plugin (Jellyfin 10.8 / 10.9+ / 10.10 / 10.11 / 12.x REST API)
+// Supports server version detection via /System/Info/Public (rejecting < 10.8 with
+// Unsupported and routing 10.8.x legacy vs >= 10.9 modern endpoints), authentication,
+// parallel & fault-tolerant home shelves (Resume / NextUp / Latest per library),
 // library categories & browsing with sorting/filtering/pagination, series/seasons/episodes,
-// search & suggestions, progress reporting, favorites, played status, external subtitles,
-// and Direct Play (H.264/HEVC/AV1) vs HLS transcode quality selection.
+// search & suggestions, progress reporting with PlayMethod, favorites, played status,
+// external subtitles, and device-capability-checked Direct Play vs HLS transcode.
 //
 // Security & protocol §11 compliance (S10):
 // - Maps depth3d codec names ('avc' -> 'h264') for Jellyfin DeviceProfile
 // - Never maps H.264 MVC to MV-HEVC
 // - Never embeds api_key / ApiKey in image, stream, or subtitle URLs (uses Authorization header)
-// - Keeps MediaSourceId lookup in a bounded in-memory LRU cache (never writes unbounded keys to ctx.storage)
+// - Never attaches Authorization header to cross-origin DeliveryUrl / TranscodingUrl
+// - Keeps MediaSourceId + PlayMethod lookup in a bounded 64-entry LRU cache
 // - Awaits all async ctx.storage.* calls
 
 const TICKS_PER_MS = 10_000;
 const PAGE_LIMIT = 40;
-const MAX_MEDIA_SOURCE_CACHE = 64;
+const MAX_PLAYBACK_META_CACHE = 64;
 
 const QUALITY_PROFILES = {
   direct: { id: 'direct', label: '原画直连', bitrate: 0, maxWidth: 0, maxHeight: 0 },
@@ -22,16 +25,22 @@ const QUALITY_PROFILES = {
   '480p': { id: '480p', label: '480P (1.5 Mbps)', bitrate: 1_500_000, maxWidth: 854, maxHeight: 480 },
 };
 
-// Bounded in-memory LRU map: itemId -> mediaSourceId (never persisted unboundedly to ctx.storage)
-const mediaSourceCache = new Map();
+// Bounded in-memory LRU map: itemId -> { mediaSourceId, playMethod }
+const playbackMetaCache = new Map();
 
-function rememberMediaSourceId(itemId, mediaSourceId) {
+// Per-runtime cached server version info keyed by normalized server base URL
+let cachedServerInfo = null;
+
+function rememberPlaybackMeta(itemId, mediaSourceId, playMethod) {
   if (!itemId || !mediaSourceId) return;
-  if (mediaSourceCache.has(itemId)) mediaSourceCache.delete(itemId);
-  mediaSourceCache.set(itemId, String(mediaSourceId));
-  if (mediaSourceCache.size > MAX_MEDIA_SOURCE_CACHE) {
-    const oldest = mediaSourceCache.keys().next().value;
-    mediaSourceCache.delete(oldest);
+  if (playbackMetaCache.has(itemId)) playbackMetaCache.delete(itemId);
+  playbackMetaCache.set(itemId, {
+    mediaSourceId: String(mediaSourceId),
+    playMethod: playMethod === 'Transcode' ? 'Transcode' : 'DirectPlay',
+  });
+  if (playbackMetaCache.size > MAX_PLAYBACK_META_CACHE) {
+    const oldest = playbackMetaCache.keys().next().value;
+    playbackMetaCache.delete(oldest);
   }
 }
 
@@ -41,6 +50,101 @@ function getServerBase(ctx) {
     throw new ctx.Error('NeedsSetup', ctx.t('err_no_server'));
   }
   return raw;
+}
+
+function extractOrigin(rawUrl) {
+  const s = String(rawUrl || '').trim();
+  const m = /^(https?):\/\/(\[[^\]]+\]|[^/:?#]+)(?::(\d+))?(?:[/?#]|$)/i.exec(s);
+  if (!m) return null;
+  const scheme = m[1].toLowerCase();
+  const host = m[2].toLowerCase();
+  const port = m[3] ? Number(m[3]) : (scheme === 'https' ? 443 : 80);
+  return `${scheme}://${host}:${port}`;
+}
+
+function isSameOrigin(urlA, urlB) {
+  const oa = extractOrigin(urlA);
+  const ob = extractOrigin(urlB);
+  return oa !== null && ob !== null && oa === ob;
+}
+
+function parseServerVersion(rawVersion) {
+  const m = /^(\d+)\.(\d+)(?:\.(\d+))?/.exec(String(rawVersion || '').trim());
+  if (!m) return null;
+  return {
+    major: Number(m[1]),
+    minor: Number(m[2]),
+    patch: Number(m[3] || 0),
+    raw: String(rawVersion).trim(),
+  };
+}
+
+async function ensureServerVersion(ctx) {
+  const base = getServerBase(ctx);
+  if (cachedServerInfo && cachedServerInfo.base === base) {
+    return cachedServerInfo;
+  }
+  let resp;
+  try {
+    resp = await ctx.fetch(`${base}/System/Info/Public`, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    });
+  } catch (err) {
+    ctx.log.warn(`Jellyfin version probe failed: ${err.message || err}`);
+    throw new ctx.Error('Unavailable', ctx.t('err_connect'));
+  }
+  if (resp.status >= 500) {
+    throw new ctx.Error('Unavailable', 'Jellyfin 服务器暂时不可用，请稍后重试。');
+  }
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new ctx.Error('Unavailable', ctx.t('err_connect'));
+  }
+  let info = null;
+  try {
+    const bodyText = resp.text();
+    info = bodyText ? JSON.parse(bodyText) : null;
+  } catch {
+    info = null;
+  }
+  const parsed = parseServerVersion(info?.Version);
+  if (parsed) {
+    if (parsed.major < 10 || (parsed.major === 10 && parsed.minor < 8)) {
+      throw new ctx.Error(
+        'Unsupported',
+        `当前 Jellyfin 服务器版本（${parsed.raw}）过低，请升级至 10.8 或更高版本。`,
+      );
+    }
+    const isLegacy108 = parsed.major === 10 && parsed.minor === 8;
+    cachedServerInfo = { base, version: parsed.raw, isLegacy108 };
+    return cachedServerInfo;
+  }
+  cachedServerInfo = { base, version: 'unknown', isLegacy108: false };
+  return cachedServerInfo;
+}
+
+function buildRoutes(serverInfo, userId) {
+  const uid = encodeURIComponent(userId);
+  if (serverInfo?.isLegacy108) {
+    return {
+      userViews: () => ({ path: `/Users/${uid}/Views`, query: {} }),
+      resume: (q) => ({ path: `/Users/${uid}/Items/Resume`, query: q }),
+      latest: (q) => ({ path: `/Users/${uid}/Items/Latest`, query: q }),
+      items: (q) => ({ path: `/Users/${uid}/Items`, query: q }),
+      itemDetail: (id, q) => ({ path: `/Users/${uid}/Items/${encodeURIComponent(id)}`, query: q }),
+      favorite: (id) => ({ path: `/Users/${uid}/FavoriteItems/${encodeURIComponent(id)}`, query: {} }),
+      played: (id) => ({ path: `/Users/${uid}/PlayedItems/${encodeURIComponent(id)}`, query: {} }),
+    };
+  }
+  return {
+    userViews: () => ({ path: '/UserViews', query: { userId } }),
+    resume: (q) => ({ path: '/UserItems/Resume', query: { userId, ...q } }),
+    latest: (q) => ({ path: '/Items/Latest', query: { userId, ...q } }),
+    items: (q) => ({ path: '/Items', query: { userId, ...q } }),
+    itemDetail: (id, q) => ({ path: `/Items/${encodeURIComponent(id)}`, query: { userId, ...q } }),
+    favorite: (id) => ({ path: `/UserFavoriteItems/${encodeURIComponent(id)}`, query: { userId } }),
+    played: (id) => ({ path: `/UserPlayedItems/${encodeURIComponent(id)}`, query: { userId } }),
+  };
 }
 
 async function getDeviceId(ctx) {
@@ -67,8 +171,10 @@ async function requireSession(ctx) {
   if (!session || !session.accessToken || !session.userId) {
     throw new ctx.Error('NeedsAuth', ctx.t('err_needs_auth'));
   }
+  const serverInfo = await ensureServerVersion(ctx);
+  const routes = buildRoutes(serverInfo, session.userId);
   const authHeader = await buildAuthHeader(ctx, session.accessToken);
-  return { base, session, authHeader };
+  return { base, session, authHeader, serverInfo, routes };
 }
 
 function stripApiKeyFromUrl(rawUrl) {
@@ -87,20 +193,52 @@ function stripApiKeyFromUrl(rawUrl) {
   return kept.length > 0 ? `${pathPart}?${kept.join('&')}` : pathPart;
 }
 
+function normalizeCodecName(raw) {
+  const c = String(raw || '').trim().toLowerCase();
+  if (!c) return '';
+  if (c === 'avc' || c === 'avc1' || c === 'h264' || c === 'x264') return 'h264';
+  if (c === 'hevc' || c === 'h265' || c === 'hvc1' || c === 'hev1' || c === 'x265') return 'hevc';
+  if (c === 'av1' || c === 'av01') return 'av1';
+  return c;
+}
+
 function mapDeviceCodecsForJellyfin(codecs) {
   const list = Array.isArray(codecs) && codecs.length > 0 ? codecs : ['avc', 'hevc'];
   const mapped = [];
   for (const raw of list) {
-    const c = String(raw || '').toLowerCase();
-    const jf = c === 'avc' ? 'h264' : c;
+    const jf = normalizeCodecName(raw);
     if (jf && !mapped.includes(jf)) mapped.push(jf);
   }
   return mapped.length > 0 ? mapped : ['h264', 'hevc'];
 }
 
+function canDeviceDirectPlayVideo(videoStream, ctx, jfCodecs) {
+  if (!videoStream) return true;
+  const maxWidth = Number(ctx.device?.maxWidth) || 3840;
+  const maxHeight = Number(ctx.device?.maxHeight) || 2160;
+  const width = Number(videoStream.Width) || 0;
+  const height = Number(videoStream.Height) || 0;
+  if ((width > 0 && width > maxWidth) || (height > 0 && height > maxHeight)) {
+    return false;
+  }
+  const codec = normalizeCodecName(videoStream.Codec);
+  if (codec && !jfCodecs.includes(codec)) {
+    return false;
+  }
+  return true;
+}
+
 async function apiRequest(ctx, path, { method = 'GET', query = null, body = null, requireAuth = true } = {}) {
   const base = getServerBase(ctx);
-  const session = requireAuth ? (await requireSession(ctx)).session : (await ctx.storage.get('session'));
+  let session;
+  if (requireAuth) {
+    session = await ctx.storage.get('session');
+    if (!session || !session.accessToken || !session.userId) {
+      throw new ctx.Error('NeedsAuth', ctx.t('err_needs_auth'));
+    }
+  } else {
+    session = await ctx.storage.get('session');
+  }
   let url = `${base}${path.startsWith('/') ? path : `/${path}`}`;
   if (query) {
     const qs = new URLSearchParams();
@@ -355,6 +493,7 @@ export default {
       throw new ctx.Error('NeedsSetup', ctx.t('err_no_user'));
     }
     const password = ctx.config.password || '';
+    await ensureServerVersion(ctx);
 
     const data = await apiRequest(ctx, '/Users/AuthenticateByName', {
       method: 'POST',
@@ -394,80 +533,112 @@ export default {
   },
 
   async home(ctx) {
-    const { base, session, authHeader } = await requireSession(ctx);
+    const { base, session, authHeader, routes } = await requireSession(ctx);
     const shelves = [];
 
-    // 1. Continue Watching (Resume) — modern Jellyfin route /UserItems/Resume
-    const resume = await apiRequest(ctx, '/UserItems/Resume', {
-      query: {
-        userId: session.userId,
-        Limit: 12,
-        Recursive: 'true',
-        MediaTypes: 'Video',
-        Fields: 'Overview,Genres,MediaSources,UserData',
-      },
+    const resumeReq = routes.resume({
+      Limit: 12,
+      Recursive: 'true',
+      MediaTypes: 'Video',
+      Fields: 'Overview,Genres,MediaSources,UserData',
     });
-    if (Array.isArray(resume?.Items) && resume.Items.length > 0) {
-      shelves.push({
-        id: 'jf-resume',
-        title: ctx.t('shelf_resume'),
-        style: 'continue',
-        items: resume.Items.map((it) => mapItem(it, base, authHeader)),
-      });
-    }
+    const viewsReq = routes.userViews();
 
-    // 2. Next Up (TV Episodes)
-    const nextUp = await apiRequest(ctx, '/Shows/NextUp', {
-      query: {
-        userId: session.userId,
-        Limit: 12,
-        Fields: 'Overview,UserData',
-      },
-    });
-    if (Array.isArray(nextUp?.Items) && nextUp.Items.length > 0) {
-      shelves.push({
-        id: 'jf-nextup',
-        title: ctx.t('shelf_next_up'),
-        style: 'thumb',
-        items: nextUp.Items.map((it) => mapItem(it, base, authHeader)),
-      });
-    }
-
-    // 3. Latest per library view — modern /UserViews + /Items/Latest
-    const views = await apiRequest(ctx, '/UserViews', {
-      query: { userId: session.userId },
-    });
-    const videoViews = (views?.Items || []).filter((v) =>
-      !['music', 'books', 'photos'].includes(String(v.CollectionType || '').toLowerCase())
-    );
-    for (const view of videoViews.slice(0, 4)) {
-      const latest = await apiRequest(ctx, '/Items/Latest', {
+    // Fetch Resume, NextUp, and UserViews in parallel so one failing shelf does not break the rest
+    const [resumeRes, nextUpRes, viewsRes] = await Promise.allSettled([
+      apiRequest(ctx, resumeReq.path, { query: resumeReq.query }),
+      apiRequest(ctx, '/Shows/NextUp', {
         query: {
           userId: session.userId,
-          ParentId: view.Id,
-          Limit: 16,
-          Fields: 'Overview,Genres,UserData,MediaSources',
+          Limit: 12,
+          Fields: 'Overview,UserData',
         },
-      });
-      if (Array.isArray(latest) && latest.length > 0) {
+      }),
+      apiRequest(ctx, viewsReq.path, { query: viewsReq.query }),
+    ]);
+
+    for (const r of [resumeRes, nextUpRes, viewsRes]) {
+      if (r.status === 'rejected' && r.reason?.code === 'NeedsAuth') {
+        throw r.reason;
+      }
+    }
+    if (resumeRes.status === 'rejected' && nextUpRes.status === 'rejected' && viewsRes.status === 'rejected') {
+      throw resumeRes.reason;
+    }
+
+    if (resumeRes.status === 'fulfilled') {
+      const resume = resumeRes.value;
+      if (Array.isArray(resume?.Items) && resume.Items.length > 0) {
         shelves.push({
-          id: `jf-latest-${view.Id}`,
-          title: ctx.t('shelf_latest', { name: view.Name }),
-          style: 'poster',
-          more: String(view.Id),
-          items: latest.map((it) => mapItem(it, base, authHeader)),
+          id: 'jf-resume',
+          title: ctx.t('shelf_resume'),
+          style: 'continue',
+          items: resume.Items.map((it) => mapItem(it, base, authHeader)),
         });
       }
+    } else {
+      ctx.log.warn(`Jellyfin home resume shelf failed: ${resumeRes.reason?.message || resumeRes.reason}`);
+    }
+
+    if (nextUpRes.status === 'fulfilled') {
+      const nextUp = nextUpRes.value;
+      if (Array.isArray(nextUp?.Items) && nextUp.Items.length > 0) {
+        shelves.push({
+          id: 'jf-nextup',
+          title: ctx.t('shelf_next_up'),
+          style: 'thumb',
+          items: nextUp.Items.map((it) => mapItem(it, base, authHeader)),
+        });
+      }
+    } else {
+      ctx.log.warn(`Jellyfin home nextUp shelf failed: ${nextUpRes.reason?.message || nextUpRes.reason}`);
+    }
+
+    if (viewsRes.status === 'fulfilled') {
+      const views = viewsRes.value;
+      const videoViews = (views?.Items || [])
+        .filter((v) => !['music', 'books', 'photos'].includes(String(v.CollectionType || '').toLowerCase()))
+        .slice(0, 4);
+
+      const latestResults = await Promise.allSettled(
+        videoViews.map((view) => {
+          const req = routes.latest({
+            ParentId: view.Id,
+            Limit: 16,
+            Fields: 'Overview,Genres,UserData,MediaSources',
+          });
+          return apiRequest(ctx, req.path, { query: req.query }).then((latest) => ({ view, latest }));
+        }),
+      );
+
+      for (const r of latestResults) {
+        if (r.status === 'rejected') {
+          if (r.reason?.code === 'NeedsAuth') throw r.reason;
+          ctx.log.warn(`Jellyfin home latest shelf failed: ${r.reason?.message || r.reason}`);
+          continue;
+        }
+        const { view, latest } = r.value;
+        if (Array.isArray(latest) && latest.length > 0) {
+          shelves.push({
+            id: `jf-latest-${view.Id}`,
+            title: ctx.t('shelf_latest', { name: view.Name }),
+            style: 'poster',
+            more: String(view.Id),
+            items: latest.map((it) => mapItem(it, base, authHeader)),
+          });
+        }
+      }
+    } else {
+      ctx.log.warn(`Jellyfin home views failed: ${viewsRes.reason?.message || viewsRes.reason}`);
     }
 
     return shelves;
   },
 
   async categories(ctx) {
-    const { session } = await requireSession(ctx);
-    const views = await apiRequest(ctx, '/UserViews', {
-      query: { userId: session.userId },
-    });
+    const { routes } = await requireSession(ctx);
+    const req = routes.userViews();
+    const views = await apiRequest(ctx, req.path, { query: req.query });
     return (views?.Items || [])
       .filter((v) => !['music', 'books', 'photos'].includes(String(v.CollectionType || '').toLowerCase()))
       .map((v) => ({
@@ -478,12 +649,11 @@ export default {
   },
 
   async browse(ctx, { categoryId = '', cursor = null, sort = null, filters = null } = {}) {
-    const { base, session, authHeader } = await requireSession(ctx);
+    const { base, authHeader, routes } = await requireSession(ctx);
 
     if (!categoryId) {
-      const views = await apiRequest(ctx, '/UserViews', {
-        query: { userId: session.userId },
-      });
+      const req = routes.userViews();
+      const views = await apiRequest(ctx, req.path, { query: req.query });
       const items = (views?.Items || [])
         .filter((v) => !['music', 'books', 'photos'].includes(String(v.CollectionType || '').toLowerCase()))
         .map((v) => mapItem(v, base, authHeader));
@@ -498,7 +668,6 @@ export default {
     else if (sort === 'rating_desc') { sortBy = 'CommunityRating'; sortOrder = 'Descending'; }
 
     const query = {
-      userId: session.userId,
       ParentId: categoryId,
       StartIndex: startIndex,
       Limit: PAGE_LIMIT,
@@ -509,7 +678,8 @@ export default {
     if (filters?.status) query.Filters = filters.status;
     if (filters?.type) query.IncludeItemTypes = filters.type;
 
-    const data = await apiRequest(ctx, '/Items', { query });
+    const req = routes.items(query);
+    const data = await apiRequest(ctx, req.path, { query: req.query });
     const rawItems = Array.isArray(data?.Items) ? data.Items : [];
     const total = Number(data?.TotalRecordCount ?? rawItems.length);
     const nextIdx = startIndex + rawItems.length;
@@ -551,13 +721,11 @@ export default {
   },
 
   async detail(ctx, { itemId }) {
-    const { base, session, authHeader } = await requireSession(ctx);
-    const raw = await apiRequest(ctx, `/Items/${encodeURIComponent(itemId)}`, {
-      query: {
-        userId: session.userId,
-        Fields: 'Overview,Genres,People,MediaSources,MediaStreams,Studios,ChildCount,UserData',
-      },
+    const { base, session, authHeader, routes } = await requireSession(ctx);
+    const detailReq = routes.itemDetail(itemId, {
+      Fields: 'Overview,Genres,People,MediaSources,MediaStreams,Studios,ChildCount,UserData',
     });
+    const raw = await apiRequest(ctx, detailReq.path, { query: detailReq.query });
     const item = mapItem(raw, base, authHeader, true);
 
     if (raw.Type === 'Series') {
@@ -601,24 +769,25 @@ export default {
     const jfCodecs = mapDeviceCodecsForJellyfin(ctx.device.codecs);
     const wantTranscodeProfile = selectedQuality !== 'direct';
     const maxBitrate = profile.bitrate > 0 ? profile.bitrate : 120_000_000;
+    const deviceMaxWidth = Number(ctx.device?.maxWidth) || 3840;
+    const deviceMaxHeight = Number(ctx.device?.maxHeight) || 2160;
+    const effectiveMaxWidth = profile.maxWidth > 0 ? Math.min(profile.maxWidth, deviceMaxWidth) : deviceMaxWidth;
+    const effectiveMaxHeight = profile.maxHeight > 0 ? Math.min(profile.maxHeight, deviceMaxHeight) : deviceMaxHeight;
 
-    const transcodeConditions = [];
-    if (profile.maxWidth > 0) {
-      transcodeConditions.push({
+    const codecConditions = [
+      {
         Condition: 'LessThanEqual',
         Property: 'Width',
-        Value: String(profile.maxWidth),
+        Value: String(effectiveMaxWidth),
         IsRequired: false,
-      });
-    }
-    if (profile.maxHeight > 0) {
-      transcodeConditions.push({
+      },
+      {
         Condition: 'LessThanEqual',
         Property: 'Height',
-        Value: String(profile.maxHeight),
+        Value: String(effectiveMaxHeight),
         IsRequired: false,
-      });
-    }
+      },
+    ];
 
     const body = {
       UserId: session.userId,
@@ -647,14 +816,12 @@ export default {
             Context: 'Streaming',
           },
         ],
-        CodecProfiles: transcodeConditions.length > 0
-          ? [
-              {
-                Type: 'Video',
-                Conditions: transcodeConditions,
-              },
-            ]
-          : [],
+        CodecProfiles: [
+          {
+            Type: 'Video',
+            Conditions: codecConditions,
+          },
+        ],
         SubtitleProfiles: [
           { Format: 'srt', Method: 'External' },
           { Format: 'vtt', Method: 'External' },
@@ -682,11 +849,12 @@ export default {
     const mediaSourceId = source.Id || itemId;
     const playSessionId = pbResp.PlaySessionId || `jf-${Date.now()}`;
     const deviceId = await getDeviceId(ctx);
-    const headers = {
+    const sameOriginHeaders = {
       Authorization: authHeader,
     };
 
     const streams = Array.isArray(source.MediaStreams) ? source.MediaStreams : [];
+    const primaryVideoStream = streams.find((s) => s.Type === 'Video') || null;
     const audios = streams
       .filter((s) => s.Type === 'Audio')
       .map((s) => ({
@@ -701,22 +869,30 @@ export default {
       const fmt = mapSubtitleFormat(s.Codec);
       if (!fmt) continue;
       const rawSubUrl = s.DeliveryUrl
-        ? (s.DeliveryUrl.startsWith('http') ? s.DeliveryUrl : `${base}${s.DeliveryUrl}`)
+        ? (/^https?:\/\//i.test(s.DeliveryUrl) ? s.DeliveryUrl : `${base}${s.DeliveryUrl}`)
         : `${base}/Videos/${encodeURIComponent(itemId)}/${encodeURIComponent(mediaSourceId)}/Subtitles/${s.Index}/0/Stream.${fmt}`;
-      subtitles.push({
+      const cleanSubUrl = stripApiKeyFromUrl(rawSubUrl);
+      const subEntry = {
         id: String(s.Index),
         label: s.DisplayTitle || s.Title || s.Language || `字幕 ${s.Index}`,
         ...(s.Language ? { lang: String(s.Language) } : {}),
-        url: stripApiKeyFromUrl(rawSubUrl),
+        url: cleanSubUrl,
         format: fmt,
-        headers,
         ...(s.IsDefault ? { default: true } : {}),
-      });
+      };
+      // Only send Authorization to subtitles hosted on the same Jellyfin origin
+      if (isSameOrigin(cleanSubUrl, base)) {
+        subEntry.headers = sameOriginHeaders;
+      }
+      subtitles.push(subEntry);
     }
 
     let url;
     let mime;
-    const useTranscode = wantTranscodeProfile || source.SupportsDirectPlay === false;
+    const deviceCanDirectPlay = canDeviceDirectPlayVideo(primaryVideoStream, ctx, jfCodecs);
+    const useTranscode = wantTranscodeProfile || source.SupportsDirectPlay === false || !deviceCanDirectPlay;
+    const playMethod = useTranscode ? 'Transcode' : 'DirectPlay';
+
     if (!useTranscode) {
       const qs = new URLSearchParams({
         Static: 'true',
@@ -726,7 +902,7 @@ export default {
       });
       url = `${base}/Videos/${encodeURIComponent(itemId)}/stream?${qs.toString()}`;
     } else if (source.TranscodingUrl) {
-      const fullTranscodeUrl = source.TranscodingUrl.startsWith('http')
+      const fullTranscodeUrl = /^https?:\/\//i.test(source.TranscodingUrl)
         ? source.TranscodingUrl
         : `${base}${source.TranscodingUrl}`;
       url = stripApiKeyFromUrl(fullTranscodeUrl);
@@ -739,8 +915,8 @@ export default {
         VideoCodec: jfCodecs.includes('hevc') ? 'h264,hevc' : 'h264',
         AudioCodec: 'aac',
         VideoBitrate: String(profile.bitrate || 8_000_000),
-        MaxWidth: String(profile.maxWidth || 1920),
-        MaxHeight: String(profile.maxHeight || 1080),
+        MaxWidth: String(effectiveMaxWidth),
+        MaxHeight: String(effectiveMaxHeight),
       });
       if (audio) qs.set('AudioStreamIndex', String(audio));
       url = `${base}/Videos/${encodeURIComponent(itemId)}/master.m3u8?${qs.toString()}`;
@@ -753,9 +929,11 @@ export default {
       selected: q.id === selectedQuality,
     }));
 
+    // Never attach Jellyfin Authorization header when TranscodingUrl points to a different origin
+    const streamHeaders = isSameOrigin(url, base) ? sameOriginHeaders : {};
     const result = {
       url,
-      headers,
+      headers: streamHeaders,
       qualities,
       session: playSessionId,
     };
@@ -769,12 +947,12 @@ export default {
     const stereo = mapStereo(source.Video3DFormat);
     if (stereo) result.stereo = stereo;
 
-    rememberMediaSourceId(itemId, mediaSourceId);
+    rememberPlaybackMeta(itemId, mediaSourceId, playMethod);
     return result;
   },
 
   async search(ctx, { query = '', cursor = null, kind = null } = {}) {
-    const { base, session, authHeader } = await requireSession(ctx);
+    const { base, authHeader, routes } = await requireSession(ctx);
     const startIndex = cursor ? Math.max(0, parseInt(String(cursor), 10) || 0) : 0;
     const typeMap = {
       movie: 'Movie',
@@ -783,17 +961,15 @@ export default {
       collection: 'BoxSet',
       video: 'Video',
     };
-    const data = await apiRequest(ctx, '/Items', {
-      query: {
-        userId: session.userId,
-        SearchTerm: query,
-        Recursive: 'true',
-        IncludeItemTypes: (kind && typeMap[kind]) || 'Movie,Series,Episode,Video,BoxSet',
-        StartIndex: startIndex,
-        Limit: 30,
-        Fields: 'Overview,Genres,UserData,MediaSources',
-      },
+    const req = routes.items({
+      SearchTerm: query,
+      Recursive: 'true',
+      IncludeItemTypes: (kind && typeMap[kind]) || 'Movie,Series,Episode,Video,BoxSet',
+      StartIndex: startIndex,
+      Limit: 30,
+      Fields: 'Overview,Genres,MediaSources,UserData',
     });
+    const data = await apiRequest(ctx, req.path, { query: req.query });
     const rawItems = Array.isArray(data?.Items) ? data.Items : [];
     const total = Number(data?.TotalRecordCount ?? rawItems.length);
     const nextIdx = startIndex + rawItems.length;
@@ -814,12 +990,15 @@ export default {
   async reportProgress(ctx, { itemId, positionMs = 0, durationMs = 0, event = 'progress', session = null }) {
     await requireSession(ctx);
     const ticks = Math.max(0, Math.floor(Number(positionMs) * TICKS_PER_MS));
-    const mediaSourceId = mediaSourceCache.get(itemId) || itemId;
+    const meta = playbackMetaCache.get(itemId);
+    const mediaSourceId = meta?.mediaSourceId || itemId;
+    const playMethod = meta?.playMethod || 'DirectPlay';
     const payload = {
       ItemId: itemId,
       MediaSourceId: mediaSourceId,
       PositionTicks: ticks,
       IsPaused: event === 'pause',
+      PlayMethod: playMethod,
       PlaySessionId: session || undefined,
     };
     if (event === 'start') {
@@ -832,18 +1011,20 @@ export default {
   },
 
   async setFavorite(ctx, { itemId, favorite }) {
-    const { session } = await requireSession(ctx);
-    await apiRequest(ctx, `/UserFavoriteItems/${encodeURIComponent(itemId)}`, {
+    const { routes } = await requireSession(ctx);
+    const req = routes.favorite(itemId);
+    await apiRequest(ctx, req.path, {
       method: favorite ? 'POST' : 'DELETE',
-      query: { userId: session.userId },
+      query: req.query,
     });
   },
 
   async setPlayed(ctx, { itemId, played }) {
-    const { session } = await requireSession(ctx);
-    await apiRequest(ctx, `/UserPlayedItems/${encodeURIComponent(itemId)}`, {
+    const { routes } = await requireSession(ctx);
+    const req = routes.played(itemId);
+    await apiRequest(ctx, req.path, {
       method: played ? 'POST' : 'DELETE',
-      query: { userId: session.userId },
+      query: req.query,
     });
   },
 };

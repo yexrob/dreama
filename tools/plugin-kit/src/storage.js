@@ -27,6 +27,15 @@ export class PluginStorage {
     return Object.prototype.hasOwnProperty.call(this.data, key) ? this.data[key] : null;
   }
 
+  setRawJson(key, rawJson) {
+    const keyBytes = Buffer.byteLength(String(key), 'utf8');
+    const valBytes = Buffer.byteLength(String(rawJson), 'utf8');
+    if (keyBytes + valBytes + 6 > this.maxBytes) {
+      throw new Error(`插件存储空间超过上限（${Math.round(this.maxBytes / 1024)} KB）`);
+    }
+    this.set(key, JSON.parse(rawJson));
+  }
+
   set(key, value) {
     const prevExisted = Object.prototype.hasOwnProperty.call(this.data, key);
     const prev = this.data[key];
