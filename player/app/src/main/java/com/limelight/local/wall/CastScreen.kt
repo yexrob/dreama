@@ -31,6 +31,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -45,6 +46,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -60,6 +62,8 @@ import com.limelight.local.airplay.takesPage
 import com.limelight.local.dlna.CastReceiver
 import com.limelight.local.dlna.ReceiverStatus
 import com.limelight.local.stream.ComputerStatus
+import com.limelight.local.stream.CrashRecoveryPrompt
+import com.limelight.local.stream.HttpHostProtocolClient
 import com.limelight.local.stream.PhoneInputServer
 import com.limelight.local.stream.StreamFlowState
 import com.limelight.local.stream.StreamingComputer
@@ -82,19 +86,33 @@ fun CastScreen(model: WallModel, nav: WallNav) {
     val hasWifi by streaming.hasWifi.collectAsState()
     val flow by streaming.flow.collectAsState()
     val banner by streaming.bannerNotice.collectAsState()
+    val crashPrompt by streaming.crashPrompt.collectAsState()
 
     var showAddSheet by remember { mutableStateOf(false) }
     var actionTarget by remember { mutableStateOf<StreamingComputer?>(null) }
+
+    // Cancel any in-flight connect/pair if the user navigates away from CastScreen
+    // so returning to the page can never remain stuck on "正在连接".
+    DisposableEffect(streaming) {
+        onDispose {
+            when (streaming.flow.value) {
+                is StreamFlowState.Connecting,
+                is StreamFlowState.AutoPairing,
+                is StreamFlowState.PinPairing -> streaming.cancelActiveOperation()
+                else -> Unit
+            }
+        }
+    }
 
     // Active pairing / connecting / session failure takes over the page cleanly
     if (flow !is StreamFlowState.Idle) {
         Box(Modifier.fillMaxSize()) {
             StreamFlowTakeover(flow, streaming, nav)
             NavBar(Tab.Cast, {
-                streaming.clearFlow()
+                streaming.cancelActiveOperation()
                 nav.tab(it)
             }, {
-                streaming.clearFlow()
+                streaming.cancelActiveOperation()
                 nav.openSettings()
             }, solid = true)
         }
@@ -180,6 +198,16 @@ fun CastScreen(model: WallModel, nav: WallNav) {
                 }
             }
 
+            crashPrompt?.let { prompt ->
+                item("stream-crash-recovery") {
+                    CrashRecoveryCard(
+                        prompt = prompt,
+                        onResetDefaults = { streaming.resetStreamingAfterCrash() },
+                        onDismiss = { streaming.dismissCrashPrompt() },
+                    )
+                }
+            }
+
             item("stream-header") {
                 Row(
                     Modifier.padding(start = Wall.Margin, end = Wall.Margin, top = 48.dp),
@@ -212,14 +240,37 @@ fun CastScreen(model: WallModel, nav: WallNav) {
                         }
                     }
                     computers.isEmpty() -> {
-                        Column(Modifier.padding(start = Wall.Margin, end = Wall.Margin, top = 20.dp)) {
+                        Column(
+                            Modifier
+                                .padding(start = Wall.Margin, end = Wall.Margin, top = 20.dp)
+                                .width(1152.dp)
+                                .clip(RoundedCornerShape(Wall.Radius))
+                                .background(Wall.Surface.copy(alpha = 0.7f))
+                                .padding(28.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
                             Text(
-                                stringResource(R.string.stream_empty_hint),
+                                stringResource(R.string.stream_empty_title),
+                                style = WallType.Head.copy(fontSize = 26.sp),
+                            )
+                            Text(
+                                stringResource(R.string.stream_empty_guide),
                                 style = WallType.Body,
                                 color = Wall.Text2,
                             )
-                            Spacer(Modifier.height(20.dp))
-                            AddComputerCard { showAddSheet = true }
+                            Row(
+                                Modifier.padding(top = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(20.dp),
+                            ) {
+                                AddComputerCard { showAddSheet = true }
+                                WallButton(
+                                    text = stringResource(R.string.action_search_again),
+                                    onClick = { streaming.refreshDiscovery() },
+                                    icon = WallIcons.Refresh,
+                                    kind = ButtonKind.Plain,
+                                )
+                            }
                         }
                     }
                     else -> {
@@ -461,14 +512,73 @@ private fun StreamFlowTakeover(flow: StreamFlowState, streaming: StreamingContro
             }
         }
         is StreamFlowState.CertConfirm -> {
-            val shortFp = flow.actualFingerprint.take(16).chunked(4).joinToString(" ")
-            CenteredTakeover(
-                icon = { Icon(WallIcons.Shield, null, Modifier.size(40.dp), tint = Wall.Accent) },
-                title = stringResource(R.string.pair_cert_title, flow.computer.name),
-                body = stringResource(R.string.pair_cert_body) + "\n" +
-                    stringResource(R.string.pair_cert_fingerprint, shortFp),
+            val oldFp = HttpHostProtocolClient.formatFingerprint(flow.expectedFingerprint)
+            val newFp = HttpHostProtocolClient.formatFingerprint(flow.actualFingerprint)
+            Column(
+                Modifier.fillMaxWidth().padding(horizontal = 96.dp).offset(y = 124.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                Box(
+                    Modifier.size(72.dp).clip(CircleShape).background(Wall.Fill),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(WallIcons.Shield, null, Modifier.size(36.dp), tint = Wall.Accent)
+                }
+                Text(
+                    stringResource(R.string.pair_cert_title, flow.computer.name),
+                    style = WallType.Title,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(top = 20.dp),
+                )
+                Text(
+                    stringResource(R.string.pair_cert_body),
+                    style = WallType.Body,
+                    color = Wall.Text2,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(top = 10.dp),
+                )
+                Column(
+                    Modifier
+                        .padding(top = 20.dp)
+                        .width(820.dp)
+                        .clip(RoundedCornerShape(Wall.Radius))
+                        .background(Wall.Surface)
+                        .padding(horizontal = 24.dp, vertical = 18.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    if (oldFp.isNotBlank()) {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(stringResource(R.string.pair_cert_old_label), style = WallType.Caption, color = Wall.Text3)
+                            Text(
+                                oldFp,
+                                style = WallType.Caption.copy(
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 18.sp,
+                                    lineHeight = 24.sp,
+                                    fontFeatureSettings = "tnum",
+                                ),
+                                color = Wall.Text2,
+                            )
+                        }
+                    }
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(stringResource(R.string.pair_cert_new_label), style = WallType.Caption, color = Wall.Accent)
+                        Text(
+                            newFp,
+                            style = WallType.Caption.copy(
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 18.sp,
+                                lineHeight = 24.sp,
+                                fontFeatureSettings = "tnum",
+                            ),
+                            color = Wall.Text,
+                        )
+                    }
+                }
+                Row(
+                    Modifier.padding(top = 28.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
                     WallButton(
                         stringResource(R.string.pair_cert_trust),
                         { nav.confirmChangedCert(flow) },
@@ -646,6 +756,66 @@ private fun PcActionSheet(
                 Row(Modifier.padding(top = 12.dp).fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                     WallButton(stringResource(R.string.action_close), onDismiss, kind = ButtonKind.Ghost)
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CrashRecoveryCard(
+    prompt: CrashRecoveryPrompt,
+    onResetDefaults: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Column(
+        Modifier
+            .padding(start = Wall.Margin, end = Wall.Margin, top = 28.dp)
+            .width(1152.dp)
+            .clip(RoundedCornerShape(Wall.Radius))
+            .background(Wall.Surface)
+            .padding(horizontal = 28.dp, vertical = 22.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Notice(
+            text = stringResource(
+                if (prompt.autoResetApplied) R.string.stream_crash_auto_reset_title
+                else R.string.stream_crash_title,
+            ),
+            icon = WallIcons.Alert,
+            danger = true,
+        )
+        Text(
+            text = stringResource(
+                if (prompt.autoResetApplied) R.string.stream_crash_auto_reset_body
+                else R.string.stream_crash_body,
+            ),
+            style = WallType.Caption,
+            color = Wall.Text2,
+        )
+        Row(
+            Modifier.padding(top = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            if (prompt.autoResetApplied) {
+                WallButton(
+                    text = stringResource(R.string.action_got_it),
+                    onClick = onDismiss,
+                    kind = ButtonKind.Primary,
+                    small = true,
+                )
+            } else {
+                WallButton(
+                    text = stringResource(R.string.stream_crash_reset_btn),
+                    onClick = onResetDefaults,
+                    kind = ButtonKind.Primary,
+                    small = true,
+                )
+                WallButton(
+                    text = stringResource(R.string.action_ignore),
+                    onClick = onDismiss,
+                    kind = ButtonKind.Ghost,
+                    small = true,
+                )
             }
         }
     }

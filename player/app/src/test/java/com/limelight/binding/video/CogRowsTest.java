@@ -33,6 +33,9 @@ public class CogRowsTest {
         assertEquals(21, SETTING_CONTROLLER_MODEL);
         assertEquals(22, SETTING_HEAD_AIM_SENSITIVITY);
         assertEquals(23, SETTING_HEAD_AIM_DEADZONE);
+        assertEquals(24, SETTING_STREAM_RES);
+        assertEquals(25, SETTING_STREAM_BITRATE);
+        assertEquals(26, SETTING_STREAM_MOUSE);
         assertEquals(0.197f, XrPanels.cogRowV(COG_TAB_DISPLAY, 0), 1e-6f);
         assertEquals(0.917f, XrPanels.cogRowV(COG_TAB_DISPLAY, COG_DISPLAY_SLIDER_ROW), 1e-5f);
         // The first row's band starts under the tab bar
@@ -106,6 +109,11 @@ public class CogRowsTest {
         for (int row = 0; row < PICTURE_VALUES; row++) {
             assertEquals(COG_ROW_V0 + row * COG_ROW_STEP, XrPanels.cogRowV(COG_TAB_PICTURE, row),
                     1e-6f);
+        }
+        assertEquals(3, COG_STREAM_ROW_COUNT);
+        for (int row = 0; row < COG_STREAM_ROW_COUNT; row++) {
+            assertEquals(COG_STREAM_ROW_V0 + row * COG_STREAM_ROW_STEP,
+                    XrPanels.cogRowV(COG_TAB_ABOUT, row), 1e-6f);
         }
     }
 }

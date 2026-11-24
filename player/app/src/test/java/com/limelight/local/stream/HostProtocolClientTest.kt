@@ -1,5 +1,7 @@
 package com.limelight.local.stream
 
+import com.limelight.nvstream.http.ComputerDetails
+import com.limelight.nvstream.http.NvHTTP
 import org.bouncycastle.asn1.x500.X500Name
 import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo
 import org.bouncycastle.cert.X509v3CertificateBuilder
@@ -9,11 +11,15 @@ import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.Closeable
+import java.io.IOException
 import java.math.BigInteger
 import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
 import java.nio.charset.StandardCharsets
 import java.security.KeyPairGenerator
 import java.security.KeyStore
@@ -22,7 +28,11 @@ import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import java.util.Date
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.logging.Handler
 import java.util.logging.LogRecord
 import java.util.logging.Logger
@@ -73,6 +83,7 @@ class HostProtocolClientTest {
         val requests = CopyOnWriteArrayList<RecordedRequest>()
         private val closed = AtomicBoolean(false)
         private val serverSocket: SSLServerSocket
+        private val workers = Executors.newCachedThreadPool()
         private val thread: Thread
 
         val port: Int get() = serverSocket.localPort
@@ -105,13 +116,15 @@ class HostProtocolClientTest {
                 } catch (_: Exception) {
                     break
                 }
-                try {
-                    handle(sock)
-                } catch (_: Exception) {
-                } finally {
+                workers.execute {
                     try {
-                        sock.close()
+                        handle(sock)
                     } catch (_: Exception) {
+                    } finally {
+                        try {
+                            sock.close()
+                        } catch (_: Exception) {
+                        }
                     }
                 }
             }
@@ -188,19 +201,24 @@ class HostProtocolClientTest {
             } catch (_: Exception) {
             }
             thread.interrupt()
+            workers.shutdownNow()
         }
     }
 
     @Test
-    fun getInfoParsesReadyNotReadyAndUpgradeRequired() {
+    fun getInfoParsesReadyNotReadyUpgradeRequiredAndRejectsIdentityMismatchWithoutPinning() {
         val serverId = generateSelfSigned("depth3d-host-info")
         val pinStore = InMemoryHostCertPinStore()
-        var mode = "ready"
+        var mode = "mismatch"
 
         LocalTlsServer(serverId) { req ->
             assertEquals("GET", req.method)
             assertEquals("/depth3d/v1/info", req.path)
             when (mode) {
+                "mismatch" -> MockResponse(
+                    200,
+                    """{"v":1,"name":"假冒电脑","id":"spoofed-id","os":"macos","stream":{"ready":true}}""",
+                )
                 "ready" -> MockResponse(
                     200,
                     """{"v":1,"name":"书房 Mac","id":"host-1","os":"macos","stream":{"ready":true},"media":{"port":8088}}""",
@@ -214,6 +232,16 @@ class HostProtocolClientTest {
         }.use { srv ->
             val client = HttpHostProtocolClient(pinStore)
 
+            // Review #5: mismatched /info id must be rejected AND must NOT save TOFU pin!
+            val mismatch = client.getInfo("127.0.0.1", srv.port, "host-1")
+            assertTrue("Expected IdentityMismatch, got $mismatch", mismatch is HostInfoResult.IdentityMismatch)
+            assertNull(
+                "Certificate pin must NOT be saved when /info id mismatches mDNS hostId",
+                pinStore.getFingerprint("host-1"),
+            )
+
+            // Valid matching id -> accepted and pinned
+            mode = "ready"
             val ok = client.getInfo("127.0.0.1", srv.port, "host-1")
             assertTrue(ok is HostInfoResult.Ok)
             val info = (ok as HostInfoResult.Ok).info
@@ -235,8 +263,9 @@ class HostProtocolClientTest {
     }
 
     @Test
-    fun requestAutoPairHandlesStatusCodesAndNeverLogsPin() {
+    fun requestAutoPairFollowsProtocolV1ClientCertRulesAnd503HandlingAndNeverLogsPin() {
         val serverId = generateSelfSigned("depth3d-host-pair")
+        val clientId = generateSelfSigned("depth3d-headset-pair-cert")
         val pinStore = InMemoryHostCertPinStore()
         var statusToReturn = 200
         val secretPin = "7391"
@@ -265,16 +294,60 @@ class HostProtocolClientTest {
                     200 -> MockResponse(200, """{"ok":true}""")
                     403 -> MockResponse(403, """{"error":"rejected"}""")
                     408 -> MockResponse(408, """{"error":"timeout"}""")
-                    else -> MockResponse(426, """{"error":"upgrade"}""")
+                    426 -> MockResponse(426, """{"error":"upgrade"}""")
+                    else -> MockResponse(503, """{"error":"stream_not_running"}""")
                 }
             }.use { srv ->
-                val client = HttpHostProtocolClient(pinStore)
+                val client = HttpHostProtocolClient(
+                    pinStore = pinStore,
+                    clientIdentityProvider = { clientId.cert to clientId.key },
+                )
 
+                // Review #10: First-time pairing MUST NOT send client certificate
                 statusToReturn = 200
                 assertEquals(
                     AutoPairResult.Approved,
+                    client.requestAutoPair(
+                        address = "127.0.0.1",
+                        port = srv.port,
+                        hostId = "host-pair",
+                        deviceName = "我的头显",
+                        deviceId = "dev-abc",
+                        pin = secretPin,
+                        presentClientCert = false,
+                    ),
+                )
+                assertNull(
+                    "First-time /pair must NOT present client certificate",
+                    srv.requests.last().clientCert,
+                )
+
+                // Review #10: Subsequent /pair after pairing MUST present pairing client certificate
+                assertEquals(
+                    AutoPairResult.Approved,
+                    client.requestAutoPair(
+                        address = "127.0.0.1",
+                        port = srv.port,
+                        hostId = "host-pair",
+                        deviceName = "我的头显",
+                        deviceId = "dev-abc",
+                        pin = secretPin,
+                        presentClientCert = true,
+                    ),
+                )
+                assertNotNull(
+                    "Re-pair /pair must present pairing client certificate",
+                    srv.requests.last().clientCert,
+                )
+                assertEquals(clientId.cert.serialNumber, srv.requests.last().clientCert!!.serialNumber)
+
+                // Review #10: 503 means Mac streaming service is not running
+                statusToReturn = 503
+                assertEquals(
+                    AutoPairResult.StreamServiceUnavailable,
                     client.requestAutoPair("127.0.0.1", srv.port, "host-pair", "我的头显", "dev-abc", secretPin),
                 )
+
                 statusToReturn = 403
                 assertEquals(
                     AutoPairResult.Rejected,
@@ -302,7 +375,7 @@ class HostProtocolClientTest {
     }
 
     @Test
-    fun getMediaCredentialsSendsMutualTlsCertAndDeviceHeader() {
+    fun getMediaCredentialsRequiresClientCertAndSendsMutualTlsCert() {
         val serverId = generateSelfSigned("depth3d-host-media")
         val clientId = generateSelfSigned("depth3d-headset-client")
         val pinStore = InMemoryHostCertPinStore()
@@ -320,6 +393,14 @@ class HostProtocolClientTest {
                 else -> MockResponse(404, """{"error":"no_media"}""")
             }
         }.use { srv ->
+            // Without client identity provider, /media refuses to call the host at all
+            val noCertClient = HttpHostProtocolClient(pinStore = pinStore, clientIdentityProvider = { null })
+            assertEquals(
+                MediaCredsResult.Unauthorized,
+                noCertClient.getMediaCredentials("127.0.0.1", srv.port, "host-m", "headset-42"),
+            )
+            assertEquals(0, srv.requests.size)
+
             val client = HttpHostProtocolClient(
                 pinStore = pinStore,
                 clientIdentityProvider = { clientId.cert to clientId.key },
@@ -347,9 +428,19 @@ class HostProtocolClientTest {
     }
 
     @Test
-    fun tofuCertPinningDetectsRotationAndAllowsExplicitTrustUpdate() {
+    fun tofuCertPinningTrustsOnlyTheExactApprovedFingerprint() {
         val certA = generateSelfSigned("depth3d-host-A")
         val certB = generateSelfSigned("depth3d-host-B")
+        val certC = generateSelfSigned("depth3d-host-C")
+        val fpA = HttpHostProtocolClient.sha256Hex(certA.cert)
+        val fpB = HttpHostProtocolClient.sha256Hex(certB.cert)
+        val fpC = HttpHostProtocolClient.sha256Hex(certC.cert)
+
+        // Full grouped fingerprint check (review #5)
+        val formatted = HttpHostProtocolClient.formatFingerprint(fpB)
+        assertEquals(fpB.uppercase(), formatted.replace(Regex("\\s+"), ""))
+        assertTrue("Expected readable 2-line grouping", formatted.contains("\n"))
+
         val pinStore = InMemoryHostCertPinStore()
         val client = HttpHostProtocolClient(pinStore)
 
@@ -358,26 +449,212 @@ class HostProtocolClientTest {
             MockResponse(200, """{"v":1,"name":"PC","id":"host-pin","os":"windows","stream":{"ready":true}}""")
         }.use { srvA ->
             assertTrue(client.getInfo("127.0.0.1", srvA.port, "host-pin") is HostInfoResult.Ok)
-            assertEquals(HttpHostProtocolClient.sha256Hex(certA.cert), pinStore.getFingerprint("host-pin"))
+            assertEquals(fpA, pinStore.getFingerprint("host-pin"))
         }
 
-        // Same host id now presents certB -> rejected with CertificateChanged
+        // Same host id now presents certB -> rejected with CertificateChanged(fpA, fpB)
         LocalTlsServer(certB) {
             MockResponse(200, """{"v":1,"name":"PC","id":"host-pin","os":"windows","stream":{"ready":true}}""")
         }.use { srvB ->
-            val changed = client.getInfo("127.0.0.1", srvB.port, "host-pin", trustChangedCert = false)
+            val changed = client.getInfo("127.0.0.1", srvB.port, "host-pin")
             assertTrue("Expected CertificateChanged, got $changed", changed is HostInfoResult.CertificateChanged)
             val details = changed as HostInfoResult.CertificateChanged
-            assertEquals(HttpHostProtocolClient.sha256Hex(certA.cert), details.expected)
-            assertEquals(HttpHostProtocolClient.sha256Hex(certB.cert), details.actual)
+            assertEquals(fpA, details.expected)
+            assertEquals(fpB, details.actual)
+        }
 
-            // User confirms trustChangedCert=true -> succeeds and updates stored pin
-            val trusted = client.getInfo("127.0.0.1", srvB.port, "host-pin", trustChangedCert = true)
+        // Review #5: user approved fpB, NOT fpC — if an attacker swaps in certC, it MUST still be rejected!
+        LocalTlsServer(certC) {
+            MockResponse(200, """{"v":1,"name":"PC","id":"host-pin","os":"windows","stream":{"ready":true}}""")
+        }.use { srvC ->
+            val stillRejected = client.getInfo(
+                address = "127.0.0.1",
+                port = srvC.port,
+                hostId = "host-pin",
+                approvedNewFingerprint = fpB,
+            )
+            assertTrue("Must reject unapproved certC even when fpB was approved", stillRejected is HostInfoResult.CertificateChanged)
+            val details = stillRejected as HostInfoResult.CertificateChanged
+            assertEquals(fpA, details.expected)
+            assertEquals(fpC, details.actual)
+            assertEquals("Original pin must remain unchanged", fpA, pinStore.getFingerprint("host-pin"))
+        }
+
+        // Now connect to certB with exact approvedNewFingerprint = fpB -> succeeds & updates pin to fpB
+        LocalTlsServer(certB) {
+            MockResponse(200, """{"v":1,"name":"PC","id":"host-pin","os":"windows","stream":{"ready":true}}""")
+        }.use { srvB ->
+            val trusted = client.getInfo(
+                address = "127.0.0.1",
+                port = srvB.port,
+                hostId = "host-pin",
+                approvedNewFingerprint = fpB,
+            )
             assertTrue(trusted is HostInfoResult.Ok)
-            assertEquals(HttpHostProtocolClient.sha256Hex(certB.cert), pinStore.getFingerprint("host-pin"))
+            assertEquals(fpB, pinStore.getFingerprint("host-pin"))
 
             // Subsequent normal call now trusts certB
-            assertTrue(client.getInfo("127.0.0.1", srvB.port, "host-pin", trustChangedCert = false) is HostInfoResult.Ok)
+            assertTrue(client.getInfo("127.0.0.1", srvB.port, "host-pin") is HostInfoResult.Ok)
+        }
+    }
+
+    @Test
+    fun cancelInterruptsInFlightPairCallAndImmediateRetrySucceeds() {
+        val serverId = generateSelfSigned("depth3d-host-cancel")
+        val pinStore = InMemoryHostCertPinStore()
+        val attempt = AtomicInteger(0)
+        val firstReqArrived = CountDownLatch(1)
+        val releaseFirstReq = CountDownLatch(1)
+
+        LocalTlsServer(serverId) { _ ->
+            val n = attempt.incrementAndGet()
+            if (n == 1) {
+                firstReqArrived.countDown()
+                // Simulate Mac waiting on user dialog for a long time
+                releaseFirstReq.await(15, TimeUnit.SECONDS)
+                MockResponse(408, """{"error":"timeout"}""")
+            } else {
+                MockResponse(200, """{"ok":true}""")
+            }
+        }.use { srv ->
+            val client = HttpHostProtocolClient(pinStore)
+            val cancelToken = CallCancelToken()
+
+            val bg = Executors.newSingleThreadExecutor()
+            try {
+                val startedAt = System.nanoTime()
+                val future = bg.submit<AutoPairResult> {
+                    client.requestAutoPair(
+                        address = "127.0.0.1",
+                        port = srv.port,
+                        hostId = "host-cancel",
+                        deviceName = "depth3d",
+                        deviceId = "dev-1",
+                        pin = "1234",
+                        cancelToken = cancelToken,
+                    )
+                }
+
+                assertTrue("First request should reach server", firstReqArrived.await(3, TimeUnit.SECONDS))
+                cancelToken.cancel()
+
+                val cancelled = future.get(3, TimeUnit.SECONDS)
+                val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
+                assertEquals(AutoPairResult.Cancelled, cancelled)
+                assertTrue("Cancel should abort quickly (< 3000ms), took ${elapsedMs}ms", elapsedMs < 3000L)
+
+                // Immediate retry with a fresh token succeeds cleanly
+                val retried = client.requestAutoPair(
+                    address = "127.0.0.1",
+                    port = srv.port,
+                    hostId = "host-cancel",
+                    deviceName = "depth3d",
+                    deviceId = "dev-1",
+                    pin = "5678",
+                    cancelToken = CallCancelToken(),
+                )
+                assertEquals(AutoPairResult.Approved, retried)
+            } finally {
+                releaseFirstReq.countDown()
+                bg.shutdownNow()
+            }
+        }
+    }
+
+    @Test
+    fun nvHttpCancelAbortsBlockedPairingSocketAndImmediateRetrySucceeds() {
+        val attempt = AtomicInteger(0)
+        val firstHit = CountDownLatch(1)
+        val releaseFirst = CountDownLatch(1)
+        val server = ServerSocket(0, 8, InetAddress.getLoopbackAddress())
+        val workers = Executors.newCachedThreadPool()
+        val running = AtomicBoolean(true)
+
+        val acceptThread = Thread {
+            while (running.get()) {
+                val sock: Socket = try {
+                    server.accept()
+                } catch (_: Exception) {
+                    break
+                }
+                workers.execute {
+                    try {
+                        sock.soTimeout = 5000
+                        val input = sock.inputStream.bufferedReader()
+                        var line = input.readLine()
+                        while (line != null && line.isNotEmpty()) {
+                            line = input.readLine()
+                        }
+                        if (attempt.incrementAndGet() == 1) {
+                            firstHit.countDown()
+                            releaseFirst.await(15, TimeUnit.SECONDS)
+                        } else {
+                            val xml = """<root status_code="200"><paired>1</paired></root>"""
+                            val body = xml.toByteArray(StandardCharsets.UTF_8)
+                            val resp = "HTTP/1.1 200 OK\r\nContent-Length: ${body.size}\r\nConnection: close\r\n\r\n"
+                            sock.outputStream.write(resp.toByteArray(StandardCharsets.US_ASCII))
+                            sock.outputStream.write(body)
+                            sock.outputStream.flush()
+                        }
+                    } catch (_: Exception) {
+                    } finally {
+                        try {
+                            sock.close()
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+            }
+        }.apply {
+            isDaemon = true
+            start()
+        }
+
+        val bg = Executors.newSingleThreadExecutor()
+        try {
+            val clientId = generateSelfSigned("depth3d-nvhttp-client")
+            val cryptoProvider = object : com.limelight.nvstream.http.LimelightCryptoProvider {
+                override fun getClientCertificate() = clientId.cert
+                override fun getClientPrivateKey() = clientId.key
+                override fun getPemEncodedClientCertificate() = ByteArray(0)
+                override fun encodeBase64String(data: ByteArray) =
+                    java.util.Base64.getEncoder().encodeToString(data)
+            }
+            val addr = ComputerDetails.AddressTuple("127.0.0.1", server.localPort)
+            val http1 = NvHTTP(addr, 0, "0123456789ABCDEF", null, cryptoProvider)
+
+            val startedAt = System.nanoTime()
+            val blocked = bg.submit<Exception?> {
+                try {
+                    http1.getServerInfo(true)
+                    null
+                } catch (e: IOException) {
+                    e
+                }
+            }
+            assertTrue("NvHTTP request should reach mock server", firstHit.await(3, TimeUnit.SECONDS))
+            http1.cancel()
+
+            val ex = blocked.get(3, TimeUnit.SECONDS)
+            val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
+            assertNotNull("Expected IOException when NvHTTP.cancel() aborts socket", ex)
+            assertTrue(http1.isCancelled)
+            assertTrue("NvHTTP.cancel() should abort quickly, took ${elapsedMs}ms", elapsedMs < 3000L)
+
+            // Immediate retry on a fresh NvHTTP succeeds
+            val http2 = NvHTTP(addr, 0, "0123456789ABCDEF", null, cryptoProvider)
+            val xml = http2.getServerInfo(true)
+            assertTrue(xml.contains("<paired>1</paired>"))
+        } finally {
+            running.set(false)
+            releaseFirst.countDown()
+            try {
+                server.close()
+            } catch (_: Exception) {
+            }
+            acceptThread.interrupt()
+            workers.shutdownNow()
+            bg.shutdownNow()
         }
     }
 }

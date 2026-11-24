@@ -9,8 +9,9 @@ import com.limelight.binding.video.XrShared
 import com.limelight.preferences.PreferenceConfiguration
 import kotlin.math.roundToInt
 
-/** Thin key-value store abstraction so settings mapping is 100% JVM unit-testable. */
+/** Thin key-value store abstraction backed by SharedPreferences for 100% JVM testability. */
 interface PrefsStore {
+    fun asSharedPreferences(): SharedPreferences
     fun getString(key: String, def: String?): String?
     fun getInt(key: String, def: Int): Int
     fun getBoolean(key: String, def: Boolean): Boolean
@@ -22,6 +23,7 @@ interface PrefsStore {
 }
 
 class AndroidPrefsStore(private val prefs: SharedPreferences) : PrefsStore {
+    override fun asSharedPreferences(): SharedPreferences = prefs
     override fun getString(key: String, def: String?): String? = prefs.getString(key, def)
     override fun getInt(key: String, def: Int): Int = prefs.getInt(key, def)
     override fun getBoolean(key: String, def: Boolean): Boolean = prefs.getBoolean(key, def)
@@ -32,33 +34,70 @@ class AndroidPrefsStore(private val prefs: SharedPreferences) : PrefsStore {
     override fun remove(key: String) { prefs.edit().remove(key).apply() }
 
     companion object {
+        @Suppress("DEPRECATION")
         fun defaultPrefs(context: Context): AndroidPrefsStore =
             AndroidPrefsStore(PreferenceManager.getDefaultSharedPreferences(context.applicationContext))
+
+        fun namedPrefs(context: Context, name: String): AndroidPrefsStore =
+            AndroidPrefsStore(context.applicationContext.getSharedPreferences(name, Context.MODE_PRIVATE))
     }
 }
 
-class MapPrefsStore : PrefsStore {
-    private val map = LinkedHashMap<String, Any>()
+class MapPrefsStore : PrefsStore, SharedPreferences {
+    private val map = LinkedHashMap<String, Any?>()
+
+    override fun asSharedPreferences(): SharedPreferences = this
+    override fun getAll(): MutableMap<String, *> = LinkedHashMap(map)
     override fun getString(key: String, def: String?): String? = map[key] as? String ?: def
+    @Suppress("UNCHECKED_CAST")
+    override fun getStringSet(key: String, def: MutableSet<String>?): MutableSet<String>? =
+        map[key] as? MutableSet<String> ?: def
     override fun getInt(key: String, def: Int): Int = map[key] as? Int ?: def
+    override fun getLong(key: String, def: Long): Long = map[key] as? Long ?: def
+    override fun getFloat(key: String, def: Float): Float = map[key] as? Float ?: def
     override fun getBoolean(key: String, def: Boolean): Boolean = map[key] as? Boolean ?: def
     override fun contains(key: String): Boolean = map.containsKey(key)
+    override fun edit(): SharedPreferences.Editor = MapEditor()
+    override fun registerOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) = Unit
+    override fun unregisterOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) = Unit
+
     override fun putString(key: String, value: String) { map[key] = value }
     override fun putInt(key: String, value: Int) { map[key] = value }
     override fun putBoolean(key: String, value: Boolean) { map[key] = value }
     override fun remove(key: String) { map.remove(key) }
-    fun snapshot(): Map<String, Any> = LinkedHashMap(map)
+
+    private inner class MapEditor : SharedPreferences.Editor {
+        override fun putString(key: String, value: String?): SharedPreferences.Editor = apply {
+            if (value == null) map.remove(key) else map[key] = value
+        }
+        override fun putStringSet(key: String, values: MutableSet<String>?): SharedPreferences.Editor = apply {
+            if (values == null) map.remove(key) else map[key] = LinkedHashSet(values)
+        }
+        override fun putInt(key: String, value: Int): SharedPreferences.Editor = apply { map[key] = value }
+        override fun putLong(key: String, value: Long): SharedPreferences.Editor = apply { map[key] = value }
+        override fun putFloat(key: String, value: Float): SharedPreferences.Editor = apply { map[key] = value }
+        override fun putBoolean(key: String, value: Boolean): SharedPreferences.Editor = apply { map[key] = value }
+        override fun remove(key: String): SharedPreferences.Editor = apply { map.remove(key) }
+        override fun clear(): SharedPreferences.Editor = apply { map.clear() }
+        override fun commit(): Boolean = true
+        override fun apply() = Unit
+    }
+
+    fun snapshot(): Map<String, Any?> = LinkedHashMap(map)
 }
 
-enum class StreamResolution(val prefValue: String) {
-    R720P(PreferenceConfiguration.RES_720P),
-    R1080P(PreferenceConfiguration.RES_1080P),
-    R1440P(PreferenceConfiguration.RES_1440P),
-    R4K(PreferenceConfiguration.RES_4K);
+enum class StreamResolution(val width: Int, val height: Int, val prefValue: String) {
+    R720P(1280, 720, PreferenceConfiguration.RES_720P),
+    R1080P(1920, 1080, PreferenceConfiguration.RES_1080P),
+    R1440P(2560, 1440, PreferenceConfiguration.RES_1440P),
+    R4K(3840, 2160, PreferenceConfiguration.RES_4K);
 
     companion object {
-        fun fromPref(value: String?): StreamResolution =
-            entries.firstOrNull { it.prefValue == value } ?: R1440P
+        fun fromDimensionsOrNull(width: Int, height: Int): StreamResolution? =
+            entries.firstOrNull { it.width == width && it.height == height }
+
+        fun fromCellIndex(cell: Int): StreamResolution =
+            entries.getOrElse(cell) { R1440P }
     }
 }
 
@@ -70,10 +109,7 @@ enum class StreamFps(val fps: Int) {
     val prefValue: String get() = fps.toString()
 
     companion object {
-        fun fromPref(value: String?, isGen1: Boolean): StreamFps {
-            val parsed = value?.toIntOrNull()
-            return entries.firstOrNull { it.fps == parsed } ?: if (isGen1) FPS_72 else FPS_72
-        }
+        fun fromFpsOrNull(fps: Int): StreamFps? = entries.firstOrNull { it.fps == fps }
     }
 }
 
@@ -86,20 +122,24 @@ enum class BitratePreset(val prefValue: String) {
     companion object {
         fun fromPref(value: String?): BitratePreset =
             entries.firstOrNull { it.prefValue == value } ?: AUTO
+
+        fun fromVrQuickCell(cell: Int): BitratePreset = when (cell) {
+            0 -> SMOOTH
+            1 -> AUTO
+            2 -> SHARP
+            else -> AUTO
+        }
     }
 }
 
-enum class StreamCodec(val prefValue: String) {
-    AUTO("auto"),
-    H264("neverh265"),
-    HEVC("forceh265");
+enum class StreamCodec(val prefValue: String, val formatOption: PreferenceConfiguration.FormatOption) {
+    AUTO("auto", PreferenceConfiguration.FormatOption.AUTO),
+    H264("neverh265", PreferenceConfiguration.FormatOption.FORCE_H264),
+    HEVC("forceh265", PreferenceConfiguration.FormatOption.FORCE_HEVC);
 
     companion object {
-        fun fromPref(value: String?): StreamCodec = when (value) {
-            "neverh265" -> H264
-            "forceh265" -> HEVC
-            else -> AUTO
-        }
+        fun fromFormatOptionOrNull(option: PreferenceConfiguration.FormatOption): StreamCodec? =
+            entries.firstOrNull { it.formatOption == option }
     }
 }
 
@@ -108,14 +148,14 @@ enum class MouseMode {
     ABSOLUTE,
 }
 
-enum class GamepadToggleShortcut(val prefValue: String) {
-    MENU_GRIP(PreferenceConfiguration.VR_GAMEPAD_TOGGLE_MENU_GRIP),
-    STICKS(PreferenceConfiguration.VR_GAMEPAD_TOGGLE_STICKS),
-    TRIGGERS_GRIPS(PreferenceConfiguration.VR_GAMEPAD_TOGGLE_TRIGGERS_GRIPS);
+enum class GamepadToggleShortcut(val prefValue: String, val xrCode: Int) {
+    MENU_GRIP(PreferenceConfiguration.VR_GAMEPAD_TOGGLE_MENU_GRIP, XrShared.PAD_SHORTCUT_MENU_GRIP),
+    STICKS(PreferenceConfiguration.VR_GAMEPAD_TOGGLE_STICKS, XrShared.PAD_SHORTCUT_STICKS),
+    TRIGGERS_GRIPS(PreferenceConfiguration.VR_GAMEPAD_TOGGLE_TRIGGERS_GRIPS, XrShared.PAD_SHORTCUT_TRIGGERS_GRIPS);
 
     companion object {
-        fun fromPref(value: String?): GamepadToggleShortcut =
-            entries.firstOrNull { it.prefValue == value } ?: MENU_GRIP
+        fun fromXrCode(code: Int): GamepadToggleShortcut =
+            entries.firstOrNull { it.xrCode == code } ?: MENU_GRIP
     }
 }
 
@@ -186,22 +226,31 @@ enum class FileLogMode(val prefValue: String) {
 }
 
 data class Depth3dSettingsSnapshot(
-    val resolution: StreamResolution,
-    val fps: StreamFps,
+    val actualWidth: Int,
+    val actualHeight: Int,
+    val resolution: StreamResolution?,
+    val actualFps: Int,
+    val fps: StreamFps?,
     val bitratePreset: BitratePreset,
+    val actualBitrateKbps: Int,
     val bitrateMbps: Int,
-    val codec: StreamCodec,
+    val actualCodec: PreferenceConfiguration.FormatOption,
+    val codec: StreamCodec?,
     val mouseMode: MouseMode,
     val multiController: Boolean,
     val flipFaceButtons: Boolean,
     val gamepadShortcut: GamepadToggleShortcut,
     val depthStrength: DepthStrength,
     val depthQuality: DepthQualityMode,
+    val actualDepthRate: Int,
     val sharpening: Boolean,
     val supersampling: Boolean,
     val screenSize: ScreenSizePreset,
+    val actualScreenSizeDm: Int,
     val screenDistance: ScreenDistancePreset,
+    val actualScreenDistanceDm: Int,
     val curvedScreen: Boolean,
+    val actualCurvature: Int,
     val environment: VrEnvironmentPreset,
     val ambilight: Boolean,
     val doffGrace: Boolean,
@@ -211,23 +260,35 @@ data class Depth3dSettingsSnapshot(
     val headAim: Boolean,
     val clickSound: Boolean,
     val fileLog: FileLogMode,
-    val crashReporting: Boolean,
     val isGen1Headset: Boolean,
 ) {
     val warn3dLag: Boolean
-        get() = StreamSettingsMapper.shouldWarn3dLag(resolution, fps)
+        get() = StreamSettingsMapper.shouldWarn3dLag(actualWidth, actualHeight, actualFps)
+
+    /** Non-null only when the stored resolution is outside the 4 standard presets (e.g. 854x480). */
+    val customResolutionLabel: String?
+        get() = if (resolution == null) "${actualWidth}×${actualHeight}" else null
+
+    /** Non-null only when the stored FPS is outside 60/72/90 (e.g. 30 or 120). */
+    val customFpsLabel: String?
+        get() = if (fps == null) "$actualFps fps" else null
+
+    /** Non-null only when stored codec is outside Auto/H.264/HEVC (e.g. AV1). */
+    val customCodecLabel: String?
+        get() = if (codec == null && actualCodec == PreferenceConfiguration.FormatOption.FORCE_AV1) "AV1" else null
 }
 
 /**
- * Translates between depth3d's Compose settings UI and [PreferenceConfiguration]'s
- * exact SharedPreferences keys so all changes take immediate effect in VR streaming & playback.
+ * Translates between depth3d's Compose settings UI, the in-VR quick menu, and
+ * [PreferenceConfiguration]. Always reads through [PreferenceConfiguration.readPreferences]
+ * so what the UI displays is guaranteed identical to what actually takes effect.
  */
 object StreamSettingsMapper {
-    const val KEY_RESOLUTION = "list_resolution"
-    const val KEY_FPS = "list_fps"
+    const val KEY_RESOLUTION = PreferenceConfiguration.RESOLUTION_PREF_STRING
+    const val KEY_FPS = PreferenceConfiguration.FPS_PREF_STRING
     const val KEY_UNLOCK_FPS = "checkbox_unlock_fps"
-    const val KEY_BITRATE_KBPS = "seekbar_bitrate_kbps"
-    const val KEY_BITRATE_PRESET = "depth3d_bitrate_preset"
+    const val KEY_BITRATE_KBPS = PreferenceConfiguration.BITRATE_PREF_STRING
+    const val KEY_BITRATE_PRESET = PreferenceConfiguration.DEPTH3D_BITRATE_PRESET_PREF_STRING
     const val KEY_VIDEO_FORMAT = "video_format"
     const val KEY_ABSOLUTE_MOUSE = "checkbox_absolute_mouse_mode"
     const val KEY_MULTI_CONTROLLER = "checkbox_multi_controller"
@@ -249,31 +310,34 @@ object StreamSettingsMapper {
     const val KEY_DOFF_GRACE = PreferenceConfiguration.VR_DOFF_GRACE_PREF_STRING
     const val KEY_SCREEN_POSE = PreferenceConfiguration.VR_SCREEN_POSE_PREF_STRING
 
-    const val KEY_HAND_TRACKING = "checkbox_vr_hand_tracking"
+    const val KEY_HAND_TRACKING = PreferenceConfiguration.VR_HAND_TRACKING_PREF_STRING
     const val KEY_SHOW_RAY = PreferenceConfiguration.VR_SHOW_RAY_PREF_STRING
     const val KEY_POINTER_SLEEP = PreferenceConfiguration.VR_POINTER_SLEEP_PREF_STRING
     const val KEY_HEAD_AIM = PreferenceConfiguration.VR_HEAD_AIM_PREF_STRING
     const val KEY_CLICK_SOUND = PreferenceConfiguration.VR_CLICK_SOUND_PREF_STRING
 
     const val KEY_FILE_LOG = PreferenceConfiguration.FILE_LOG_PREF_STRING
-    const val KEY_CRASH_REPORTING = "depth3d_crash_reporting"
 
     const val MIN_BITRATE_MBPS = 5
     const val MAX_BITRATE_MBPS = 150
     private const val CURVED_DEFAULT = 45
 
-    /** Spec: warn 「3D 会变卡」 when 4K or 90 fps is selected. */
-    fun shouldWarn3dLag(resolution: StreamResolution, fps: StreamFps): Boolean =
-        resolution == StreamResolution.R4K || fps == StreamFps.FPS_90
+    /** Spec: warn 「3D 会变卡」 whenever actual effective resolution >= 4K or FPS >= 90. */
+    fun shouldWarn3dLag(width: Int, height: Int, fps: Int): Boolean =
+        height >= 2160 || width >= 3840 || fps >= 90
 
-    /** Computes target bitrate in kbps for a preset + resolution + fps combination. */
+    fun shouldWarn3dLag(resolution: StreamResolution, fps: StreamFps): Boolean =
+        shouldWarn3dLag(resolution.width, resolution.height, fps.fps)
+
+    /** Computes target bitrate in kbps for a preset + actual resolution + actual fps. */
     fun bitrateKbpsForPreset(
         preset: BitratePreset,
-        resolution: StreamResolution,
-        fps: StreamFps,
+        width: Int,
+        height: Int,
+        fps: Int,
         customMbps: Int,
     ): Int {
-        val base = PreferenceConfiguration.getDefaultBitrate(resolution.prefValue, fps.prefValue)
+        val base = PreferenceConfiguration.getDefaultBitrate("${width}x${height}", fps.toString())
         val raw = when (preset) {
             BitratePreset.AUTO -> base
             BitratePreset.SMOOTH -> (base * 0.65f).roundToInt()
@@ -283,105 +347,126 @@ object StreamSettingsMapper {
         return raw.coerceIn(MIN_BITRATE_MBPS * 1000, MAX_BITRATE_MBPS * 1000)
     }
 
-    fun read(store: PrefsStore, isGen1Headset: Boolean): Depth3dSettingsSnapshot {
-        val defaultRes = StreamResolution.R1440P
-        val defaultFps = if (isGen1Headset) StreamFps.FPS_72 else StreamFps.FPS_72
-        val resolution = if (store.contains(KEY_RESOLUTION)) {
-            StreamResolution.fromPref(store.getString(KEY_RESOLUTION, defaultRes.prefValue))
-        } else {
-            defaultRes
-        }
-        val fps = if (store.contains(KEY_FPS)) {
-            StreamFps.fromPref(store.getString(KEY_FPS, defaultFps.prefValue), isGen1Headset)
-        } else {
-            defaultFps
-        }
-        val bitratePreset = BitratePreset.fromPref(store.getString(KEY_BITRATE_PRESET, BitratePreset.AUTO.prefValue))
-        val defaultKbps = PreferenceConfiguration.getDefaultBitrate(resolution.prefValue, fps.prefValue)
-        val storedKbps = if (store.contains(KEY_BITRATE_KBPS)) {
-            store.getInt(KEY_BITRATE_KBPS, defaultKbps)
-        } else {
-            defaultKbps
-        }
-        val bitrateMbps = (storedKbps / 1000f).roundToInt().coerceIn(MIN_BITRATE_MBPS, MAX_BITRATE_MBPS)
+    fun bitrateKbpsForPreset(
+        preset: BitratePreset,
+        resolution: StreamResolution,
+        fps: StreamFps,
+        customMbps: Int,
+    ): Int = bitrateKbpsForPreset(preset, resolution.width, resolution.height, fps.fps, customMbps)
 
-        val codec = StreamCodec.fromPref(store.getString(KEY_VIDEO_FORMAT, StreamCodec.AUTO.prefValue))
-        val mouseMode = if (store.getBoolean(KEY_ABSOLUTE_MOUSE, false)) MouseMode.ABSOLUTE else MouseMode.RELATIVE
-        val multiController = store.getBoolean(KEY_MULTI_CONTROLLER, true)
-        val flipFaceButtons = store.getBoolean(KEY_FLIP_FACE_BUTTONS, false)
-        val gamepadShortcut = GamepadToggleShortcut.fromPref(
-            store.getString(KEY_GAMEPAD_TOGGLE, PreferenceConfiguration.VR_GAMEPAD_TOGGLE_MENU_GRIP)
+    fun read(store: PrefsStore, isGen1Headset: Boolean): Depth3dSettingsSnapshot {
+        val prefs = store.asSharedPreferences()
+        val cfg = PreferenceConfiguration.readPreferences(prefs, isGen1Headset)
+
+        val resolution = StreamResolution.fromDimensionsOrNull(cfg.width, cfg.height)
+        val fps = StreamFps.fromFpsOrNull(cfg.fps)
+
+        val storedPreset = if (store.contains(KEY_BITRATE_PRESET)) {
+            BitratePreset.fromPref(store.getString(KEY_BITRATE_PRESET, BitratePreset.AUTO.prefValue))
+        } else {
+            null
+        }
+        val actualMbps = (cfg.bitrate / 1000f).roundToInt().coerceAtLeast(1)
+        val bitratePreset = resolveEffectiveBitratePreset(
+            storedPreset = storedPreset,
+            actualBitrateKbps = cfg.bitrate,
+            hasStoredBitrate = store.contains(KEY_BITRATE_KBPS),
+            width = cfg.width,
+            height = cfg.height,
+            fps = cfg.fps,
+            customMbps = actualMbps,
         )
 
-        val depthSource = store.getString(KEY_DEPTH_SOURCE, PreferenceConfiguration.VR_DEPTH_SOURCE_ZIPDEPTH)
-        val defaultSep = PreferenceConfiguration.defaultSeparation(PreferenceConfiguration.VR_DEPTH_SOURCE_ZIPDEPTH)
-        val storedSep = store.getInt(KEY_SEPARATION, defaultSep)
+        val codec = StreamCodec.fromFormatOptionOrNull(cfg.videoFormat)
+        val mouseMode = if (cfg.absoluteMouseMode) MouseMode.ABSOLUTE else MouseMode.RELATIVE
+        val gamepadShortcut = GamepadToggleShortcut.fromXrCode(cfg.vrGamepadToggle)
+
+        val defaultSep = PreferenceConfiguration.defaultSeparation(cfg.vrDepthModel)
         val depthStrength = when {
-            depthSource == "off" -> DepthStrength.OFF
-            storedSep <= DepthPresets.value(DepthPresets.COMFORT, defaultSep) -> DepthStrength.SOFT
-            storedSep >= DepthPresets.value(DepthPresets.STRONG, defaultSep) -> DepthStrength.STRONG
+            cfg.vrDepthMode == XrShared.DEPTH_MODE_OFF -> DepthStrength.OFF
+            cfg.vrStereoSeparation <= DepthPresets.value(DepthPresets.COMFORT, defaultSep) -> DepthStrength.SOFT
+            cfg.vrStereoSeparation >= DepthPresets.value(DepthPresets.STRONG, defaultSep) -> DepthStrength.STRONG
             else -> DepthStrength.STANDARD
         }
 
-        val defaultRate = if (isGen1Headset) XrShared.DEPTH_RATE_GEN1 else XrShared.DEPTH_RATE_DEFAULT
-        val storedRate = store.getInt(KEY_DEPTH_RATE, defaultRate)
-        val depthQuality = if (storedRate >= XrShared.DEPTH_RATE_DEFAULT) DepthQualityMode.QUALITY else DepthQualityMode.SMOOTH
-
-        val sharpening = store.getString(KEY_SHARPENING, "quality") != "off"
-        val supersampling = store.getString(KEY_SUPERSAMPLING, "off") != "off"
-
-        val screenSize = ScreenSizePreset.fromDecimeters(store.getInt(KEY_SCREEN_SIZE, 30))
-        val screenDistance = ScreenDistancePreset.fromDecimeters(store.getInt(KEY_SCREEN_DISTANCE, 30))
-        val curvedScreen = store.getInt(KEY_CURVATURE, 0) > 0
-        val envId = if (store.contains(KEY_ENV_ID)) {
-            VrEnvironmentPreset.fromEnvId(store.getInt(KEY_ENV_ID, PreferenceConfiguration.VR_ENV_VOID)).envId
-        } else if (store.getBoolean(KEY_PASSTHROUGH, false)) {
-            PreferenceConfiguration.VR_ENV_PASSTHROUGH
+        val depthQuality = if (cfg.vrDepthRate >= XrShared.DEPTH_RATE_DEFAULT) {
+            DepthQualityMode.QUALITY
         } else {
-            PreferenceConfiguration.VR_ENV_VOID
+            DepthQualityMode.SMOOTH
         }
+
+        val envId = EnvironmentIds.listValue(prefs).toIntOrNull() ?: PreferenceConfiguration.VR_ENV_VOID
         val environment = VrEnvironmentPreset.fromEnvId(envId)
-        val ambilight = store.getBoolean(KEY_AMBILIGHT, PreferenceConfiguration.DEFAULT_VR_AMBILIGHT)
-        val doffGrace = store.getBoolean(KEY_DOFF_GRACE, true)
-
-        val handTracking = store.getBoolean(KEY_HAND_TRACKING, true)
-        val showRay = store.getBoolean(KEY_SHOW_RAY, true)
-        val pointerSleep = store.getBoolean(KEY_POINTER_SLEEP, true)
-        val headAim = store.getBoolean(KEY_HEAD_AIM, false)
-        val clickSound = store.getBoolean(KEY_CLICK_SOUND, true)
-
-        val fileLog = FileLogMode.fromPref(store.getString(KEY_FILE_LOG, PreferenceConfiguration.DEFAULT_FILE_LOG))
-        val crashReporting = store.getBoolean(KEY_CRASH_REPORTING, false)
 
         return Depth3dSettingsSnapshot(
+            actualWidth = cfg.width,
+            actualHeight = cfg.height,
             resolution = resolution,
+            actualFps = cfg.fps,
             fps = fps,
             bitratePreset = bitratePreset,
-            bitrateMbps = bitrateMbps,
+            actualBitrateKbps = cfg.bitrate,
+            bitrateMbps = actualMbps,
+            actualCodec = cfg.videoFormat,
             codec = codec,
             mouseMode = mouseMode,
-            multiController = multiController,
-            flipFaceButtons = flipFaceButtons,
+            multiController = cfg.multiController,
+            flipFaceButtons = cfg.flipFaceButtons,
             gamepadShortcut = gamepadShortcut,
             depthStrength = depthStrength,
             depthQuality = depthQuality,
-            sharpening = sharpening,
-            supersampling = supersampling,
-            screenSize = screenSize,
-            screenDistance = screenDistance,
-            curvedScreen = curvedScreen,
+            actualDepthRate = cfg.vrDepthRate,
+            sharpening = cfg.vrSharpening != 0,
+            supersampling = cfg.vrSupersampling != 0,
+            screenSize = ScreenSizePreset.fromDecimeters(cfg.vrScreenSize),
+            actualScreenSizeDm = cfg.vrScreenSize,
+            screenDistance = ScreenDistancePreset.fromDecimeters(cfg.vrDistance),
+            actualScreenDistanceDm = cfg.vrDistance,
+            curvedScreen = cfg.vrCurvature > 0,
+            actualCurvature = cfg.vrCurvature,
             environment = environment,
-            ambilight = ambilight,
-            doffGrace = doffGrace,
-            handTracking = handTracking,
-            showRay = showRay,
-            pointerSleep = pointerSleep,
-            headAim = headAim,
-            clickSound = clickSound,
-            fileLog = fileLog,
-            crashReporting = crashReporting,
+            ambilight = cfg.vrAmbilight,
+            doffGrace = cfg.vrDoffGrace,
+            handTracking = cfg.vrHandTracking,
+            showRay = cfg.vrShowRay,
+            pointerSleep = cfg.vrPointerSleep,
+            headAim = cfg.vrHeadAim,
+            clickSound = cfg.vrClickSound,
+            fileLog = FileLogMode.fromPref(cfg.fileLogLevel),
             isGen1Headset = isGen1Headset,
         )
+    }
+
+    private fun resolveEffectiveBitratePreset(
+        storedPreset: BitratePreset?,
+        actualBitrateKbps: Int,
+        hasStoredBitrate: Boolean,
+        width: Int,
+        height: Int,
+        fps: Int,
+        customMbps: Int,
+    ): BitratePreset {
+        if (!hasStoredBitrate && (storedPreset == null || storedPreset == BitratePreset.AUTO)) {
+            return BitratePreset.AUTO
+        }
+        val autoKbps = bitrateKbpsForPreset(BitratePreset.AUTO, width, height, fps, customMbps)
+        val smoothKbps = bitrateKbpsForPreset(BitratePreset.SMOOTH, width, height, fps, customMbps)
+        val sharpKbps = bitrateKbpsForPreset(BitratePreset.SHARP, width, height, fps, customMbps)
+        if (storedPreset != null && storedPreset != BitratePreset.CUSTOM) {
+            val expected = when (storedPreset) {
+                BitratePreset.AUTO -> autoKbps
+                BitratePreset.SMOOTH -> smoothKbps
+                BitratePreset.SHARP -> sharpKbps
+                BitratePreset.CUSTOM -> actualBitrateKbps
+            }
+            if (actualBitrateKbps == expected) return storedPreset
+        }
+        return when (actualBitrateKbps) {
+            autoKbps -> BitratePreset.AUTO
+            smoothKbps -> BitratePreset.SMOOTH
+            sharpKbps -> BitratePreset.SHARP
+            else -> BitratePreset.CUSTOM
+        }
     }
 
     fun setResolution(store: PrefsStore, resolution: StreamResolution, isGen1: Boolean) {
@@ -390,7 +475,7 @@ object StreamSettingsMapper {
         if (current.bitratePreset != BitratePreset.CUSTOM) {
             store.putInt(
                 KEY_BITRATE_KBPS,
-                bitrateKbpsForPreset(current.bitratePreset, resolution, current.fps, current.bitrateMbps),
+                bitrateKbpsForPreset(current.bitratePreset, resolution.width, resolution.height, current.actualFps, current.bitrateMbps),
             )
         }
     }
@@ -402,7 +487,7 @@ object StreamSettingsMapper {
         if (current.bitratePreset != BitratePreset.CUSTOM) {
             store.putInt(
                 KEY_BITRATE_KBPS,
-                bitrateKbpsForPreset(current.bitratePreset, current.resolution, fps, current.bitrateMbps),
+                bitrateKbpsForPreset(current.bitratePreset, current.actualWidth, current.actualHeight, fps.fps, current.bitrateMbps),
             )
         }
     }
@@ -410,7 +495,7 @@ object StreamSettingsMapper {
     fun setBitratePreset(store: PrefsStore, preset: BitratePreset, isGen1: Boolean) {
         val current = read(store, isGen1)
         store.putString(KEY_BITRATE_PRESET, preset.prefValue)
-        val kbps = bitrateKbpsForPreset(preset, current.resolution, current.fps, current.bitrateMbps)
+        val kbps = bitrateKbpsForPreset(preset, current.actualWidth, current.actualHeight, current.actualFps, current.bitrateMbps)
         store.putInt(KEY_BITRATE_KBPS, kbps)
     }
 
@@ -488,9 +573,7 @@ object StreamSettingsMapper {
     }
 
     fun setEnvironment(store: PrefsStore, preset: VrEnvironmentPreset) {
-        val id = VrEnvironmentPreset.fromEnvId(preset.envId).envId
-        store.putInt(KEY_ENV_ID, id)
-        store.putBoolean(KEY_PASSTHROUGH, id == PreferenceConfiguration.VR_ENV_PASSTHROUGH)
+        EnvironmentIds.store(store.asSharedPreferences(), preset.envId)
     }
 
     fun setAmbilight(store: PrefsStore, enabled: Boolean) {
@@ -529,7 +612,83 @@ object StreamSettingsMapper {
         store.putString(KEY_FILE_LOG, mode.prefValue)
     }
 
-    fun setCrashReporting(store: PrefsStore, enabled: Boolean) {
-        store.putBoolean(KEY_CRASH_REPORTING, enabled)
+    /** Java-friendly helper for the in-VR Stream quick menu tab. */
+    @JvmStatic
+    fun readVrStreamCells(context: Context): IntArray {
+        val snap = read(AndroidPrefsStore.defaultPrefs(context), PreferenceConfiguration.isXr2Gen1Headset())
+        val resCell = snap.resolution?.ordinal ?: -1
+        val bitrateCell = when (snap.bitratePreset) {
+            BitratePreset.SMOOTH -> 0
+            BitratePreset.AUTO -> 1
+            BitratePreset.SHARP -> 2
+            BitratePreset.CUSTOM -> -1
+        }
+        val mouseCell = if (snap.mouseMode == MouseMode.ABSOLUTE) 1 else 0
+        return intArrayOf(resCell, bitrateCell, mouseCell)
+    }
+
+    @JvmStatic
+    fun applyVrStreamResolutionCell(context: Context, cell: Int) {
+        setResolution(
+            AndroidPrefsStore.defaultPrefs(context),
+            StreamResolution.fromCellIndex(cell),
+            PreferenceConfiguration.isXr2Gen1Headset(),
+        )
+    }
+
+    @JvmStatic
+    fun applyVrStreamBitrateCell(context: Context, cell: Int) {
+        setBitratePreset(
+            AndroidPrefsStore.defaultPrefs(context),
+            BitratePreset.fromVrQuickCell(cell),
+            PreferenceConfiguration.isXr2Gen1Headset(),
+        )
+    }
+
+    @JvmStatic
+    fun applyVrStreamMouseCell(context: Context, cell: Int) {
+        setMouseMode(
+            AndroidPrefsStore.defaultPrefs(context),
+            if (cell == 1) MouseMode.ABSOLUTE else MouseMode.RELATIVE,
+        )
+    }
+}
+
+/**
+ * Decoder crash recovery state persisted in SharedPreferences("DecoderTombstone") by Game.java.
+ * Replaces the removed upstream PcView/AppView decoder crash dialog with a clean Cast-page prompt.
+ */
+data class CrashRecoveryPrompt(
+    val crashCount: Int,
+    val autoResetApplied: Boolean,
+)
+
+object DecoderCrashRecovery {
+    const val TOMBSTONE_PREFS_NAME = "DecoderTombstone"
+    const val KEY_CRASH_COUNT = "CrashCount"
+    const val KEY_LAST_NOTIFIED = "LastNotifiedCrashCount"
+
+    fun checkAndPrepare(tombstone: PrefsStore, streamingPrefs: PrefsStore): CrashRecoveryPrompt? {
+        val crashCount = tombstone.getInt(KEY_CRASH_COUNT, 0)
+        val lastNotified = tombstone.getInt(KEY_LAST_NOTIFIED, 0)
+        if (crashCount <= 0 || crashCount == lastNotified) {
+            return null
+        }
+        return if (crashCount % 3 == 0) {
+            PreferenceConfiguration.resetStreamingSettings(streamingPrefs.asSharedPreferences())
+            CrashRecoveryPrompt(crashCount = crashCount, autoResetApplied = true)
+        } else {
+            CrashRecoveryPrompt(crashCount = crashCount, autoResetApplied = false)
+        }
+    }
+
+    fun resetDefaultsAndClear(tombstone: PrefsStore, streamingPrefs: PrefsStore) {
+        PreferenceConfiguration.resetStreamingSettings(streamingPrefs.asSharedPreferences())
+        tombstone.putInt(KEY_CRASH_COUNT, 0)
+        tombstone.putInt(KEY_LAST_NOTIFIED, 0)
+    }
+
+    fun acknowledge(tombstone: PrefsStore, crashCount: Int) {
+        tombstone.putInt(KEY_LAST_NOTIFIED, crashCount)
     }
 }

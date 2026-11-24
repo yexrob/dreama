@@ -130,10 +130,6 @@ int createPointerSwapchain(XrCtx* ctx) {
                            &ctx->hintSwapchain, &ctx->hintImages, &ctx->hintImageCount);
     }
 
-    // The Ko-fi sheet, in every session, since every session has the About tab
-    createArtSwapchain(ctx, KOFI_TEX_W, KOFI_TEX_H, "create Ko-fi sheet swapchain",
-                       &ctx->kofiSwapchain, &ctx->kofiImages, &ctx->kofiImageCount);
-
     createArtSwapchain(ctx, OUTLINE_TEX, OUTLINE_TEX, "create outline swapchain",
                        &ctx->outlineSwapchain, &ctx->outlineImages, &ctx->outlineImageCount);
 
@@ -928,19 +924,21 @@ Java_com_limelight_binding_video_XrRenderer_nativeUploadHandHint(JNIEnv* env, jo
     LOGI("hand lock hint art %s", ctx->hintReady ? "ready" : "missing");
 }
 
-// The Ko-fi sheet, drawn once at the start of every session. Until it is up
-// the About tab's button opens nothing, since a modal nobody can see would
-// swallow every press.
+// Seed the Stream quick-menu cell selections (resolution, bitrate, mouse)
+// from the current preferences before the first frame.
 JNIEXPORT void JNICALL
-Java_com_limelight_binding_video_XrRenderer_nativeUploadKofi(JNIEnv* env, jobject thiz,
-                                                             jlong handle, jobject sheet) {
+Java_com_limelight_binding_video_XrRenderer_nativeSetStreamOptions(JNIEnv* env, jobject thiz,
+                                                                   jlong handle, jint resCell,
+                                                                   jint bitrateCell,
+                                                                   jint mouseCell) {
     XrCtx* ctx = (XrCtx*)(intptr_t)handle;
     if (ctx == NULL) {
         return;
     }
-    uploadSheet(env, ctx, sheet, ctx->kofiSwapchain, ctx->kofiImages, KOFI_TEX_W, KOFI_TEX_H,
-                &ctx->kofiReady);
-    LOGI("Ko-fi sheet art %s", ctx->kofiReady ? "ready" : "missing");
+    ctx->streamResCell = (resCell >= 0 && resCell < COG_STREAM_RES_CELLS) ? resCell : -1;
+    ctx->streamBitrateCell = (bitrateCell >= 0 && bitrateCell < COG_STREAM_BITRATE_CELLS)
+            ? bitrateCell : -1;
+    ctx->streamMouseCell = (mouseCell >= 0 && mouseCell < COG_STREAM_MOUSE_CELLS) ? mouseCell : 0;
 }
 
 // Which room a picker cell puts up, 0 for a cell that is not a room. The one

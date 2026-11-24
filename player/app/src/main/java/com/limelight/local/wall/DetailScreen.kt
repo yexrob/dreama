@@ -49,7 +49,8 @@ fun DetailScreen(model: WallModel, nav: WallNav, page: Page.Detail) {
         Box(Modifier.offset(64.dp, 32.dp)) { RoundButton(WallIcons.ChevL, { nav.back() }, filled = true) }
         Column(Modifier.offset(64.dp, 140.dp).width(640.dp)) {
             Text(item.title, style = WallType.Display, maxLines = 3, overflow = TextOverflow.Ellipsis)
-            val meta = listOfNotNull(src?.source?.name, item.year?.toString(), item.durationMs?.let(::duration),
+            val durText = item.durationMs?.let { formatDuration(it) }
+            val meta = listOfNotNull(src?.source?.name, item.year?.toString(), durText,
                 item.subtitle?.takeIf { it.isNotEmpty() })
             Text(meta.joinToString(" · "), style = WallType.Caption, color = Wall.Text2, maxLines = 1,
                 overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 14.dp))

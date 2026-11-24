@@ -31,19 +31,21 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import com.limelight.R
 import kotlinx.coroutines.launch
 
 /**
- * The WebDAV server: address, user, password. The design wants text typed
- * on the phone, not on the headset keyboard; until that exists this is the
- * system keyboard, as the old form was. The server is checked before it is
- * saved so a wrong password shows here.
+ * The WebDAV server configuration sheet: address, user, password.
+ * The server is checked before saving so a wrong password surfaces immediately.
  */
 @Composable
 fun WebDavSheet(model: WallModel, nav: WallNav, suggested: String) {
+    val context = LocalContext.current
     val saved = remember { model.savedWebDav() }
     val base = rememberTextFieldState(suggested)
     val user = rememberTextFieldState(saved?.user ?: "depth3d")
@@ -63,38 +65,52 @@ fun WebDavSheet(model: WallModel, nav: WallNav, suggested: String) {
             .clip(RoundedCornerShape(Wall.RadiusXl)).background(Wall.Sheet)
             .clickable(remember { MutableInteractionSource() }, indication = null) {}
             .padding(horizontal = 48.dp, vertical = 40.dp)) {
-            Text(if (found) "找到 Mac 了，填一下密码" else "WebDAV 服务器", style = WallType.Head)
-            Text("Mac 上运行 scripts/serve-gdrive.sh；密码在 ~/.config/depth3d/webdav-pass。",
-                style = WallType.Caption, color = Wall.Text2, modifier = Modifier.padding(top = 6.dp))
-            Field("地址", base, KeyboardType.Uri, Modifier.padding(top = 28.dp))
+            Text(
+                stringResource(if (found) R.string.webdav_found_mac_title else R.string.webdav_default_title),
+                style = WallType.Head,
+            )
+            Text(
+                stringResource(R.string.webdav_setup_hint),
+                style = WallType.Caption,
+                color = Wall.Text2,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+            Field(stringResource(R.string.webdav_field_address), base, KeyboardType.Uri, Modifier.padding(top = 28.dp))
             Row(Modifier.padding(top = 20.dp), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
-                Field("用户名", user, KeyboardType.Ascii, Modifier.weight(1f))
+                Field(stringResource(R.string.webdav_field_user), user, KeyboardType.Ascii, Modifier.weight(1f))
                 // Shown in the clear: typed on the headset keyboard, a mistake is otherwise invisible
-                Field("密码", pass, KeyboardType.Ascii, Modifier.weight(1f))
+                Field(stringResource(R.string.webdav_field_pass), pass, KeyboardType.Ascii, Modifier.weight(1f))
             }
             error?.let {
                 Box(Modifier.padding(top = 20.dp)) { Notice(it) }
             }
             Row(Modifier.padding(top = 32.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                WallButton(if (busy) "正在连接…" else "连接", {
-                    if (busy) {
-                        return@WallButton
-                    }
-                    busy = true
-                    error = null
-                    scope.launch {
-                        try {
-                            model.connectWebDav(base.text.trim().toString(), user.text.trim().toString(),
-                                pass.text.trim().toString())
-                            nav.closeWebDav()
-                        } catch (e: Exception) {
-                            error = "连不上这个地址，请检查网络、地址和密码是否正确。"
-                        } finally {
-                            busy = false
+                WallButton(
+                    stringResource(if (busy) R.string.webdav_connecting else R.string.webdav_connect),
+                    {
+                        if (busy) {
+                            return@WallButton
                         }
-                    }
-                }, kind = ButtonKind.Primary)
-                WallButton("取消", { if (!busy) nav.closeWebDav() })
+                        busy = true
+                        error = null
+                        scope.launch {
+                            try {
+                                model.connectWebDav(
+                                    base.text.trim().toString(),
+                                    user.text.trim().toString(),
+                                    pass.text.trim().toString(),
+                                )
+                                nav.closeWebDav()
+                            } catch (e: Exception) {
+                                error = context.getString(R.string.webdav_connect_failed)
+                            } finally {
+                                busy = false
+                            }
+                        }
+                    },
+                    kind = ButtonKind.Primary,
+                )
+                WallButton(stringResource(R.string.action_cancel), { if (!busy) nav.closeWebDav() })
             }
         }
     }

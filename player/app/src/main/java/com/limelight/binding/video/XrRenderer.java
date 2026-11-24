@@ -262,8 +262,6 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     private int noticeSlot;
     // The hand lock hint's sheet, only drawn in a session that may show it
     private final AtomicReference<ByteBuffer> pendingHandHint = new AtomicReference<>();
-    // The Ko-fi sheet the About tab opens, in every session
-    private final AtomicReference<ByteBuffer> pendingKofi = new AtomicReference<>();
     // The 3D switch's two faces, only drawn in a session with stereo to switch
     private final AtomicReference<ByteBuffer> pendingStereoOff = new AtomicReference<>();
     private final AtomicReference<ByteBuffer> pendingStereoOn = new AtomicReference<>();
@@ -535,7 +533,8 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     private native String nativeGetExitReason(long ctx);
     private native String nativeGetRuntime(long ctx);
     private native void nativeUploadHandHint(long ctx, ByteBuffer sheet);
-    private native void nativeUploadKofi(long ctx, ByteBuffer sheet);
+    // Stream quick-menu selections on tab 4 (res, bitrate, mouse)
+    private native void nativeSetStreamOptions(long ctx, int resCell, int bitrateCell, int mouseCell);
     // Whether this session may show the hand lock hint, before the first frame
     private native void nativeSetHandHint(long ctx, boolean wanted);
     private native void nativeUploadStereoButton(long ctx, ByteBuffer off, ByteBuffer on);
@@ -573,7 +572,8 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     private native void nativeSetTransport(long ctx, boolean visible);
     private native void nativeSetLocalMedia(long ctx, boolean on);
 
-    private final AtomicReference<ByteBuffer> pendingTransport = new AtomicReference<>();
+    private final TransportBufferQueue transportQueue =
+            new TransportBufferQueue(TRANSPORT_WIDTH * TRANSPORT_HEIGHT * 4);
     private volatile boolean localMedia;
 
     /** Before start(): this session plays a local file rather than a stream. */
@@ -582,12 +582,13 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     }
 
     /**
-     * A new transport strip, TRANSPORT_WIDTH x TRANSPORT_HEIGHT RGBA with rows
-     * bottom up, uploaded on the next frame. Returns false while the last one
-     * has not been picked up, so the caller must not reuse that buffer yet.
+     * Queues a new transport strip (TRANSPORT_WIDTH x TRANSPORT_HEIGHT RGBA,
+     * rows bottom up) for upload on the next GL frame. Copies into an internal
+     * staging buffer under lock so the caller can immediately reuse {@code pixels}
+     * and newer frames are never dropped.
      */
     public boolean postTransport(ByteBuffer pixels) {
-        return pendingTransport.compareAndSet(null, pixels);
+        return transportQueue.post(pixels);
     }
 
     public void setTransportVisible(boolean visible) {
@@ -671,6 +672,11 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
 
                 nativeSetLocalMedia(nativeCtx, localMedia);
                 prefsContext = activity.getApplicationContext();
+                if (!localMedia) {
+                    int[] streamCells = com.limelight.local.stream.StreamSettingsMapper
+                            .readVrStreamCells(prefsContext);
+                    nativeSetStreamOptions(nativeCtx, streamCells[0], streamCells[1], streamCells[2]);
+                }
                 gazeAllowed = EyeTrackingPermission.gazeAllowed(prefsContext);
                 // Kept for a report, which can be made long after this session,
                 // and a failed start before it no longer says how VR stands
@@ -1248,7 +1254,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
             if (overlay != null) {
                 nativeUploadOverlay(nativeCtx, overlay, OVERLAY_WIDTH, OVERLAY_HEIGHT);
             }
-            ByteBuffer transport = pendingTransport.getAndSet(null);
+            ByteBuffer transport = transportQueue.pollForUpload();
             if (transport != null) {
                 nativeUploadTransport(nativeCtx, transport);
             }
@@ -1283,11 +1289,6 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
             ByteBuffer hint = pendingHandHint.getAndSet(null);
             if (hint != null) {
                 nativeUploadHandHint(nativeCtx, hint);
-            }
-
-            ByteBuffer kofi = pendingKofi.getAndSet(null);
-            if (kofi != null) {
-                nativeUploadKofi(nativeCtx, kofi);
             }
 
             ByteBuffer stereoOff = pendingStereoOff.getAndSet(null);
@@ -2291,6 +2292,21 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                     .putInt(PreferenceConfiguration.VR_HEAD_AIM_DEADZONE_PREF_STRING, value)
                     .apply();
             FileLog.event("head aim dead zone " + value + " saved");
+        }
+        else if (setting == SETTING_STREAM_RES) {
+            com.limelight.local.stream.StreamSettingsMapper.applyVrStreamResolutionCell(
+                    prefsContext, value);
+            FileLog.event("stream resolution cell " + value + " saved for next connect");
+        }
+        else if (setting == SETTING_STREAM_BITRATE) {
+            com.limelight.local.stream.StreamSettingsMapper.applyVrStreamBitrateCell(
+                    prefsContext, value);
+            FileLog.event("stream bitrate cell " + value + " saved for next connect");
+        }
+        else if (setting == SETTING_STREAM_MOUSE) {
+            com.limelight.local.stream.StreamSettingsMapper.applyVrStreamMouseCell(
+                    prefsContext, value);
+            FileLog.event("stream mouse cell " + value + " saved for next connect");
         }
         else if (setting == SETTING_AMBI_LEVEL) {
             if (prefConfig != null) {

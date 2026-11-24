@@ -52,12 +52,14 @@ import com.limelight.nvstream.ConnectionContext;
 import com.limelight.nvstream.http.PairingManager.PairState;
 import com.limelight.nvstream.jni.MoonBridge;
 
+import okhttp3.Call;
 import okhttp3.ConnectionPool;
 import okhttp3.HttpUrl;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
 import okhttp3.ResponseBody;
+import java.util.concurrent.atomic.AtomicReference;
 
 
 public class NvHTTP {
@@ -80,6 +82,33 @@ public class NvHTTP {
     private OkHttpClient httpClientLongConnectTimeout;
     private OkHttpClient httpClientLongConnectNoReadTimeout;
     private OkHttpClient httpClientShortConnectTimeout;
+    private final AtomicReference<Call> activeCall = new AtomicReference<>();
+    private volatile boolean cancelled;
+
+    /** Immediately interrupts any blocking HTTP/pairing request on this NvHTTP instance. */
+    public void cancel() {
+        cancelled = true;
+        Call c = activeCall.getAndSet(null);
+        if (c != null) {
+            c.cancel();
+        }
+        if (httpClientLongConnectTimeout != null) {
+            httpClientLongConnectTimeout.dispatcher().cancelAll();
+            httpClientLongConnectTimeout.connectionPool().evictAll();
+        }
+        if (httpClientLongConnectNoReadTimeout != null) {
+            httpClientLongConnectNoReadTimeout.dispatcher().cancelAll();
+            httpClientLongConnectNoReadTimeout.connectionPool().evictAll();
+        }
+        if (httpClientShortConnectTimeout != null) {
+            httpClientShortConnectTimeout.dispatcher().cancelAll();
+            httpClientShortConnectTimeout.connectionPool().evictAll();
+        }
+    }
+
+    public boolean isCancelled() {
+        return cancelled;
+    }
 
     private X509TrustManager defaultTrustManager;
     private X509TrustManager trustManager;
@@ -428,9 +457,24 @@ public class NvHTTP {
     // The initial pair query does require outside action (user entering a PIN) but subsequent pairing
     // queries do not.
     private ResponseBody openHttpConnection(OkHttpClient client, HttpUrl baseUrl, String path, String query) throws IOException {
+        if (cancelled) {
+            throw new IOException("Cancelled");
+        }
         HttpUrl completeUrl = getCompleteUrl(baseUrl, path, query);
         Request request = new Request.Builder().url(completeUrl).get().build();
-        Response response = performAndroidTlsHack(client).newCall(request).execute();
+        Call call = performAndroidTlsHack(client).newCall(request);
+        activeCall.set(call);
+        if (cancelled) {
+            call.cancel();
+            activeCall.compareAndSet(call, null);
+            throw new IOException("Cancelled");
+        }
+        Response response;
+        try {
+            response = call.execute();
+        } finally {
+            activeCall.compareAndSet(call, null);
+        }
 
         ResponseBody body = response.body();
         

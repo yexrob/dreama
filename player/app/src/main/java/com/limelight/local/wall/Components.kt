@@ -532,7 +532,7 @@ fun BreathingDot(color: Color = Wall.Text2) {
 @Composable
 fun <T> SegmentedControl(
     options: List<Pair<T, String>>,
-    selected: T,
+    selected: T?,
     onSelect: (T) -> Unit,
     modifier: Modifier = Modifier,
 ) {

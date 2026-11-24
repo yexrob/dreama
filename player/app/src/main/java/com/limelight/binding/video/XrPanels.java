@@ -36,7 +36,7 @@ import static com.limelight.binding.video.XrShared.*;
  * The flat panels reachable from inside the session: the environment picker,
  * the settings sheets, the keyboard and the exit prompt, and the buttons along
  * the bar that open them or switch the 3D, with the splash the session opens
- * on, the hand lock hint and the Ko-fi sheet. Java is the only place Android
+ * on and the hand lock hint. Java is the only place Android
  * will lay out text, so their art is drawn to bitmaps here and handed back as
  * pixels for the frame loop to upload, since that thread owns the GL context.
  * Nothing in here touches the session, so it can run on whichever thread has
@@ -860,6 +860,9 @@ final class XrPanels {
         if (tab == COG_TAB_SCREEN) {
             return COG_SCREEN_ROW_V0 + row * COG_SCREEN_ROW_STEP;
         }
+        if (tab == COG_TAB_ABOUT) {
+            return COG_STREAM_ROW_V0 + row * COG_STREAM_ROW_STEP;
+        }
         return COG_ROW_V0 + row * COG_ROW_STEP;
     }
 
@@ -1429,14 +1432,15 @@ final class XrPanels {
                 reset.centerY() - (text.ascent() + text.descent()) * 0.5f, text);
     }
 
-    // Tab 4: in streaming mode shows live stream configuration ("串流"); in local playback shows
-    // clean depth3d version & local log status without upstream Ko-fi or external report actions.
+    // Tab 4: in streaming mode shows selectable stream options ("串流") for
+    // resolution, bitrate and mouse mode (persisted for next connection); in
+    // local playback shows clean depth3d version and local log status.
     private void drawCogAbout(Canvas canvas) {
         final float mid = COG_TEX_W * 0.5f;
         final float room = COG_TEX_W - 96.0f;
 
         Paint titlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        titlePaint.setTextSize(32.0f);
+        titlePaint.setTextSize(streamingMode ? 28.0f : 32.0f);
         titlePaint.setTypeface(Typeface.DEFAULT_BOLD);
         titlePaint.setTextAlign(Paint.Align.CENTER);
         titlePaint.setColor(0xFFECECEE);
@@ -1453,26 +1457,58 @@ final class XrPanels {
 
         if (streamingMode) {
             String host = (streamHostName != null && !streamHostName.trim().isEmpty())
-                    ? streamHostName.trim() : context.getString(R.string.vr_stream_tab_title);
+                    ? streamHostName.trim() : context.getString(R.string.vr_stream_default_pc);
             canvas.drawText(Toast.fit(host + " · " + context.getString(R.string.vr_stream_status_live),
-                    titlePaint, room), mid, 0.27f * COG_TEX_H, titlePaint);
+                    titlePaint, room), mid, 0.24f * COG_TEX_H, titlePaint);
 
-            String videoLine = context.getString(
-                    R.string.vr_stream_info_video,
-                    streamWidth + "×" + streamHeight,
-                    streamFps,
-                    streamBitrateMbps);
-            canvas.drawText(Toast.fit(videoLine, bodyPaint, room), mid, 0.39f * COG_TEX_H, bodyPaint);
+            String currentSpec = streamWidth + "×" + streamHeight
+                    + " · " + streamFps + " fps · " + streamBitrateMbps + " Mbps";
+            canvas.drawText(Toast.fit(currentSpec, subPaint, room), mid, 0.305f * COG_TEX_H, subPaint);
 
-            String mouseLine = context.getString(streamAbsoluteMouse
-                    ? R.string.vr_stream_info_mouse_abs : R.string.vr_stream_info_mouse_rel);
-            canvas.drawText(Toast.fit(mouseLine, bodyPaint, room), mid, 0.49f * COG_TEX_H, bodyPaint);
+            Paint labelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            labelPaint.setTextSize(22.0f);
+            labelPaint.setTextAlign(Paint.Align.LEFT);
+            labelPaint.setColor(Color.WHITE);
 
-            String hintLine = context.getString(R.string.vr_stream_info_controls_hint);
-            canvas.drawText(Toast.fit(hintLine, subPaint, room), mid, 0.63f * COG_TEX_H, subPaint);
+            String[] streamRowLabels = {
+                    context.getString(R.string.vr_stream_row_resolution),
+                    context.getString(R.string.vr_stream_row_bitrate),
+                    context.getString(R.string.vr_stream_row_mouse),
+            };
+            String[][] streamRowCells = {
+                    {
+                            context.getString(R.string.settings_res_720p),
+                            context.getString(R.string.settings_res_1080p),
+                            context.getString(R.string.settings_res_1440p),
+                            context.getString(R.string.settings_res_4k),
+                    },
+                    {
+                            context.getString(R.string.settings_bitrate_smooth),
+                            context.getString(R.string.settings_bitrate_auto),
+                            context.getString(R.string.settings_bitrate_sharp),
+                    },
+                    {
+                            context.getString(R.string.settings_mouse_relative),
+                            context.getString(R.string.settings_mouse_absolute),
+                    },
+            };
+
+            for (int row = 0; row < streamRowLabels.length; row++) {
+                float y = cogRowV(COG_TAB_ABOUT, row) * COG_TEX_H;
+                canvas.drawText(streamRowLabels[row], 0.06f * COG_TEX_W,
+                        y - (labelPaint.ascent() + labelPaint.descent()) * 0.5f, labelPaint);
+                drawCogCells(canvas, streamRowCells[row], y, true);
+            }
+
+            Paint notePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            notePaint.setTextSize(20.0f);
+            notePaint.setTextAlign(Paint.Align.CENTER);
+            notePaint.setColor(0xFFE3A857);
+            canvas.drawText(Toast.fit(context.getString(R.string.vr_stream_next_connect_note),
+                    notePaint, room), mid, 0.835f * COG_TEX_H, notePaint);
 
             String version = "depth3d " + BuildConfig.VERSION_NAME;
-            canvas.drawText(Toast.fit(version, subPaint, room), mid, 0.80f * COG_TEX_H, subPaint);
+            canvas.drawText(Toast.fit(version, subPaint, room), mid, 0.915f * COG_TEX_H, subPaint);
         }
         else {
             canvas.drawText(COG_ABOUT_NAME, mid, 0.30f * COG_TEX_H, titlePaint);
@@ -1489,23 +1525,6 @@ final class XrPanels {
                             : context.getString(R.string.vr_panel_log_file_off),
                     subPaint, room), mid, 0.54f * COG_TEX_H, subPaint);
         }
-    }
-
-    // One of the About tab's buttons, plain like the reset buttons
-    private static void drawAboutButton(Canvas canvas, float l, float t, float r, float b,
-                                        String text) {
-        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        paint.setColor(0xEEFFFFFF);
-        paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeWidth(4.0f);
-        RectF button = new RectF(l * COG_TEX_W, t * COG_TEX_H, r * COG_TEX_W, b * COG_TEX_H);
-        canvas.drawRoundRect(button, 14.0f, 14.0f, paint);
-        Paint label = new Paint(Paint.ANTI_ALIAS_FLAG);
-        label.setTextSize(24.0f);
-        label.setTextAlign(Paint.Align.CENTER);
-        label.setColor(Color.WHITE);
-        canvas.drawText(Toast.fit(text, label, button.width() - 24.0f), button.centerX(),
-                button.centerY() - (label.ascent() + label.descent()) * 0.5f, label);
     }
 
     /**

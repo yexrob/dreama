@@ -2,6 +2,7 @@ package com.limelight.local.stream
 
 import android.content.Context
 import com.limelight.LimeLog
+import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -14,13 +15,50 @@ import java.security.SecureRandom
 import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
 import java.util.Locale
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.HostnameVerifier
 import javax.net.ssl.KeyManager
 import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
+
+/** Thread-safe cancellation token that immediately cancels in-flight OkHttp calls and custom hooks. */
+class CallCancelToken {
+    private val cancelled = AtomicBoolean(false)
+    private val hooks = CopyOnWriteArrayList<() -> Unit>()
+
+    val isCancelled: Boolean get() = cancelled.get()
+
+    fun register(onCancel: () -> Unit): () -> Unit {
+        hooks.add(onCancel)
+        if (cancelled.get()) {
+            hooks.remove(onCancel)
+            try {
+                onCancel()
+            } catch (_: Throwable) {
+            }
+        }
+        return { hooks.remove(onCancel) }
+    }
+
+    fun registerCall(call: Call): () -> Unit = register { call.cancel() }
+
+    fun cancel() {
+        if (!cancelled.compareAndSet(false, true)) return
+        val snapshot = hooks.toList()
+        hooks.clear()
+        for (hook in snapshot) {
+            try {
+                hook()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+}
 
 /** Persists TOFU (Trust On First Use) SHA-256 certificate fingerprints per depth3d Host id. */
 interface HostCertPinStore {
@@ -81,9 +119,11 @@ data class WebDavCredentials(
 )
 
 sealed interface HostInfoResult {
-    data class Ok(val info: HostInfo) : HostInfoResult
+    data class Ok(val info: HostInfo, val fingerprint: String) : HostInfoResult
+    data class IdentityMismatch(val expectedId: String, val actualId: String) : HostInfoResult
     data object UpgradeRequired : HostInfoResult
     data class CertificateChanged(val hostId: String, val expected: String, val actual: String) : HostInfoResult
+    data object Cancelled : HostInfoResult
     data class Failed(val detail: String) : HostInfoResult
 }
 
@@ -92,7 +132,9 @@ sealed interface AutoPairResult {
     data object Rejected : AutoPairResult
     data object TimedOut : AutoPairResult
     data object UpgradeRequired : AutoPairResult
+    data object StreamServiceUnavailable : AutoPairResult
     data class CertificateChanged(val hostId: String, val expected: String, val actual: String) : AutoPairResult
+    data object Cancelled : AutoPairResult
     data class Failed(val detail: String) : AutoPairResult
 }
 
@@ -102,6 +144,7 @@ sealed interface MediaCredsResult {
     data object NotConfigured : MediaCredsResult
     data object UpgradeRequired : MediaCredsResult
     data class CertificateChanged(val hostId: String, val expected: String, val actual: String) : MediaCredsResult
+    data object Cancelled : MediaCredsResult
     data class Failed(val detail: String) : MediaCredsResult
 }
 
@@ -110,7 +153,8 @@ interface HostProtocolApi {
         address: String,
         port: Int,
         hostId: String,
-        trustChangedCert: Boolean = false,
+        approvedNewFingerprint: String? = null,
+        cancelToken: CallCancelToken? = null,
     ): HostInfoResult
 
     fun requestAutoPair(
@@ -120,7 +164,9 @@ interface HostProtocolApi {
         deviceName: String,
         deviceId: String,
         pin: String,
-        trustChangedCert: Boolean = false,
+        presentClientCert: Boolean = false,
+        approvedNewFingerprint: String? = null,
+        cancelToken: CallCancelToken? = null,
     ): AutoPairResult
 
     fun getMediaCredentials(
@@ -128,16 +174,21 @@ interface HostProtocolApi {
         port: Int,
         hostId: String,
         deviceId: String,
-        trustChangedCert: Boolean = false,
+        approvedNewFingerprint: String? = null,
+        cancelToken: CallCancelToken? = null,
     ): MediaCredsResult
 }
 
 /**
  * Client for the depth3d Host v1 HTTPS control API (docs/specs/host-protocol.md).
  *
- * Uses self-signed TLS with TOFU certificate fingerprint pinning per host id, and presents
- * the headset's client certificate (when available) so /depth3d/v1/media can authenticate
- * paired headsets. Never logs PINs, passwords, or key material.
+ * Security guarantees:
+ * - Never pins a server certificate on an unverified mDNS id: /info verifies `info.id == hostId`
+ *   and protocol version before saving the first-use SHA-256 fingerprint.
+ * - Certificate-change approval pins ONLY the exact SHA-256 fingerprint the user confirmed.
+ * - First-time /pair omits the client certificate; paired /pair and /media present the pairing
+ *   client certificate so Mac Host authenticates paired headsets by certificate fingerprint.
+ * - Never logs PINs, passwords, or key material.
  */
 class HttpHostProtocolClient(
     private val pinStore: HostCertPinStore,
@@ -159,6 +210,18 @@ class HttpHostProtocolClient(
                 sb.append(String.format(Locale.ROOT, "%02x", b.toInt() and 0xFF))
             }
             return sb.toString()
+        }
+
+        /** Formats a full 64-char SHA-256 hex string into readable 4-char groups across 2 lines. */
+        fun formatFingerprint(sha256Hex: String): String {
+            val clean = sha256Hex.trim().uppercase(Locale.ROOT)
+            if (clean.isEmpty()) return ""
+            val groups = clean.chunked(4)
+            return if (groups.size > 8) {
+                groups.take(8).joinToString(" ") + "\n" + groups.drop(8).joinToString(" ")
+            } else {
+                groups.joinToString(" ")
+            }
         }
 
         internal fun formatHostUrl(address: String, port: Int, path: String): String {
@@ -227,30 +290,50 @@ class HttpHostProtocolClient(
         address: String,
         port: Int,
         hostId: String,
-        trustChangedCert: Boolean,
+        approvedNewFingerprint: String?,
+        cancelToken: CallCancelToken?,
     ): HostInfoResult {
+        if (cancelToken?.isCancelled == true) return HostInfoResult.Cancelled
         val url = formatHostUrl(address, port, "/depth3d/v1/info")
         LimeLog.info("depth3d: host GET /depth3d/v1/info -> $address:$port")
+        val observed = AtomicReference<String?>(null)
         return try {
-            val client = buildClient(hostId, trustChangedCert, infoReadTimeoutMs)
-            val request = Request.Builder().url(url).get().build()
-            client.newCall(request).execute().use { resp ->
-                when (resp.code) {
-                    200 -> {
-                        val body = resp.body.string()
-                        val info = parseHostInfoJson(body)
-                            ?: return HostInfoResult.Failed("电脑返回的信息格式无法识别")
-                        if (info.version != PROTOCOL_VERSION) {
-                            HostInfoResult.UpgradeRequired
-                        } else {
-                            HostInfoResult.Ok(info)
+            val client = buildClient(
+                hostId = hostId,
+                presentClientCert = false,
+                approvedNewFingerprint = approvedNewFingerprint,
+                readTimeoutMs = infoReadTimeoutMs,
+                observedFingerprintOut = observed,
+            )
+            val call = client.newCall(Request.Builder().url(url).get().build())
+            val unregister = cancelToken?.registerCall(call)
+            try {
+                call.execute().use { resp ->
+                    when (resp.code) {
+                        200 -> {
+                            val body = resp.body.string()
+                            val info = parseHostInfoJson(body)
+                                ?: return HostInfoResult.Failed("invalid info json")
+                            if (info.version != PROTOCOL_VERSION) {
+                                return HostInfoResult.UpgradeRequired
+                            }
+                            if (!info.id.equals(hostId, ignoreCase = true)) {
+                                LimeLog.warning("depth3d: host /info id mismatch (expected=$hostId actual=${info.id})")
+                                return HostInfoResult.IdentityMismatch(hostId, info.id)
+                            }
+                            val fp = observed.get() ?: return HostInfoResult.Failed("missing server cert")
+                            commitPinIfEligible(hostId, fp, approvedNewFingerprint)
+                            HostInfoResult.Ok(info, fp)
                         }
+                        426 -> HostInfoResult.UpgradeRequired
+                        else -> HostInfoResult.Failed("HTTP ${resp.code}")
                     }
-                    426 -> HostInfoResult.UpgradeRequired
-                    else -> HostInfoResult.Failed("HTTP ${resp.code}")
                 }
+            } finally {
+                unregister?.invoke()
             }
         } catch (e: Throwable) {
+            if (cancelToken?.isCancelled == true) return HostInfoResult.Cancelled
             val changed = findCertChanged(e)
             if (changed != null) {
                 LimeLog.warning("depth3d: host certificate changed for $hostId")
@@ -269,28 +352,53 @@ class HttpHostProtocolClient(
         deviceName: String,
         deviceId: String,
         pin: String,
-        trustChangedCert: Boolean,
+        presentClientCert: Boolean,
+        approvedNewFingerprint: String?,
+        cancelToken: CallCancelToken?,
     ): AutoPairResult {
+        if (cancelToken?.isCancelled == true) return AutoPairResult.Cancelled
         val url = formatHostUrl(address, port, "/depth3d/v1/pair")
         val payload = "{\"device\":\"${escapeJson(deviceName)}\",\"deviceId\":\"${escapeJson(deviceId)}\",\"pin\":\"${escapeJson(pin)}\"}"
-        LimeLog.info("depth3d: host POST /depth3d/v1/pair -> $address:$port (device=$deviceName)")
+        LimeLog.info("depth3d: host POST /depth3d/v1/pair -> $address:$port (device=$deviceName, clientCert=$presentClientCert)")
+        val observed = AtomicReference<String?>(null)
         return try {
-            val client = buildClient(hostId, trustChangedCert, pairReadTimeoutMs)
+            val client = buildClient(
+                hostId = hostId,
+                presentClientCert = presentClientCert,
+                approvedNewFingerprint = approvedNewFingerprint,
+                readTimeoutMs = pairReadTimeoutMs,
+                observedFingerprintOut = observed,
+            )
             val request = Request.Builder()
                 .url(url)
                 .post(payload.toRequestBody(JSON_MEDIA))
                 .build()
-            client.newCall(request).execute().use { resp ->
-                val body = resp.body.string()
-                when (resp.code) {
-                    200 -> if (parsePairOkJson(body)) AutoPairResult.Approved else AutoPairResult.Failed("pair response not ok")
-                    403 -> AutoPairResult.Rejected
-                    408 -> AutoPairResult.TimedOut
-                    426 -> AutoPairResult.UpgradeRequired
-                    else -> AutoPairResult.Failed("HTTP ${resp.code}")
+            val call = client.newCall(request)
+            val unregister = cancelToken?.registerCall(call)
+            try {
+                call.execute().use { resp ->
+                    val body = resp.body.string()
+                    val fp = observed.get()
+                    if (fp != null && approvedNewFingerprint != null &&
+                        approvedNewFingerprint.equals(fp, ignoreCase = true) &&
+                        resp.code != 426
+                    ) {
+                        pinStore.saveFingerprint(hostId, fp)
+                    }
+                    when (resp.code) {
+                        200 -> if (parsePairOkJson(body)) AutoPairResult.Approved else AutoPairResult.Failed("pair response not ok")
+                        403 -> AutoPairResult.Rejected
+                        408 -> AutoPairResult.TimedOut
+                        426 -> AutoPairResult.UpgradeRequired
+                        503 -> AutoPairResult.StreamServiceUnavailable
+                        else -> AutoPairResult.Failed("HTTP ${resp.code}")
+                    }
                 }
+            } finally {
+                unregister?.invoke()
             }
         } catch (e: Throwable) {
+            if (cancelToken?.isCancelled == true) return AutoPairResult.Cancelled
             val changed = findCertChanged(e)
             if (changed != null) {
                 LimeLog.warning("depth3d: host certificate changed during pair for $hostId")
@@ -307,30 +415,52 @@ class HttpHostProtocolClient(
         port: Int,
         hostId: String,
         deviceId: String,
-        trustChangedCert: Boolean,
+        approvedNewFingerprint: String?,
+        cancelToken: CallCancelToken?,
     ): MediaCredsResult {
+        if (cancelToken?.isCancelled == true) return MediaCredsResult.Cancelled
+        val keyManagers = buildClientKeyManagers()
+        if (keyManagers == null) {
+            LimeLog.warning("depth3d: skipping /depth3d/v1/media because pairing client certificate is unavailable")
+            return MediaCredsResult.Unauthorized
+        }
         val url = formatHostUrl(address, port, "/depth3d/v1/media")
         LimeLog.info("depth3d: host GET /depth3d/v1/media -> $address:$port")
+        val observed = AtomicReference<String?>(null)
         return try {
-            val client = buildClient(hostId, trustChangedCert, infoReadTimeoutMs)
+            val client = buildClient(
+                hostId = hostId,
+                presentClientCert = true,
+                approvedNewFingerprint = approvedNewFingerprint,
+                readTimeoutMs = infoReadTimeoutMs,
+                observedFingerprintOut = observed,
+                precomputedKeyManagers = keyManagers,
+            )
             val request = Request.Builder()
                 .url(url)
                 .header(HEADER_DEVICE, deviceId)
                 .get()
                 .build()
-            client.newCall(request).execute().use { resp ->
-                when (resp.code) {
-                    200 -> {
-                        val creds = parseMediaCredsJson(resp.body.string())
-                        if (creds != null) MediaCredsResult.Available(creds) else MediaCredsResult.NotConfigured
+            val call = client.newCall(request)
+            val unregister = cancelToken?.registerCall(call)
+            try {
+                call.execute().use { resp ->
+                    when (resp.code) {
+                        200 -> {
+                            val creds = parseMediaCredsJson(resp.body.string())
+                            if (creds != null) MediaCredsResult.Available(creds) else MediaCredsResult.NotConfigured
+                        }
+                        401 -> MediaCredsResult.Unauthorized
+                        404 -> MediaCredsResult.NotConfigured
+                        426 -> MediaCredsResult.UpgradeRequired
+                        else -> MediaCredsResult.Failed("HTTP ${resp.code}")
                     }
-                    401 -> MediaCredsResult.Unauthorized
-                    404 -> MediaCredsResult.NotConfigured
-                    426 -> MediaCredsResult.UpgradeRequired
-                    else -> MediaCredsResult.Failed("HTTP ${resp.code}")
                 }
+            } finally {
+                unregister?.invoke()
             }
         } catch (e: Throwable) {
+            if (cancelToken?.isCancelled == true) return MediaCredsResult.Cancelled
             val changed = findCertChanged(e)
             if (changed != null) {
                 LimeLog.warning("depth3d: host certificate changed during media query for $hostId")
@@ -342,9 +472,30 @@ class HttpHostProtocolClient(
         }
     }
 
-    private fun buildClient(hostId: String, trustChangedCert: Boolean, readTimeoutMs: Long): OkHttpClient {
-        val trustManager = TofuTrustManager(pinStore, hostId, trustChangedCert)
-        val keyManagers = buildClientKeyManagers()
+    private fun commitPinIfEligible(hostId: String, observed: String, approvedNewFingerprint: String?) {
+        val saved = pinStore.getFingerprint(hostId)
+        when {
+            saved == null -> pinStore.saveFingerprint(hostId, observed)
+            saved.equals(observed, ignoreCase = true) -> Unit
+            approvedNewFingerprint != null && approvedNewFingerprint.equals(observed, ignoreCase = true) ->
+                pinStore.saveFingerprint(hostId, observed)
+        }
+    }
+
+    private fun buildClient(
+        hostId: String,
+        presentClientCert: Boolean,
+        approvedNewFingerprint: String?,
+        readTimeoutMs: Long,
+        observedFingerprintOut: AtomicReference<String?>,
+        precomputedKeyManagers: Array<KeyManager>? = null,
+    ): OkHttpClient {
+        val trustManager = TofuTrustManager(pinStore, hostId, approvedNewFingerprint, observedFingerprintOut)
+        val keyManagers = when {
+            !presentClientCert -> null
+            precomputedKeyManagers != null -> precomputedKeyManagers
+            else -> buildClientKeyManagers()
+        }
         val sslContext = SSLContext.getInstance("TLS")
         sslContext.init(keyManagers, arrayOf<TrustManager>(trustManager), SecureRandom())
         return OkHttpClient.Builder()
@@ -392,7 +543,8 @@ class HttpHostProtocolClient(
     private class TofuTrustManager(
         private val store: HostCertPinStore,
         private val hostId: String,
-        private val trustChangedCert: Boolean,
+        private val approvedNewFingerprint: String?,
+        private val observedOut: AtomicReference<String?>,
     ) : X509TrustManager {
         override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
 
@@ -401,11 +553,13 @@ class HttpHostProtocolClient(
                 throw CertificateException("Empty server certificate chain")
             }
             val fingerprint = sha256Hex(chain[0])
+            observedOut.set(fingerprint)
             val saved = store.getFingerprint(hostId)
             when {
-                saved == null -> store.saveFingerprint(hostId, fingerprint)
+                // First contact: defer persisting the pin until /info verifies info.id == hostId.
+                saved == null -> Unit
                 saved.equals(fingerprint, ignoreCase = true) -> Unit
-                trustChangedCert -> store.saveFingerprint(hostId, fingerprint)
+                approvedNewFingerprint != null && approvedNewFingerprint.equals(fingerprint, ignoreCase = true) -> Unit
                 else -> throw HostCertificateChangedException(hostId, saved, fingerprint)
             }
         }
@@ -448,19 +602,27 @@ internal class MiniJson private constructor(private val entries: Map<String, Any
             skipWs()
             if (pos >= s.length) throw IOException("EOF")
             return when (s[pos]) {
-                '{' -> parseObj()
-                '[' -> parseArr()
-                '"' -> parseStr()
-                't', 'f' -> parseBool()
-                'n' -> parseNull()
-                else -> parseNum()
+                '{' -> parseObject()
+                '[' -> parseArray()
+                '"' -> parseString()
+                't' -> expect("true", true)
+                'f' -> expect("false", false)
+                'n' -> expect("null", null)
+                '-', in '0'..'9' -> parseNumber()
+                else -> throw IOException("Unexpected char '${s[pos]}'")
             }
         }
 
-        private fun parseObj(): MiniJson {
+        private fun expect(lit: String, value: Any?): Any? {
+            if (!s.regionMatches(pos, lit, 0, lit.length)) throw IOException("Expected $lit")
+            pos += lit.length
+            return value
+        }
+
+        private fun parseObject(): MiniJson {
             pos++ // '{'
-            skipWs()
             val map = LinkedHashMap<String, Any?>()
+            skipWs()
             if (pos < s.length && s[pos] == '}') {
                 pos++
                 return MiniJson(map)
@@ -468,12 +630,11 @@ internal class MiniJson private constructor(private val entries: Map<String, Any
             while (true) {
                 skipWs()
                 if (pos >= s.length || s[pos] != '"') throw IOException("Expected key")
-                val k = parseStr()
+                val key = parseString()
                 skipWs()
                 if (pos >= s.length || s[pos] != ':') throw IOException("Expected :")
                 pos++
-                val v = parseValue()
-                map[k] = v
+                map[key] = parseValue()
                 skipWs()
                 if (pos >= s.length) throw IOException("Unterminated object")
                 when (s[pos]) {
@@ -487,10 +648,10 @@ internal class MiniJson private constructor(private val entries: Map<String, Any
             }
         }
 
-        private fun parseArr(): List<Any?> {
+        private fun parseArray(): List<Any?> {
             pos++ // '['
-            skipWs()
             val list = ArrayList<Any?>()
+            skipWs()
             if (pos < s.length && s[pos] == ']') {
                 pos++
                 return list
@@ -510,62 +671,54 @@ internal class MiniJson private constructor(private val entries: Map<String, Any
             }
         }
 
-        private fun parseStr(): String {
+        private fun parseString(): String {
             pos++ // '"'
             val sb = StringBuilder()
             while (pos < s.length) {
-                val c = s[pos++]
-                when (c) {
+                val ch = s[pos++]
+                when (ch) {
                     '"' -> return sb.toString()
                     '\\' -> {
-                        if (pos >= s.length) throw IOException("Bad escape")
-                        when (val e = s[pos++]) {
-                            '"', '\\', '/' -> sb.append(e)
+                        if (pos >= s.length) throw IOException("Unterminated escape")
+                        when (val esc = s[pos++]) {
+                            '"', '\\', '/' -> sb.append(esc)
                             'b' -> sb.append('\b')
                             'f' -> sb.append('\u000C')
                             'n' -> sb.append('\n')
                             'r' -> sb.append('\r')
                             't' -> sb.append('\t')
                             'u' -> {
-                                if (pos + 4 > s.length) throw IOException("Bad unicode")
-                                val hex = s.substring(pos, pos + 4)
+                                if (pos + 4 > s.length) throw IOException("Bad unicode escape")
+                                sb.append(s.substring(pos, pos + 4).toInt(16).toChar())
                                 pos += 4
-                                sb.append(hex.toInt(16).toChar())
                             }
-                            else -> throw IOException("Unknown escape")
+                            else -> throw IOException("Unknown escape \\$esc")
                         }
                     }
-                    else -> sb.append(c)
+                    else -> sb.append(ch)
                 }
             }
             throw IOException("Unterminated string")
         }
 
-        private fun parseBool(): Boolean = when {
-            s.startsWith("true", pos) -> { pos += 4; true }
-            s.startsWith("false", pos) -> { pos += 5; false }
-            else -> throw IOException("Bad boolean")
-        }
-
-        private fun parseNull(): Any? {
-            if (!s.startsWith("null", pos)) throw IOException("Bad null")
-            pos += 4
-            return null
-        }
-
-        private fun parseNum(): Number {
+        private fun parseNumber(): Number {
             val start = pos
-            if (pos < s.length && s[pos] == '-') pos++
-            while (pos < s.length && (s[pos].isDigit() || s[pos] == '.' || s[pos] == 'e' || s[pos] == 'E' || s[pos] == '+' || s[pos] == '-')) {
-                if ((s[pos] == '+' || s[pos] == '-') && pos > start && s[pos - 1] != 'e' && s[pos - 1] != 'E') break
+            if (s[pos] == '-') pos++
+            while (pos < s.length && s[pos].isDigit()) pos++
+            var isFloat = false
+            if (pos < s.length && s[pos] == '.') {
+                isFloat = true
                 pos++
+                while (pos < s.length && s[pos].isDigit()) pos++
             }
-            val token = s.substring(start, pos)
-            return if (token.contains('.') || token.contains('e') || token.contains('E')) {
-                token.toDouble()
-            } else {
-                token.toLong()
+            if (pos < s.length && (s[pos] == 'e' || s[pos] == 'E')) {
+                isFloat = true
+                pos++
+                if (pos < s.length && (s[pos] == '+' || s[pos] == '-')) pos++
+                while (pos < s.length && s[pos].isDigit()) pos++
             }
+            val raw = s.substring(start, pos)
+            return if (isFloat) raw.toDouble() else raw.toLong()
         }
     }
 }

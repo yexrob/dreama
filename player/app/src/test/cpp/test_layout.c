@@ -494,10 +494,10 @@ static void testThePresetAccent(void) {
 // bands apart and every cell drawn inside its own band
 static void testTheRowsFit(void) {
     int counts[COG_TAB_COUNT] = {
-        COG_SCREEN_ROW_COUNT, COG_DISPLAY_SLIDER_ROW + 1, COG_ROW3D_COUNT, PICTURE_VALUES, 0
+        COG_SCREEN_ROW_COUNT, COG_DISPLAY_SLIDER_ROW + 1, COG_ROW3D_COUNT, PICTURE_VALUES,
+        COG_STREAM_ROW_COUNT
     };
     for (int tab = 0; tab < COG_TAB_COUNT; tab++) {
-        // The About tab has no rows, only its button
         if (counts[tab] == 0) {
             continue;
         }
@@ -512,6 +512,14 @@ static void testTheRowsFit(void) {
         CHECK(last + 0.0425f < 1.0f - 0.03f);
         CHECK(last + half <= 1.0f);
     }
+    // Stream quick-menu tab carries 3 selectable cell rows with breathing room
+    // for header above and "next connection" note below.
+    CHECK(COG_STREAM_ROW_COUNT == 3);
+    CHECK(COG_STREAM_RES_CELLS == 4 && COG_STREAM_BITRATE_CELLS == 3 && COG_STREAM_MOUSE_CELLS == 2);
+    CHECK_NEAR(cogRowV(COG_TAB_ABOUT, COG_STREAM_ROW_RES), COG_STREAM_ROW_V0, 1e-6);
+    CHECK_NEAR(cogRowV(COG_TAB_ABOUT, COG_STREAM_ROW_MOUSE),
+               COG_STREAM_ROW_V0 + 2 * COG_STREAM_ROW_STEP, 1e-6);
+    CHECK(cogRowV(COG_TAB_ABOUT, COG_STREAM_ROW_MOUSE) + cogRowHalf(COG_TAB_ABOUT) < 0.80f);
     // The display tab's thirteen rows, head aim's after head locked and the
     // controllers' pointer or gamepad after that, the glow level track last
     CHECK(COG_DISPLAY_SLIDER_ROW == 12);
@@ -736,20 +744,6 @@ static void testTheReportParts(void) {
     CHECK(!cogReportButtonAt(0.5f, COG_REPORT_B + 0.01f));
     CHECK(!cogReportButtonAt(0.5f, 0.08f));
 
-    // Ko-fi directly above the report button, with room between the two for
-    // the line under it, and the same width
-    CHECK(COG_KOFI_T > COG_TAB_BAR_B && COG_KOFI_T < COG_KOFI_B);
-    CHECK(COG_KOFI_B + 0.08f < COG_REPORT_T);
-    CHECK(COG_KOFI_L == COG_REPORT_L && COG_KOFI_R == COG_REPORT_R);
-    float kofiV = (COG_KOFI_T + COG_KOFI_B) * 0.5f;
-    float reportV = (COG_REPORT_T + COG_REPORT_B) * 0.5f;
-    CHECK(cogKofiButtonAt(0.5f, kofiV));
-    CHECK(!cogReportButtonAt(0.5f, kofiV));
-    CHECK(!cogKofiButtonAt(0.5f, reportV));
-    CHECK(!cogKofiButtonAt(0.5f, (COG_KOFI_B + COG_REPORT_T) * 0.5f));
-    CHECK(!cogReportButtonAt(0.5f, (COG_KOFI_B + COG_REPORT_T) * 0.5f));
-    CHECK(!cogKofiButtonAt(COG_KOFI_R + 0.01f, kofiV));
-
     float mid = (REPORT_FIELD_L + REPORT_FIELD_R) * 0.5f;
     CHECK(reportZone(mid, (REPORT_NOTE_T + REPORT_NOTE_B) * 0.5f) == REPORT_ZONE_NOTE);
     CHECK(reportZone(mid, (REPORT_EMAIL_T + REPORT_EMAIL_B) * 0.5f) == REPORT_ZONE_EMAIL);
@@ -789,25 +783,6 @@ static void testTheHintButtons(void) {
     CHECK(HINT_BTN_T > 0.5f && HINT_BTN_T < HINT_BTN_B && HINT_BTN_B < 1.0f);
     // The longer label gets the wider button
     CHECK(HINT_NEVER_R - HINT_NEVER_L > HINT_OK_R - HINT_OK_L);
-}
-
-// The Ko-fi sheet's one button is where a press on it lands, and the rest of
-// the sheet is nothing
-static void testTheKofiButton(void) {
-    float btn = (KOFI_BTN_T + KOFI_BTN_B) * 0.5f;
-    CHECK(kofiSheetZone((KOFI_CLOSE_L + KOFI_CLOSE_R) * 0.5f, btn) == KOFI_ZONE_CLOSE);
-    CHECK(kofiSheetZone(KOFI_CLOSE_L - 0.01f, btn) == KOFI_ZONE_NONE);
-    CHECK(kofiSheetZone(KOFI_CLOSE_R + 0.01f, btn) == KOFI_ZONE_NONE);
-    CHECK(kofiSheetZone((KOFI_CLOSE_L + KOFI_CLOSE_R) * 0.5f, KOFI_BTN_T - 0.01f)
-          == KOFI_ZONE_NONE);
-    CHECK(kofiSheetZone((KOFI_CLOSE_L + KOFI_CLOSE_R) * 0.5f, KOFI_BTN_B + 0.01f)
-          == KOFI_ZONE_NONE);
-    // On the code and the title is nothing
-    CHECK(kofiSheetZone(KOFI_QR_L + 0.05f, KOFI_QR_T + 0.1f) == KOFI_ZONE_NONE);
-    CHECK(kofiSheetZone(0.5f, 0.1f) == KOFI_ZONE_NONE);
-    // The code is clear of the button, on the left
-    CHECK(KOFI_QR_L + (float)KOFI_QR_PX / KOFI_TEX_W < KOFI_CLOSE_L);
-    CHECK(KOFI_QR_T + (float)KOFI_QR_PX / KOFI_TEX_H < 1.0f);
 }
 
 // The bar's buttons share one texture, a cell a face. Every face has a cell
@@ -898,7 +873,6 @@ int main(void) {
     testTheRowsFit();
     testTheReportParts();
     testTheHintButtons();
-    testTheKofiButton();
     testCornersFollowTheirArt();
     testNoCornersWhereThereAreNone();
     testTheRestOfThePicture();

@@ -305,9 +305,9 @@ public class LocalPlayerXR extends Activity
             pendingMore = null;
         } else if (!ready) {
             if (castId != 0) {
-                r.showNotice("正在打开投屏…", title());
+                r.showNotice(getString(com.limelight.R.string.player_opening_cast), title());
             } else if (isHttp(getIntent().getData())) {
-                r.showNotice("正在从网盘缓冲…", title());
+                r.showNotice(getString(com.limelight.R.string.player_buffering_webdav), title());
             }
         }
         if (ready && !errored) {
@@ -335,7 +335,7 @@ public class LocalPlayerXR extends Activity
                     p.setPlayWhenReady(wantPlay);
                 }
             } else if (state == Player.STATE_BUFFERING && ready && isHttp(getIntent().getData())) {
-                notice("缓冲中…", null);
+                notice(getString(com.limelight.R.string.player_buffering), null);
             }
             tickBar();
         }
@@ -371,7 +371,9 @@ public class LocalPlayerXR extends Activity
         public void onPlayerError(PlaybackException e) {
             errored = true;
             LimeLog.warning("depth3d: cannot play " + getIntent().getData() + ": " + e);
-            notice(castId != 0 ? "投屏的视频放不了" : "播放出错", e.getErrorCodeName());
+            notice(getString(castId != 0
+                    ? com.limelight.R.string.player_cast_error
+                    : com.limelight.R.string.player_play_error), e.getErrorCodeName());
             probed.countDown();
             tickBar();
         }
@@ -441,7 +443,9 @@ public class LocalPlayerXR extends Activity
         checkShape = surfaceSet;
         XrRenderer r = renderer;
         if (r != null && surfaceSet) {
-            r.showNotice(castId != 0 ? "正在打开投屏…" : "正在打开…", title());
+            r.showNotice(getString(castId != 0
+                    ? com.limelight.R.string.player_opening_cast
+                    : com.limelight.R.string.player_opening), title());
         }
         tickBar();
     }
@@ -700,7 +704,7 @@ public class LocalPlayerXR extends Activity
     public void onVrUnavailable(XrStartFailure failure) {
         LimeLog.warning("depth3d: VR unavailable: " + failure);
         main.post(() -> {
-            Toast.makeText(this, "无法进入沉浸式 3D 画面，请重试", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, getString(com.limelight.R.string.player_vr_unavailable), Toast.LENGTH_LONG).show();
             finish();
         });
     }

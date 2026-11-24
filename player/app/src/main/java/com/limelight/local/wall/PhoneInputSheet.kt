@@ -23,6 +23,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -32,6 +33,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -40,15 +42,21 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.limelight.LimeLog
 import com.limelight.R
+import com.limelight.local.stream.PhoneInputCopy
 import com.limelight.local.stream.PhoneInputServer
+import com.limelight.local.stream.PhoneSubmitResult
 import com.limelight.local.stream.QrCodeMatrix
 import com.limelight.local.stream.UserFacingError
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Modal sheet that lets the user enter a computer IP address or rename the headset from their
- * phone via QR code + short LAN URL + 4-digit code, with an explicit opt-in fallback to the
- * headset keyboard (ux-spec §4.6, 00-quality-bar.md #4).
+ * phone via QR code (carrying a 128-bit random token) + short LAN URL + 4-digit fallback code,
+ * with an explicit opt-in fallback to the headset keyboard (ux-spec §4.6, 00-quality-bar.md #4).
  */
 @Composable
 fun PhoneInputSheet(
@@ -58,15 +66,18 @@ fun PhoneInputSheet(
     onSubmit: suspend (String) -> UserFacingError?,
     onDismiss: () -> Unit,
 ) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var useHeadsetKeyboard by remember { mutableStateOf(lanIp == null) }
     var busy by remember { mutableStateOf(false) }
+    var lockedOut by remember { mutableStateOf(false) }
+    var serverGeneration by remember { mutableIntStateOf(0) }
     var error by remember { mutableStateOf<UserFacingError?>(null) }
     val textFieldState = rememberTextFieldState(initialValue)
 
     var serverInfo by remember { mutableStateOf<Triple<String, String, QrCodeMatrix>?>(null) }
 
-    fun triggerSubmit(raw: String) {
+    fun triggerSubmitFromKeyboard(raw: String) {
         if (busy) return
         busy = true
         error = null
@@ -81,17 +92,83 @@ fun PhoneInputSheet(
         }
     }
 
-    DisposableEffect(mode, lanIp, useHeadsetKeyboard) {
+    DisposableEffect(mode, lanIp, useHeadsetKeyboard, serverGeneration) {
         if (useHeadsetKeyboard || lanIp.isNullOrBlank()) {
             serverInfo = null
             onDispose { }
         } else {
+            val copy = PhoneInputCopy.from(context, mode)
             val server = try {
                 PhoneInputServer(
-                    mode = mode,
+                    copy = copy,
                     displayHost = lanIp,
                     onSubmitted = { submitted ->
-                        scope.launch { triggerSubmit(submitted) }
+                        // Invoked on PhoneInputServer's worker thread: wait for the headset to
+                        // actually accept or reject the submitted value before replying to the phone.
+                        try {
+                            runBlocking {
+                                val alreadyBusy = withContext(Dispatchers.Main.immediate) {
+                                    if (busy) {
+                                        true
+                                    } else {
+                                        busy = true
+                                        error = null
+                                        false
+                                    }
+                                }
+                                if (alreadyBusy) {
+                                    return@runBlocking PhoneSubmitResult.Rejected(
+                                        context.getString(R.string.phone_input_connecting),
+                                    )
+                                }
+                                val err: UserFacingError? = try {
+                                    val outcome = withTimeoutOrNull(20_000L) {
+                                        Pair(true, onSubmit(submitted))
+                                    }
+                                    if (outcome == null) {
+                                        UserFacingError(
+                                            title = context.getString(
+                                                R.string.err_net_timeout_title,
+                                                context.getString(R.string.stream_action_add_pc),
+                                            ),
+                                            detail = context.getString(R.string.err_net_timeout_detail),
+                                        )
+                                    } else {
+                                        outcome.second
+                                    }
+                                } catch (_: Exception) {
+                                    UserFacingError(
+                                        title = context.getString(
+                                            R.string.err_action_failed_title,
+                                            context.getString(R.string.stream_action_add_pc),
+                                        ),
+                                        detail = context.getString(R.string.err_action_failed_detail),
+                                    )
+                                }
+                                withContext(Dispatchers.Main.immediate) {
+                                    busy = false
+                                    if (err == null) {
+                                        onDismiss()
+                                    } else {
+                                        error = err
+                                    }
+                                }
+                                if (err == null) {
+                                    PhoneSubmitResult.Accepted
+                                } else {
+                                    PhoneSubmitResult.Rejected("${err.title}：${err.detail}")
+                                }
+                            }
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            PhoneSubmitResult.Rejected(context.getString(R.string.action_cancel))
+                        }
+                    },
+                    onLockedOut = {
+                        scope.launch {
+                            lockedOut = true
+                            serverInfo = null
+                        }
                     },
                 ).start()
             } catch (e: Exception) {
@@ -99,6 +176,7 @@ fun PhoneInputSheet(
                 null
             }
             if (server != null) {
+                lockedOut = false
                 serverInfo = Triple(server.shortUrl, server.verificationCode, QrCodeMatrix.encode(server.qrUrl))
             } else {
                 serverInfo = null
@@ -141,55 +219,84 @@ fun PhoneInputSheet(
 
             if (!useHeadsetKeyboard) {
                 val info = serverInfo
-                if (info != null) {
-                    val (url, code, qr) = info
-                    Row(
-                        Modifier.padding(top = 28.dp),
-                        horizontalArrangement = Arrangement.spacedBy(36.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        QrCodeView(qr, size = 228.dp)
-                        Column(Modifier.weight(1f)) {
-                            Box(
-                                Modifier
-                                    .clip(RoundedCornerShape(Wall.Radius))
-                                    .background(Wall.Surface)
-                                    .padding(horizontal = 20.dp, vertical = 14.dp),
-                            ) {
-                                Text(url, style = WallType.Body.copy(fontFeatureSettings = "tnum"))
-                            }
-                            Row(
-                                Modifier.padding(top = 18.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(16.dp),
-                            ) {
-                                Text(stringResource(R.string.phone_input_code_label), style = WallType.Caption, color = Wall.Text2)
-                                Text(
-                                    code,
-                                    style = WallType.Title.copy(
-                                        fontSize = 36.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        letterSpacing = 6.sp,
-                                        fontFeatureSettings = "tnum",
-                                    ),
-                                    color = Wall.Accent,
-                                )
-                            }
-                            if (busy) {
+                when {
+                    lockedOut -> {
+                        Column(
+                            Modifier.padding(top = 24.dp),
+                            verticalArrangement = Arrangement.spacedBy(18.dp),
+                        ) {
+                            Notice(stringResource(R.string.phone_input_locked), WallIcons.Alert, danger = true)
+                            WallButton(
+                                text = stringResource(R.string.phone_input_reopen_qr),
+                                onClick = {
+                                    lockedOut = false
+                                    error = null
+                                    serverGeneration++
+                                },
+                                icon = WallIcons.Refresh,
+                                kind = ButtonKind.Primary,
+                            )
+                        }
+                    }
+                    info != null -> {
+                        val (url, code, qr) = info
+                        Row(
+                            Modifier.padding(top = 28.dp),
+                            horizontalArrangement = Arrangement.spacedBy(36.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            QrCodeView(qr, size = 228.dp)
+                            Column(Modifier.weight(1f)) {
+                                Box(
+                                    Modifier
+                                        .clip(RoundedCornerShape(Wall.Radius))
+                                        .background(Wall.Surface)
+                                        .padding(horizontal = 20.dp, vertical = 14.dp),
+                                ) {
+                                    Text(url, style = WallType.Body.copy(fontFeatureSettings = "tnum"))
+                                }
                                 Row(
                                     Modifier.padding(top = 18.dp),
                                     verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(16.dp),
                                 ) {
-                                    WallSpinner(size = 24.dp)
-                                    Text(stringResource(R.string.phone_input_connecting), style = WallType.Caption, color = Wall.Text2)
+                                    Text(
+                                        stringResource(R.string.phone_input_code_label),
+                                        style = WallType.Caption,
+                                        color = Wall.Text2,
+                                    )
+                                    Text(
+                                        code,
+                                        style = WallType.Title.copy(
+                                            fontSize = 36.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            letterSpacing = 6.sp,
+                                            fontFeatureSettings = "tnum",
+                                        ),
+                                        color = Wall.Accent,
+                                    )
+                                }
+                                if (busy) {
+                                    Row(
+                                        Modifier.padding(top = 18.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                    ) {
+                                        WallSpinner(size = 24.dp)
+                                        Text(
+                                            stringResource(R.string.phone_input_connecting),
+                                            style = WallType.Caption,
+                                            color = Wall.Text2,
+                                        )
+                                    }
                                 }
                             }
                         }
                     }
-                } else {
-                    Box(Modifier.padding(top = 24.dp)) {
-                        Notice(stringResource(R.string.phone_input_no_wifi), WallIcons.Wifi, danger = false)
+                    else -> {
+                        Box(Modifier.padding(top = 24.dp)) {
+                            Notice(stringResource(R.string.phone_input_no_wifi), WallIcons.Wifi, danger = false)
+                        }
                     }
                 }
             } else {
@@ -237,7 +344,12 @@ fun PhoneInputSheet(
             error?.let { err ->
                 Column(Modifier.padding(top = 20.dp)) {
                     Notice(err.title, WallIcons.Alert, danger = true)
-                    Text(err.detail, style = WallType.Caption, color = Wall.Text2, modifier = Modifier.padding(start = 38.dp, top = 4.dp))
+                    Text(
+                        err.detail,
+                        style = WallType.Caption,
+                        color = Wall.Text2,
+                        modifier = Modifier.padding(start = 38.dp, top = 4.dp),
+                    )
                 }
             }
 
@@ -250,20 +362,32 @@ fun PhoneInputSheet(
                     WallButton(
                         text = if (busy) stringResource(R.string.phone_input_connecting)
                         else stringResource(if (mode == PhoneInputServer.Mode.ADD_COMPUTER) R.string.action_add else R.string.action_save),
-                        onClick = { triggerSubmit(textFieldState.text.toString()) },
+                        onClick = { triggerSubmitFromKeyboard(textFieldState.text.toString()) },
                         kind = ButtonKind.Primary,
                     )
                     if (!lanIp.isNullOrBlank()) {
                         WallButton(
                             text = stringResource(R.string.phone_input_back_to_qr),
-                            onClick = { if (!busy) { error = null; useHeadsetKeyboard = false } },
+                            onClick = {
+                                if (!busy) {
+                                    error = null
+                                    lockedOut = false
+                                    useHeadsetKeyboard = false
+                                }
+                            },
                             kind = ButtonKind.Plain,
                         )
                     }
                 } else {
                     WallButton(
                         text = stringResource(R.string.phone_input_use_headset_kb),
-                        onClick = { if (!busy) { error = null; useHeadsetKeyboard = true } },
+                        onClick = {
+                            if (!busy) {
+                                error = null
+                                lockedOut = false
+                                useHeadsetKeyboard = true
+                            }
+                        },
                         icon = WallIcons.Keyboard,
                         kind = ButtonKind.Plain,
                     )

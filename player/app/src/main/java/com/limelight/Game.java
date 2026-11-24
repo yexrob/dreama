@@ -143,16 +143,21 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     private NvApp app;
     private float desiredRefreshRate;
 
-    // depth3d VR streaming bar state (rendered on XrRenderer's transport layer)
+    // depth3d VR streaming bar state (rendered on XrRenderer's transport layer;
+    // xr_layers.c automatically displays it alongside the VR control bar and
+    // whenever setTransportVisible(true) is asserted for a network warning)
     private StreamControlBar streamControlBar;
     private final Handler streamBarHandler = new Handler(Looper.getMainLooper());
     private volatile int liveRttMs = 0;
     private volatile float livePacketLossPct = 0f;
     private volatile boolean livePoorConnection = false;
     private volatile boolean liveGamepadMode = false;
-    private long streamBarIntroUntilMs = 0L;
     private long streamBarWarnUntilMs = 0L;
-    private static final long STREAM_BAR_INTRO_MS = 4500L;
+    private boolean streamBarDrawnOnce = false;
+    private int streamBarLastRttMs = -1;
+    private int streamBarLastLossPctRounded = -1;
+    private boolean streamBarLastPoor = false;
+    private boolean streamBarLastGamepad = false;
     private static final long STREAM_BAR_WARN_LINGER_MS = 2500L;
     private static final long STREAM_BAR_TICK_MS = 500L;
     private final Runnable streamBarTick = this::tickStreamBar;
@@ -699,7 +704,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         }
 
         if (!decoderRenderer.isAvcSupported()) {
-            recordSessionErrorAndFinish(StreamErrorMapper.INSTANCE.forStageFailed("video"));
+            recordSessionErrorAndFinish(StreamErrorMapper.forStageFailed(this, "video"));
             return;
         }
 
@@ -1238,18 +1243,35 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         XrRenderer r = decoderRenderer != null ? decoderRenderer.getXrRenderer() : null;
         if (r != null) {
             long now = SystemClock.uptimeMillis();
-            boolean warn = StreamControlBar.shouldWarnNetwork(liveRttMs, livePacketLossPct, livePoorConnection);
+            int rtt = liveRttMs;
+            float loss = livePacketLossPct;
+            boolean poor = livePoorConnection;
+            boolean pad = liveGamepadMode;
+            boolean warn = StreamControlBar.shouldWarnNetwork(rtt, loss, poor);
             if (warn) {
                 streamBarWarnUntilMs = now + STREAM_BAR_WARN_LINGER_MS;
             }
-            boolean show = warn || now < streamBarIntroUntilMs || now < streamBarWarnUntilMs;
-            r.setTransportVisible(show);
-            if (show) {
+            // xr_layers.c shows the bar whenever view->barArea is true; asserting
+            // transportVisible forces it visible during network warnings as well.
+            boolean forceShow = warn || now < streamBarWarnUntilMs;
+            r.setTransportVisible(forceShow);
+
+            int roundedLoss = Math.round(loss);
+            boolean changed = !streamBarDrawnOnce
+                    || rtt != streamBarLastRttMs
+                    || roundedLoss != streamBarLastLossPctRounded
+                    || poor != streamBarLastPoor
+                    || pad != streamBarLastGamepad;
+            if (changed) {
                 if (streamControlBar == null) {
-                    streamControlBar = new StreamControlBar();
+                    streamControlBar = new StreamControlBar(this);
                 }
-                r.postTransport(streamControlBar.draw(
-                        pcName, liveRttMs, livePacketLossPct, livePoorConnection, liveGamepadMode));
+                r.postTransport(streamControlBar.draw(pcName, rtt, loss, poor, pad));
+                streamBarDrawnOnce = true;
+                streamBarLastRttMs = rtt;
+                streamBarLastLossPctRounded = roundedLoss;
+                streamBarLastPoor = poor;
+                streamBarLastGamepad = pad;
             }
         }
         streamBarHandler.postDelayed(streamBarTick, STREAM_BAR_TICK_MS);
@@ -2529,7 +2551,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                     displayedFailureDialog = true;
                     LimeLog.severe("depth3d: stream stage failed: " + stage + " (" + errorCode + ")");
                     stopConnection();
-                    recordSessionErrorAndFinish(StreamErrorMapper.INSTANCE.forStageFailed(stage));
+                    recordSessionErrorAndFinish(StreamErrorMapper.forStageFailed(Game.this, stage));
                 }
             }
         });
@@ -2554,7 +2576,8 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                     stopConnection();
 
                     if (errorCode != MoonBridge.ML_ERROR_GRACEFUL_TERMINATION) {
-                        recordSessionErrorAndFinish(StreamErrorMapper.INSTANCE.forConnectionTerminated(errorCode));
+                        recordSessionErrorAndFinish(
+                                StreamErrorMapper.forConnectionTerminated(Game.this, errorCode));
                     }
                     else {
                         finish();
@@ -2600,8 +2623,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 UiHelper.notifyStreamConnected(Game.this);
                 hideSystemUi(1000);
 
-                // Show depth3d streaming status pill briefly on connect, then automatically on poor network
-                streamBarIntroUntilMs = SystemClock.uptimeMillis() + STREAM_BAR_INTRO_MS;
+                // Publish initial depth3d streaming status bar texture so it shows immediately
+                // alongside the VR control bar and whenever network warnings trigger.
+                streamBarDrawnOnce = false;
                 tickStreamBar();
             }
         });
@@ -2958,7 +2982,6 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 handler.detachXrPad();
             }
             if (connected) {
-                streamBarIntroUntilMs = SystemClock.uptimeMillis() + 2500L;
                 tickStreamBar();
             }
         });
@@ -3036,7 +3059,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 relaunchedFlat = true;
                 FileLog.event("VR session unavailable: " + failure);
                 stopConnection();
-                recordSessionErrorAndFinish(StreamErrorMapper.INSTANCE.forVrUnavailable());
+                recordSessionErrorAndFinish(StreamErrorMapper.forVrUnavailable(Game.this));
             }
         });
     }

@@ -51,8 +51,8 @@ data class RawComputer(
             manualAddress?.let { it to manualPort },
         )
         return candidatePairs.any { (addr, port) ->
-            addr.equals(host.address, ignoreCase = true) &&
-                (port == host.gsPort || port <= 0 || host.gsPort == NvHTTP.DEFAULT_HTTP_PORT)
+            val effectivePort = if (port > 0) port else NvHTTP.DEFAULT_HTTP_PORT
+            addr.equals(host.address, ignoreCase = true) && effectivePort == host.gsPort
         }
     }
 

@@ -1,13 +1,14 @@
 package com.limelight.local.stream;
 
+import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
-import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.PorterDuff;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 
+import com.limelight.R;
 import com.limelight.binding.video.XrShared;
 
 import java.nio.ByteBuffer;
@@ -16,8 +17,10 @@ import java.nio.ByteOrder;
 /**
  * In-VR streaming status bar drawn onto XrRenderer's transport quad layer
  * (1536x112 RGBA, rows bottom-up). Follows design-opus/ux-spec.md §6.9:
- * shows "<PC name> · 串流中" cleanly on connect and lights up a red warning
- * pill (#EE8577) whenever latency > 60 ms, packet loss > 0%, or network is poor.
+ * always visible whenever the VR control bar is visible, showing
+ * "<PC name> · 串流中", optional gamepad-mode badge, and a red warning pill
+ * (#EE8577) whenever latency > 60 ms, packet loss >= 0.5%, or network is poor.
+ * All user-facing copy is loaded from Android XML resources.
  */
 public final class StreamControlBar {
     public static final int TEX_W = XrShared.TRANSPORT_WIDTH;
@@ -33,18 +36,20 @@ public final class StreamControlBar {
     private static final int ACCENT_AMBER = 0xFFE3A857;
     private static final int DANGER_RED = 0xFFEE8577;
     private static final int DANGER_BG = 0x38EE8577;
-    private static final int PILL_BG = 0x1FFFFFFF;
 
+    private final StringLookup strings;
     private final Bitmap bitmap = Bitmap.createBitmap(TEX_W, TEX_H, Bitmap.Config.ARGB_8888);
     private final Canvas canvas = new Canvas(bitmap);
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final ByteBuffer[] buffers = new ByteBuffer[2];
-    private int nextBuffer;
+    private final ByteBuffer scratch =
+            ByteBuffer.allocateDirect(TEX_W * TEX_H * 4).order(ByteOrder.nativeOrder());
 
-    public StreamControlBar() {
-        for (int i = 0; i < buffers.length; i++) {
-            buffers[i] = ByteBuffer.allocateDirect(TEX_W * TEX_H * 4).order(ByteOrder.nativeOrder());
-        }
+    public StreamControlBar(Context context) {
+        this(new AndroidStringLookup(context));
+    }
+
+    public StreamControlBar(StringLookup strings) {
+        this.strings = strings;
     }
 
     /** Returns whether the bar should show a network degradation warning. */
@@ -52,27 +57,33 @@ public final class StreamControlBar {
         return poorConnection || rttMs > LATENCY_WARN_MS || packetLossPct >= LOSS_WARN_PCT;
     }
 
-    /** Formats the red network warning copy, or null when network health is normal. */
-    public static String formatNetworkWarning(int rttMs, float packetLossPct, boolean poorConnection) {
+    /** Formats the red network warning copy from XML resources, or null when network health is normal. */
+    public static String formatNetworkWarning(
+            StringLookup strings,
+            int rttMs,
+            float packetLossPct,
+            boolean poorConnection
+    ) {
         if (!shouldWarnNetwork(rttMs, packetLossPct, poorConnection)) {
             return null;
         }
         int roundedLoss = Math.round(packetLossPct);
         if (rttMs > 0 && roundedLoss > 0) {
-            return "延迟 " + rttMs + " ms · 丢包 " + roundedLoss + "%";
+            return strings.get(R.string.vr_stream_net_warn, rttMs, roundedLoss);
         }
         if (rttMs > LATENCY_WARN_MS) {
-            return "网络延迟偏高 · " + rttMs + " ms";
+            return strings.get(R.string.vr_stream_net_warn_rtt, rttMs);
         }
         if (roundedLoss > 0) {
-            return "网络丢包 · " + roundedLoss + "%";
+            return strings.get(R.string.vr_stream_net_warn_loss, roundedLoss);
         }
-        return "当前网络较差，画面可能卡顿";
+        return strings.get(R.string.vr_stream_net_warn_poor);
     }
 
     /**
-     * Draws one frame of the streaming bar and returns a direct RGBA ByteBuffer ready for
-     * {@link com.limelight.binding.video.XrRenderer#postTransport(ByteBuffer)}.
+     * Draws one frame of the streaming bar into the reusable scratch RGBA ByteBuffer.
+     * Safe to pass directly to {@link com.limelight.binding.video.XrRenderer#postTransport(ByteBuffer)},
+     * which copies the pixels into its internal double-buffered staging queue before returning.
      */
     public ByteBuffer draw(
             String pcName,
@@ -87,7 +98,7 @@ public final class StreamControlBar {
         canvas.translate(0f, TEX_H);
         canvas.scale(1f, -1f);
 
-        String warn = formatNetworkWarning(rttMs, packetLossPct, poorConnection);
+        String warn = formatNetworkWarning(strings, rttMs, packetLossPct, poorConnection);
         boolean hasWarn = warn != null;
 
         // Main capsule background
@@ -109,10 +120,12 @@ public final class StreamControlBar {
         paint.setColor(hasWarn ? DANGER_RED : ACCENT_AMBER);
         canvas.drawCircle(58f, cy, 10f, paint);
 
-        // PC name + "串流中"
-        String host = (pcName != null && !pcName.trim().isEmpty()) ? pcName.trim() : "电脑";
+        // PC name + status
+        String host = (pcName != null && !pcName.trim().isEmpty())
+                ? pcName.trim()
+                : strings.get(R.string.vr_stream_default_pc);
         if (host.length() > 22) {
-            host = host.substring(0, 21) + "…";
+            host = host.substring(0, 21) + "\u2026";
         }
         paint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
         paint.setTextSize(34f);
@@ -126,13 +139,14 @@ public final class StreamControlBar {
         paint.setTextSize(28f);
         paint.setColor(TEXT_SECONDARY);
         float subBaseline = cy - (paint.ascent() + paint.descent()) * 0.5f;
-        canvas.drawText(" · 串流中", 86f + nameWidth + 4f, subBaseline, paint);
+        canvas.drawText(" \u00b7 " + strings.get(R.string.vr_stream_status_live),
+                86f + nameWidth + 4f, subBaseline, paint);
 
         // Right-aligned status / warning pills
         float rightEdge = TEX_W - 36f;
 
         if (gamepadMode) {
-            String padLabel = "手柄模式";
+            String padLabel = strings.get(R.string.vr_stream_gamepad_badge);
             paint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
             paint.setTextSize(26f);
             float padW = paint.measureText(padLabel) + 40f;
@@ -157,28 +171,14 @@ public final class StreamControlBar {
             paint.setTextAlign(Paint.Align.CENTER);
             canvas.drawText(warn, warnPill.centerX(),
                     warnPill.centerY() - (paint.ascent() + paint.descent()) * 0.5f, paint);
-        } else {
-            String hint = "下方操作栏：退出 · 键盘 · 手柄 · 调整";
-            paint.setTypeface(Typeface.DEFAULT);
-            paint.setTextSize(25f);
-            float hintW = paint.measureText(hint) + 38f;
-            RectF hintPill = new RectF(rightEdge - hintW, 24f, rightEdge, TEX_H - 24f);
-            paint.setColor(PILL_BG);
-            canvas.drawRoundRect(hintPill, hintPill.height() * 0.5f, hintPill.height() * 0.5f, paint);
-            paint.setColor(TEXT_SECONDARY);
-            paint.setTextAlign(Paint.Align.CENTER);
-            canvas.drawText(hint, hintPill.centerX(),
-                    hintPill.centerY() - (paint.ascent() + paint.descent()) * 0.5f, paint);
         }
 
         canvas.restore();
 
-        ByteBuffer out = buffers[nextBuffer];
-        nextBuffer = (nextBuffer + 1) % buffers.length;
-        out.rewind();
-        bitmap.copyPixelsToBuffer(out);
-        out.rewind();
-        return out;
+        scratch.rewind();
+        bitmap.copyPixelsToBuffer(scratch);
+        scratch.rewind();
+        return scratch;
     }
 
     public void release() {

@@ -244,6 +244,9 @@ float cogRowV(int tab, int row) {
     if (tab == COG_TAB_SCREEN) {
         return COG_SCREEN_ROW_V0 + row * COG_SCREEN_ROW_STEP;
     }
+    if (tab == COG_TAB_ABOUT) {
+        return COG_STREAM_ROW_V0 + row * COG_STREAM_ROW_STEP;
+    }
     return COG_ROW_V0 + row * COG_ROW_STEP;
 }
 
@@ -321,7 +324,7 @@ int cogTrackSteps(int tab, int row) {
                 : row == COG_ROW3D_CONVERGENCE ? 100 : 0;
     }
     if (tab == COG_TAB_ABOUT) {
-        // No rows at all, only the button
+        // Stream tab rows are discrete cells, not tracks
         return 0;
     }
     if (tab == COG_TAB_PICTURE) {
@@ -351,10 +354,6 @@ int cogReportButtonAt(float pu, float pv) {
     return pu >= COG_REPORT_L && pu <= COG_REPORT_R && pv >= COG_REPORT_T && pv <= COG_REPORT_B;
 }
 
-int cogKofiButtonAt(float pu, float pv) {
-    return pu >= COG_KOFI_L && pu <= COG_KOFI_R && pv >= COG_KOFI_T && pv <= COG_KOFI_B;
-}
-
 // The two fields across the sheet, one over the other, then the two buttons
 // side by side under them. Everything else on it is words.
 int reportZone(float u, float v) {
@@ -377,12 +376,6 @@ int reportZone(float u, float v) {
         return REPORT_ZONE_EMAIL;
     }
     return REPORT_ZONE_NONE;
-}
-
-// The one button, bottom right. The code and the words are nothing.
-int kofiSheetZone(float u, float v) {
-    return u >= KOFI_CLOSE_L && u <= KOFI_CLOSE_R && v >= KOFI_BTN_T && v <= KOFI_BTN_B
-            ? KOFI_ZONE_CLOSE : KOFI_ZONE_NONE;
 }
 
 // The two buttons side by side along the bottom. The words over them are

@@ -28,6 +28,8 @@ class WallActivity : ComponentActivity(), WallActions {
     private val model: WallModel by viewModels()
     private val pendingTab = MutableStateFlow<Tab?>(null)
 
+    // The storage prompt can be asked for from the wall, and Android stops
+    // showing it once refused twice; then the wall's button opens app info
     private var askedByUser = false
     private val storage = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) {
@@ -45,6 +47,8 @@ class WallActivity : ComponentActivity(), WallActions {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // adb can still hand over a server, as with the old Google Drive page:
+        //   am start -n …/com.limelight.local.wall.WallActivity --es base http://… --es pass …
         intent.getStringExtra("base")?.let {
             WebDav.save(
                 this,
@@ -56,7 +60,10 @@ class WallActivity : ComponentActivity(), WallActions {
             storage.launch(LocalVideoSource.permission)
         }
         setContent { WallApp(model, this, pendingTab) }
+        // The AirPlay receiver runs while the wall is open
         AirPlayService.start(this)
+        // The mockups assume a 1280 wide panel at about 24 px per degree;
+        // what the headset really gives is worth knowing (ux-spec §8 #1)
         window.decorView.post {
             val v = window.decorView
             LimeLog.info(
@@ -72,6 +79,8 @@ class WallActivity : ComponentActivity(), WallActions {
         applyInitialTab(intent)
     }
 
+    // The DLNA cast receiver runs while the wall is in front (and the player
+    // holds it while a film plays), never once the app is closed
     override fun onStart() {
         super.onStart()
         CastReceiver.hold(this)
@@ -93,6 +102,8 @@ class WallActivity : ComponentActivity(), WallActions {
 
     override fun onRestart() {
         super.onRestart()
+        // Back from the player, streaming session or system settings: files may have
+        // been added and a server may have come up
         model.refreshAll()
     }
 
@@ -106,6 +117,8 @@ class WallActivity : ComponentActivity(), WallActions {
         pendingTab.value = null
     }
 
+    // Whether the controller ray reaches Compose as hover at all is the one
+    // thing the hover design rests on (ux-spec §8 #9), so the first of each is logged
     override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
         if (!loggedHover && ev.actionMasked == MotionEvent.ACTION_HOVER_MOVE) {
             loggedHover = true
@@ -130,6 +143,7 @@ class WallActivity : ComponentActivity(), WallActions {
             .putExtra(LocalPlayerXR.EXTRA_START_MS, info.startPositionMs)
             .putExtra(LocalPlayerXR.EXTRA_SOURCE_ID, sourceId)
             .putExtra(LocalPlayerXR.EXTRA_ITEM_ID, itemId)
+        // The player takes one header, which is all WebDAV needs
         info.headers["Authorization"]?.let { play.putExtra(LocalPlayerXR.EXTRA_AUTH, it) }
         startActivity(play)
     }

@@ -820,7 +820,6 @@ static void destroyCtx(JNIEnv* env, XrCtx* ctx) {
     destroyArtSwapchain(ctx, &ctx->reportSwapchain, &ctx->reportImages);
     destroyArtSwapchain(ctx, &ctx->buttonSwapchain, &ctx->buttonImages);
     destroyArtSwapchain(ctx, &ctx->hintSwapchain, &ctx->hintImages);
-    destroyArtSwapchain(ctx, &ctx->kofiSwapchain, &ctx->kofiImages);
     destroyArtSwapchain(ctx, &ctx->outlineSwapchain, &ctx->outlineImages);
     destroyArtSwapchain(ctx, &ctx->glowSwapchain, &ctx->glowImages);
     destroyArtSwapchain(ctx, &ctx->roomSwapchain, &ctx->roomImages);
@@ -961,6 +960,9 @@ Java_com_limelight_binding_video_XrRenderer_nativeInit(JNIEnv* env, jobject thiz
     ctx->cogDragHand = -1;
     ctx->cogDragFace = -1;
     ctx->cogHoverSlider = -1;
+    ctx->streamResCell = -1;
+    ctx->streamBitrateCell = -1;
+    ctx->streamMouseCell = 0;
     // Nothing the splash waits on is ready yet, and no map has been made
     ctx->fadeNs = FADE_NS;
     for (int i = 0; i < 3; i++) {

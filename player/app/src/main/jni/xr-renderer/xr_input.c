@@ -1169,9 +1169,6 @@ static Vec3 furniturePoint(XrCtx* ctx, int hover, float u, float v, XrPosef scre
     if (hover == HOVER_HINT) {
         return screenPoint(u, v, ctx->hintPose, ctx->hintW, ctx->hintH, 0.0f, 0);
     }
-    if (hover == HOVER_KOFI) {
-        return screenPoint(u, v, ctx->kofiPose, ctx->kofiW, ctx->kofiH, 0.0f, 0);
-    }
     return screenPoint(u, v, screenPose, ctx->screenWidth, height, radius, curved);
 }
 
@@ -1982,10 +1979,9 @@ static void updatePointerWake(XrCtx* ctx, InputFrame* f) {
         ctx->stillFor = 0.0f;
     }
 
-    // The hand lock hint and the Ko-fi sheet wait on a press, so the pointer
-    // stays up under them. Retiring there would cost the press that puts one
-    // away as a waking pinch.
-    if (ctx->hintOpen || ctx->kofiOpen) {
+    // The hand lock hint waits on a press, so the pointer stays up under it.
+    // Retiring there would cost the press that puts it away as a waking pinch.
+    if (ctx->hintOpen) {
         ctx->pointerAwake = 1;
         ctx->stillFor = 0.0f;
     }
@@ -2064,7 +2060,6 @@ static void clearHotState(XrCtx* ctx) {
     ctx->padButtonHot = 0;
     ctx->reportHoverZone = REPORT_ZONE_NONE;
     ctx->cogReportHot = 0;
-    ctx->cogKofiHot = 0;
 }
 
 // The picker is modal: while it is open the ray belongs to it and nothing
@@ -2132,24 +2127,6 @@ static void updatePicker(XrCtx* ctx, InputFrame* f) {
     }
 }
 
-// Puts the settings panel away for the report sheet, with the keyboard up
-// under it on its letters and nothing held. The sheet shows once Java has
-// drawn it for this opening, which the event says to do.
-static __attribute__((unused)) void openReport(XrCtx* ctx, InputFrame* f) {
-    ctx->cogOpen = 0;
-    ctx->reportOpen = 1;
-    ctx->reportReady = 0;
-    ctx->reportSendReady = 0;
-    ctx->reportHoverZone = REPORT_ZONE_NONE;
-    ctx->reportPose = reportSheetPose(ctx, &ctx->reportW, &ctx->reportH);
-    ctx->kbOpen = 1;
-    ctx->kbState = KB_STATE_LOWER;
-    ctx->kbMods = 0;
-    ctx->kbPose = kbPanelPose(ctx, &ctx->kbW, &ctx->kbH);
-    f->out[IN_REPORT] = (float)REPORT_OPENED;
-    LOGEV("report sheet open");
-}
-
 // A press on a key: the sheet it leaves showing and what it types, one key a
 // frame, which is as fast as anyone presses them. Into the report sheet
 // nothing is held, since nothing there would act on Ctrl, Alt or Win and the
@@ -2201,21 +2178,6 @@ static void pressReport(XrCtx* ctx, InputFrame* f, int zone) {
     ctx->reportOpen = 0;
     ctx->kbOpen = 0;
     LOGEV("report sheet %s", zone == REPORT_ZONE_SEND ? "sent" : "cancelled");
-}
-
-// Puts the settings panel away for the Ko-fi sheet. Its art is drawn at the
-// start of the session; until it has arrived the button does nothing, since a
-// modal nobody can see would eat every press.
-static __attribute__((unused)) void openKofi(XrCtx* ctx) {
-    if (!ctx->kofiReady) {
-        LOGI("Ko-fi pressed on the About tab before its sheet's art arrived");
-        return;
-    }
-    ctx->cogOpen = 0;
-    ctx->kofiOpen = 1;
-    ctx->kofiHoverZone = KOFI_ZONE_NONE;
-    ctx->kofiPose = kofiSheetPose(ctx, &ctx->kofiW, &ctx->kofiH);
-    LOGEV("Ko-fi sheet open from the About tab");
 }
 
 // A press on a slider. The eyes only choose the row, so a gaze press hands the
@@ -2379,11 +2341,10 @@ static void updateCogPanel(XrCtx* ctx, InputFrame* f) {
             break;
         }
 
-        // depth3d: tab 4 displays streaming session details (or app info in local playback)
-        // without upstream Ko-fi or external bug report triggers.
+        // depth3d: tab 4 carries stream quick-menu cell rows (handled above when
+        // !localMedia) and no reset or external report buttons.
         if (face == COG_TAB_ABOUT) {
             ctx->cogReportHot = 0;
-            ctx->cogKofiHot = 0;
             break;
         }
 
@@ -2641,59 +2602,6 @@ static void updateHandHint(XrCtx* ctx, InputFrame* f) {
     }
 }
 
-// Modal like the hint, against the pose frozen when it opened. It is there to
-// be read and scanned, so any press or pinch puts it away, on its Close
-// button, anywhere else on or off it, or on the cog button that stays up
-// beside it, and reaches nothing behind.
-static void updateKofiSheet(XrCtx* ctx, InputFrame* f) {
-    f->hover = HOVER_KOFI;
-    f->hand = -1;
-    int zone = KOFI_ZONE_NONE;
-    for (int h = 0; h < SRC_COUNT; h++) {
-        float pu, pv;
-        if (!canPoint(ctx, f, h)) {
-            continue;
-        }
-        if (!screenProject(f->aimPoses[h], ctx->kofiPose, ctx->kofiW, ctx->kofiH,
-                           0.0f, 0, &pu, &pv)) {
-            continue;
-        }
-        if (pu < 0.0f || pu > 1.0f || pv < 0.0f || pv > 1.0f) {
-            continue;
-        }
-        f->hand = h;
-        f->hitU[h] = pu;
-        f->hitV[h] = pv;
-        zone = kofiSheetZone(pu, pv);
-        break;
-    }
-    ctx->kofiHoverZone = zone;
-
-    int pressed = -1;
-    for (int h = 0; h < SRC_COUNT && pressed < 0; h++) {
-        if (ctx->triggerEdge[h]) {
-            pressed = h;
-        }
-    }
-    if (pressed < 0) {
-        return;
-    }
-    int onClose = pressed == f->hand && zone == KOFI_ZONE_CLOSE;
-    if (onClose) {
-        ctx->clickPending = 1;
-    }
-    ctx->kofiOpen = 0;
-    ctx->kofiHoverZone = KOFI_ZONE_NONE;
-    int byHand = pressed == SRC_GAZE
-            || (pressed < HAND_COUNT && ctx->profileKind[pressed] != PROFILE_CONTROLLER);
-    LOGEV("Ko-fi sheet put away by %s", onClose ? "Close" : byHand ? "a pinch" : "a press");
-    for (int h = 0; h < SRC_COUNT; h++) {
-        if (ctx->triggerEdge[h]) {
-            swallowTrigger(ctx, h);
-        }
-    }
-}
-
 // Lights whichever piece of furniture the ray is on, and acts on a press there.
 // A press on any of them, a key included, ticks.
 static void updateFurniture(XrCtx* ctx, InputFrame* f) {
@@ -2801,7 +2709,7 @@ static void updateFurniture(XrCtx* ctx, InputFrame* f) {
 // dismiss it while the first is still on the screen.
 static void dismissKeyboard(XrCtx* ctx, InputFrame* f) {
     if (ctx->kbOpen && !ctx->pickerOpen && !ctx->cogOpen && !ctx->exitConfirmOpen
-            && !ctx->reportOpen && !ctx->hintOpen && !ctx->kofiOpen) {
+            && !ctx->reportOpen && !ctx->hintOpen) {
         for (int h = 0; h < SRC_COUNT; h++) {
             if (!canPoint(ctx, f, h) || !ctx->triggerEdge[h]) {
                 continue;
@@ -3393,7 +3301,6 @@ static void padPutPanelsAway(XrCtx* ctx, float* out) {
     ctx->exitConfirmOpen = 0;
     ctx->reportOpen = 0;
     ctx->hintOpen = 0;
-    ctx->kofiOpen = 0;
     ctx->buttonsDown = 0;
 }
 
@@ -3647,9 +3554,6 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
     else if (ctx->hintOpen) {
         updateHandHint(ctx, &f);
     }
-    else if (ctx->kofiOpen) {
-        updateKofiSheet(ctx, &f);
-    }
     else {
         updateFurniture(ctx, &f);
     }
@@ -3719,7 +3623,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
             || f.hover == HOVER_KBPANEL || f.hover == HOVER_EXITBUTTON
             || f.hover == HOVER_EXITPROMPT || f.hover == HOVER_STEREOBUTTON
             || f.hover == HOVER_RAYBUTTON || f.hover == HOVER_AIMBUTTON
-            || f.hover == HOVER_PADBUTTON || f.hover == HOVER_REPORT || f.hover == HOVER_KOFI)
+            || f.hover == HOVER_PADBUTTON || f.hover == HOVER_REPORT)
             && f.headValid && f.hand >= 0) {
         beamToFurniture(ctx, &f);
     }

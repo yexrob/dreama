@@ -144,36 +144,48 @@ private fun HeroBlock(hero: Hero, resumes: List<Resume>, nav: WallNav) {
                 .background(Brush.verticalGradient(listOf(Wall.Bg.copy(alpha = 0.62f), Color.Transparent))))
         }
         Column(Modifier.offset(64.dp, 128.dp).width(640.dp)) {
-            Text(if (r != null) "上次看到 · 来自 ${hero.source.source.name}" else "最近添加 · 来自 ${hero.source.source.name}",
-                style = WallType.Caption, color = Wall.Text2)
+            Text(
+                if (r != null) stringResource(R.string.home_hero_resume_from, hero.source.source.name)
+                else stringResource(R.string.home_hero_recent_from, hero.source.source.name),
+                style = WallType.Caption,
+                color = Wall.Text2,
+            )
             Text(hero.item.title, style = WallType.Display, maxLines = 2, overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(top = 6.dp))
-            val meta = listOfNotNull(hero.item.subtitle?.takeIf { it.isNotEmpty() },
-                r?.let { "剩余 ${minutesLeft(it.progress.remainingMs)} 分钟" }
-                    ?: hero.item.durationMs?.let(::duration))
+            val meta = listOfNotNull(
+                hero.item.subtitle?.takeIf { it.isNotEmpty() },
+                r?.let { stringResource(R.string.home_hero_remaining_min, minutesLeft(it.progress.remainingMs)) }
+                    ?: hero.item.durationMs?.let { formatDuration(it) },
+            )
             if (meta.isNotEmpty()) {
                 Text(meta.joinToString(" · "), style = WallType.Caption, color = Wall.Text2, maxLines = 1,
                     overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 12.dp))
             }
             Row(Modifier.padding(top = 28.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                WallButton(if (r != null) "继续播放" else "播放", {
-                    nav.play(hero.source, hero.item, r?.progress?.positionMs ?: 0)
-                }, icon = WallIcons.Play, kind = ButtonKind.Primary)
-                WallButton("详情", { nav.detail(hero.source, hero.item) })
+                WallButton(
+                    stringResource(if (r != null) R.string.home_action_resume else R.string.home_action_play),
+                    { nav.play(hero.source, hero.item, r?.progress?.positionMs ?: 0) },
+                    icon = WallIcons.Play,
+                    kind = ButtonKind.Primary,
+                )
+                WallButton(stringResource(R.string.home_action_detail), { nav.detail(hero.source, hero.item) })
             }
         }
         if (resumes.isNotEmpty()) {
-            SectionTitle("继续观看", Modifier.offset(64.dp, 424.dp))
+            SectionTitle(stringResource(R.string.home_section_continue), Modifier.offset(64.dp, 424.dp))
             val row = rememberLazyListState()
             LazyRow(Modifier.offset(y = 482.dp).fillMaxWidth(), state = row,
                 flingBehavior = rememberSnapFlingBehavior(row),
                 contentPadding = PaddingValues(horizontal = Wall.Margin),
                 horizontalArrangement = Arrangement.spacedBy(24.dp)) {
                 items(resumes, key = { "${it.source.source.id}/${it.item.id}" }) { c ->
-                    ContinueCard(c.item.title, "剩 ${minutesLeft(c.progress.remainingMs)} 分钟",
+                    ContinueCard(
+                        c.item.title,
+                        stringResource(R.string.home_continue_left_min, minutesLeft(c.progress.remainingMs)),
                         c.item.backdrop ?: c.item.poster,
                         c.progress.positionMs.toFloat() / c.progress.durationMs,
-                        { nav.play(c.source, c.item, c.progress.positionMs) })
+                        { nav.play(c.source, c.item, c.progress.positionMs) },
+                    )
                 }
             }
         }
@@ -197,7 +209,9 @@ private fun ShelfRow(src: MediaSource, shelf: Shelf, nav: WallNav) {
             horizontalArrangement = Arrangement.spacedBy(24.dp)) {
             items(shelf.items, key = { it.id }) { item ->
                 if (item.isFolder) {
-                    FolderTile(item.title, item.childCount?.let { "$it 个" } ?: "文件夹", item.previews,
+                    val caption = item.childCount?.let { stringResource(R.string.home_folder_count, it) }
+                        ?: stringResource(R.string.home_folder_label)
+                    FolderTile(item.title, caption, item.previews,
                         { nav.item(src, item) }, Modifier.size(168.dp, 252.dp))
                 } else {
                     Poster(item.title, item.poster, { nav.item(src, item) })
@@ -214,12 +228,15 @@ private fun FailedRow(src: MediaSource, error: Throwable, model: WallModel, nav:
         horizontalArrangement = Arrangement.spacedBy(20.dp)) {
         SectionTitle(src.source.name)
         if (setup) {
-            Notice(error.message ?: "需要设置", danger = false)
-            WallButton("允许访问", { if (src.source.id == LocalVideoSource.ID) nav.storage() else nav.editWebDav() },
-                small = true)
+            Notice(error.message ?: stringResource(R.string.home_source_needs_setup), danger = false)
+            WallButton(
+                stringResource(R.string.home_source_allow_access),
+                { if (src.source.id == LocalVideoSource.ID) nav.storage() else nav.editWebDav() },
+                small = true,
+            )
         } else {
-            Notice("连不上 ${src.source.name}")
-            WallButton("重试", { model.refresh(src.source.id) }, icon = WallIcons.Refresh, small = true)
+            Notice(stringResource(R.string.home_source_unreachable, src.source.name))
+            WallButton(stringResource(R.string.action_retry), { model.refresh(src.source.id) }, icon = WallIcons.Refresh, small = true)
         }
     }
 }
@@ -258,16 +275,26 @@ private fun EmptyState(model: WallModel, nav: WallNav) {
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxWidth().padding(horizontal = Wall.Margin).offset(y = 148.dp),
             horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("还没有可以看的片子", style = WallType.Title, textAlign = TextAlign.Center)
-            Text("添加一个播放源、拷进视频，或者直接投屏与连接电脑。", style = WallType.Body, color = Wall.Text2,
+            Text(stringResource(R.string.home_empty_title), style = WallType.Title, textAlign = TextAlign.Center)
+            Text(stringResource(R.string.home_empty_body), style = WallType.Body, color = Wall.Text2,
                 textAlign = TextAlign.Center, modifier = Modifier.padding(top = 12.dp))
         }
         Row(Modifier.offset(88.dp, 318.dp), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-            OptionTile("局域网网盘",
-                found?.let { "找到 ${it.substringAfter("://")}（WebDAV）" } ?: "WebDAV，比如电脑上的共享目录",
-                WallIcons.Server, { nav.editWebDav(found) }, Modifier.size(352.dp, 216.dp))
-            OptionTile("头显里的视频", if (storage) "拷进头显的视频会出现在这里" else "需要允许访问存储",
-                WallIcons.Headset, { if (!storage) nav.storage() }, Modifier.size(352.dp, 216.dp))
+            OptionTile(
+                stringResource(R.string.home_empty_webdav_title),
+                found?.let { stringResource(R.string.home_empty_webdav_found, it.substringAfter("://")) }
+                    ?: stringResource(R.string.home_empty_webdav_sub),
+                WallIcons.Server,
+                { nav.editWebDav(found) },
+                Modifier.size(352.dp, 216.dp),
+            )
+            OptionTile(
+                stringResource(R.string.home_empty_local_title),
+                stringResource(if (storage) R.string.home_empty_local_ready else R.string.home_empty_local_perm),
+                WallIcons.Headset,
+                { if (!storage) nav.storage() },
+                Modifier.size(352.dp, 216.dp),
+            )
             OptionTile(
                 stringResource(R.string.home_empty_cast_title),
                 stringResource(R.string.home_empty_cast_sub),

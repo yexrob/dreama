@@ -19,6 +19,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import com.limelight.R
 import com.limelight.local.media.Item
 import com.limelight.local.media.MediaSource
 import com.limelight.local.media.PlaybackInfo
@@ -150,7 +152,7 @@ fun WallApp(model: WallModel, actions: WallActions, pendingTab: StateFlow<Tab?>)
                     val info = source.playback(item.id).copy(startPositionMs = startMs)
                     actions.launchPlayer(info, source.source.id, item.id)
                 } catch (e: Exception) {
-                    actions.toast("无法播放当前视频，请稍后再试。")
+                    actions.toast(actions.hostActivity.getString(R.string.wall_play_failed))
                 }
             }
         }
@@ -196,8 +198,13 @@ fun WallApp(model: WallModel, actions: WallActions, pendingTab: StateFlow<Tab?>)
 /** "剩 65 分钟": the time left, in whole minutes, rounded up so it never says 0. */
 fun minutesLeft(ms: Long): Int = ((ms + 59_999) / 60_000).toInt().coerceAtLeast(1)
 
-/** "1 小时 52 分" or "48 分钟". */
-fun duration(ms: Long): String {
+/** Resource-backed formatted duration for Compose screens. */
+@Composable
+fun formatDuration(ms: Long): String {
     val m = (ms / 60_000).toInt()
-    return if (m >= 60) "${m / 60} 小时 ${m % 60} 分" else "${m.coerceAtLeast(1)} 分钟"
+    return if (m >= 60) {
+        stringResource(R.string.duration_hours_minutes, m / 60, m % 60)
+    } else {
+        stringResource(R.string.duration_minutes, m.coerceAtLeast(1))
+    }
 }

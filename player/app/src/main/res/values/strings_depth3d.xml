@@ -15,7 +15,49 @@
     <string name="action_save">保存</string>
     <string name="action_add">添加</string>
     <string name="action_remove">移除</string>
+    <string name="action_ignore">忽略</string>
+    <string name="action_got_it">知道了</string>
     <string name="action_open_wifi">打开 Wi-Fi 设置</string>
+    <string name="action_search_again">重新搜索</string>
+
+    <!-- Home & Library shared strings -->
+    <string name="home_hero_resume_from">上次看到 · 来自 %1$s</string>
+    <string name="home_hero_recent_from">最近添加 · 来自 %1$s</string>
+    <string name="home_hero_remaining_min">剩余 %1$d 分钟</string>
+    <string name="home_action_resume">继续播放</string>
+    <string name="home_action_play">播放</string>
+    <string name="home_action_detail">详情</string>
+    <string name="home_section_continue">继续观看</string>
+    <string name="home_continue_left_min">剩 %1$d 分钟</string>
+    <string name="home_folder_count">%1$d 个</string>
+    <string name="home_folder_label">文件夹</string>
+    <string name="home_source_needs_setup">需要设置</string>
+    <string name="home_source_allow_access">允许访问</string>
+    <string name="home_source_unreachable">连不上 %1$s</string>
+    <string name="home_empty_title">还没有可以看的片子</string>
+    <string name="home_empty_body">添加一个播放源、拷进视频，或者直接投屏与连接电脑。</string>
+    <string name="home_empty_webdav_title">局域网网盘</string>
+    <string name="home_empty_webdav_found">找到 %1$s（WebDAV）</string>
+    <string name="home_empty_webdav_sub">WebDAV，比如电脑上的共享目录</string>
+    <string name="home_empty_local_title">头显里的视频</string>
+    <string name="home_empty_local_ready">拷进头显的视频会出现在这里</string>
+    <string name="home_empty_local_perm">需要允许访问存储</string>
+    <string name="home_empty_cast_title">投屏与串流</string>
+    <string name="home_empty_cast_sub">iPad、手机投屏，或连接电脑桌面</string>
+    <string name="wall_play_failed">无法播放当前视频，请稍后再试。</string>
+    <string name="duration_hours_minutes">%1$d 小时 %2$d 分</string>
+    <string name="duration_minutes">%1$d 分钟</string>
+
+    <!-- WebDAV sheet -->
+    <string name="webdav_found_mac_title">找到 Mac 了，填一下密码</string>
+    <string name="webdav_default_title">WebDAV 服务器</string>
+    <string name="webdav_setup_hint">在电脑上开启 depth3d Host 媒体共享，或填写局域网 WebDAV 地址与密码。</string>
+    <string name="webdav_field_address">地址</string>
+    <string name="webdav_field_user">用户名</string>
+    <string name="webdav_field_pass">密码</string>
+    <string name="webdav_connecting">正在连接…</string>
+    <string name="webdav_connect">连接</string>
+    <string name="webdav_connect_failed">连不上这个地址，请检查网络、地址和密码是否正确。</string>
 
     <!-- Cast page (AirPlay + DLNA + PC streaming) -->
     <string name="cast_subtitle">在同一个 Wi-Fi 里，从 iPad、iPhone 或手机 App 选择这个名字。</string>
@@ -29,12 +71,35 @@
     <string name="cast_no_wifi_body">投屏和电脑串流需要头显与手机、电脑在同一个 Wi-Fi 里。</string>
     <string name="cast_connecting_body">画面一出来就会自动进入 3D 播放。</string>
 
+    <!-- AirPlay receiver service notifications & status -->
+    <string name="airplay_err_missing_native">投屏组件没有装好</string>
+    <string name="airplay_err_decoder">画面解码没有准备好</string>
+    <string name="airplay_err_start_failed">投屏服务启动失败，请重试</string>
+    <string name="airplay_err_restart_failed">重新开启投屏接收失败，请重试</string>
+    <string name="airplay_err_announce_failed">没能在当前 Wi-Fi 里广播设备名称，请检查网络</string>
+    <string name="airplay_notif_channel">投屏接收</string>
+    <string name="airplay_notif_showing_prefix">正在显示</string>
+    <string name="airplay_notif_showing_suffix">的屏幕</string>
+    <string name="airplay_notif_tap_return">点这里回到 3D 画面</string>
+    <string name="airplay_notif_ready_title">可以接收投屏</string>
+    <string name="airplay_notif_ready_body">在 iPad 或 iPhone 的「屏幕镜像」里选「%1$s」</string>
+
+    <!-- Player XR notices -->
+    <string name="player_vr_unavailable">无法进入沉浸式 3D 画面，请重试</string>
+    <string name="player_opening_cast">正在打开投屏…</string>
+    <string name="player_opening">正在打开…</string>
+    <string name="player_buffering_webdav">正在从网盘缓冲…</string>
+    <string name="player_buffering">缓冲中…</string>
+    <string name="player_cast_error">投屏的视频放不了</string>
+    <string name="player_play_error">播放出错</string>
+
     <!-- PC streaming section -->
     <string name="stream_section_title">电脑串流</string>
     <string name="stream_section_subtitle">整个桌面，也能玩游戏</string>
     <string name="stream_home_section_title">电脑</string>
     <string name="stream_discovering">正在搜索同一 Wi-Fi 里的电脑…</string>
-    <string name="stream_empty_hint">同一 Wi-Fi 里还没有发现电脑，请确认电脑已打开串流服务，或手动添加。</string>
+    <string name="stream_empty_title">还没发现可连接的电脑</string>
+    <string name="stream_empty_guide">在 Mac 上安装并打开 depth3d Host，并确保与头显连在同一个 Wi-Fi；也可以手动扫码添加电脑地址。</string>
     <string name="stream_add_pc_title">添加电脑</string>
     <string name="stream_add_pc_sub">同一 Wi-Fi 自动发现，也可扫码输入地址</string>
     <string name="stream_status_paired">已配对 · 点一下连接</string>
@@ -45,6 +110,14 @@
     <string name="stream_status_discovering">正在刷新状态…</string>
     <string name="stream_status_not_ready">暂未就绪 · %1$s</string>
     <string name="stream_more_actions">更多</string>
+
+    <!-- Decoder crash recovery prompt -->
+    <string name="stream_crash_title">上次串流异常退出</string>
+    <string name="stream_crash_body">可能是当前分辨率、帧率或编码设置与头显解码器不兼容，可以恢复默认串流设置后再试。</string>
+    <string name="stream_crash_reset_btn">恢复默认串流设置</string>
+    <string name="stream_crash_auto_reset_title">已自动恢复默认串流设置</string>
+    <string name="stream_crash_auto_reset_body">上次串流连续多次异常退出，已自动将分辨率、帧率、码率和编码恢复为默认配置。</string>
+    <string name="stream_crash_reset_done">已恢复默认串流设置</string>
 
     <!-- PC action sheet -->
     <string name="pc_action_connect">连接桌面</string>
@@ -60,40 +133,159 @@
 
     <!-- Pairing & Connecting screens -->
     <string name="pair_auto_title">正在请求配对「%1$s」</string>
+    <string name="pair_auto_wait_allow">请在电脑上点「允许」</string>
+    <string name="pair_auto_completing">电脑已允许，正在完成配对…</string>
     <string name="pair_pin_title">在「%1$s」上输入这 4 个数字</string>
     <string name="pair_pin_waiting">正在等待电脑确认…</string>
     <string name="pair_fallback_manual">改用 4 位配对码</string>
     <string name="pair_cert_title">「%1$s」的安全证书变了</string>
-    <string name="pair_cert_body">如果电脑刚重装过系统或更新了服务，点「信任并继续」；否则请取消。</string>
-    <string name="pair_cert_fingerprint">新证书指纹：%1$s</string>
+    <string name="pair_cert_body">如果电脑刚重装过系统或更新了服务，请核对下方完整指纹后点「信任并继续」；否则请取消。</string>
+    <string name="pair_cert_old_label">原证书指纹</string>
+    <string name="pair_cert_new_label">新证书指纹</string>
     <string name="pair_cert_trust">信任并继续</string>
     <string name="stream_connecting_title">正在连接「%1$s」…</string>
     <string name="stream_connecting_app_title">正在打开「%1$s」…</string>
+    <string name="stream_stage_check_host">正在检查电脑状态…</string>
+    <string name="stream_stage_fetch_desktop">正在获取桌面信息…</string>
+    <string name="stream_stage_enter_vr">正在进入 3D 画面…</string>
+    <string name="stream_stage_open_desktop">正在打开电脑桌面…</string>
+    <string name="stream_stage_handshake">正在和电脑握手…</string>
+    <string name="stream_stage_control">正在建立控制通道…</string>
+    <string name="stream_stage_video">正在建立画面传输…</string>
+    <string name="stream_stage_audio">正在建立音频传输…</string>
+    <string name="stream_stage_input">正在准备手柄和指针…</string>
+    <string name="stream_stage_default">正在连接电脑…</string>
 
-    <!-- Phone QR input sheet -->
+    <!-- Controller action notices -->
+    <string name="stream_notice_paired">已和「%1$s」配对，点一下即可连接</string>
+    <string name="stream_notice_quit_ok">已结束「%1$s」上正在运行的应用</string>
+    <string name="stream_notice_quit_fail">没能结束正在运行的应用，请在电脑上关闭</string>
+    <string name="stream_notice_wake_sent">已向「%1$s」发送唤醒请求，请稍等几秒</string>
+    <string name="stream_notice_removed">已移除「%1$s」</string>
+    <string name="stream_action_pair">配对</string>
+    <string name="stream_action_connect">连接</string>
+    <string name="stream_action_fetch_apps">获取应用列表</string>
+    <string name="stream_action_quit_app">结束应用</string>
+    <string name="stream_action_add_pc">添加电脑</string>
+
+    <!-- Stream error copy (what happened + next step) -->
+    <string name="err_service_starting_title">串流服务正在准备中</string>
+    <string name="err_service_starting_detail">请稍等一两秒后再点重试。</string>
+    <string name="err_pc_offline_title">「%1$s」当前离线</string>
+    <string name="err_pc_offline_detail">请先唤醒或打开电脑，再点重试。</string>
+    <string name="err_pc_unreachable_named_title">连不上「%1$s」</string>
+    <string name="err_pc_unreachable_named_detail">请确认电脑在线并且和头显在同一个 Wi-Fi。</string>
+    <string name="err_pair_pin_wrong_title">配对码不对</string>
+    <string name="err_pair_pin_wrong_detail">电脑上输入的数字和头显不一致，点重试重新生成配对码。</string>
+    <string name="err_pair_in_progress_title">电脑正在处理其他配对</string>
+    <string name="err_pair_in_progress_detail">请先在电脑上完成或取消当前的配对弹窗，再试一次。</string>
+    <string name="err_pair_running_game_title">电脑正在运行串流会话</string>
+    <string name="err_pair_running_game_detail">请先在电脑上结束正在运行的应用，再重新配对。</string>
+    <string name="err_pair_failed_title">配对没有完成</string>
+    <string name="err_pair_failed_detail">请确认电脑上的串流服务已经打开，再点重试。</string>
+    <string name="err_pair_generic_detail">请检查电脑和头显是否连在同一个 Wi-Fi，再试一次。</string>
+    <string name="err_autopair_rejected_title">电脑拒绝了这次配对</string>
+    <string name="err_autopair_rejected_detail">如果想连接这台电脑，请在电脑弹出提示时点「允许」。</string>
+    <string name="err_autopair_timeout_title">等待电脑确认超时</string>
+    <string name="err_autopair_timeout_detail">请留意电脑屏幕上的连接提示，点重试再发一次请求。</string>
+    <string name="err_host_upgrade_title">请更新电脑上的 depth3d Host</string>
+    <string name="err_host_upgrade_detail">电脑端版本和当前头显不兼容，更新电脑端后再试。</string>
+    <string name="err_host_service_down_title">电脑上的串流服务没有运行</string>
+    <string name="err_host_service_down_detail">请在电脑上打开 depth3d Host 并确认串流服务已就绪，再点重试。</string>
+    <string name="err_host_id_mismatch_title">电脑身份信息不一致</string>
+    <string name="err_host_id_mismatch_detail">发现的电脑标识和回应不匹配，已出于安全原因取消连接，请确认局域网设备后重试。</string>
+    <string name="err_cert_changed_title">电脑的安全证书变了</string>
+    <string name="err_cert_changed_detail">如果电脑刚重装过系统或服务，点「信任并继续」；否则请取消。</string>
+    <string name="err_autopair_failed_title">没有连上电脑的快速配对服务</string>
+    <string name="err_autopair_failed_detail">可以点重试，或者改用 4 位配对码手动配对。</string>
+    <string name="err_host_not_ready_title">电脑还没准备好串流</string>
+    <string name="err_host_not_ready_detail">请先在电脑上完成串流权限设置，再点重试。</string>
+    <string name="err_stage_video_title">画面解码没有启动</string>
+    <string name="err_stage_video_detail">当前分辨率或帧率可能超出设备支持范围，请到设置里调低画质后再试。</string>
+    <string name="err_stage_audio_title">声音通道没有连上</string>
+    <string name="err_stage_audio_detail">请确认电脑的音频服务正常，然后点重试。</string>
+    <string name="err_stage_control_title">连不上这台电脑</string>
+    <string name="err_stage_control_detail">电脑可能休眠了，或者被防火墙拦住了，请检查后点重试。</string>
+    <string name="err_stage_generic_title">没能开始串流</string>
+    <string name="err_stage_generic_detail">请确认电脑开着且和头显在同一个 Wi-Fi 里，然后点重试。</string>
+    <string name="err_term_no_video_title">没有收到电脑传来的画面</string>
+    <string name="err_term_no_video_detail">电脑的防火墙可能拦住了画面传输，请允许串流服务通过防火墙后重试。</string>
+    <string name="err_term_no_frame_title">当前网络太卡，画面中断了</string>
+    <string name="err_term_no_frame_detail">请靠近路由器，或在设置里把码率调到「流畅」后再试。</string>
+    <string name="err_term_early_title">电脑端提前结束了串流</string>
+    <string name="err_term_early_detail">请确认电脑上没有受版权保护的全屏播放窗口，再重新连接。</string>
+    <string name="err_term_encode_title">电脑端画面编码出错</string>
+    <string name="err_term_encode_detail">请在设置里换一个分辨率或编码格式，再重新连接。</string>
+    <string name="err_term_disconnected_title">和电脑的连接断开了</string>
+    <string name="err_term_disconnected_detail">电脑可能休眠、关机了，或者网络波动了一下，点重试重新连接。</string>
+    <string name="err_vr_unavailable_title">无法进入沉浸式 3D 画面</string>
+    <string name="err_vr_unavailable_detail">头显的 3D 显示服务没有响应，请退出应用重新打开后再试。</string>
+    <string name="err_net_unknown_host_title">找不到这台电脑</string>
+    <string name="err_net_unknown_host_detail">请检查输入的地址有没有填错，以及头显和电脑是否在同一个 Wi-Fi。</string>
+    <string name="err_net_timeout_title">%1$s超时了</string>
+    <string name="err_net_timeout_detail">电脑没有及时回应，请确认电脑醒着且串流服务正在运行。</string>
+    <string name="err_net_connect_title">连不上这台电脑</string>
+    <string name="err_net_connect_detail">请确认电脑上的串流服务已经启动，并且和头显在同一个 Wi-Fi。</string>
+    <string name="err_net_not_ready_title">电脑上的串流服务没有就绪</string>
+    <string name="err_net_not_ready_detail">请在电脑上重新打开串流服务后再试。</string>
+    <string name="err_host_quit_other_title">无法从这台头显结束应用</string>
+    <string name="err_host_quit_other_detail">这个应用不是由当前头显启动的，请直接在电脑上关闭它。</string>
+    <string name="err_host_rejected_title">电脑拒绝了这次操作</string>
+    <string name="err_host_rejected_detail">请确认头显已经和电脑配对，再点重试。</string>
+    <string name="err_action_failed_title">%1$s没有成功</string>
+    <string name="err_action_failed_detail">请检查电脑和头显是否连在同一个 Wi-Fi，稍后再试。</string>
+    <string name="err_add_pc_failed_title">连不上 %1$s</string>
+    <string name="err_add_pc_failed_detail">请确认地址无误、电脑已经开机并且启动了串流服务，再试一次。</string>
+    <string name="err_invalid_addr_title">请输入正确的电脑地址</string>
+    <string name="err_invalid_addr_detail">例如局域网地址 192.168.1.20，不能留空。</string>
+    <string name="err_wake_no_mac_title">无法远程唤醒这台电脑</string>
+    <string name="err_wake_no_mac_detail">还没有记录到这台电脑的网卡信息，先手动开机连接一次就可以支持唤醒。</string>
+    <string name="err_wake_failed_title">唤醒请求没发出去</string>
+    <string name="err_wake_failed_detail">请检查头显的 Wi-Fi 连接是否正常，再试一次。</string>
+    <string name="err_device_name_empty_title">名称不能为空</string>
+    <string name="err_device_name_empty_detail">请输入一个简短好记的设备名称。</string>
+
+    <!-- Phone QR input sheet & HTML form -->
     <string name="phone_input_add_pc_title">用手机输入电脑地址</string>
-    <string name="phone_input_add_pc_sub">用手机扫码，或在浏览器打开下面的地址填写电脑 IP。</string>
+    <string name="phone_input_add_pc_sub">用手机扫码，或在浏览器打开下面的地址填写电脑地址。</string>
     <string name="phone_input_device_name_title">用手机修改设备名称</string>
     <string name="phone_input_device_name_sub">用手机扫码，或在浏览器打开下面的地址输入新名称。</string>
-    <string name="phone_input_code_label">4 位验证码</string>
+    <string name="phone_input_code_label">手动打开地址时的 4 位验证码</string>
     <string name="phone_input_use_headset_kb">用头显键盘输入</string>
     <string name="phone_input_back_to_qr">返回手机扫码</string>
     <string name="phone_input_no_wifi">还没连上 Wi-Fi，暂时无法开启手机扫码输入，可先连接网络或改用头显键盘。</string>
+    <string name="phone_input_locked">验证码连续输错次数过多，本次扫码通道已关闭，请重新打开。</string>
+    <string name="phone_input_reopen_qr">重新生成二维码</string>
     <string name="phone_input_addr_label">电脑局域网地址</string>
     <string name="phone_input_addr_placeholder">例如 192.168.1.20</string>
     <string name="phone_input_name_label">头显投屏名称</string>
     <string name="phone_input_name_placeholder">例如 客厅的 depth3d</string>
-    <string name="phone_input_connecting">正在连接电脑…</string>
+    <string name="phone_input_connecting">正在处理…</string>
+
+    <string name="phone_html_add_pc_page_title">depth3d · 添加电脑</string>
+    <string name="phone_html_add_pc_heading">添加电脑到头显</string>
+    <string name="phone_html_add_pc_hint">输入电脑在当前 Wi-Fi 里的局域网地址</string>
+    <string name="phone_html_add_pc_placeholder">例如 192.168.1.20</string>
+    <string name="phone_html_add_pc_submit">发送到头显</string>
+    <string name="phone_html_rename_page_title">depth3d · 设备名称</string>
+    <string name="phone_html_rename_heading">修改头显投屏名称</string>
+    <string name="phone_html_rename_hint">投屏列表和电脑配对提示里会显示这个名字</string>
+    <string name="phone_html_rename_placeholder">例如 客厅的 depth3d</string>
+    <string name="phone_html_rename_submit">保存名称</string>
+    <string name="phone_html_code_label">头显上的 4 位数字</string>
+    <string name="phone_html_code_placeholder">4 位验证码</string>
+    <string name="phone_html_value_label">内容</string>
+    <string name="phone_html_err_wrong_code">验证码不对，请核对头显上的数字。</string>
+    <string name="phone_html_err_locked">验证失败次数过多，通道已关闭，请在头显上重新打开。</string>
+    <string name="phone_html_err_empty_or_long">内容不能为空，也不能超过 128 个字符。</string>
+    <string name="phone_html_done_title">头显已收下</string>
+    <string name="phone_html_done_subtitle">现在可以戴回头显继续操作，这个页面可以直接关闭。</string>
 
     <!-- PC App Grid -->
     <string name="pc_apps_count">%1$d 个应用</string>
     <string name="pc_apps_running_badge">运行中</string>
     <string name="pc_apps_empty">这台电脑里还没有可串流的应用。</string>
     <string name="pc_apps_quit_running">结束运行中应用</string>
-
-    <!-- Home empty state -->
-    <string name="home_empty_cast_title">投屏与串流</string>
-    <string name="home_empty_cast_sub">iPad、手机投屏，或连接电脑桌面</string>
 
     <!-- Settings categories -->
     <string name="settings_cat_stream">串流</string>
@@ -107,23 +299,25 @@
     <string name="settings_cat_input">手柄与手势</string>
     <string name="settings_cat_input_sub">手势、射线、指针与音效</string>
     <string name="settings_cat_privacy">隐私</string>
-    <string name="settings_cat_privacy_sub">运行日志与崩溃报告</string>
+    <string name="settings_cat_privacy_sub">本地运行日志</string>
     <string name="settings_cat_about">关于</string>
     <string name="settings_cat_about_sub">版本、开源许可与第三方组件</string>
 
     <!-- Settings: Streaming -->
     <string name="settings_resolution_title">分辨率</string>
     <string name="settings_resolution_sub">更高分辨率更清晰，但会增加网络和 3D 计算压力</string>
+    <string name="settings_resolution_custom_sub">当前生效：%1$s（自定义已存值），点右侧选项可切换</string>
     <string name="settings_res_720p">720p</string>
     <string name="settings_res_1080p">1080p</string>
     <string name="settings_res_1440p">1440p</string>
     <string name="settings_res_4k">4K</string>
     <string name="settings_fps_title">帧率</string>
     <string name="settings_fps_sub">72 fps 兼顾流畅和实时 3D 稳定</string>
+    <string name="settings_fps_custom_sub">当前生效：%1$s（自定义已存值），点右侧选项可切换</string>
     <string name="settings_fps_60">60</string>
     <string name="settings_fps_72">72</string>
     <string name="settings_fps_90">90</string>
-    <string name="settings_3d_lag_warning">选到 4K 或 90 fps 时，开启实时 3D 会变卡，推荐使用 1440p / 72 fps。</string>
+    <string name="settings_3d_lag_warning">当前画质达到 4K 或 90 fps 以上，开启实时 3D 可能会变卡，推荐使用 1440p / 72 fps。</string>
     <string name="settings_bitrate_title">码率</string>
     <string name="settings_bitrate_sub">当前约 %1$d Mbps，网络不稳定时可选「流畅」</string>
     <string name="settings_bitrate_auto">自动</string>
@@ -135,6 +329,7 @@
     <string name="settings_bitrate_mbps">%1$d Mbps</string>
     <string name="settings_codec_title">视频编码</string>
     <string name="settings_codec_sub">自动优先选择头显和电脑都支持的低延迟编码</string>
+    <string name="settings_codec_custom_sub">当前生效：%1$s，点右侧选项可切换</string>
     <string name="settings_codec_auto">自动</string>
     <string name="settings_codec_h264">H.264</string>
     <string name="settings_codec_hevc">HEVC</string>
@@ -216,36 +411,43 @@
     <string name="settings_click_sound_sub">点击 VR 快捷面板和虚拟键盘时播放轻快提示音</string>
 
     <!-- Settings: Privacy -->
-    <string name="settings_log_title">运行日志</string>
-    <string name="settings_log_sub">仅保存在头显本地的 Download/depth3d 目录，重启应用生效</string>
+    <string name="settings_log_title">本地运行日志</string>
+    <string name="settings_log_sub">仅保存在头显本地的 Download/depth3d 目录，重启应用生效，不会自动上传。</string>
     <string name="settings_log_off">关闭</string>
     <string name="settings_log_basic">基础</string>
     <string name="settings_log_verbose">详细</string>
-    <string name="settings_crash_report_title">自动发送崩溃报告</string>
-    <string name="settings_crash_report_sub">默认关闭，不会向任何外部服务器自动上传数据</string>
 
-    <!-- Settings: About -->
+    <!-- Settings: About & Licenses -->
     <string name="settings_about_product">depth3d</string>
     <string name="settings_about_tagline">头显端实时 3D 影院与电脑串流</string>
     <string name="settings_about_version_title">当前版本</string>
     <string name="settings_about_license_title">开源许可</string>
     <string name="settings_about_license_sub">GNU General Public License v3.0 (GPLv3)</string>
-    <string name="settings_about_license_view">查看全文</string>
+    <string name="settings_about_license_view">阅读 GPLv3 全文</string>
+    <string name="settings_about_license_summary">depth3d 遵循 GNU 通用公共许可证第 3 版（GPLv3）发布，以下为随包附带的完整许可证原文：</string>
+    <string name="settings_about_license_missing">完整 GPLv3 原文随源码仓库 LICENSE.txt 一并发布。</string>
     <string name="settings_about_third_party_title">第三方开源组件</string>
-    <string name="settings_about_third_party_sub">depth3d 基于以下优秀开源项目构建，特此致谢</string>
+    <string name="settings_about_third_party_sub">本头显端应用包含以下开源项目，特此致谢</string>
+    <string name="settings_tp_moonlight_role">串流客户端协议栈与 OpenXR 3D 渲染管线</string>
+    <string name="settings_tp_uxplay_role">AirPlay 屏幕镜像接收核心</string>
+    <string name="settings_tp_depth_role">头显端实时 2D 转 3D 深度估计模型</string>
+    <string name="settings_tp_media3_role">本地与局域网视频解码播放</string>
+    <string name="settings_tp_openxr_role">OpenXR 运行时加载器与端侧推理引擎</string>
+    <string name="settings_tp_net_role">HTTPS 传输、证书加密与局域网服务发现</string>
 
     <!-- VR in-session streaming bar & quick menu -->
+    <string name="vr_stream_default_pc">电脑</string>
     <string name="vr_stream_status_live">串流中</string>
+    <string name="vr_stream_gamepad_badge">手柄模式</string>
     <string name="vr_stream_net_warn">延迟 %1$d ms · 丢包 %2$d%%</string>
     <string name="vr_stream_net_warn_rtt">网络延迟偏高 · %1$d ms</string>
+    <string name="vr_stream_net_warn_loss">网络丢包 · %1$d%%</string>
     <string name="vr_stream_net_warn_poor">当前网络较差，画面可能卡顿</string>
     <string name="vr_stream_tab_title">串流</string>
-    <string name="vr_stream_info_host">当前电脑：%1$s</string>
-    <string name="vr_stream_info_video">画面设置：%1$s · %2$d fps · %3$d Mbps</string>
-    <string name="vr_stream_info_mouse_abs">鼠标模式：绝对定位（桌面）</string>
-    <string name="vr_stream_info_mouse_rel">鼠标模式：相对移动（游戏）</string>
-    <string name="vr_stream_info_controls_hint">键盘、手柄与退出按钮位于屏幕下方操作栏</string>
-    <string name="vr_stream_info_net_ok">网络状态：良好</string>
+    <string name="vr_stream_row_resolution">分辨率</string>
+    <string name="vr_stream_row_bitrate">码率</string>
+    <string name="vr_stream_row_mouse">鼠标模式</string>
+    <string name="vr_stream_next_connect_note">修改后将在下次连接时生效</string>
 
     <!-- Services -->
     <string name="service_airplay_label">depth3d 屏幕镜像接收</string>

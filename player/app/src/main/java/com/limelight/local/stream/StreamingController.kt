@@ -14,6 +14,7 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.IBinder
 import com.limelight.LimeLog
+import com.limelight.R
 import com.limelight.binding.PlatformBinding
 import com.limelight.computers.ComputerManagerListener
 import com.limelight.computers.ComputerManagerService
@@ -33,6 +34,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -101,12 +103,13 @@ sealed interface PcAppsState {
 
 /**
  * Owns PC streaming discovery, depth3d Host control protocol calls, pairing, app list loading,
- * Wake-on-LAN, and launching [com.limelight.GameXR] for the Compose UI.
+ * Wake-on-LAN, decoder crash recovery, and launching [com.limelight.GameXR] for the Compose UI.
  */
 class StreamingController(
     private val app: Application,
     private val onAutoWebDavConfigured: () -> Unit = {},
 ) {
+    private val strings: StringLookup = AndroidStringLookup(app)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val hostDiscovery = HostDiscovery(app)
     private val pinStore = SharedPrefsHostCertPinStore(app)
@@ -122,16 +125,21 @@ class StreamingController(
 
     private val rawComputers = LinkedHashMap<String, ComputerDetails>()
     private val hostInfos = ConcurrentHashMap<String, HostInfo>()
-    private val probedHosts = HashSet<String>()
-    private val mediaSyncedHosts = HashSet<String>()
-    private val boxArtCache = ConcurrentHashMap<String, Bitmap>()
+    private val infoRetry = HostRetryTracker()
+    private val mediaRetry = HostRetryTracker()
+    private val retryJobs = ConcurrentHashMap<String, Job>()
+    private val boxArtCache = BoundedLruCache<String, Bitmap>(MAX_BOX_ART_ENTRIES)
 
     @Volatile
     private var binder: ComputerManagerService.ComputerManagerBinder? = null
     private var serviceBound = false
     private var foregroundActive = false
     private var activeOperationJob: Job? = null
+    private var activeCancelToken: CallCancelToken? = null
+    private var pendingUnpairJob: Job? = null
     private var appListJob: Job? = null
+    private var discoveryTimeoutJob: Job? = null
+    private var knownHostIds = emptySet<String>()
 
     private val _computers = MutableStateFlow<List<StreamingComputer>>(emptyList())
     val computers: StateFlow<List<StreamingComputer>> get() = _computers
@@ -148,6 +156,9 @@ class StreamingController(
     private val _bannerNotice = MutableStateFlow<String?>(null)
     val bannerNotice: StateFlow<String?> get() = _bannerNotice
 
+    private val _crashPrompt = MutableStateFlow<CrashRecoveryPrompt?>(null)
+    val crashPrompt: StateFlow<CrashRecoveryPrompt?> get() = _crashPrompt
+
     private val _pcApps = MutableStateFlow<PcAppsState>(PcAppsState.Loading)
     val pcApps: StateFlow<PcAppsState> get() = _pcApps
 
@@ -160,6 +171,7 @@ class StreamingController(
             synchronized(rawComputers) {
                 rawComputers[details.uuid] = details
             }
+            cancelDiscoveryTimeout()
             _discovering.value = false
             republishComputers()
             maybeSyncHostMedia(details)
@@ -189,11 +201,23 @@ class StreamingController(
     init {
         scope.launch {
             hostDiscovery.hosts.collect { hosts ->
+                val currentIds = hosts.map { it.id }.toSet()
+                val lostIds = knownHostIds - currentIds
+                for (lost in lostIds) {
+                    infoRetry.clear(lost)
+                    mediaRetry.clear(lost)
+                    retryJobs.remove("info:$lost")?.cancel()
+                    retryJobs.remove("media:$lost")?.cancel()
+                }
+                knownHostIds = currentIds
                 if (hosts.isNotEmpty()) {
+                    cancelDiscoveryTimeout()
                     _discovering.value = false
                 }
                 republishComputers()
-                hosts.forEach { probeHostIfNeeded(it) }
+                hosts.forEach { scheduleHostInfoProbe(it) }
+                synchronized(rawComputers) { rawComputers.values.toList() }
+                    .forEach { maybeSyncHostMedia(it) }
             }
         }
         scope.launch {
@@ -224,8 +248,15 @@ class StreamingController(
     fun onStart() {
         foregroundActive = true
         _hasWifi.value = checkLanAvailable()
+        if (_flow.value is StreamFlowState.Connecting && activeOperationJob?.isActive != true) {
+            _flow.value = StreamFlowState.Idle
+        }
+        checkDecoderCrashRecovery()
         watchNetworks()
         hostDiscovery.start()
+        if (_computers.value.isEmpty()) {
+            startDiscoveryTimeout()
+        }
         if (!serviceBound) {
             serviceBound = app.bindService(
                 Intent(app, ComputerManagerService::class.java),
@@ -235,10 +266,12 @@ class StreamingController(
         } else {
             binder?.startPolling(computerListener)
         }
+        hostDiscovery.hosts.value.forEach { scheduleHostInfoProbe(it) }
     }
 
     fun onStop() {
         foregroundActive = false
+        cancelDiscoveryTimeout()
         unwatchNetworks()
         hostDiscovery.stop()
         binder?.stopPolling()
@@ -247,6 +280,8 @@ class StreamingController(
     fun onDestroy() {
         cancelActiveOperation()
         appListJob?.cancel()
+        retryJobs.values.forEach { it.cancel() }
+        retryJobs.clear()
         onStop()
         if (serviceBound) {
             try {
@@ -256,6 +291,46 @@ class StreamingController(
             serviceBound = false
             binder = null
         }
+    }
+
+    /** Re-runs discovery spinner for 8 seconds and resets transient host probe backoffs. */
+    fun refreshDiscovery() {
+        if (_computers.value.isEmpty()) {
+            _discovering.value = true
+            startDiscoveryTimeout()
+        }
+        infoRetry.resetAll()
+        mediaRetry.resetAll()
+        if (foregroundActive) {
+            hostDiscovery.stop()
+            hostDiscovery.start()
+            binder?.startPolling(computerListener)
+            hostDiscovery.hosts.value.forEach { scheduleHostInfoProbe(it) }
+        }
+    }
+
+    fun checkDecoderCrashRecovery() {
+        val tombstone = AndroidPrefsStore.namedPrefs(app, DecoderCrashRecovery.TOMBSTONE_PREFS_NAME)
+        val streamingPrefs = AndroidPrefsStore.defaultPrefs(app)
+        val prompt = DecoderCrashRecovery.checkAndPrepare(tombstone, streamingPrefs)
+        if (prompt != null) {
+            _crashPrompt.value = prompt
+        }
+    }
+
+    fun resetStreamingAfterCrash() {
+        val tombstone = AndroidPrefsStore.namedPrefs(app, DecoderCrashRecovery.TOMBSTONE_PREFS_NAME)
+        val streamingPrefs = AndroidPrefsStore.defaultPrefs(app)
+        DecoderCrashRecovery.resetDefaultsAndClear(tombstone, streamingPrefs)
+        _crashPrompt.value = null
+        _bannerNotice.value = app.getString(R.string.stream_crash_reset_done)
+    }
+
+    fun dismissCrashPrompt() {
+        val prompt = _crashPrompt.value ?: return
+        val tombstone = AndroidPrefsStore.namedPrefs(app, DecoderCrashRecovery.TOMBSTONE_PREFS_NAME)
+        DecoderCrashRecovery.acknowledge(tombstone, prompt.crashCount)
+        _crashPrompt.value = null
     }
 
     fun dismissBanner() {
@@ -268,6 +343,8 @@ class StreamingController(
     }
 
     fun cancelActiveOperation() {
+        activeCancelToken?.cancel()
+        activeCancelToken = null
         activeOperationJob?.cancel()
         activeOperationJob = null
         if (_flow.value !is StreamFlowState.Idle) {
@@ -299,31 +376,38 @@ class StreamingController(
     fun startPair(
         computer: StreamingComputer,
         forceManualPin: Boolean = false,
-        trustChangedCert: Boolean = false,
+        approvedNewFingerprint: String? = null,
     ) {
         cancelActiveOperation()
         val b = binder
         if (b == null) {
             _flow.value = StreamFlowState.Failed(
                 computer,
-                UserFacingError("串流服务正在准备中", "请稍等一两秒后再点重试。"),
+                StreamErrorMapper.forServiceStarting(strings),
                 RetryAction.Pair(computer, forceManualPin),
             )
             return
         }
 
+        val token = CallCancelToken()
+        activeCancelToken = token
         val useAutoPair = !forceManualPin && computer.isDepth3dHost && computer.autoPairSupported && computer.host != null
         activeOperationJob = scope.launch {
             try {
+                // Wait briefly for any previous cancelled pairing cleanup to finish unpairing on host.
+                pendingUnpairJob?.join()
+
                 b.stopPolling()
                 withContext(Dispatchers.IO) { b.waitForPollingStopped() }
+                if (token.isCancelled) return@launch
 
                 val pin = PairingManager.generatePinString()
                 val details = ensureDetailsForComputer(computer, b)
+                if (token.isCancelled) return@launch
                 if (details == null || details.activeAddress == null) {
                     _flow.value = StreamFlowState.Failed(
                         computer,
-                        UserFacingError("连不上这台电脑", "请确认电脑开着且和头显在同一个 Wi-Fi，再点重试。"),
+                        StreamErrorMapper.forStageFailed(strings, "control"),
                         RetryAction.Pair(computer, forceManualPin),
                     )
                     resumePollingIfForeground()
@@ -332,9 +416,67 @@ class StreamingController(
 
                 if (useAutoPair) {
                     val host = computer.host
+                    // Verify host identity (/info) before first-time pinning so an unverified mDNS id
+                    // can never pin a certificate.
+                    if (pinStore.getFingerprint(host.id) == null) {
+                        val infoRes = withContext(Dispatchers.IO) {
+                            hostApi.getInfo(
+                                address = host.address,
+                                port = host.controlPort,
+                                hostId = host.id,
+                                approvedNewFingerprint = approvedNewFingerprint,
+                                cancelToken = token,
+                            )
+                        }
+                        when (infoRes) {
+                            is HostInfoResult.Ok -> {
+                                hostInfos[host.id] = infoRes.info
+                                infoRetry.markCompleted(host.id)
+                                republishComputers()
+                            }
+                            is HostInfoResult.IdentityMismatch -> {
+                                _flow.value = StreamFlowState.Failed(
+                                    computer,
+                                    StreamErrorMapper.forHostIdentityMismatch(strings),
+                                    RetryAction.Pair(computer, forceManualPin = false),
+                                )
+                                resumePollingIfForeground()
+                                return@launch
+                            }
+                            HostInfoResult.UpgradeRequired -> {
+                                _flow.value = StreamFlowState.Failed(
+                                    computer,
+                                    StreamErrorMapper.forHostUpgradeRequired(strings),
+                                    retryAction = null,
+                                )
+                                resumePollingIfForeground()
+                                return@launch
+                            }
+                            is HostInfoResult.CertificateChanged -> {
+                                _flow.value = StreamFlowState.CertConfirm(
+                                    computer = computer,
+                                    hostId = infoRes.hostId,
+                                    expectedFingerprint = infoRes.expected,
+                                    actualFingerprint = infoRes.actual,
+                                    resumeAction = CertResumeAction.AUTO_PAIR,
+                                )
+                                resumePollingIfForeground()
+                                return@launch
+                            }
+                            HostInfoResult.Cancelled -> return@launch
+                            is HostInfoResult.Failed -> Unit // Proceed to /pair which will fail/fallback cleanly
+                        }
+                    }
+
+                    // Per updated Host Protocol v1:
+                    // First-time pairing omits client certificate; re-pairing an already-paired host
+                    // presents the pairing client certificate so Mac Host identifies it by cert fingerprint.
+                    val alreadyPairedHost = details.pairState == PairingManager.PairState.PAIRED &&
+                        details.serverCert != null
+
                     _flow.value = StreamFlowState.AutoPairing(
                         computer = computer,
-                        stageText = "请在电脑上点「允许」",
+                        stageText = app.getString(R.string.pair_auto_wait_allow),
                     )
                     val pairResp = withContext(Dispatchers.IO) {
                         hostApi.requestAutoPair(
@@ -344,16 +486,38 @@ class StreamingController(
                             deviceName = CastReceiver.name(app),
                             deviceId = b.uniqueId,
                             pin = pin,
-                            trustChangedCert = trustChangedCert,
+                            presentClientCert = alreadyPairedHost,
+                            approvedNewFingerprint = approvedNewFingerprint,
+                            cancelToken = token,
                         )
+                    }
+                    if (token.isCancelled || pairResp == AutoPairResult.Cancelled) {
+                        resumePollingIfForeground()
+                        return@launch
                     }
                     when (pairResp) {
                         AutoPairResult.Approved -> {
                             _flow.value = StreamFlowState.AutoPairing(
                                 computer = computer,
-                                stageText = "电脑已允许，正在完成配对…",
+                                stageText = app.getString(R.string.pair_auto_completing),
                             )
-                            completeGameStreamPair(computer, details, b, pin, allowManualFallback = true)
+                            completeGameStreamPair(computer, details, b, pin, allowManualFallback = true, token = token)
+                        }
+                        AutoPairResult.StreamServiceUnavailable -> {
+                            // 503: refresh /info to surface the exact stream.reason from Mac Host
+                            val freshInfo = withContext(Dispatchers.IO) {
+                                hostApi.getInfo(host.address, host.controlPort, host.id, cancelToken = token)
+                            }
+                            val reason = (freshInfo as? HostInfoResult.Ok)?.info?.also {
+                                hostInfos[host.id] = it
+                                republishComputers()
+                            }?.stream?.reason ?: hostInfos[host.id]?.stream?.reason
+                            _flow.value = StreamFlowState.Failed(
+                                computer = computer,
+                                error = StreamErrorMapper.forAutoPair(strings, pairResp, streamReason = reason),
+                                retryAction = RetryAction.Pair(computer, forceManualPin = false),
+                            )
+                            resumePollingIfForeground()
                         }
                         is AutoPairResult.CertificateChanged -> {
                             _flow.value = StreamFlowState.CertConfirm(
@@ -368,7 +532,7 @@ class StreamingController(
                         is AutoPairResult.Failed -> {
                             _flow.value = StreamFlowState.Failed(
                                 computer = computer,
-                                error = StreamErrorMapper.forAutoPair(pairResp),
+                                error = StreamErrorMapper.forAutoPair(strings, pairResp),
                                 retryAction = RetryAction.Pair(computer, forceManualPin = false),
                                 fallbackPinComputer = computer,
                             )
@@ -377,7 +541,7 @@ class StreamingController(
                         else -> {
                             _flow.value = StreamFlowState.Failed(
                                 computer = computer,
-                                error = StreamErrorMapper.forAutoPair(pairResp),
+                                error = StreamErrorMapper.forAutoPair(strings, pairResp),
                                 retryAction = if (pairResp != AutoPairResult.UpgradeRequired) {
                                     RetryAction.Pair(computer, forceManualPin = false)
                                 } else null,
@@ -388,15 +552,19 @@ class StreamingController(
                     }
                 } else {
                     _flow.value = StreamFlowState.PinPairing(computer, pin)
-                    completeGameStreamPair(computer, details, b, pin, allowManualFallback = false)
+                    completeGameStreamPair(computer, details, b, pin, allowManualFallback = false, token = token)
                 }
             } catch (_: CancellationException) {
                 resumePollingIfForeground()
             } catch (e: Exception) {
+                if (token.isCancelled) {
+                    resumePollingIfForeground()
+                    return@launch
+                }
                 LimeLog.warning("depth3d: pair error: ${e.javaClass.simpleName}")
                 _flow.value = StreamFlowState.Failed(
                     computer,
-                    StreamErrorMapper.forThrowable(e, "配对"),
+                    StreamErrorMapper.forThrowable(strings, e, app.getString(R.string.stream_action_pair)),
                     RetryAction.Pair(computer, forceManualPin),
                 )
                 resumePollingIfForeground()
@@ -410,7 +578,9 @@ class StreamingController(
         b: ComputerManagerService.ComputerManagerBinder,
         pin: String,
         allowManualFallback: Boolean,
+        token: CallCancelToken,
     ) {
+        var gsPairStarted = false
         val result = withContext(Dispatchers.IO) {
             val http = NvHTTP(
                 ServerHelper.getCurrentAddressFromComputer(details),
@@ -419,15 +589,28 @@ class StreamingController(
                 details.serverCert,
                 PlatformBinding.getCryptoProvider(app),
             )
-            val serverInfo = http.getServerInfo(true)
-            val alreadyPaired = http.getPairState(serverInfo) == PairingManager.PairState.PAIRED
-            if (alreadyPaired) {
-                PairingManager.PairState.PAIRED to details.serverCert
-            } else {
-                val pm = http.pairingManager
-                val state = pm.pair(serverInfo, pin)
-                state to pm.pairedCert
+            val unregister = token.register { http.cancel() }
+            try {
+                val serverInfo = http.getServerInfo(true)
+                val alreadyPaired = http.getPairState(serverInfo) == PairingManager.PairState.PAIRED
+                if (alreadyPaired) {
+                    PairingManager.PairState.PAIRED to details.serverCert
+                } else {
+                    gsPairStarted = true
+                    val pm = http.pairingManager
+                    val state = pm.pair(serverInfo, pin)
+                    state to pm.pairedCert
+                }
+            } finally {
+                unregister()
             }
+        }
+        if (token.isCancelled) {
+            if (gsPairStarted) {
+                scheduleBestEffortUnpair(details, b)
+            }
+            resumePollingIfForeground()
+            return
         }
         val (pairState, cert) = result
         if (pairState == PairingManager.PairState.PAIRED) {
@@ -448,19 +631,39 @@ class StreamingController(
                     rawComputers[details.uuid] = details
                 }
             }
+            computer.host?.id?.let { mediaRetry.clear(it) }
             republishComputers()
             maybeSyncHostMedia(details)
             _flow.value = StreamFlowState.Idle
-            _bannerNotice.value = "已和「${computer.name}」配对，点一下即可连接"
+            _bannerNotice.value = app.getString(R.string.stream_notice_paired, computer.name)
             resumePollingIfForeground()
         } else {
             _flow.value = StreamFlowState.Failed(
                 computer = computer,
-                error = StreamErrorMapper.forPairState(pairState, details.runningGameId != 0),
+                error = StreamErrorMapper.forPairState(strings, pairState, details.runningGameId != 0),
                 retryAction = RetryAction.Pair(computer, forceManualPin = !allowManualFallback),
                 fallbackPinComputer = if (allowManualFallback) computer else null,
             )
             resumePollingIfForeground()
+        }
+    }
+
+    private fun scheduleBestEffortUnpair(
+        details: ComputerDetails,
+        b: ComputerManagerService.ComputerManagerBinder,
+    ) {
+        pendingUnpairJob = scope.launch(Dispatchers.IO) {
+            try {
+                val cleanupHttp = NvHTTP(
+                    ServerHelper.getCurrentAddressFromComputer(details),
+                    details.httpsPort,
+                    b.uniqueId,
+                    details.serverCert,
+                    PlatformBinding.getCryptoProvider(app),
+                )
+                cleanupHttp.unpair()
+            } catch (_: Exception) {
+            }
         }
     }
 
@@ -469,9 +672,20 @@ class StreamingController(
         state: StreamFlowState.CertConfirm,
         onOpenAppGrid: (StreamingComputer) -> Unit,
     ) {
+        // Trust ONLY the exact fingerprint displayed to and confirmed by the user.
         when (state.resumeAction) {
-            CertResumeAction.AUTO_PAIR -> startPair(state.computer, forceManualPin = false, trustChangedCert = true)
-            CertResumeAction.CONNECT -> connect(activity, state.computer, appOverride = null, trustChangedCert = true, onOpenAppGrid = onOpenAppGrid)
+            CertResumeAction.AUTO_PAIR -> startPair(
+                state.computer,
+                forceManualPin = false,
+                approvedNewFingerprint = state.actualFingerprint,
+            )
+            CertResumeAction.CONNECT -> connect(
+                activity,
+                state.computer,
+                appOverride = null,
+                approvedNewFingerprint = state.actualFingerprint,
+                onOpenAppGrid = onOpenAppGrid,
+            )
         }
     }
 
@@ -479,7 +693,7 @@ class StreamingController(
         activity: Activity,
         computer: StreamingComputer,
         appOverride: NvApp? = null,
-        trustChangedCert: Boolean = false,
+        approvedNewFingerprint: String? = null,
         onOpenAppGrid: (StreamingComputer) -> Unit = {},
     ) {
         cancelActiveOperation()
@@ -487,7 +701,7 @@ class StreamingController(
         if (b == null) {
             _flow.value = StreamFlowState.Failed(
                 computer,
-                UserFacingError("串流服务正在准备中", "请稍等一两秒后再点重试。"),
+                StreamErrorMapper.forServiceStarting(strings),
                 RetryAction.Connect(computer, appOverride),
             )
             return
@@ -496,42 +710,59 @@ class StreamingController(
         if (details == null || details.state == ComputerDetails.State.OFFLINE || details.activeAddress == null) {
             _flow.value = StreamFlowState.Failed(
                 computer,
-                UserFacingError("「${computer.name}」当前离线", "请先唤醒或打开电脑，再点重试。"),
+                StreamErrorMapper.forComputerOffline(strings, computer.name),
                 RetryAction.Connect(computer, appOverride),
             )
             return
         }
 
+        val token = CallCancelToken()
+        activeCancelToken = token
         _flow.value = StreamFlowState.Connecting(
             computer = computer,
             appName = appOverride?.appName,
-            stageText = "正在检查电脑状态…",
+            stageText = app.getString(R.string.stream_stage_check_host),
         )
         activeOperationJob = scope.launch {
             try {
-                // 1. If this is a depth3d Host, verify readiness via /depth3d/v1/info
                 val host = computer.host
                 if (host != null) {
                     val infoResult = withContext(Dispatchers.IO) {
-                        hostApi.getInfo(host.address, host.controlPort, host.id, trustChangedCert)
+                        hostApi.getInfo(
+                            address = host.address,
+                            port = host.controlPort,
+                            hostId = host.id,
+                            approvedNewFingerprint = approvedNewFingerprint,
+                            cancelToken = token,
+                        )
                     }
+                    if (token.isCancelled || infoResult == HostInfoResult.Cancelled) return@launch
                     when (infoResult) {
                         is HostInfoResult.Ok -> {
                             hostInfos[host.id] = infoResult.info
+                            infoRetry.markCompleted(host.id)
                             republishComputers()
                             if (!infoResult.info.stream.ready) {
                                 _flow.value = StreamFlowState.Failed(
                                     computer,
-                                    StreamErrorMapper.forHostNotReady(infoResult.info.stream.reason),
+                                    StreamErrorMapper.forHostNotReady(strings, infoResult.info.stream.reason),
                                     RetryAction.Connect(computer, appOverride),
                                 )
                                 return@launch
                             }
                         }
+                        is HostInfoResult.IdentityMismatch -> {
+                            _flow.value = StreamFlowState.Failed(
+                                computer,
+                                StreamErrorMapper.forHostIdentityMismatch(strings),
+                                RetryAction.Connect(computer, appOverride),
+                            )
+                            return@launch
+                        }
                         HostInfoResult.UpgradeRequired -> {
                             _flow.value = StreamFlowState.Failed(
                                 computer,
-                                StreamErrorMapper.forHostUpgradeRequired(),
+                                StreamErrorMapper.forHostUpgradeRequired(strings),
                                 retryAction = null,
                             )
                             return@launch
@@ -546,20 +777,23 @@ class StreamingController(
                             )
                             return@launch
                         }
+                        HostInfoResult.Cancelled -> return@launch
                         is HostInfoResult.Failed -> {
-                            // Control port unreachable; proceed with GameStream connect directly if reachable.
                             LimeLog.warning("depth3d: host /info unreachable, continuing direct stream connect")
                         }
                     }
                 }
 
-                // 2. Pick app to start: explicit app > running game > Desktop > single app > app grid
                 val targetApp: NvApp = if (appOverride != null) {
                     appOverride
                 } else if (details.runningGameId != 0) {
                     NvApp(computer.name, details.runningGameId, false)
                 } else {
-                    _flow.value = StreamFlowState.Connecting(computer, null, "正在获取桌面信息…")
+                    _flow.value = StreamFlowState.Connecting(
+                        computer,
+                        null,
+                        app.getString(R.string.stream_stage_fetch_desktop),
+                    )
                     val apps = withContext(Dispatchers.IO) {
                         val http = NvHTTP(
                             ServerHelper.getCurrentAddressFromComputer(details),
@@ -568,8 +802,14 @@ class StreamingController(
                             details.serverCert,
                             PlatformBinding.getCryptoProvider(app),
                         )
-                        DesktopLaunch.parse(http.appListRaw)
+                        val unregister = token.register { http.cancel() }
+                        try {
+                            DesktopLaunch.parse(http.appListRaw)
+                        } finally {
+                            unregister()
+                        }
                     }
+                    if (token.isCancelled) return@launch
                     val chosen = DesktopLaunch.choose(apps, details.runningGameId)
                         ?: apps.singleOrNull()
                     if (chosen == null) {
@@ -580,19 +820,24 @@ class StreamingController(
                     chosen
                 }
 
+                if (token.isCancelled) return@launch
                 _flow.value = StreamFlowState.Connecting(
                     computer = computer,
                     appName = targetApp.appName,
-                    stageText = "正在进入 3D 画面…",
+                    stageText = app.getString(R.string.stream_stage_enter_vr),
                 )
                 ServerHelper.doStartVrStream(activity, targetApp, details, b)
+                // Reset immediately after handing off to GameXR so returning to WallActivity never
+                // stays stuck on the "Connecting" screen.
+                _flow.value = StreamFlowState.Idle
             } catch (_: CancellationException) {
-                // User canceled
+                // User cancelled
             } catch (e: Exception) {
+                if (token.isCancelled) return@launch
                 LimeLog.warning("depth3d: connect failed: ${e.javaClass.simpleName}")
                 _flow.value = StreamFlowState.Failed(
                     computer,
-                    StreamErrorMapper.forThrowable(e, "连接"),
+                    StreamErrorMapper.forThrowable(strings, e, app.getString(R.string.stream_action_connect)),
                     RetryAction.Connect(computer, appOverride),
                 )
             }
@@ -622,7 +867,7 @@ class StreamingController(
         if (b == null || details == null || details.activeAddress == null) {
             _pcApps.value = PcAppsState.Failed(
                 computer,
-                UserFacingError("连不上「${computer.name}」", "请确认电脑在线并且和头显在同一个 Wi-Fi。"),
+                StreamErrorMapper.forComputerUnreachable(strings, computer.name),
             )
             return
         }
@@ -646,7 +891,10 @@ class StreamingController(
             } catch (_: CancellationException) {
             } catch (e: Exception) {
                 LimeLog.warning("depth3d: app list failed: ${e.javaClass.simpleName}")
-                _pcApps.value = PcAppsState.Failed(computer, StreamErrorMapper.forThrowable(e, "获取应用列表"))
+                _pcApps.value = PcAppsState.Failed(
+                    computer,
+                    StreamErrorMapper.forThrowable(strings, e, app.getString(R.string.stream_action_fetch_apps)),
+                )
             }
         }
     }
@@ -668,7 +916,7 @@ class StreamingController(
                 )
                 http.getBoxArt(nvApp).use { stream ->
                     BitmapFactory.decodeStream(stream)?.also { bmp ->
-                        boxArtCache[key] = bmp
+                        boxArtCache.put(key, bmp)
                     }
                 }
             } catch (_: Exception) {
@@ -678,8 +926,12 @@ class StreamingController(
     }
 
     fun quitRunningApp(computer: StreamingComputer, onDone: (Boolean) -> Unit = {}) {
-        val b = binder ?: return
-        val details = findDetails(computer, b) ?: return
+        val b = binder
+        val details = if (b != null) findDetails(computer, b) else null
+        if (b == null || details == null) {
+            onDone(false)
+            return
+        }
         scope.launch {
             try {
                 val ok = withContext(Dispatchers.IO) {
@@ -696,13 +948,13 @@ class StreamingController(
                     details.runningGameId = 0
                     b.invalidateStateForComputer(details.uuid)
                     republishComputers()
-                    _bannerNotice.value = "已结束「${computer.name}」上正在运行的应用"
+                    _bannerNotice.value = app.getString(R.string.stream_notice_quit_ok, computer.name)
                 } else {
-                    _bannerNotice.value = "没能结束正在运行的应用，请在电脑上关闭"
+                    _bannerNotice.value = app.getString(R.string.stream_notice_quit_fail)
                 }
                 onDone(ok)
             } catch (e: Exception) {
-                val err = StreamErrorMapper.forThrowable(e, "结束应用")
+                val err = StreamErrorMapper.forThrowable(strings, e, app.getString(R.string.stream_action_quit_app))
                 _bannerNotice.value = "${err.title}：${err.detail}"
                 onDone(false)
             }
@@ -713,7 +965,7 @@ class StreamingController(
         val b = binder ?: return
         val details = findDetails(computer, b)
         if (details == null || details.macAddress.isNullOrBlank()) {
-            val err = StreamErrorMapper.forWakeNoMac()
+            val err = StreamErrorMapper.forWakeNoMac(strings)
             _bannerNotice.value = "${err.title}，${err.detail}"
             return
         }
@@ -728,9 +980,9 @@ class StreamingController(
                 }
             }
             _bannerNotice.value = if (ok) {
-                "已向「${computer.name}」发送唤醒请求，请稍等几秒"
+                app.getString(R.string.stream_notice_wake_sent, computer.name)
             } else {
-                val err = StreamErrorMapper.forWakeFailed()
+                val err = StreamErrorMapper.forWakeFailed(strings)
                 "${err.title}，${err.detail}"
             }
         }
@@ -743,16 +995,20 @@ class StreamingController(
         synchronized(rawComputers) {
             rawComputers.remove(details.uuid)
         }
-        computer.host?.id?.let { pinStore.clearFingerprint(it) }
+        computer.host?.id?.let { id ->
+            pinStore.clearFingerprint(id)
+            infoRetry.clear(id)
+            mediaRetry.clear(id)
+        }
         republishComputers()
-        _bannerNotice.value = "已移除「${computer.name}」"
+        _bannerNotice.value = app.getString(R.string.stream_notice_removed, computer.name)
     }
 
     /** Adds a PC by IP/hostname (from phone QR form or optional headset keyboard). */
     suspend fun addComputerByAddress(rawInput: String): UserFacingError? {
         val trimmed = rawInput.trim()
-        if (trimmed.isEmpty()) return StreamErrorMapper.forInvalidAddress()
-        val b = binder ?: return UserFacingError("串流服务正在准备中", "请稍后再试。")
+        if (trimmed.isEmpty()) return StreamErrorMapper.forInvalidAddress(strings)
+        val b = binder ?: return StreamErrorMapper.forServiceStarting(strings)
         val (host, port) = parseHostPort(trimmed)
         val fake = ComputerDetails().apply {
             manualAddress = ComputerDetails.AddressTuple(host, port)
@@ -763,10 +1019,10 @@ class StreamingController(
                 if (added) {
                     null
                 } else {
-                    StreamErrorMapper.forAddComputerFailed(trimmed)
+                    StreamErrorMapper.forAddComputerFailed(strings, trimmed)
                 }
             } catch (e: Exception) {
-                StreamErrorMapper.forThrowable(e, "添加电脑")
+                StreamErrorMapper.forThrowable(strings, e, app.getString(R.string.stream_action_add_pc))
             }
         }
     }
@@ -809,36 +1065,103 @@ class StreamingController(
         }
     }
 
-    private fun probeHostIfNeeded(host: DiscoveredHost) {
-        if (!probedHosts.add(host.id)) return
+    private fun startDiscoveryTimeout() {
+        cancelDiscoveryTimeout()
+        discoveryTimeoutJob = scope.launch {
+            delay(DISCOVERY_TIMEOUT_MS)
+            if (_computers.value.isEmpty()) {
+                _discovering.value = false
+            }
+        }
+    }
+
+    private fun cancelDiscoveryTimeout() {
+        discoveryTimeoutJob?.cancel()
+        discoveryTimeoutJob = null
+    }
+
+    private fun scheduleHostInfoProbe(host: DiscoveredHost) {
+        val now = System.currentTimeMillis()
+        if (!infoRetry.tryAcquire(host.id, now)) return
         scope.launch(Dispatchers.IO) {
-            val res = hostApi.getInfo(host.address, host.controlPort, host.id, trustChangedCert = false)
-            if (res is HostInfoResult.Ok) {
-                hostInfos[host.id] = res.info
-                withContext(Dispatchers.Main.immediate) {
-                    republishComputers()
+            val res = hostApi.getInfo(host.address, host.controlPort, host.id)
+            withContext(Dispatchers.Main.immediate) {
+                when (res) {
+                    is HostInfoResult.Ok -> {
+                        infoRetry.markCompleted(host.id)
+                        hostInfos[host.id] = res.info
+                        republishComputers()
+                        synchronized(rawComputers) { rawComputers.values.toList() }
+                            .forEach { maybeSyncHostMedia(it) }
+                    }
+                    is HostInfoResult.IdentityMismatch,
+                    is HostInfoResult.CertificateChanged,
+                    HostInfoResult.UpgradeRequired -> {
+                        infoRetry.markCompleted(host.id)
+                    }
+                    HostInfoResult.Cancelled -> Unit
+                    is HostInfoResult.Failed -> {
+                        val waitMs = infoRetry.markTransientFailure(host.id, System.currentTimeMillis())
+                        if (foregroundActive && host.id in knownHostIds) {
+                            retryJobs["info:${host.id}"]?.cancel()
+                            retryJobs["info:${host.id}"] = scope.launch {
+                                delay(waitMs)
+                                val latest = hostDiscovery.hosts.value.firstOrNull { it.id == host.id }
+                                if (foregroundActive && latest != null) {
+                                    scheduleHostInfoProbe(latest)
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
     private fun maybeSyncHostMedia(details: ComputerDetails) {
-        if (details.pairState != PairingManager.PairState.PAIRED) return
+        // Strictly refuse to query /media on unpaired hosts or hosts without a saved pairing cert.
+        if (details.pairState != PairingManager.PairState.PAIRED || details.serverCert == null) return
         val raw = RawComputer.from(details)
         val host = hostDiscovery.hosts.value.firstOrNull { raw.matchesHost(it) } ?: return
         val mediaPort = hostInfos[host.id]?.media?.port ?: host.mediaPort ?: return
-        if (mediaPort <= 0 || !mediaSyncedHosts.add(host.id)) return
+        if (mediaPort <= 0) return
         val b = binder ?: return
-        // Only auto-configure WebDAV if none is saved yet, so we don't overwrite a user's manual setup
-        if (WebDav.load(app) != null) return
+        if (WebDav.load(app) != null) {
+            mediaRetry.markCompleted(host.id)
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (!mediaRetry.tryAcquire(host.id, now)) return
         scope.launch(Dispatchers.IO) {
             val res = hostApi.getMediaCredentials(host.address, host.controlPort, host.id, b.uniqueId)
-            if (res is MediaCredsResult.Available) {
-                val base = "http://${host.address}:${res.creds.port}"
-                WebDav.save(app, WebDav.Server(base, res.creds.user, res.creds.pass))
-                LimeLog.info("depth3d: auto-configured WebDAV media source from host ${host.name}")
-                withContext(Dispatchers.Main.immediate) {
-                    onAutoWebDavConfigured()
+            withContext(Dispatchers.Main.immediate) {
+                when (res) {
+                    is MediaCredsResult.Available -> {
+                        mediaRetry.markCompleted(host.id)
+                        val base = "http://${host.address}:${res.creds.port}"
+                        WebDav.save(app, WebDav.Server(base, res.creds.user, res.creds.pass))
+                        LimeLog.info("depth3d: auto-configured WebDAV media source from host ${host.name}")
+                        onAutoWebDavConfigured()
+                    }
+                    MediaCredsResult.NotConfigured,
+                    MediaCredsResult.Unauthorized,
+                    MediaCredsResult.UpgradeRequired,
+                    is MediaCredsResult.CertificateChanged -> {
+                        mediaRetry.markCompleted(host.id)
+                    }
+                    MediaCredsResult.Cancelled -> Unit
+                    is MediaCredsResult.Failed -> {
+                        val waitMs = mediaRetry.markTransientFailure(host.id, System.currentTimeMillis())
+                        if (foregroundActive && host.id in knownHostIds) {
+                            retryJobs["media:${host.id}"]?.cancel()
+                            retryJobs["media:${host.id}"] = scope.launch {
+                                delay(waitMs)
+                                if (foregroundActive) {
+                                    maybeSyncHostMedia(details)
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -879,6 +1202,14 @@ class StreamingController(
                     val wasOffline = !_hasWifi.value
                     _hasWifi.value = true
                     if (wasOffline && foregroundActive) {
+                        infoRetry.resetAll()
+                        mediaRetry.resetAll()
+                        retryJobs.values.forEach { it.cancel() }
+                        retryJobs.clear()
+                        if (_computers.value.isEmpty()) {
+                            _discovering.value = true
+                            startDiscoveryTimeout()
+                        }
                         hostDiscovery.stop()
                         hostDiscovery.start()
                         binder?.startPolling(computerListener)
@@ -915,6 +1246,9 @@ class StreamingController(
     }
 
     companion object {
+        const val DISCOVERY_TIMEOUT_MS = 8_000L
+        const val MAX_BOX_ART_ENTRIES = 48
+
         internal fun parseHostPort(input: String): Pair<String, Int> {
             val clean = input.trim().removePrefix("http://").removePrefix("https://").substringBefore('/')
             if (clean.startsWith('[')) {

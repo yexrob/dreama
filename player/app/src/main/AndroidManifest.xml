@@ -16,6 +16,7 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <!-- Android 13 and later ask for videos by type -->
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.VIBRATE" />
@@ -26,6 +27,7 @@
     <!-- mDNS uses NsdManager on API level 34+, but the DLNA receiver's SSDP
          discovery needs a MulticastLock on every version -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- The DLNA cast receiver runs as a media playback foreground service -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
 
@@ -35,18 +37,30 @@
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
     <uses-feature android:name="android.hardware.sensor.accelerometer" android:required="false" />
     <uses-feature android:name="android.hardware.sensor.gyroscope" android:required="false" />
+
+    <!-- Disable legacy input emulation on ChromeOS -->
     <uses-feature android:name="android.hardware.type.pc" android:required="false" />
 
-    <!-- VR headsets -->
+    <!-- VR headsets. Optional so phones and TVs are unaffected -->
     <uses-feature android:name="android.hardware.vr.headtracking" android:version="1" android:required="false" />
+    <!-- Meta gates the passthrough cameras on this. Not required, since the
+         other headset does passthrough as a blend mode instead -->
     <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="false" />
+    <!-- Hand tracking. Meta wants the feature and the permission together, and
+         Pico reads its own key. All optional: controllers still work without -->
     <uses-feature android:name="oculus.software.handtracking" android:required="false" />
     <uses-permission android:name="com.oculus.permission.HAND_TRACKING" />
     <uses-feature android:name="pvr.software.handtracking" android:required="false" />
+    <!-- Eye tracking, for headsets that point by looking. Optional again, and
+         only ever used to aim the existing pointer -->
     <uses-feature android:name="oculus.software.eye_tracking" android:required="false" />
     <uses-permission android:name="com.oculus.permission.EYE_TRACKING" />
     <uses-feature android:name="pvr.software.eyetracking" android:required="false" />
     <uses-permission android:name="com.picovr.permission.EYE_TRACKING" />
+    <!-- Android XR. The OpenXR feature is optional here so Meta and Pico
+         installs are unaffected; 1.0 is the API version the instance asks
+         for. Hand joints and eye gaze are runtime permissions there, asked
+         for with the eye tracking one above -->
     <uses-feature android:name="android.software.xr.api.openxr" android:version="0x00010000" android:required="false" />
     <uses-feature android:name="android.hardware.xr.input.controller" android:required="false" />
     <uses-feature android:name="android.hardware.xr.input.hand_tracking" android:required="false" />
@@ -79,6 +93,7 @@
             android:name="libopenxr.google.so"
             android:required="false" />
 
+        <!-- Disable downscaling to 1080p on Android 12+ -->
         <meta-data
             android:name="com.android.graphics.intervention.wm.allowDownscale"
             android:value="false" />
@@ -117,6 +132,12 @@
                 <data android:scheme="content" android:mimeType="video/*" />
             </intent-filter>
             <meta-data android:name="pvr.app.type" android:value="vr" />
+            <!-- Android XR's equivalent of the VR category: start in Full
+                 Space with the app drawing it through OpenXR. Only this
+                 activity, so the 2d ones stay panels -->
+            <property
+                android:name="android.window.PROPERTY_XR_ACTIVITY_START_MODE"
+                android:value="XR_ACTIVITY_START_MODE_FULL_SPACE_UNMANAGED" />
         </activity>
 
         <!-- Immersive 3D PC streaming session -->
@@ -128,19 +149,22 @@
             android:launchMode="singleTask"
             android:excludeFromRecents="true"
             android:theme="@style/StreamTheme"
-            android:preferMinimalPostProcessing="true"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="com.oculus.intent.category.VR" />
             </intent-filter>
             <meta-data android:name="pvr.app.type" android:value="vr" />
+            <!-- Android XR's equivalent of the VR category: start in Full
+                 Space with the app drawing it through OpenXR. Only this
+                 activity, so the 2d ones stay panels -->
             <property
                 android:name="android.window.PROPERTY_XR_ACTIVITY_START_MODE"
                 android:value="XR_ACTIVITY_START_MODE_FULL_SPACE_UNMANAGED" />
         </activity>
 
-        <!-- Immersive 3D AirPlay screen mirroring session -->
+        <!-- AirPlay screen mirroring: the receiver runs while the wall is
+             open and brings the player up when an iPad starts mirroring -->
         <activity
             android:name=".local.airplay.AirPlayPlayerXR"
             android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection"
@@ -180,6 +204,7 @@
             android:exported="false"
             android:label="@string/service_usb_driver_label" />
 
+        <!-- depth3d: the DLNA cast receiver, only while the app is open -->
         <service
             android:name=".local.dlna.DlnaService"
             android:label="@string/service_dlna_label"

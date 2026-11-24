@@ -88,6 +88,51 @@ class ComputerListStateTest {
     }
 
     @Test
+    fun rawComputerMatchesHostChecksExactPortEvenWhenGsPortIsDefault() {
+        val hostDefaultPort = DiscoveredHost(
+            id = "host-default",
+            name = "Mac",
+            address = "192.168.1.10",
+            controlPort = 47990,
+            gsPort = NvHTTP.DEFAULT_HTTP_PORT,
+            pairMode = "auto",
+        )
+        // Review #13: explicit non-default port 48000 must NOT match gsPort 47989!
+        val differentPortPc = rawComputer(
+            uuid = "other-uuid",
+            name = "VM",
+            activeAddress = "192.168.1.10",
+            activePort = 48000,
+        )
+        assertFalse(
+            "Port 48000 must not match host gsPort 47989",
+            differentPortPc.matchesHost(hostDefaultPort),
+        )
+
+        // Exact default port 47989 matches
+        val samePortPc = rawComputer(
+            uuid = "other-uuid",
+            name = "Mac",
+            activeAddress = "192.168.1.10",
+            activePort = 47989,
+        )
+        assertTrue(samePortPc.matchesHost(hostDefaultPort))
+
+        // Unspecified port (0 -> treated as default 47989) matches default gsPort 47989
+        val zeroPortPc = rawComputer(
+            uuid = "other-uuid",
+            name = "Mac",
+            activeAddress = "192.168.1.10",
+            activePort = 0,
+        )
+        assertTrue(zeroPortPc.matchesHost(hostDefaultPort))
+
+        // Unspecified port (0 -> 47989) must NOT match non-default gsPort 49000
+        val hostCustomPort = hostDefaultPort.copy(gsPort = 49000)
+        assertFalse(zeroPortPc.matchesHost(hostCustomPort))
+    }
+
+    @Test
     fun mergeDeduplicatesByUuidAndByIpPort() {
         val gs1 = rawComputer(
             uuid = "HOST-UUID-1",
@@ -218,5 +263,52 @@ class ComputerListStateTest {
 
         val homeShelf = ComputerListMerger.homeScreenComputers(merged)
         assertEquals(listOf("u-stream", "u-paired"), homeShelf.map { it.id })
+    }
+
+    @Test
+    fun hostRetryTrackerAppliesExponentialBackoffAndResetsOnWifiRecovery() {
+        val tracker = HostRetryTracker(backoffScheduleMs = longArrayOf(3_000L, 10_000L, 30_000L, 60_000L))
+        var now = 1_000L
+
+        // Initially eligible
+        assertTrue(tracker.tryAcquire("host-1", now))
+        // In-flight prevents duplicate concurrent probes
+        assertFalse(tracker.tryAcquire("host-1", now))
+
+        // Failure #1 -> 3s backoff
+        val delay1 = tracker.markTransientFailure("host-1", now)
+        assertEquals(3_000L, delay1)
+        assertFalse(tracker.tryAcquire("host-1", now + 2_999L))
+        assertTrue(tracker.tryAcquire("host-1", now + 3_000L))
+
+        // Failure #2 -> 10s backoff
+        now += 3_000L
+        assertEquals(10_000L, tracker.markTransientFailure("host-1", now))
+        assertFalse(tracker.tryAcquire("host-1", now + 9_999L))
+
+        // Wi-Fi recovery resets backoff immediately
+        tracker.resetAll()
+        assertTrue(tracker.tryAcquire("host-1", now))
+
+        // Completion stops retries until reset
+        tracker.markCompleted("host-1")
+        assertFalse(tracker.tryAcquire("host-1", now + 1_000_000L))
+    }
+
+    @Test
+    fun boundedLruCacheEvictsLeastRecentlyUsedBeyondCapacity() {
+        val cache = BoundedLruCache<String, Int>(maxEntries = 3)
+        cache.put("a", 1)
+        cache.put("b", 2)
+        cache.put("c", 3)
+        // Touch "a" so "b" becomes least-recently-used
+        assertEquals(1, cache.get("a"))
+        cache.put("d", 4)
+
+        assertEquals(3, cache.size())
+        assertEquals(1, cache.get("a"))
+        assertNull("Least recently used key 'b' should be evicted", cache.get("b"))
+        assertEquals(3, cache.get("c"))
+        assertEquals(4, cache.get("d"))
     }
 }

@@ -136,7 +136,9 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
                     item("res") {
                         SettingRow(
                             title = stringResource(R.string.settings_resolution_title),
-                            sub = stringResource(R.string.settings_resolution_sub),
+                            sub = snapshot.customResolutionLabel?.let {
+                                stringResource(R.string.settings_resolution_custom_sub, it)
+                            } ?: stringResource(R.string.settings_resolution_sub),
                         ) {
                             SegmentedControl(
                                 options = listOf(
@@ -153,7 +155,9 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
                     item("fps") {
                         SettingRow(
                             title = stringResource(R.string.settings_fps_title),
-                            sub = stringResource(R.string.settings_fps_sub),
+                            sub = snapshot.customFpsLabel?.let {
+                                stringResource(R.string.settings_fps_custom_sub, it)
+                            } ?: stringResource(R.string.settings_fps_sub),
                         ) {
                             SegmentedControl(
                                 options = listOf(
@@ -237,7 +241,9 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
                     item("codec") {
                         SettingRow(
                             title = stringResource(R.string.settings_codec_title),
-                            sub = stringResource(R.string.settings_codec_sub),
+                            sub = snapshot.customCodecLabel?.let {
+                                stringResource(R.string.settings_codec_custom_sub, it)
+                            } ?: stringResource(R.string.settings_codec_sub),
                         ) {
                             SegmentedControl(
                                 options = listOf(
@@ -551,16 +557,6 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
                             )
                         }
                     }
-                    item("crash-report") {
-                        SettingRow(
-                            title = stringResource(R.string.settings_crash_report_title),
-                            sub = stringResource(R.string.settings_crash_report_sub),
-                        ) {
-                            WallSwitch(snapshot.crashReporting) {
-                                update { StreamSettingsMapper.setCrashReporting(store, it) }
-                            }
-                        }
-                    }
                 }
 
                 SettingsCategory.ABOUT -> {
@@ -621,7 +617,7 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
                                 color = Wall.Text2,
                             )
                             Spacer(Modifier.height(4.dp))
-                            for ((proj, lic, role) in THIRD_PARTY_COMPONENTS) {
+                            for ((proj, lic, roleRes) in THIRD_PARTY_COMPONENTS) {
                                 Row(
                                     Modifier.fillMaxWidth().padding(vertical = 4.dp),
                                     verticalAlignment = Alignment.CenterVertically,
@@ -629,7 +625,7 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
                                 ) {
                                     Column(Modifier.weight(1f)) {
                                         Text(proj, style = WallType.Label.copy(fontSize = 22.sp, fontWeight = FontWeight.SemiBold))
-                                        Text(role, style = WallType.Caption.copy(fontSize = 19.sp), color = Wall.Text2)
+                                        Text(stringResource(roleRes), style = WallType.Caption.copy(fontSize = 19.sp), color = Wall.Text2)
                                     }
                                     Text(lic, style = WallType.Caption.copy(fontSize = 19.sp), color = Wall.Text3)
                                 }
@@ -650,7 +646,10 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
                 onSubmit = { entered ->
                     val trimmed = entered.trim()
                     if (trimmed.isEmpty()) {
-                        UserFacingError("名称不能为空", "请输入一个简短好记的设备名称。")
+                        UserFacingError(
+                            context.getString(R.string.err_device_name_empty_title),
+                            context.getString(R.string.err_device_name_empty_detail),
+                        )
                     } else {
                         CastReceiver.setName(context, trimmed)
                         null
@@ -712,6 +711,12 @@ private fun SettingRow(
 
 @Composable
 private fun GplLicenseSheet(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val licenseText = remember(context) {
+        runCatching {
+            context.assets.open("LICENSE.txt").bufferedReader().use { it.readText() }
+        }.getOrNull()
+    }
     Box(
         Modifier
             .fillMaxSize()
@@ -721,8 +726,8 @@ private fun GplLicenseSheet(onDismiss: () -> Unit) {
     ) {
         Column(
             Modifier
-                .width(920.dp)
-                .height(600.dp)
+                .width(960.dp)
+                .height(620.dp)
                 .shadow(40.dp, RoundedCornerShape(Wall.RadiusXl))
                 .clip(RoundedCornerShape(Wall.RadiusXl))
                 .background(Wall.Sheet)
@@ -733,41 +738,42 @@ private fun GplLicenseSheet(onDismiss: () -> Unit) {
                 Text(stringResource(R.string.settings_about_license_title), style = WallType.Head, modifier = Modifier.weight(1f))
                 WallButton(stringResource(R.string.action_close), onDismiss, kind = ButtonKind.Plain, small = true)
             }
-            Spacer(Modifier.height(16.dp))
+            Text(
+                stringResource(R.string.settings_about_license_summary),
+                style = WallType.Caption,
+                color = Wall.Text2,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+            Spacer(Modifier.height(14.dp))
             Column(
                 Modifier
                     .weight(1f)
+                    .fillMaxWidth()
                     .clip(RoundedCornerShape(Wall.Radius))
                     .background(Wall.Bg)
                     .verticalScroll(rememberScrollState())
                     .padding(24.dp),
             ) {
-                Text(GPLV3_SUMMARY_TEXT, style = WallType.Caption.copy(fontSize = 20.sp, lineHeight = 30.sp), color = Wall.Text2)
+                Text(
+                    licenseText ?: stringResource(R.string.settings_about_license_missing),
+                    style = WallType.Caption.copy(
+                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                        fontSize = 16.sp,
+                        lineHeight = 24.sp,
+                    ),
+                    color = Wall.Text2,
+                )
             }
         }
     }
 }
 
-// Upstream & third-party credits (sole location where upstream project names appear per quality bar)
+// Upstream & third-party credits bundled in this headset app (sole location where upstream project names appear).
 private val THIRD_PARTY_COMPONENTS = listOf(
-    Triple("Moonlight Android / MoonlightXR", "GPLv3", "串流协议栈与 OpenXR 3D 渲染管线"),
-    Triple("Sunshine", "GPLv3", "电脑端低延迟串流兼容协议"),
-    Triple("UxPlay", "GPLv3", "AirPlay 屏幕镜像接收核心"),
-    Triple("ZipDepth / MiDaS", "MIT", "头显端实时 2D 转 3D 深度估计模型"),
-    Triple("AndroidX Media3 (ExoPlayer)", "Apache 2.0", "本地与局域网视频解码播放"),
-    Triple("Khronos OpenXR Loader & LiteRT", "Apache 2.0", "OpenXR 运行时与端侧神经网络推理"),
-    Triple("OkHttp / BouncyCastle / JmDNS", "Apache 2.0 / MIT", "安全传输、证书加密与局域网服务发现"),
+    Triple("Moonlight Android / MoonlightXR", "GPLv3", R.string.settings_tp_moonlight_role),
+    Triple("UxPlay", "GPLv3", R.string.settings_tp_uxplay_role),
+    Triple("ZipDepth / MiDaS", "MIT", R.string.settings_tp_depth_role),
+    Triple("AndroidX Media3 (ExoPlayer)", "Apache 2.0", R.string.settings_tp_media3_role),
+    Triple("Khronos OpenXR Loader & LiteRT", "Apache 2.0", R.string.settings_tp_openxr_role),
+    Triple("OkHttp / BouncyCastle / JmDNS", "Apache 2.0 / MIT", R.string.settings_tp_net_role),
 )
-
-private val GPLV3_SUMMARY_TEXT = """
-GNU GENERAL PUBLIC LICENSE
-Version 3, 29 June 2007
-
-depth3d 遵循 GNU 通用公共许可证第 3 版（GPLv3）发布。
-
-你可以自由运行本软件，研究并修改其源代码，并按照相同的 GPLv3 协议再分发原始或修改后的版本。
-
-本程序基于开源社区项目构建并分发，希望能为你带来帮助，但不附带任何明示或暗示的担保（包括但不限于适销性或特定用途适用性的默示担保）。
-
-完整 GPLv3 英文原文见本软件源码仓库根目录 LICENSE.txt 文件，亦可访问 https://www.gnu.org/licenses/gpl-3.0.html 查阅。
-""".trimIndent()

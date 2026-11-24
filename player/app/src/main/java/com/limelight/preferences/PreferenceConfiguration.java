@@ -30,9 +30,10 @@ public class PreferenceConfiguration {
     private static final String LEGACY_RES_FPS_PREF_STRING = "list_resolution_fps";
     private static final String LEGACY_ENABLE_51_SURROUND_PREF_STRING = "checkbox_51_surround";
 
-    static final String RESOLUTION_PREF_STRING = "list_resolution";
-    static final String FPS_PREF_STRING = "list_fps";
-    static final String BITRATE_PREF_STRING = "seekbar_bitrate_kbps";
+    public static final String RESOLUTION_PREF_STRING = "list_resolution";
+    public static final String FPS_PREF_STRING = "list_fps";
+    public static final String BITRATE_PREF_STRING = "seekbar_bitrate_kbps";
+    public static final String DEPTH3D_BITRATE_PRESET_PREF_STRING = "depth3d_bitrate_preset";
     private static final String BITRATE_PREF_OLD_STRING = "seekbar_bitrate";
     private static final String STRETCH_PREF_STRING = "checkbox_stretch_video";
     private static final String SOPS_PREF_STRING = "checkbox_enable_sops";
@@ -74,7 +75,7 @@ public class PreferenceConfiguration {
     public static final String VR_PASSTHROUGH_PREF_STRING = "checkbox_vr_passthrough";
     private static final String VR_POINTER_PREF_STRING = "checkbox_vr_pointer";
     private static final String VR_GAZE_PREF_STRING = "checkbox_vr_gaze";
-    private static final String VR_HAND_TRACKING_PREF_STRING = "checkbox_vr_hand_tracking";
+    public static final String VR_HAND_TRACKING_PREF_STRING = "checkbox_vr_hand_tracking";
     // Set once the hand lock hint in the session is put away with "Don't show
     // this again". Not a row in the settings, only ever written from the hint.
     static final String VR_HAND_LOCK_HINT_SEEN_PREF_STRING = "checkbox_vr_hand_lock_hint_seen";
@@ -172,15 +173,15 @@ public class PreferenceConfiguration {
     // 1440p everywhere. 4K looks better on a headset panel but costs decode
     // latency and host bitrate, and it is one list entry away for anyone who
     // wants it.
-    static final String DEFAULT_RESOLUTION = "2560x1440";
-    static final String DEFAULT_FPS = "90";
+    public static final String DEFAULT_RESOLUTION = "2560x1440";
+    public static final String DEFAULT_FPS = "90";
 
     // What a Gen 1 headset starts on. The depth model is most of the cost of a
     // 3D frame, so its rate is the big lever here, and 72 is what these
     // panels run at natively anyway.
-    private static final String GEN1_RESOLUTION = "2560x1440";
-    private static final String GEN1_FPS = "72";
-    static final int GEN1_DEPTH_RATE = XrShared.DEPTH_RATE_GEN1;
+    public static final String GEN1_RESOLUTION = "2560x1440";
+    public static final String GEN1_FPS = "72";
+    public static final int GEN1_DEPTH_RATE = XrShared.DEPTH_RATE_GEN1;
     // These headsets have neither the memory nor the fill rate for a full size
     // room, so they start on the smallest tier
     private static final String GEN1_ENV_RES = "low";
@@ -1126,14 +1127,16 @@ public class PreferenceConfiguration {
 
     public static int getDefaultBitrate(Context context) {
         SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
+        return getDefaultBitrate(prefs);
+    }
+
+    public static int getDefaultBitrate(SharedPreferences prefs) {
         return getDefaultBitrate(
                 prefs.getString(RESOLUTION_PREF_STRING, DEFAULT_RESOLUTION),
                 prefs.getString(FPS_PREF_STRING, DEFAULT_FPS));
     }
 
-    private static FormatOption getVideoFormatValue(Context context) {
-        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
-
+    private static FormatOption getVideoFormatValue(SharedPreferences prefs) {
         String str = prefs.getString(VIDEO_FORMAT_PREF_STRING, DEFAULT_VIDEO_FORMAT);
         if (str.equals("auto")) {
             return FormatOption.AUTO;
@@ -1153,9 +1156,7 @@ public class PreferenceConfiguration {
         }
     }
 
-    private static int getFramePacingValue(Context context) {
-        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
-
+    private static int getFramePacingValue(SharedPreferences prefs) {
         // Migrate legacy never drop frames option to the new location
         if (prefs.contains(LEGACY_DISABLE_FRAME_DROP_PREF_STRING)) {
             boolean legacyNeverDropFrames = prefs.getBoolean(LEGACY_DISABLE_FRAME_DROP_PREF_STRING, false);
@@ -1184,9 +1185,7 @@ public class PreferenceConfiguration {
         }
     }
 
-    private static AnalogStickForScrolling getAnalogStickForScrollingValue(Context context) {
-        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
-
+    private static AnalogStickForScrolling getAnalogStickForScrollingValue(SharedPreferences prefs) {
         String str = prefs.getString(ANALOG_SCROLLING_PREF_STRING, DEFAULT_ANALOG_STICK_FOR_SCROLLING);
         if (str.equals("right")) {
             return AnalogStickForScrolling.RIGHT;
@@ -1200,11 +1199,15 @@ public class PreferenceConfiguration {
     }
 
     public static void resetStreamingSettings(Context context) {
+        resetStreamingSettings(PreferenceManager.getDefaultSharedPreferences(context));
+    }
+
+    public static void resetStreamingSettings(SharedPreferences prefs) {
         // We consider resolution, FPS, bitrate, HDR, and video format as "streaming settings" here
-        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
         prefs.edit()
                 .remove(BITRATE_PREF_STRING)
                 .remove(BITRATE_PREF_OLD_STRING)
+                .remove(DEPTH3D_BITRATE_PRESET_PREF_STRING)
                 .remove(LEGACY_RES_FPS_PREF_STRING)
                 .remove(RESOLUTION_PREF_STRING)
                 .remove(FPS_PREF_STRING)
@@ -1230,6 +1233,28 @@ public class PreferenceConfiguration {
 
     public static PreferenceConfiguration readPreferences(Context context) {
         SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
+        return readPreferences(
+                prefs,
+                isXr2Gen1Headset(),
+                getDefaultSmallMode(context),
+                isShieldAtvFirmwareWithBrokenHdr(),
+                Build.VERSION.SDK_INT == Build.VERSION_CODES.S);
+    }
+
+    /**
+     * Pure SharedPreferences reader shared by the Compose settings UI and unit tests so displayed
+     * values and effective runtime values always come from the exact same parsing and defaults.
+     */
+    public static PreferenceConfiguration readPreferences(SharedPreferences prefs, boolean isGen1) {
+        return readPreferences(prefs, isGen1, false, false, false);
+    }
+
+    private static PreferenceConfiguration readPreferences(
+            SharedPreferences prefs,
+            boolean isGen1,
+            boolean defaultSmallIconMode,
+            boolean brokenHdr,
+            boolean android12SensorBug) {
         PreferenceConfiguration config = new PreferenceConfiguration();
 
         // Migrate legacy preferences to the new locations
@@ -1315,10 +1340,10 @@ public class PreferenceConfiguration {
         if (!prefs.contains(SMALL_ICONS_PREF_STRING)) {
             // We need to write small icon mode's default to disk for the settings page to display
             // the current state of the option properly
-            prefs.edit().putBoolean(SMALL_ICONS_PREF_STRING, getDefaultSmallMode(context)).apply();
+            prefs.edit().putBoolean(SMALL_ICONS_PREF_STRING, defaultSmallIconMode).apply();
         }
 
-        if (!prefs.contains(GAMEPAD_MOTION_SENSORS_PREF_STRING) && Build.VERSION.SDK_INT == Build.VERSION_CODES.S) {
+        if (!prefs.contains(GAMEPAD_MOTION_SENSORS_PREF_STRING) && android12SensorBug) {
             // Android 12 has a nasty bug that causes crashes when the app touches the InputDevice's
             // associated InputDeviceSensorManager (just calling getSensorManager() is enough).
             // As a workaround, we will override the default value for the gamepad motion sensor
@@ -1330,24 +1355,24 @@ public class PreferenceConfiguration {
         // This must happen after the preferences migration to ensure the preferences are populated
         config.bitrate = prefs.getInt(BITRATE_PREF_STRING, prefs.getInt(BITRATE_PREF_OLD_STRING, 0) * 1000);
         if (config.bitrate == 0) {
-            config.bitrate = getDefaultBitrate(context);
+            config.bitrate = getDefaultBitrate(prefs);
         }
 
         String audioConfig = prefs.getString(AUDIO_CONFIG_PREF_STRING, DEFAULT_AUDIO_CONFIG);
         if (audioConfig.equals("71")) {
-            config.audioConfiguration = MoonBridge.AUDIO_CONFIGURATION_71_SURROUND;
+            config.audioConfiguration = new MoonBridge.AudioConfiguration(8, 0x63F);
         }
         else if (audioConfig.equals("51")) {
-            config.audioConfiguration = MoonBridge.AUDIO_CONFIGURATION_51_SURROUND;
+            config.audioConfiguration = new MoonBridge.AudioConfiguration(6, 0x3F);
         }
         else /* if (audioConfig.equals("2")) */ {
-            config.audioConfiguration = MoonBridge.AUDIO_CONFIGURATION_STEREO;
+            config.audioConfiguration = new MoonBridge.AudioConfiguration(2, 0x3);
         }
 
-        config.videoFormat = getVideoFormatValue(context);
-        config.framePacing = getFramePacingValue(context);
+        config.videoFormat = getVideoFormatValue(prefs);
+        config.framePacing = getFramePacingValue(prefs);
 
-        config.analogStickForScrolling = getAnalogStickForScrollingValue(context);
+        config.analogStickForScrolling = getAnalogStickForScrollingValue(prefs);
 
         config.deadzonePercentage = prefs.getInt(DEADZONE_PREF_STRING, DEFAULT_DEADZONE);
 
@@ -1362,13 +1387,13 @@ public class PreferenceConfiguration {
         config.playHostAudio = prefs.getBoolean(HOST_AUDIO_PREF_STRING, DEFAULT_HOST_AUDIO);
         config.autoLaunchDesktop = prefs.getBoolean(AUTO_DESKTOP_PREF_STRING, DEFAULT_AUTO_DESKTOP);
         config.checkUpdates = checkUpdatesOn(prefs);
-        config.smallIconMode = prefs.getBoolean(SMALL_ICONS_PREF_STRING, getDefaultSmallMode(context));
+        config.smallIconMode = prefs.getBoolean(SMALL_ICONS_PREF_STRING, defaultSmallIconMode);
         config.multiController = prefs.getBoolean(MULTI_CONTROLLER_PREF_STRING, DEFAULT_MULTI_CONTROLLER);
         config.usbDriver = prefs.getBoolean(USB_DRIVER_PREF_SRING, DEFAULT_USB_DRIVER);
         config.onscreenController = prefs.getBoolean(ONSCREEN_CONTROLLER_PREF_STRING, ONSCREEN_CONTROLLER_DEFAULT);
         config.onlyL3R3 = prefs.getBoolean(ONLY_L3_R3_PREF_STRING, ONLY_L3_R3_DEFAULT);
         config.showGuideButton = prefs.getBoolean(SHOW_GUIDE_BUTTON_PREF_STRING, SHOW_GUIDE_BUTTON_DEFAULT);
-        config.enableHdr = prefs.getBoolean(ENABLE_HDR_PREF_STRING, DEFAULT_ENABLE_HDR) && !isShieldAtvFirmwareWithBrokenHdr();
+        config.enableHdr = prefs.getBoolean(ENABLE_HDR_PREF_STRING, DEFAULT_ENABLE_HDR) && !brokenHdr;
         config.enablePip = prefs.getBoolean(ENABLE_PIP_PREF_STRING, DEFAULT_ENABLE_PIP);
         config.enablePerfOverlay = prefs.getBoolean(ENABLE_PERF_OVERLAY_STRING, DEFAULT_ENABLE_PERF_OVERLAY);
         config.enableGlRenderPath = prefs.getBoolean(ENABLE_GL_RENDER_PATH_PREF_STRING, DEFAULT_ENABLE_GL_RENDER_PATH);
@@ -1380,7 +1405,7 @@ public class PreferenceConfiguration {
         // A Gen 1 headset runs ZipDepth for a stored MiDaS it does not offer
         String depthSource = depthSourceForHeadset(
                 prefs.getString(VR_DEPTH_SOURCE_PREF_STRING, DEFAULT_VR_DEPTH_SOURCE),
-                isXr2Gen1Headset());
+                isGen1);
         config.vrDepthModel = DEFAULT_VR_DEPTH_SOURCE;
         if (depthSource.equals("flat")) {
             config.vrDepthMode = XrShared.DEPTH_MODE_FLAT;
@@ -1446,7 +1471,7 @@ public class PreferenceConfiguration {
         config.vrGamepadToggle = gamepadToggle(prefs);
         config.vrStereoSeparation = storedSeparation(prefs, config.vrDepthModel);
         config.vrDepthDebug = prefs.getBoolean(VR_DEPTH_DEBUG_PREF_STRING, DEFAULT_VR_DEPTH_DEBUG);
-        config.vrDepthRate = storedDepthRate(prefs, isXr2Gen1Headset());
+        config.vrDepthRate = storedDepthRate(prefs, isGen1);
         config.vrConvergence = storedConvergence(prefs, config.vrDepthModel);
         config.vrDepthScale = prefs.getInt(VR_DEPTH_SCALE_PREF_STRING, DEFAULT_VR_DEPTH_SCALE);
         config.vrAmbilight = prefs.getBoolean(VR_AMBILIGHT_PREF_STRING, DEFAULT_VR_AMBILIGHT);
