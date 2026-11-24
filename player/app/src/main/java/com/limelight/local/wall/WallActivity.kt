@@ -15,6 +15,7 @@ import com.limelight.PcView
 import com.limelight.local.LocalPlayerXR
 import com.limelight.local.WebDav
 import com.limelight.local.dlna.CastReceiver
+import com.limelight.local.airplay.AirPlayService
 import com.limelight.local.media.LocalVideoSource
 import com.limelight.local.media.PlaybackInfo
 import com.limelight.preferences.StreamSettings
@@ -54,6 +55,8 @@ class WallActivity : ComponentActivity(), WallActions {
             storage.launch(LocalVideoSource.permission)
         }
         setContent { WallApp(model, this) }
+        // The AirPlay receiver runs while the wall is open
+        AirPlayService.start(this)
         // The mockups assume a 1280 wide panel at about 24 px per degree;
         // what the headset really gives is worth knowing (ux-spec §8 #1)
         window.decorView.post {
@@ -73,6 +76,13 @@ class WallActivity : ComponentActivity(), WallActions {
     override fun onStop() {
         super.onStop()
         CastReceiver.release(this)
+    }
+
+    override fun onDestroy() {
+        if (isFinishing) {
+            AirPlayService.stop(this)
+        }
+        super.onDestroy()
     }
 
     override fun onRestart() {

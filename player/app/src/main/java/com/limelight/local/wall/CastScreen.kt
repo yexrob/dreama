@@ -21,24 +21,45 @@ import androidx.compose.ui.text.font.FontWeight
 import com.limelight.local.dlna.CastReceiver
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.limelight.local.airplay.AirPlayNotice
+import com.limelight.local.airplay.AirPlayState
+import com.limelight.local.airplay.AirPlayTakeover
+import com.limelight.local.airplay.takesPage
 
 /**
- * 投屏 (design-opus cast.html). Phone video apps cast over DLNA to the name
- * shown here; AirPlay is not built yet. 电脑串流 below is the Moonlight host
- * list.
+ * 投屏 (design-opus cast.html). The top half is the two receivers under one
+ * name: AirPlay mirroring (AirPlayService), whose connecting and no Wi-Fi
+ * states take the whole page, and DLNA from phone video apps (CastReceiver).
+ * 电脑串流 below is the Moonlight host list.
  */
 @Composable
 fun CastScreen(nav: WallNav) {
     val dlna by CastReceiver.status.collectAsState()
     val copy = dlnaCastCopy(dlna)
+    val air by AirPlayState.status.collectAsStateWithLifecycle()
+    if (air.takesPage) {
+        Box(Modifier.fillMaxSize()) {
+            AirPlayTakeover(air)
+            NavBar(Tab.Cast, nav::tab, nav.settings, solid = true)
+        }
+        return
+    }
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.offset(64.dp, 136.dp).width(1152.dp)) {
-            Notice(copy.notice, if (copy.danger) WallIcons.Alert else WallIcons.Cast, danger = copy.danger)
+            // One line of state for both receivers: DLNA's when it has
+            // something to say (a fault, or a cast playing), AirPlay's otherwise
+            if (copy.danger) {
+                Notice(copy.notice, WallIcons.Alert, danger = true)
+            } else {
+                AirPlayNotice(air)
+            }
             Text(dlna.name, style = WallType.Display, modifier = Modifier.padding(top = 12.dp))
-            Text(copy.body, style = WallType.Body, color = Wall.Text2, modifier = Modifier.padding(top = 12.dp))
+            Text("在同一个 Wi-Fi 里，从 iPad、iPhone 或手机 App 选择这个名字。",
+                style = WallType.Body, color = Wall.Text2, modifier = Modifier.padding(top = 12.dp))
         }
         Row(Modifier.offset(64.dp, 372.dp), horizontalArrangement = Arrangement.spacedBy(48.dp)) {
-            HowTo(WallIcons.Tablet, "iPad / iPhone", "即将支持 · 控制中心 › 屏幕镜像")
+            HowTo(WallIcons.Tablet, "iPad / iPhone", "控制中心 › 屏幕镜像 › 选这个名字")
             HowTo(WallIcons.Phone, "手机里的视频 App", copy.phoneHowTo)
         }
         Row(Modifier.offset(64.dp, 520.dp), verticalAlignment = Alignment.CenterVertically,
