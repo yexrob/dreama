@@ -103,14 +103,28 @@ object StreamErrorMapper {
             title = s.get(R.string.err_autopair_timeout_title),
             detail = s.get(R.string.err_autopair_timeout_detail),
         )
+        AutoPairResult.Busy -> UserFacingError(
+            title = s.get(R.string.err_autopair_busy_title),
+            detail = s.get(R.string.err_autopair_busy_detail),
+        )
+        is AutoPairResult.Cooldown -> UserFacingError(
+            title = s.get(R.string.err_autopair_cooldown_title),
+            detail = if (result.retryAfterSec != null && result.retryAfterSec > 0) {
+                s.get(R.string.err_autopair_cooldown_detail_sec, result.retryAfterSec)
+            } else {
+                s.get(R.string.err_autopair_cooldown_detail)
+            },
+        )
         AutoPairResult.UpgradeRequired -> UserFacingError(
             title = s.get(R.string.err_host_upgrade_title),
             detail = s.get(R.string.err_host_upgrade_detail),
             retryable = false,
         )
-        AutoPairResult.StreamServiceUnavailable -> UserFacingError(
+        is AutoPairResult.StreamServiceUnavailable -> UserFacingError(
             title = s.get(R.string.err_host_service_down_title),
-            detail = streamReason?.takeIf { it.isNotBlank() } ?: s.get(R.string.err_host_service_down_detail),
+            detail = result.reason?.takeIf { it.isNotBlank() }
+                ?: streamReason?.takeIf { it.isNotBlank() }
+                ?: s.get(R.string.err_host_service_down_detail),
             retryable = true,
         )
         is AutoPairResult.CertificateChanged -> UserFacingError(
@@ -121,7 +135,43 @@ object StreamErrorMapper {
             title = s.get(R.string.err_autopair_failed_title),
             detail = s.get(R.string.err_autopair_failed_detail),
         )
-        AutoPairResult.Approved, AutoPairResult.Cancelled -> UserFacingError(
+        is AutoPairResult.Approved, AutoPairResult.Cancelled -> UserFacingError(
+            title = s.get(R.string.err_pair_failed_title),
+            detail = s.get(R.string.err_pair_generic_detail),
+        )
+    }
+
+    fun forPairComplete(s: StringLookup, result: PairCompleteResult): UserFacingError = when (result) {
+        PairCompleteResult.NotPaired -> UserFacingError(
+            title = s.get(R.string.err_pair_complete_not_paired_title),
+            detail = s.get(R.string.err_pair_complete_not_paired_detail),
+        )
+        PairCompleteResult.TicketExpired -> UserFacingError(
+            title = s.get(R.string.err_pair_complete_expired_title),
+            detail = s.get(R.string.err_pair_complete_expired_detail),
+        )
+        PairCompleteResult.Unauthorized -> UserFacingError(
+            title = s.get(R.string.err_pair_complete_unauth_title),
+            detail = s.get(R.string.err_pair_complete_unauth_detail),
+        )
+        PairCompleteResult.Forbidden -> UserFacingError(
+            title = s.get(R.string.err_pair_complete_forbidden_title),
+            detail = s.get(R.string.err_pair_complete_forbidden_detail),
+        )
+        PairCompleteResult.UpgradeRequired -> UserFacingError(
+            title = s.get(R.string.err_host_upgrade_title),
+            detail = s.get(R.string.err_host_upgrade_detail),
+            retryable = false,
+        )
+        is PairCompleteResult.CertificateChanged -> UserFacingError(
+            title = s.get(R.string.err_cert_changed_title),
+            detail = s.get(R.string.err_cert_changed_detail),
+        )
+        is PairCompleteResult.Failed -> UserFacingError(
+            title = s.get(R.string.err_pair_complete_failed_title),
+            detail = s.get(R.string.err_pair_complete_failed_detail),
+        )
+        is PairCompleteResult.Completed, PairCompleteResult.Cancelled -> UserFacingError(
             title = s.get(R.string.err_pair_failed_title),
             detail = s.get(R.string.err_pair_generic_detail),
         )

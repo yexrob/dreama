@@ -139,6 +139,8 @@ class StreamingController(
     private val observedFingerprintsByEndpoint = ConcurrentHashMap<String, String>()
     private val infoRetry = HostRetryTracker()
     private val mediaRetry = HostRetryTracker()
+    private val lastMediaRevisionByEndpoint = ConcurrentHashMap<String, Int>()
+    private val forceRefreshMediaEndpoints = ConcurrentHashMap.newKeySet<String>()
     private val retryJobs = ConcurrentHashMap<String, Job>()
     private val boxArtCache = BoundedLruCache<String, Bitmap>(MAX_BOX_ART_ENTRIES)
     private val networkTracker = NetworkChangeTracker(currentLanNetworkId())
@@ -222,8 +224,20 @@ class StreamingController(
                     mediaRetry.clear(lost)
                     hostInfosByEndpoint.remove(lost)
                     observedFingerprintsByEndpoint.remove(lost)
+                    lastMediaRevisionByEndpoint.remove(lost)
+                    forceRefreshMediaEndpoints.remove(lost)
                     retryJobs.remove("info:$lost")?.cancel()
                     retryJobs.remove("media:$lost")?.cancel()
+                }
+                for (host in hosts) {
+                    val rev = host.mediaRevision
+                    if (rev != null) {
+                        val prev = lastMediaRevisionByEndpoint.put(host.endpointKey, rev)
+                        if (prev != null && prev != rev) {
+                            mediaRetry.clear(host.endpointKey)
+                            forceRefreshMediaEndpoints.add(host.endpointKey)
+                        }
+                    }
                 }
                 knownEndpointKeys = currentEndpoints
                 if (hosts.isNotEmpty()) {
@@ -499,8 +513,17 @@ class StreamingController(
                                 stageText = app.getString(R.string.pair_auto_completing),
                             )
                         },
+                        onCompletingPairRecord = {
+                            _flow.value = StreamFlowState.AutoPairing(
+                                computer = computer,
+                                stageText = app.getString(R.string.pair_auto_finalizing),
+                            )
+                        },
+                        verifyExistingGameStreamPair = { cancelToken ->
+                            verifyExistingGameStreamPair(host, details, b, cancelToken)
+                        },
                         runGameStreamPair = { activePin, cancelToken ->
-                            runGameStreamPair(host, details, b, activePin, cancelToken)
+                            runFullGameStreamPair(host, details, b, activePin, cancelToken)
                         },
                     )
                     handleHostPairOutcome(computer, host, details, b, outcome, connectAfterPair, allowManualFallback = true)
@@ -630,10 +653,11 @@ class StreamingController(
             }
             is HostAutoPairOutcome.PairRejectedOrFailed -> {
                 val pairResp = outcome.result
+                val err = StreamErrorMapper.forAutoPair(strings, pairResp, streamReason = outcome.streamReason)
                 _flow.value = StreamFlowState.Failed(
                     computer = computer,
-                    error = StreamErrorMapper.forAutoPair(strings, pairResp, streamReason = outcome.streamReason),
-                    retryAction = if (pairResp != AutoPairResult.UpgradeRequired) {
+                    error = err,
+                    retryAction = if (err.retryable) {
                         RetryAction.Pair(computer, forceManualPin = false)
                     } else {
                         null
@@ -643,6 +667,15 @@ class StreamingController(
                     } else {
                         null
                     },
+                )
+                resumePollingIfForeground()
+            }
+            is HostAutoPairOutcome.PairCompleteFailed -> {
+                val err = StreamErrorMapper.forPairComplete(strings, outcome.result)
+                _flow.value = StreamFlowState.Failed(
+                    computer = computer,
+                    error = err,
+                    retryAction = if (err.retryable) RetryAction.Pair(computer, forceManualPin = false) else null,
                 )
                 resumePollingIfForeground()
             }
@@ -658,6 +691,49 @@ class StreamingController(
             HostAutoPairOutcome.Cancelled -> resumePollingIfForeground()
         }
     }
+
+    private suspend fun verifyExistingGameStreamPair(
+        host: DiscoveredHost,
+        details: ComputerDetails,
+        b: ComputerManagerService.ComputerManagerBinder,
+        token: CallCancelToken,
+    ): Boolean = GameStreamPairRunner.verifyExistingPair(
+        httpFactory = {
+            // Always dial the Host's own IPv4 address + gsPort (host-protocol.md §控制接口 & §升级路径).
+            NvHTTP(
+                ComputerDetails.AddressTuple(host.address, host.gsPort),
+                0,
+                b.uniqueId,
+                details.serverCert,
+                PlatformBinding.getCryptoProvider(app),
+            )
+        },
+        existingServerCert = details.serverCert,
+        expectedComputerUuid = details.uuid,
+        token = token,
+    )
+
+    private suspend fun runFullGameStreamPair(
+        host: DiscoveredHost,
+        details: ComputerDetails,
+        b: ComputerManagerService.ComputerManagerBinder,
+        pin: String,
+        token: CallCancelToken,
+    ): GameStreamPairOutcome = GameStreamPairRunner.runFullPair(
+        httpFactory = {
+            // Always dial the Host's own IPv4 address + gsPort so GameStream pairing shares the
+            // exact same IPv4 as POST /depth3d/v1/pair and POST /depth3d/v1/pair/complete.
+            NvHTTP(
+                ComputerDetails.AddressTuple(host.address, host.gsPort),
+                0,
+                b.uniqueId,
+                details.serverCert,
+                PlatformBinding.getCryptoProvider(app),
+            )
+        },
+        pin = pin,
+        token = token,
+    )
 
     private suspend fun runGameStreamPair(
         host: DiscoveredHost?,
@@ -715,7 +791,7 @@ class StreamingController(
         }
         computer.host?.endpointKey?.let { mediaRetry.clear(it) }
         republishComputers()
-        maybeSyncHostMedia(details)
+        maybeSyncHostMedia(details, forceRefresh = true)
         _flow.value = StreamFlowState.Idle
         _bannerNotice.value = app.getString(R.string.stream_notice_paired, computer.name)
         resumePollingIfForeground()
@@ -1211,7 +1287,7 @@ class StreamingController(
         }
     }
 
-    private fun maybeSyncHostMedia(details: ComputerDetails) {
+    private fun maybeSyncHostMedia(details: ComputerDetails, forceRefresh: Boolean = false) {
         // B1 + #7: Strictly refuse to query /media unless pairing was completed with this exact
         // fingerprinted Host AND the discovered endpoint's observed fingerprint matches the trust!
         val serverCert = details.serverCert ?: return
@@ -1237,11 +1313,12 @@ class StreamingController(
         val mediaPort = hostInfosByEndpoint[host.endpointKey]?.media?.port ?: host.mediaPort ?: return
         if (mediaPort <= 0) return
         val b = binder ?: return
-        if (WebDav.load(app) != null) {
-            mediaRetry.markCompleted(host.endpointKey)
+        val key = host.endpointKey
+        val shouldForce = forceRefresh || forceRefreshMediaEndpoints.remove(key)
+        if (!shouldForce && WebDav.load(app) != null) {
+            mediaRetry.markCompleted(key)
             return
         }
-        val key = host.endpointKey
         val now = System.currentTimeMillis()
         if (!mediaRetry.tryAcquire(key, now)) return
         scope.launch(Dispatchers.IO) {
@@ -1276,7 +1353,7 @@ class StreamingController(
                             retryJobs["media:$key"] = scope.launch {
                                 delay(waitMs)
                                 if (foregroundActive) {
-                                    maybeSyncHostMedia(details)
+                                    maybeSyncHostMedia(details, forceRefresh = shouldForce)
                                 }
                             }
                         }

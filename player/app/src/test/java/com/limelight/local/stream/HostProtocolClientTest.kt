@@ -250,14 +250,26 @@ class HostProtocolClientTest {
         private val uniqueId: String = "gs-server-uuid-1",
         private val httpPairStatus: Int = 0,
         private val httpsPairStatus: Int = 0,
+        private val requirePairUnlockBeforeAcceptingPin: Boolean = false,
+        private val onPairStarted: () -> Unit = {},
+        private val onPairFinished: () -> Unit = {},
     ) : Closeable {
         val pairingInProgress = AtomicBoolean(false)
         val unpairCount = AtomicInteger(0)
         val busyRejectionCount = AtomicInteger(0)
         val firstPairBlocked = CountDownLatch(1)
+        val pairedClientCertFps = CopyOnWriteArrayList<String>()
 
+        @Volatile private var unlockedPin: String? = null
         private val getCertAttempts = AtomicInteger(0)
         private val releaseFirstBlock = CountDownLatch(1)
+
+        fun unlockPairingForPin(pin: String) {
+            unlockedPin = pin
+        }
+
+        fun isClientCertPaired(cert: X509Certificate): Boolean =
+            pairedClientCertFps.any { it.equals(HttpHostProtocolClient.sha256Hex(cert), ignoreCase = true) }
         private val closed = AtomicBoolean(false)
         private val httpSocket = ServerSocket(0, 16, InetAddress.getLoopbackAddress())
         private val httpsSocket: SSLServerSocket
@@ -371,6 +383,12 @@ class HostProtocolClientTest {
         private fun handlePair(q: Map<String, String>, isHttps: Boolean): String {
             val phrase = q["phrase"]
             if (phrase == "getservercert") {
+                onPairStarted()
+                val activePin = if (requirePairUnlockBeforeAcceptingPin) {
+                    unlockedPin ?: return """<root status_code="200"><paired>0</paired></root>"""
+                } else {
+                    expectedPin
+                }
                 if (!pairingInProgress.compareAndSet(false, true)) {
                     // Exact real GFE/Sunshine busy response: paired=1 WITHOUT <plaincert>
                     // -> PairingManager.pair() returns PairState.ALREADY_IN_PROGRESS!
@@ -388,9 +406,9 @@ class HostProtocolClientTest {
                 val clientPem = hexToBytes(q["clientcert"]!!)
                 clientCert = CertificateFactory.getInstance("X.509")
                     .generateCertificate(ByteArrayInputStream(clientPem)) as X509Certificate
-                val salted = ByteArray(salt.size + expectedPin.length)
+                val salted = ByteArray(salt.size + activePin.length)
                 System.arraycopy(salt, 0, salted, 0, salt.size)
-                System.arraycopy(expectedPin.toByteArray(StandardCharsets.UTF_8), 0, salted, salt.size, expectedPin.length)
+                System.arraycopy(activePin.toByteArray(StandardCharsets.UTF_8), 0, salted, salt.size, activePin.length)
                 aesKey = Arrays.copyOf(sha256(salted), 16)
                 return """<root status_code="200"><paired>1</paired><plaincert>${bytesToHex(serverId.pemBytes)}</plaincert></root>"""
             }
@@ -419,7 +437,9 @@ class HostProtocolClientTest {
                 return """<root status_code="200"><paired>1</paired></root>"""
             }
             if (phrase == "pairchallenge" && isHttps) {
+                clientCert?.let { pairedClientCertFps.add(HttpHostProtocolClient.sha256Hex(it)) }
                 pairingInProgress.set(false)
+                onPairFinished()
                 return """<root status_code="200"><paired>1</paired></root>"""
             }
             return """<root status_code="200"><paired>0</paired></root>"""
@@ -559,7 +579,7 @@ class HostProtocolClientTest {
                 }
                 "/depth3d/v1/pair" -> {
                     pairCalls.incrementAndGet()
-                    MockResponse(200, """{"ok":true}""")
+                    MockResponse(200, """{"ok":true,"next":"gamestream","ticket":"tk-b2"}""")
                 }
                 else -> MockResponse(404, "{}")
             }
@@ -748,15 +768,21 @@ class HostProtocolClientTest {
 
         // Step 1 (B3): First-time pairing with certA — discovery /info does NOT pin;
         // /pair 403 does NOT pin; /pair 200 + GameStream FAILED does NOT pin;
-        // ONLY /pair 200 + GameStream PAIRED persists fpA!
+        // /pair/complete 410 does NOT pin; ONLY /pair/complete 200 persists fpA!
         var pairCodeA = 403
+        var completeCodeA = 410
         LocalTlsServer(certA) { req ->
             when (req.path) {
                 "/depth3d/v1/info" -> MockResponse(200, """{"v":1,"name":"PC","id":"host-pin","os":"macos","stream":{"ready":true}}""")
                 "/depth3d/v1/pair" -> {
                     assertNull("First-time /pair must NOT present client cert", req.clientCert)
-                    if (pairCodeA == 200) MockResponse(200, """{"ok":true}""")
-                    else MockResponse(pairCodeA, """{"error":"denied"}""")
+                    if (pairCodeA == 200) MockResponse(200, """{"ok":true,"next":"gamestream","ticket":"tk-a"}""")
+                    else MockResponse(pairCodeA, """{"error":"rejected"}""")
+                }
+                "/depth3d/v1/pair/complete" -> {
+                    assertNotNull("/pair/complete must present client cert", req.clientCert)
+                    if (completeCodeA == 200) MockResponse(200, """{"ok":true,"media":{"port":8890}}""")
+                    else MockResponse(completeCodeA, """{"error":"ticket_expired"}""")
                 }
                 else -> MockResponse(404, "{}")
             }
@@ -784,7 +810,20 @@ class HostProtocolClientTest {
             assertTrue(gsFail is HostAutoPairOutcome.GameStreamFailed)
             assertNull("B3: Failed GameStream pair must NOT persist pin", pinStore.getFingerprint("host-pin"))
 
-            // /pair 200 + GameStream PAIRED -> NOW fpA is persisted!
+            // /pair 200 + GameStream PAIRED + /pair/complete 410 -> pin STILL NOT saved!
+            completeCodeA = 410
+            val completeFail = HostAutoPairOrchestrator.execute(
+                hostApi = client, pinStore = pinStore, address = "127.0.0.1", controlPort = srvA.port,
+                hostId = "host-pin", deviceName = "depth3d", deviceId = "dev-1", pin = "1111",
+                computerUuid = "uuid-a", alreadyPairedGsCert = null, approvedNewFingerprint = null,
+                token = CallCancelToken(),
+                runGameStreamPair = { _, _ -> GameStreamPairOutcome.Paired(gsCertA.cert) },
+            )
+            assertTrue(completeFail is HostAutoPairOutcome.PairCompleteFailed)
+            assertNull("Failed /pair/complete must NOT persist pin", pinStore.getFingerprint("host-pin"))
+
+            // /pair 200 + GameStream PAIRED + /pair/complete 200 -> NOW fpA is persisted!
+            completeCodeA = 200
             val paired = HostAutoPairOrchestrator.execute(
                 hostApi = client, pinStore = pinStore, address = "127.0.0.1", controlPort = srvA.port,
                 hostId = "host-pin", deviceName = "depth3d", deviceId = "dev-1", pin = "1111",
@@ -797,7 +836,7 @@ class HostProtocolClientTest {
             assertEquals("uuid-a", pinStore.getPairedTrust("host-pin")?.computerUuid)
         }
 
-        // Step 2 (S2): Cert changed to certB. Approving fpB must NEVER save on 403/408/500/503 or /info id mismatch!
+        // Step 2 (S2): Cert changed to certB. Approving fpB must NEVER save on 403/408/429/500/503 or /info id mismatch!
         var infoIdB = "wrong-id"
         var pairCodeB = 403
         LocalTlsServer(certB) { req ->
@@ -805,8 +844,12 @@ class HostProtocolClientTest {
                 "/depth3d/v1/info" -> MockResponse(200, """{"v":1,"name":"PC","id":"$infoIdB","os":"macos","stream":{"ready":true}}""")
                 "/depth3d/v1/pair" -> {
                     assertNull("Cert-change /pair must NOT send client cert before new cert is paired", req.clientCert)
-                    if (pairCodeB == 200) MockResponse(200, """{"ok":true}""")
+                    if (pairCodeB == 200) MockResponse(200, """{"ok":true,"next":"gamestream","ticket":"tk-b"}""")
                     else MockResponse(pairCodeB, """{"error":"status_$pairCodeB"}""")
+                }
+                "/depth3d/v1/pair/complete" -> {
+                    assertNotNull("/pair/complete must present client cert", req.clientCert)
+                    MockResponse(200, """{"ok":true,"media":{"port":8890}}""")
                 }
                 else -> MockResponse(404, "{}")
             }
@@ -829,9 +872,9 @@ class HostProtocolClientTest {
             assertTrue(idFail is HostAutoPairOutcome.InfoIdentityMismatch)
             assertEquals("S2: /info id mismatch must NOT update pin", fpA, pinStore.getFingerprint("host-pin"))
 
-            // Approved fpB, /info id matches, but /pair returns 403, 408, 500, 503 -> pin MUST stay fpA!
+            // Approved fpB, /info id matches, but /pair returns 403, 408, 429, 500, 503 -> pin MUST stay fpA!
             infoIdB = "host-pin"
-            for (errStatus in listOf(403, 408, 500, 503)) {
+            for (errStatus in listOf(403, 408, 429, 500, 503)) {
                 pairCodeB = errStatus
                 val res = HostAutoPairOrchestrator.execute(
                     hostApi = client, pinStore = pinStore, address = "127.0.0.1", controlPort = srvB.port,
@@ -854,7 +897,7 @@ class HostProtocolClientTest {
                 assertEquals(fpA, pinStore.getFingerprint("host-pin"))
             }
 
-            // Now /info id matches AND /pair returns 200 AND GameStream pairs -> pin updates to fpB!
+            // Now /info id matches AND /pair returns 200 AND GameStream pairs AND /pair/complete returns 200 -> pin updates to fpB!
             pairCodeB = 200
             val okB = HostAutoPairOrchestrator.execute(
                 hostApi = client, pinStore = pinStore, address = "127.0.0.1", controlPort = srvB.port,
@@ -864,7 +907,7 @@ class HostProtocolClientTest {
                 runGameStreamPair = { _, _ -> GameStreamPairOutcome.Paired(gsCertB.cert) },
             )
             assertTrue(okB is HostAutoPairOutcome.Paired)
-            assertEquals("S2: Pin must update to fpB after /info + /pair + pairing succeed", fpB, pinStore.getFingerprint("host-pin"))
+            assertEquals("S2: Pin must update to fpB after /info + /pair + pairing + /pair/complete succeed", fpB, pinStore.getFingerprint("host-pin"))
         }
     }
 
@@ -877,6 +920,7 @@ class HostProtocolClientTest {
         val gsFp = HttpHostProtocolClient.sha256Hex(gsCert.cert)
         val pinStore = InMemoryHostCertPinStore()
         var statusToReturn = 200
+        var pairBody = """{"ok":true,"next":"gamestream","ticket":"tk-secret-1"}"""
         val secretPin = "7391"
 
         val capturedLogs = CopyOnWriteArrayList<String>()
@@ -899,23 +943,23 @@ class HostProtocolClientTest {
                 assertEquals("我的头显", json!!.string("device"))
                 assertEquals("dev-abc", json.string("deviceId"))
                 assertEquals(secretPin, json.string("pin"))
-                when (statusToReturn) {
-                    200 -> MockResponse(200, """{"ok":true}""")
-                    403 -> MockResponse(403, """{"error":"rejected"}""")
-                    408 -> MockResponse(408, """{"error":"timeout"}""")
-                    426 -> MockResponse(426, """{"error":"upgrade"}""")
-                    else -> MockResponse(503, """{"error":"stream_not_running"}""")
-                }
+                MockResponse(statusToReturn, pairBody)
             }.use { srv ->
                 val client = HttpHostProtocolClient(
                     pinStore = pinStore,
                     clientIdentityProvider = { clientId.cert to clientId.key },
                 )
+                // Spec requirement #1: /pair read timeout must be >= 75 s
+                assertTrue(
+                    "/pair read timeout must be >= 75s, was ${client.configuredPairReadTimeoutMs}",
+                    client.configuredPairReadTimeoutMs >= HttpHostProtocolClient.MIN_PAIR_READ_TIMEOUT_MS,
+                )
 
-                // B1 + #10: Unpinned host NEVER receives client cert even if presentClientCert = true!
+                // B1: Unpinned host NEVER receives client cert when verifiedGameStreamUpgrade=false!
                 statusToReturn = 200
+                pairBody = """{"ok":true,"next":"gamestream","ticket":"tk-secret-1"}"""
                 assertEquals(
-                    AutoPairResult.Approved,
+                    AutoPairResult.Approved(PairNextStep.GAMESTREAM, "tk-secret-1"),
                     client.requestAutoPair(
                         address = "127.0.0.1",
                         port = srv.port,
@@ -925,17 +969,19 @@ class HostProtocolClientTest {
                         pin = secretPin,
                         expectedFingerprint = serverFp,
                         presentClientCert = true,
+                        verifiedGameStreamUpgrade = false,
                     ),
                 )
                 assertNull(
-                    "B1: Unpinned host must NOT receive client certificate",
+                    "B1: Unpinned host must NOT receive client certificate without verified upgrade",
                     srv.requests.last().clientCert,
                 )
 
                 // Once paired & pinned, re-pair DOES present the pairing client certificate
                 pinStore.savePairedTrust("host-pair", HostPairedTrust(serverFp, "uuid-pair", gsFp))
+                pairBody = """{"ok":true,"next":"done","ticket":"tk-done-2"}"""
                 assertEquals(
-                    AutoPairResult.Approved,
+                    AutoPairResult.Approved(PairNextStep.DONE, "tk-done-2"),
                     client.requestAutoPair(
                         address = "127.0.0.1",
                         port = srv.port,
@@ -950,23 +996,39 @@ class HostProtocolClientTest {
                 assertNotNull("Paired re-pair /pair must present client certificate", srv.requests.last().clientCert)
                 assertEquals(clientId.cert.serialNumber, srv.requests.last().clientCert!!.serialNumber)
 
-                // 503 means Mac streaming service is not running
+                // Spec requirement #5: verify EVERY /pair error status & JSON payload
                 statusToReturn = 503
+                pairBody = """{"error":"stream_not_ready","reason":"请在系统设置中授予屏幕录制权限"}"""
                 assertEquals(
-                    AutoPairResult.StreamServiceUnavailable,
+                    AutoPairResult.StreamServiceUnavailable("请在系统设置中授予屏幕录制权限"),
+                    client.requestAutoPair("127.0.0.1", srv.port, "host-pair", "我的头显", "dev-abc", secretPin, serverFp),
+                )
+                statusToReturn = 429
+                pairBody = """{"error":"busy"}"""
+                assertEquals(
+                    AutoPairResult.Busy,
+                    client.requestAutoPair("127.0.0.1", srv.port, "host-pair", "我的头显", "dev-abc", secretPin, serverFp),
+                )
+                statusToReturn = 429
+                pairBody = """{"error":"cooldown","retryAfterSec":27}"""
+                assertEquals(
+                    AutoPairResult.Cooldown(27),
                     client.requestAutoPair("127.0.0.1", srv.port, "host-pair", "我的头显", "dev-abc", secretPin, serverFp),
                 )
                 statusToReturn = 403
+                pairBody = """{"error":"rejected"}"""
                 assertEquals(
                     AutoPairResult.Rejected,
                     client.requestAutoPair("127.0.0.1", srv.port, "host-pair", "我的头显", "dev-abc", secretPin, serverFp),
                 )
                 statusToReturn = 408
+                pairBody = """{"error":"timeout"}"""
                 assertEquals(
                     AutoPairResult.TimedOut,
                     client.requestAutoPair("127.0.0.1", srv.port, "host-pair", "我的头显", "dev-abc", secretPin, serverFp),
                 )
                 statusToReturn = 426
+                pairBody = """{"error":"upgrade"}"""
                 assertEquals(
                     AutoPairResult.UpgradeRequired,
                     client.requestAutoPair("127.0.0.1", srv.port, "host-pair", "我的头显", "dev-abc", secretPin, serverFp),
@@ -977,6 +1039,7 @@ class HostProtocolClientTest {
         }
 
         assertTrue("PIN must never be written to logs", capturedLogs.none { it.contains(secretPin) })
+        assertTrue("Ticket must never be written to logs", capturedLogs.none { it.contains("tk-secret-1") })
     }
 
     @Test
@@ -995,7 +1058,7 @@ class HostProtocolClientTest {
                 releaseFirstReq.await(15, TimeUnit.SECONDS)
                 MockResponse(408, """{"error":"timeout"}""")
             } else {
-                MockResponse(200, """{"ok":true}""")
+                MockResponse(200, """{"ok":true,"next":"gamestream","ticket":"tk-retry"}""")
             }
         }.use { srv ->
             val client = HttpHostProtocolClient(pinStore)
@@ -1034,7 +1097,7 @@ class HostProtocolClientTest {
                     expectedFingerprint = serverFp,
                     cancelToken = CallCancelToken(),
                 )
-                assertEquals(AutoPairResult.Approved, retried)
+                assertEquals(AutoPairResult.Approved(PairNextStep.GAMESTREAM, "tk-retry"), retried)
             } finally {
                 releaseFirstReq.countDown()
                 bg.shutdownNow()
@@ -1147,7 +1210,7 @@ class HostProtocolClientTest {
     }
 
     @Test
-    fun r4_1_2_skipPairRequiresStrictHttpsPinnedCertAndRejectsImposterLyingOverHttp() = runBlocking {
+    fun r4_1_2_upgradePathPreVerifiesHttpsCertBeforeClientCertAndRejectsImposter() = runBlocking {
         val realGsId = generateSelfSigned("real-mac-gs")
         val imposterGsId = generateSelfSigned("imposter-gs")
         val realHostId = generateSelfSigned("real-mac-host")
@@ -1157,27 +1220,35 @@ class HostProtocolClientTest {
         val realHostFp = HttpHostProtocolClient.sha256Hex(realHostId.cert)
         val imposterHostFp = HttpHostProtocolClient.sha256Hex(imposterHostId.cert)
 
-        // Attack (#2): Imposter runs a fake Host returning 200 on /pair + fake GameStream server that
-        // lies <PairStatus>1</PairStatus> over plain HTTP AND serves imposterGsId (NOT realGsId) on HTTPS.
-        // Because imposter does NOT possess realGsId's private key, verifyPinnedPairedServer MUST return false,
-        // forcing full pm.pair (which fails with wrong PIN), and HostPairedTrust MUST NOT be persisted!
+        // Attack (#2 + spec §升级路径): Imposter copies host.id at another IPv4, lies <PairStatus>1</PairStatus>
+        // over HTTP, serves imposterGsId (NOT realGsId) on HTTPS, AND lies next="done" on /pair!
+        // Step 1 strict HTTPS pinned-cert verify MUST fail -> NO client cert sent on /pair ->
+        // headset REFUSES next="done" and forces full pm.pair (which fails) -> /pair/complete NEVER called
+        // and HostPairedTrust is NEVER overwritten!
+        val imposterCompleteCalls = AtomicInteger(0)
         StatefulMockGameStreamServer(
             serverId = imposterGsId,
-            expectedPin = "0000", // imposter doesn't know the real PIN on GS
+            expectedPin = "0000",
             blockFirstGetServerCert = false,
             uniqueId = "real-gs-uuid",
-            httpPairStatus = 1, // lies over HTTP!
-            httpsPairStatus = 1, // even lies over HTTPS, but with wrong cert!
+            httpPairStatus = 1,
+            httpsPairStatus = 1,
         ).use { imposterGs ->
             LocalTlsServer(imposterHostId) { req ->
                 when (req.path) {
                     "/depth3d/v1/info" -> MockResponse(200, """{"v":1,"name":"Mac","id":"host-real","os":"macos","stream":{"ready":true}}""")
-                    "/depth3d/v1/pair" -> MockResponse(200, """{"ok":true}""")
+                    "/depth3d/v1/pair" -> {
+                        assertNull("Unverified imposter must NEVER receive client cert on /pair", req.clientCert)
+                        MockResponse(200, """{"ok":true,"next":"done","ticket":"tk-evil"}""")
+                    }
+                    "/depth3d/v1/pair/complete" -> {
+                        imposterCompleteCalls.incrementAndGet()
+                        MockResponse(200, """{"ok":true,"media":{"port":9999}}""")
+                    }
                     else -> MockResponse(404, "{}")
                 }
             }.use { imposterHost ->
                 val pinStore = InMemoryHostCertPinStore()
-                // Suppose user previously trusted realHostFp, then clicked "Trust new cert" for imposterHostFp
                 pinStore.savePairedTrust(
                     "host-real",
                     HostPairedTrust(realHostFp, "real-gs-uuid", HttpHostProtocolClient.sha256Hex(realGsId.cert), "书房 Mac"),
@@ -1186,6 +1257,15 @@ class HostProtocolClientTest {
                     pinStore = pinStore,
                     clientIdentityProvider = { clientId.cert to clientId.key },
                 )
+                val imposterHttpFactory = {
+                    NvHTTP(
+                        ComputerDetails.AddressTuple("127.0.0.1", imposterGs.httpPort),
+                        0,
+                        "0123456789ABCDEF",
+                        realGsId.cert,
+                        crypto,
+                    )
+                }
 
                 val outcome = HostAutoPairOrchestrator.execute(
                     hostApi = client,
@@ -1200,28 +1280,27 @@ class HostProtocolClientTest {
                     alreadyPairedGsCert = realGsId.cert,
                     approvedNewFingerprint = imposterHostFp,
                     token = CallCancelToken(),
-                    runGameStreamPair = { pin, token ->
-                        GameStreamPairRunner.run(
-                            httpFactory = {
-                                NvHTTP(
-                                    ComputerDetails.AddressTuple("127.0.0.1", imposterGs.httpPort),
-                                    0,
-                                    "0123456789ABCDEF",
-                                    realGsId.cert,
-                                    crypto,
-                                )
-                            },
+                    verifyExistingGameStreamPair = { token ->
+                        GameStreamPairRunner.verifyExistingPair(
+                            httpFactory = imposterHttpFactory,
                             existingServerCert = realGsId.cert,
                             expectedComputerUuid = "real-gs-uuid",
+                            token = token,
+                        )
+                    },
+                    runGameStreamPair = { pin, token ->
+                        GameStreamPairRunner.runFullPair(
+                            httpFactory = imposterHttpFactory,
                             pin = pin,
                             token = token,
                         )
                     },
                 )
                 assertTrue(
-                    "#2: Imposter without realGsId private key must fail full PIN pair, got $outcome",
+                    "#2: Imposter without realGsId private key must fail full PIN pair despite next=done, got $outcome",
                     outcome is HostAutoPairOutcome.GameStreamFailed,
                 )
+                assertEquals("Imposter must never reach /pair/complete", 0, imposterCompleteCalls.get())
                 assertEquals(
                     "#2: Pin must stay realHostFp and NEVER be overwritten with imposterHostFp!",
                     realHostFp,
@@ -1230,9 +1309,16 @@ class HostProtocolClientTest {
             }
         }
 
-        // Upgrade path (#1 + #2): Real Mac is ALREADY paired at GameStream (presents exact realGsId.cert
-        // on HTTPS with PairStatus=1 and uniqueid=real-gs-uuid), user clicks card -> /info -> /pair 200 ->
-        // verifyPinnedPairedServer succeeds -> skips PIN entry -> saves HostPairedTrust -> /media succeeds!
+        // Upgrade path (#1 + #2 + spec §已经在串流层面配过对的头显):
+        // Real Mac is ALREADY paired at GameStream (exact realGsId.cert on HTTPS, PairStatus=1, uniqueid=real-gs-uuid)
+        // and Host has NO record yet:
+        // 1) /info -> 2) strict HTTPS pinned-cert verify passes -> 3) /pair WITH client cert returns next="done" ->
+        // 4) GameStream pm.pair SKIPPED -> 5) /pair/complete WITH client cert returns 200 -> 6) trust saved -> /media succeeds!
+        val events = CopyOnWriteArrayList<String>()
+        val gsPairCalls = AtomicInteger(0)
+        val registeredClientFps = CopyOnWriteArrayList<String>()
+        val pinStore = InMemoryHostCertPinStore()
+
         StatefulMockGameStreamServer(
             serverId = realGsId,
             expectedPin = "unused-because-verified-over-https",
@@ -1243,20 +1329,55 @@ class HostProtocolClientTest {
         ).use { realGs ->
             LocalTlsServer(realHostId) { req ->
                 when (req.path) {
-                    "/depth3d/v1/info" -> MockResponse(200, """{"v":1,"name":"书房 Mac","id":"host-real","os":"macos","stream":{"ready":true},"media":{"port":8088}}""")
-                    "/depth3d/v1/pair" -> MockResponse(200, """{"ok":true}""")
+                    "/depth3d/v1/info" -> {
+                        events += "info"
+                        assertNull("Discovery/pre-pair /info must not send client cert", req.clientCert)
+                        MockResponse(200, """{"v":1,"name":"书房 Mac","id":"host-real","os":"macos","stream":{"ready":true},"media":{"port":8890}}""")
+                    }
+                    "/depth3d/v1/pair" -> {
+                        events += "pair"
+                        assertNotNull("Verified upgrade /pair MUST present client cert", req.clientCert)
+                        assertEquals(clientId.cert.serialNumber, req.clientCert!!.serialNumber)
+                        assertNull("Trust must NOT be saved yet at /pair", pinStore.getFingerprint("host-real"))
+                        MockResponse(200, """{"ok":true,"next":"done","ticket":"tk-upg-1"}""")
+                    }
+                    "/depth3d/v1/pair/complete" -> {
+                        events += "pair_complete"
+                        assertNotNull("/pair/complete MUST present client cert", req.clientCert)
+                        val body = MiniJson.parseObject(req.body)!!
+                        assertEquals("tk-upg-1", body.string("ticket"))
+                        assertEquals("dev-1", body.string("deviceId"))
+                        assertEquals("depth3d", body.string("device"))
+                        assertNull("Trust must NOT be saved until /pair/complete returns 200", pinStore.getFingerprint("host-real"))
+                        registeredClientFps += HttpHostProtocolClient.sha256Hex(req.clientCert!!)
+                        MockResponse(200, """{"ok":true,"media":{"port":8890}}""")
+                    }
                     "/depth3d/v1/media" -> {
-                        assertNotNull("Expected client cert on /media", req.clientCert)
-                        MockResponse(200, """{"webdav":{"port":8088,"user":"depth3d","pass":"secret"}}""")
+                        events += "media"
+                        // Spec #6: Host authenticates purely by client cert fingerprint, does NOT require X-Depth3d-Device
+                        val fp = req.clientCert?.let { HttpHostProtocolClient.sha256Hex(it) }
+                        if (fp != null && registeredClientFps.contains(fp)) {
+                            MockResponse(200, """{"webdav":{"port":8890,"user":"depth3d","pass":"secret"}}""")
+                        } else {
+                            MockResponse(401, """{"error":"unpaired"}""")
+                        }
                     }
                     else -> MockResponse(404, "{}")
                 }
             }.use { realHost ->
-                val pinStore = InMemoryHostCertPinStore()
                 val client = HttpHostProtocolClient(
                     pinStore = pinStore,
                     clientIdentityProvider = { clientId.cert to clientId.key },
                 )
+                val realHttpFactory = {
+                    NvHTTP(
+                        ComputerDetails.AddressTuple("127.0.0.1", realGs.httpPort),
+                        0,
+                        "0123456789ABCDEF",
+                        realGsId.cert,
+                        crypto,
+                    )
+                }
 
                 val outcome = HostAutoPairOrchestrator.execute(
                     hostApi = client,
@@ -1272,29 +1393,29 @@ class HostProtocolClientTest {
                     approvedNewFingerprint = null,
                     savedName = "书房 Mac",
                     token = CallCancelToken(),
-                    runGameStreamPair = { pin, token ->
-                        GameStreamPairRunner.run(
-                            httpFactory = {
-                                NvHTTP(
-                                    ComputerDetails.AddressTuple("127.0.0.1", realGs.httpPort),
-                                    0,
-                                    "0123456789ABCDEF",
-                                    realGsId.cert,
-                                    crypto,
-                                )
-                            },
+                    verifyExistingGameStreamPair = { token ->
+                        events += "gs_https_verify"
+                        GameStreamPairRunner.verifyExistingPair(
+                            httpFactory = realHttpFactory,
                             existingServerCert = realGsId.cert,
                             expectedComputerUuid = "real-gs-uuid",
+                            token = token,
+                        )
+                    },
+                    runGameStreamPair = { pin, token ->
+                        gsPairCalls.incrementAndGet()
+                        GameStreamPairRunner.runFullPair(
+                            httpFactory = realHttpFactory,
                             pin = pin,
                             token = token,
                         )
                     },
                 )
-                assertTrue("#1/#2: Real Mac upgrade must succeed via HTTPS pinned verification, got $outcome", outcome is HostAutoPairOutcome.Paired)
+                assertTrue("#1/#2: Real Mac upgrade must succeed via HTTPS verify -> /pair(next=done) -> /pair/complete, got $outcome", outcome is HostAutoPairOutcome.Paired)
+                assertEquals("GameStream pm.pair must be skipped when next=done and HTTPS verify passed", 0, gsPairCalls.get())
                 assertEquals(realHostFp, pinStore.getFingerprint("host-real"))
                 assertEquals("real-gs-uuid", pinStore.getPairedTrust("host-real")?.computerUuid)
 
-                // Immediately after trust is saved, /media succeeds with mutual TLS!
                 val mediaRes = client.getMediaCredentials(
                     address = "127.0.0.1",
                     port = realHost.port,
@@ -1304,6 +1425,10 @@ class HostProtocolClientTest {
                     expectedGsCertFingerprint = HttpHostProtocolClient.sha256Hex(realGsId.cert),
                 )
                 assertTrue("#1: /media must succeed right after upgrade setup", mediaRes is MediaCredsResult.Available)
+                assertEquals(
+                    listOf("info", "gs_https_verify", "pair", "pair_complete", "media"),
+                    events.toList(),
+                )
             }
         }
     }
@@ -1313,6 +1438,7 @@ class HostProtocolClientTest {
         val certDiscovered = generateSelfSigned("host-discovered")
         val certAtPair = generateSelfSigned("host-changed-before-pair")
         val gsCert = generateSelfSigned("gs-cert")
+        val clientId = generateSelfSigned("headset-r6")
         val fpDiscovered = HttpHostProtocolClient.sha256Hex(certDiscovered.cert)
         val fpAtPair = HttpHostProtocolClient.sha256Hex(certAtPair.cert)
         val pairCalls = AtomicInteger(0)
@@ -1322,13 +1448,17 @@ class HostProtocolClientTest {
                 "/depth3d/v1/info" -> MockResponse(200, """{"v":1,"name":"Mac","id":"host-r6","os":"macos","stream":{"ready":true}}""")
                 "/depth3d/v1/pair" -> {
                     pairCalls.incrementAndGet()
-                    MockResponse(200, """{"ok":true}""")
+                    MockResponse(200, """{"ok":true,"next":"gamestream","ticket":"tk-r6"}""")
                 }
+                "/depth3d/v1/pair/complete" -> MockResponse(200, """{"ok":true,"media":null}""")
                 else -> MockResponse(404, "{}")
             }
         }.use { srv ->
             val pinStore = InMemoryHostCertPinStore()
-            val client = HttpHostProtocolClient(pinStore)
+            val client = HttpHostProtocolClient(
+                pinStore = pinStore,
+                clientIdentityProvider = { clientId.cert to clientId.key },
+            )
 
             // #6: Unpinned host observed with fpDiscovered during discovery now presents certAtPair -> CertificateChanged!
             val changed = HostAutoPairOrchestrator.execute(
@@ -1498,6 +1628,239 @@ class HostProtocolClientTest {
                 "#11: Subsequent /info without approvedNewFingerprint must succeed without re-prompting",
                 client.getInfo("127.0.0.1", srv.port, "host-manual") is HostInfoResult.Ok,
             )
+        }
+    }
+
+    @Test
+    fun spec_twoStepPairingNonDeadlockingTimingAndNotPairedRetryAndMediaSync() = runBlocking {
+        // Exercises the EXACT two-step protocol timing from docs/specs/host-protocol.md (51306f9):
+        // 1) /info -> 2) /pair returns 200 {"ok":true,"next":"gamestream","ticket":"..."} IMMEDIATELY
+        //    and hands the PIN to the GameStream server ONLY after /pair approves ->
+        // 3) ONLY AFTER /pair returns does headset start GameStream pm.pair with the SAME PIN ->
+        // 4) /pair/complete (with client cert + ticket) returns 409 not_paired twice, retries within 5s,
+        //    then returns 200 {"ok":true,"media":{"port":8890}} once engine reflects the paired cert ->
+        // 5) ONLY AFTER /pair/complete 200 is HostPairedTrust saved -> /media succeeds via client cert!
+        val hostIdCert = generateSelfSigned("spec-mac-host")
+        val gsIdCert = generateSelfSigned("spec-mac-gs")
+        val clientId = generateSelfSigned("spec-headset-client")
+        val crypto = cryptoProviderFor(clientId)
+        val hostFp = HttpHostProtocolClient.sha256Hex(hostIdCert.cert)
+        val pinStore = InMemoryHostCertPinStore()
+
+        val events = CopyOnWriteArrayList<String>()
+        val completeAttempts = AtomicInteger(0)
+        val savedHostDevices = CopyOnWriteArrayList<String>()
+        val activeTicket = "tk-live-987654"
+
+        StatefulMockGameStreamServer(
+            serverId = gsIdCert,
+            expectedPin = "UNUSED_UNTIL_HOST_PAIR_APPROVES",
+            blockFirstGetServerCert = false,
+            uniqueId = "spec-gs-uuid",
+            requirePairUnlockBeforeAcceptingPin = true,
+            onPairStarted = { events += "gs_pair_started" },
+            onPairFinished = { events += "gs_pair_finished" },
+        ).use { gsSrv ->
+            LocalTlsServer(hostIdCert) { req ->
+                when (req.path) {
+                    "/depth3d/v1/info" -> {
+                        events += "info"
+                        assertNull(req.clientCert)
+                        MockResponse(200, """{"v":1,"name":"工作室 Mac","id":"host-spec","os":"macOS 15.1","stream":{"ready":true},"media":null}""")
+                    }
+                    "/depth3d/v1/pair" -> {
+                        val body = MiniJson.parseObject(req.body)!!
+                        val pin = body.string("pin")!!
+                        assertNull("Unpaired headset must NOT present client cert on /pair", req.clientCert)
+                        // Hand PIN to GameStream engine and return IMMEDIATELY (no deadlock!)
+                        gsSrv.unlockPairingForPin(pin)
+                        events += "pair_returned_gamestream"
+                        MockResponse(200, """{"ok":true,"next":"gamestream","ticket":"$activeTicket"}""")
+                    }
+                    "/depth3d/v1/pair/complete" -> {
+                        val cert = req.clientCert
+                        if (cert == null) {
+                            MockResponse(401, """{"error":"no_client_cert"}""")
+                        } else {
+                            val body = MiniJson.parseObject(req.body)!!
+                            assertEquals(activeTicket, body.string("ticket"))
+                            assertEquals("headset-spec-1", body.string("deviceId"))
+                            assertEquals("客厅的 depth3d", body.string("device"))
+                            assertTrue("GameStream pairing must have completed before /pair/complete", gsSrv.isClientCertPaired(cert))
+                            assertNull("Trust must NOT be persisted before /pair/complete returns 200", pinStore.getFingerprint("host-spec"))
+                            val attempt = completeAttempts.incrementAndGet()
+                            if (attempt <= 2) {
+                                events += "complete_409_$attempt"
+                                MockResponse(409, """{"error":"not_paired"}""")
+                            } else {
+                                events += "complete_200"
+                                savedHostDevices += HttpHostProtocolClient.sha256Hex(cert)
+                                MockResponse(200, """{"ok":true,"media":{"port":8890}}""")
+                            }
+                        }
+                    }
+                    "/depth3d/v1/media" -> {
+                        // Spec #6: authenticates purely via mutual TLS client cert, does not require X-Depth3d-Device
+                        val fp = req.clientCert?.let { HttpHostProtocolClient.sha256Hex(it) }
+                        if (fp != null && savedHostDevices.contains(fp)) {
+                            events += "media_200"
+                            MockResponse(200, """{"webdav":{"port":8890,"user":"depth3d","pass":"pw-live"}}""")
+                        } else {
+                            MockResponse(401, """{"error":"unpaired"}""")
+                        }
+                    }
+                    else -> MockResponse(404, "{}")
+                }
+            }.use { hostSrv ->
+                val client = HttpHostProtocolClient(
+                    pinStore = pinStore,
+                    clientIdentityProvider = { clientId.cert to clientId.key },
+                )
+                assertTrue(
+                    "Default /pair read timeout must be >= 75s per host-protocol.md",
+                    client.configuredPairReadTimeoutMs >= HttpHostProtocolClient.MIN_PAIR_READ_TIMEOUT_MS,
+                )
+
+                val outcome = HostAutoPairOrchestrator.execute(
+                    hostApi = client,
+                    pinStore = pinStore,
+                    address = "127.0.0.1",
+                    controlPort = hostSrv.port,
+                    hostId = "host-spec",
+                    deviceName = "客厅的 depth3d",
+                    deviceId = "headset-spec-1",
+                    pin = "6284",
+                    computerUuid = "spec-gs-uuid",
+                    alreadyPairedGsCert = null,
+                    approvedNewFingerprint = null,
+                    savedName = "工作室 Mac",
+                    token = CallCancelToken(),
+                    runGameStreamPair = { pin, token ->
+                        GameStreamPairRunner.runFullPair(
+                            httpFactory = {
+                                NvHTTP(
+                                    ComputerDetails.AddressTuple("127.0.0.1", gsSrv.httpPort),
+                                    0,
+                                    "0123456789ABCDEF",
+                                    null,
+                                    crypto,
+                                )
+                            },
+                            pin = pin,
+                            token = token,
+                        )
+                    },
+                    notPairedRetryDelaysMs = listOf(20L, 30L, 40L),
+                )
+
+                assertTrue("Two-step pairing must succeed, got $outcome", outcome is HostAutoPairOutcome.Paired)
+                val paired = outcome as HostAutoPairOutcome.Paired
+                assertEquals("Media port from /pair/complete 200 must populate HostInfo", 8890, paired.hostInfo.media?.port)
+                assertEquals(hostFp, pinStore.getFingerprint("host-spec"))
+                assertEquals(HttpHostProtocolClient.sha256Hex(gsIdCert.cert), pinStore.getPairedTrust("host-spec")?.gsCertFingerprint)
+
+                val media = client.getMediaCredentials(
+                    address = "127.0.0.1",
+                    port = hostSrv.port,
+                    hostId = "host-spec",
+                    deviceId = "headset-spec-1",
+                    expectedComputerUuid = "spec-gs-uuid",
+                    expectedGsCertFingerprint = HttpHostProtocolClient.sha256Hex(gsIdCert.cert),
+                )
+                assertTrue("Media sync must succeed right after /pair/complete 200, got $media", media is MediaCredsResult.Available)
+                assertEquals(8890, (media as MediaCredsResult.Available).creds.port)
+                assertEquals(
+                    listOf(
+                        "info",
+                        "pair_returned_gamestream",
+                        "gs_pair_started",
+                        "gs_pair_finished",
+                        "complete_409_1",
+                        "complete_409_2",
+                        "complete_200",
+                        "media_200",
+                    ),
+                    events.toList(),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun spec_pairCompleteErrorsNeverPersistTrustAndNotPairedExhaustsRetries() = runBlocking {
+        val hostIdCert = generateSelfSigned("spec-err-host")
+        val gsIdCert = generateSelfSigned("spec-err-gs")
+        val clientId = generateSelfSigned("spec-err-client")
+        var completeCode = 409
+        var completeBody = """{"error":"not_paired"}"""
+        val completeCalls = AtomicInteger(0)
+
+        LocalTlsServer(hostIdCert) { req ->
+            when (req.path) {
+                "/depth3d/v1/info" -> MockResponse(200, """{"v":1,"name":"Mac","id":"host-err","os":"macos","stream":{"ready":true}}""")
+                "/depth3d/v1/pair" -> MockResponse(200, """{"ok":true,"next":"gamestream","ticket":"tk-err"}""")
+                "/depth3d/v1/pair/complete" -> {
+                    completeCalls.incrementAndGet()
+                    MockResponse(completeCode, completeBody)
+                }
+                else -> MockResponse(404, "{}")
+            }
+        }.use { srv ->
+            val pinStore = InMemoryHostCertPinStore()
+            val client = HttpHostProtocolClient(
+                pinStore = pinStore,
+                clientIdentityProvider = { clientId.cert to clientId.key },
+            )
+            val retries = listOf(10L, 10L, 10L)
+
+            suspend fun runOnce(): HostAutoPairOutcome = HostAutoPairOrchestrator.execute(
+                hostApi = client,
+                pinStore = pinStore,
+                address = "127.0.0.1",
+                controlPort = srv.port,
+                hostId = "host-err",
+                deviceName = "depth3d",
+                deviceId = "dev-1",
+                pin = "1234",
+                computerUuid = "uuid-err",
+                alreadyPairedGsCert = null,
+                approvedNewFingerprint = null,
+                token = CallCancelToken(),
+                runGameStreamPair = { _, _ -> GameStreamPairOutcome.Paired(gsIdCert.cert) },
+                notPairedRetryDelaysMs = retries,
+            )
+
+            // 1) Persistent 409 not_paired retries 1 + retries.size times then fails without saving trust
+            completeCalls.set(0)
+            completeCode = 409
+            completeBody = """{"error":"not_paired"}"""
+            assertEquals(HostAutoPairOutcome.PairCompleteFailed(PairCompleteResult.NotPaired), runOnce())
+            assertEquals(1 + retries.size, completeCalls.get())
+            assertNull(pinStore.getFingerprint("host-err"))
+
+            // 2) 410 ticket expired fails immediately (1 call) without saving trust
+            completeCalls.set(0)
+            completeCode = 410
+            completeBody = """{"error":"ticket_expired"}"""
+            assertEquals(HostAutoPairOutcome.PairCompleteFailed(PairCompleteResult.TicketExpired), runOnce())
+            assertEquals(1, completeCalls.get())
+            assertNull(pinStore.getFingerprint("host-err"))
+
+            // 3) 401 unauthorized, 403 forbidden, 426 upgrade required all fail without saving trust
+            completeCode = 401
+            completeBody = """{"error":"no_cert"}"""
+            assertEquals(HostAutoPairOutcome.PairCompleteFailed(PairCompleteResult.Unauthorized), runOnce())
+            assertNull(pinStore.getFingerprint("host-err"))
+
+            completeCode = 403
+            completeBody = """{"error":"ip_mismatch"}"""
+            assertEquals(HostAutoPairOutcome.PairCompleteFailed(PairCompleteResult.Forbidden), runOnce())
+            assertNull(pinStore.getFingerprint("host-err"))
+
+            completeCode = 426
+            completeBody = """{"error":"upgrade_required"}"""
+            assertEquals(HostAutoPairOutcome.UpgradeRequired, runOnce())
+            assertNull(pinStore.getFingerprint("host-err"))
         }
     }
 }

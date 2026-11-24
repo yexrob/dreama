@@ -202,15 +202,34 @@ sealed interface HostInfoResult {
     data class Failed(val detail: String) : HostInfoResult
 }
 
+enum class PairNextStep {
+    GAMESTREAM,
+    DONE,
+}
+
 sealed interface AutoPairResult {
-    data object Approved : AutoPairResult
+    data class Approved(val next: PairNextStep, val ticket: String) : AutoPairResult
     data object Rejected : AutoPairResult
     data object TimedOut : AutoPairResult
+    data object Busy : AutoPairResult
+    data class Cooldown(val retryAfterSec: Int?) : AutoPairResult
     data object UpgradeRequired : AutoPairResult
-    data object StreamServiceUnavailable : AutoPairResult
+    data class StreamServiceUnavailable(val reason: String? = null) : AutoPairResult
     data class CertificateChanged(val hostId: String, val expected: String, val actual: String) : AutoPairResult
     data object Cancelled : AutoPairResult
     data class Failed(val detail: String) : AutoPairResult
+}
+
+sealed interface PairCompleteResult {
+    data class Completed(val mediaPort: Int?) : PairCompleteResult
+    data object NotPaired : PairCompleteResult
+    data object TicketExpired : PairCompleteResult
+    data object Unauthorized : PairCompleteResult
+    data object Forbidden : PairCompleteResult
+    data object UpgradeRequired : PairCompleteResult
+    data class CertificateChanged(val hostId: String, val expected: String, val actual: String) : PairCompleteResult
+    data object Cancelled : PairCompleteResult
+    data class Failed(val detail: String) : PairCompleteResult
 }
 
 sealed interface MediaCredsResult {
@@ -238,10 +257,14 @@ interface HostProtocolApi {
     ): HostInfoResult
 
     /**
-     * Sends `/depth3d/v1/pair` strictly pinned to [expectedFingerprint] (obtained from a verified
-     * [getInfo] call). Never saves a pin on any response; pin persistence happens only after the
-     * full pairing flow completes (B2/B3/S2). Never sends a client cert unless the host already has
-     * a matching saved paired pin (B1).
+     * Step 1 of two-step Host pairing (`POST /depth3d/v1/pair`, docs/specs/host-protocol.md):
+     * obtains user consent on the Host and returns `(next, ticket)` without waiting for GameStream
+     * pairing. Strictly pinned to [expectedFingerprint] from a verified [getInfo] call.
+     *
+     * Client certificate is ONLY sent when either:
+     * - [hostId] already has a persisted [HostPairedTrust] matching [expectedFingerprint], OR
+     * - [verifiedGameStreamUpgrade] is true (caller already proved over strict HTTPS pinned-cert
+     *   check on the same IPv4 address that this endpoint holds the saved GameStream server cert).
      */
     fun requestAutoPair(
         address: String,
@@ -252,15 +275,34 @@ interface HostProtocolApi {
         pin: String,
         expectedFingerprint: String,
         presentClientCert: Boolean = false,
+        verifiedGameStreamUpgrade: Boolean = false,
         approvedNewFingerprint: String? = null,
         cancelToken: CallCancelToken? = null,
     ): AutoPairResult
 
     /**
+     * Step 2 of two-step Host pairing (`POST /depth3d/v1/pair/complete`, docs/specs/host-protocol.md):
+     * called with the pairing TLS client certificate and [ticket] after GameStream pairing succeeds
+     * (or immediately when `/pair` returned `next="done"` for a verified upgrade).
+     * Never writes [pinStore]; the caller commits [HostPairedTrust] only after receiving `200 OK`.
+     */
+    fun completeAutoPair(
+        address: String,
+        port: Int,
+        hostId: String,
+        ticket: String,
+        deviceId: String,
+        deviceName: String,
+        expectedFingerprint: String,
+        approvedNewFingerprint: String? = null,
+        cancelToken: CallCancelToken? = null,
+    ): PairCompleteResult
+
+    /**
      * Requests `/depth3d/v1/media` ONLY if [hostId] has a persisted [HostPairedTrust] matching
      * [expectedComputerUuid] and [expectedGsCertFingerprint], AND the TLS handshake certificate
-     * matches the persisted Host fingerprint. Refuses to dial, send client cert, send
-     * `X-Depth3d-Device`, or accept WebDAV credentials otherwise (B1).
+     * matches the persisted Host fingerprint. Refuses to dial, send client cert, or accept WebDAV
+     * credentials otherwise (B1).
      */
     fun getMediaCredentials(
         address: String,
@@ -278,23 +320,29 @@ interface HostProtocolApi {
  *
  * Security guarantees:
  * - `/info` never persists a certificate pin; first-use discovery stays in memory only (B3).
- * - `/pair` requires an explicit [expectedFingerprint] from a verified `/info` (`info.id == hostId`)
- *   and pins the TLS handshake to that exact fingerprint; never persists on 403/408/500/503 (B2/S2).
+ * - `/pair` requires an explicit [expectedFingerprint] from a verified `/info` (`info.id == hostId`),
+ *   uses read timeout >= 75 s, and never persists trust on any status code.
+ * - `/pair/complete` sends the client certificate + ticket strictly pinned to [expectedFingerprint];
+ *   Host trust is only saved by the orchestrator after `/pair/complete` returns `200 OK`.
  * - `/media` strictly requires a persisted [HostPairedTrust] binding (saved Host fingerprint +
  *   paired computer UUID + paired GameStream cert fingerprint) and verifies the TLS server cert
- *   matches that exact saved fingerprint before sending client cert or `X-Depth3d-Device` (B1).
- * - Never logs PINs, passwords, or key material.
+ *   matches that exact saved fingerprint before sending the client certificate (B1).
+ * - Never logs PINs, tickets, passwords, or key material.
  */
 class HttpHostProtocolClient(
     private val pinStore: HostCertPinStore,
     private val clientIdentityProvider: () -> Pair<X509Certificate, PrivateKey>? = { null },
     private val connectTimeoutMs: Long = 5_000L,
     private val infoReadTimeoutMs: Long = 8_000L,
-    private val pairReadTimeoutMs: Long = 70_000L,
+    private val pairReadTimeoutMs: Long = DEFAULT_PAIR_READ_TIMEOUT_MS,
 ) : HostProtocolApi {
+
+    internal val configuredPairReadTimeoutMs: Long get() = pairReadTimeoutMs
 
     companion object {
         const val PROTOCOL_VERSION = 1
+        const val MIN_PAIR_READ_TIMEOUT_MS = 75_000L
+        const val DEFAULT_PAIR_READ_TIMEOUT_MS = 80_000L
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
         private const val HEADER_DEVICE = "X-Depth3d-Device"
 
@@ -382,9 +430,39 @@ class HttpHostProtocolClient(
             return WebDavCredentials(port = port, user = user, pass = pass)
         }
 
-        internal fun parsePairOkJson(raw: String): Boolean {
-            val root = MiniJson.parseObject(raw) ?: return false
-            return root.bool("ok") == true
+        internal fun parsePairApprovedJson(raw: String): AutoPairResult.Approved? {
+            val root = MiniJson.parseObject(raw) ?: return null
+            if (root.bool("ok") != true) return null
+            val next = when (root.string("next")?.lowercase(Locale.ROOT)) {
+                "gamestream" -> PairNextStep.GAMESTREAM
+                "done" -> PairNextStep.DONE
+                else -> return null
+            }
+            val ticket = root.string("ticket")?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+            return AutoPairResult.Approved(next = next, ticket = ticket)
+        }
+
+        internal fun parsePairCompleteJson(raw: String): PairCompleteResult.Completed? {
+            val root = MiniJson.parseObject(raw) ?: return null
+            if (root.bool("ok") != true) return null
+            val mediaPort = root.obj("media")?.int("port")?.takeIf { it in 1..65535 }
+            return PairCompleteResult.Completed(mediaPort = mediaPort)
+        }
+
+        internal fun parsePairRateLimitJson(raw: String): AutoPairResult {
+            val root = MiniJson.parseObject(raw)
+            val err = root?.string("error")?.lowercase(Locale.ROOT)
+            val retryAfter = root?.int("retryAfterSec")?.takeIf { it > 0 }
+            return if (err == "cooldown" || (err != "busy" && retryAfter != null)) {
+                AutoPairResult.Cooldown(retryAfterSec = retryAfter)
+            } else {
+                AutoPairResult.Busy
+            }
+        }
+
+        internal fun parseStreamNotReadyReason(raw: String): String? {
+            val root = MiniJson.parseObject(raw) ?: return null
+            return root.string("reason")?.trim()?.takeIf { it.isNotEmpty() }
         }
     }
 
@@ -461,6 +539,7 @@ class HttpHostProtocolClient(
         pin: String,
         expectedFingerprint: String,
         presentClientCert: Boolean,
+        verifiedGameStreamUpgrade: Boolean,
         approvedNewFingerprint: String?,
         cancelToken: CallCancelToken?,
     ): AutoPairResult {
@@ -478,12 +557,15 @@ class HttpHostProtocolClient(
             }
         }
 
-        // B1: Never send a client certificate on any connection without a matching saved paired pin.
-        val allowClientCert = presentClientCert &&
-            savedPin != null &&
+        // B1 + host-protocol.md §升级路径:
+        // Send client cert ONLY when either (1) we already have a matching persisted HostPairedTrust,
+        // OR (2) caller already verified this exact IPv4 endpoint's GameStream HTTPS cert against our
+        // saved paired serverCert (the sole allowed unpinned upgrade case).
+        val hasMatchingSavedTrust = savedPin != null &&
             pairedTrust != null &&
             savedPin.equals(expected, ignoreCase = true) &&
             pairedTrust.hostFingerprint.equals(savedPin, ignoreCase = true)
+        val allowClientCert = presentClientCert && (hasMatchingSavedTrust || verifiedGameStreamUpgrade)
 
         val url = formatHostUrl(address, port, "/depth3d/v1/pair")
         val payload = "{\"device\":\"${escapeJson(deviceName)}\",\"deviceId\":\"${escapeJson(deviceId)}\",\"pin\":\"${escapeJson(pin)}\"}"
@@ -514,14 +596,14 @@ class HttpHostProtocolClient(
                     if (fp == null || !fp.equals(expected, ignoreCase = true)) {
                         return AutoPairResult.Failed("unexpected server cert")
                     }
-                    // Never write pinStore here on 403/408/500/503 or even 200;
-                    // the caller commits HostPairedTrust ONLY after the entire pairing succeeds (B3/S2).
+                    // Never write pinStore here on any response; trust is saved only after /pair/complete 200.
                     when (resp.code) {
-                        200 -> if (parsePairOkJson(body)) AutoPairResult.Approved else AutoPairResult.Failed("pair response not ok")
+                        200 -> parsePairApprovedJson(body) ?: AutoPairResult.Failed("invalid pair response")
                         403 -> AutoPairResult.Rejected
                         408 -> AutoPairResult.TimedOut
                         426 -> AutoPairResult.UpgradeRequired
-                        503 -> AutoPairResult.StreamServiceUnavailable
+                        429 -> parsePairRateLimitJson(body)
+                        503 -> AutoPairResult.StreamServiceUnavailable(parseStreamNotReadyReason(body))
                         else -> AutoPairResult.Failed("HTTP ${resp.code}")
                     }
                 }
@@ -537,6 +619,92 @@ class HttpHostProtocolClient(
             } else {
                 LimeLog.warning("depth3d: host pair failed ($address:$port): ${e.javaClass.simpleName}")
                 AutoPairResult.Failed(e.message ?: e.javaClass.simpleName)
+            }
+        }
+    }
+
+    override fun completeAutoPair(
+        address: String,
+        port: Int,
+        hostId: String,
+        ticket: String,
+        deviceId: String,
+        deviceName: String,
+        expectedFingerprint: String,
+        approvedNewFingerprint: String?,
+        cancelToken: CallCancelToken?,
+    ): PairCompleteResult {
+        if (cancelToken?.isCancelled == true) return PairCompleteResult.Cancelled
+        val expected = expectedFingerprint.trim()
+        if (expected.isEmpty() || ticket.isBlank()) {
+            return PairCompleteResult.Failed("missing verified fingerprint or ticket")
+        }
+
+        val savedPin = pinStore.getFingerprint(hostId)
+        if (savedPin != null && !savedPin.equals(expected, ignoreCase = true)) {
+            if (approvedNewFingerprint == null || !approvedNewFingerprint.equals(expected, ignoreCase = true)) {
+                return PairCompleteResult.CertificateChanged(hostId, savedPin, expected)
+            }
+        }
+
+        val keyManagers = buildClientKeyManagers()
+        if (keyManagers == null) {
+            LimeLog.warning("depth3d: skipping /depth3d/v1/pair/complete because pairing client cert is unavailable")
+            return PairCompleteResult.Unauthorized
+        }
+
+        val url = formatHostUrl(address, port, "/depth3d/v1/pair/complete")
+        val payload = "{\"ticket\":\"${escapeJson(ticket)}\",\"deviceId\":\"${escapeJson(deviceId)}\",\"device\":\"${escapeJson(deviceName)}\"}"
+        LimeLog.info("depth3d: host POST /depth3d/v1/pair/complete -> $address:$port (device=$deviceName)")
+        val observed = AtomicReference<String?>(null)
+        val policy = CertPinPolicy.ExactOnly(
+            expectedFingerprint = expected,
+            reportedExpectedForError = savedPin ?: expected,
+        )
+        return try {
+            val client = buildClient(
+                hostId = hostId,
+                policy = policy,
+                presentClientCert = true,
+                readTimeoutMs = infoReadTimeoutMs,
+                observedFingerprintOut = observed,
+                precomputedKeyManagers = keyManagers,
+            )
+            val request = Request.Builder()
+                .url(url)
+                .post(payload.toRequestBody(JSON_MEDIA))
+                .build()
+            val call = client.newCall(request)
+            val unregister = cancelToken?.registerCall(call)
+            try {
+                call.execute().use { resp ->
+                    val body = resp.body.string()
+                    val fp = observed.get()
+                    if (fp == null || !fp.equals(expected, ignoreCase = true)) {
+                        return PairCompleteResult.Failed("unexpected server cert")
+                    }
+                    when (resp.code) {
+                        200 -> parsePairCompleteJson(body) ?: PairCompleteResult.Failed("invalid pair/complete response")
+                        401 -> PairCompleteResult.Unauthorized
+                        403 -> PairCompleteResult.Forbidden
+                        409 -> PairCompleteResult.NotPaired
+                        410 -> PairCompleteResult.TicketExpired
+                        426 -> PairCompleteResult.UpgradeRequired
+                        else -> PairCompleteResult.Failed("HTTP ${resp.code}")
+                    }
+                }
+            } finally {
+                unregister?.invoke()
+            }
+        } catch (e: Throwable) {
+            if (cancelToken?.isCancelled == true) return PairCompleteResult.Cancelled
+            val changed = findCertChanged(e)
+            if (changed != null) {
+                LimeLog.warning("depth3d: host certificate changed during pair/complete for $hostId")
+                PairCompleteResult.CertificateChanged(changed.hostId, changed.expectedFingerprint, changed.actualFingerprint)
+            } else {
+                LimeLog.warning("depth3d: host pair/complete failed ($address:$port): ${e.javaClass.simpleName}")
+                PairCompleteResult.Failed(e.message ?: e.javaClass.simpleName)
             }
         }
     }

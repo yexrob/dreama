@@ -21,16 +21,38 @@ class HostDiscoveryAddressTest {
     }
 
     @Test
-    fun routableIpv6BeforeLinkLocal() {
-        assertEquals(ip("2409:8a00::1ec").hostAddress, HostDiscovery.chooseAddress(listOf(linkLocal, ip("2409:8a00::1ec"))))
+    fun routableIpv6AloneIsNotDialledBecauseHostProtocolRequiresIpv4() {
+        // Per docs/specs/host-protocol.md: all connections to a Host (control API + GameStream pairing)
+        // must use the same IPv4 address; if only IPv6 has arrived, return null and wait for next update.
+        assertNull(HostDiscovery.chooseAddress(listOf(linkLocal, ip("2409:8a00::1ec"))))
     }
 
     @Test
-    fun scopedLinkLocalIsNotDialledBecauseOkHttpRejectsZoneIds() {
-        // #4: OkHttp 5.5.0 HttpUrl.parse returns null for [fe80::...%3] (and %25),
-        // so chooseAddress only returns IPv4 or routable (non-link-local) IPv6.
+    fun scopedLinkLocalAndLinkLocalIpv4AreNotDialled() {
         val scoped = Inet6Address.getByAddress(null, linkLocal.address, 3)
-        assertNull(HostDiscovery.chooseAddress(listOf(ip("127.0.0.1"), scoped)))
+        assertNull(HostDiscovery.chooseAddress(listOf(ip("127.0.0.1"), scoped, ip("169.254.10.20"))))
+    }
+
+    @Test
+    fun fromTxtParsesMrevAndGsPort() {
+        val host = DiscoveredHost.fromTxt(
+            serviceName = "Study Mac",
+            address = "192.168.1.50",
+            controlPort = 47990,
+            txt = mapOf(
+                "v" to "1",
+                "id" to "host-abc",
+                "name" to "书房 Mac",
+                "pair" to "auto",
+                "gs" to "47989",
+                "media" to "8890",
+                "mrev" to "3",
+            ),
+        )
+        assertEquals("host-abc", host?.id)
+        assertEquals(47989, host?.gsPort)
+        assertEquals(8890, host?.mediaPort)
+        assertEquals(3, host?.mediaRevision)
     }
 
     @Test

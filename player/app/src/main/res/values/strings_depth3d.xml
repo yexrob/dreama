@@ -188,6 +188,21 @@
     <string name="err_autopair_rejected_detail">如果想连接这台电脑，请在电脑弹出提示时点「允许」。</string>
     <string name="err_autopair_timeout_title">等待电脑确认超时</string>
     <string name="err_autopair_timeout_detail">请留意电脑屏幕上的连接提示，点重试再发一次请求。</string>
+    <string name="err_autopair_busy_title">电脑正在确认其他请求</string>
+    <string name="err_autopair_busy_detail">电脑屏幕上已有配对确认窗，请先处理后再点重试。</string>
+    <string name="err_autopair_cooldown_title">配对请求过于频繁</string>
+    <string name="err_autopair_cooldown_detail_sec">请等待 %1$d 秒后再点重试。</string>
+    <string name="err_autopair_cooldown_detail">请稍等片刻后再点重试。</string>
+    <string name="err_pair_complete_not_paired_title">电脑还没完成配对记录</string>
+    <string name="err_pair_complete_not_paired_detail">电脑端串流服务暂时没有确认这台头显，请稍候点重试。</string>
+    <string name="err_pair_complete_expired_title">这次配对已过期</string>
+    <string name="err_pair_complete_expired_detail">配对凭证已超时失效，请重新发起配对并在电脑上点「允许」。</string>
+    <string name="err_pair_complete_unauth_title">未能验证头显凭据</string>
+    <string name="err_pair_complete_unauth_detail">电脑没有收到有效的设备凭据，请点重试重新配对。</string>
+    <string name="err_pair_complete_forbidden_title">配对来源校验未通过</string>
+    <string name="err_pair_complete_forbidden_detail">请确认头显和电脑连在同一个 Wi-Fi，再点重试。</string>
+    <string name="err_pair_complete_failed_title">未能完成电脑端配对确认</string>
+    <string name="err_pair_complete_failed_detail">请确认电脑保持唤醒且在同一个 Wi-Fi，再点重试。</string>
     <string name="err_host_upgrade_title">请更新电脑上的 depth3d Host</string>
     <string name="err_host_upgrade_detail">电脑端版本和当前头显不兼容，更新电脑端后再试。</string>
     <string name="err_host_service_down_title">电脑上的串流服务没有运行</string>
@@ -471,6 +486,7 @@
     <string name="stream_status_paired_offline">已配对 · 暂时连不上</string>
     <string name="pc_action_complete_host_setup">完成设置（同步电脑影片）</string>
     <string name="pair_stage_preparing">正在准备连接…</string>
+    <string name="pair_auto_finalizing">正在确认配对结果…</string>
 
     <string name="dlna_body">在同一个 Wi-Fi 里，从手机上的视频 App 选择这个名字。</string>
     <string name="dlna_casting_title">正在播放手机投屏 · %1$s</string>

@@ -9,7 +9,6 @@ import com.limelight.nvstream.http.NvHTTP
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.net.Inet4Address
-import java.net.Inet6Address
 import java.net.InetAddress
 import java.nio.charset.StandardCharsets
 import java.util.ArrayDeque
@@ -26,6 +25,7 @@ data class DiscoveredHost(
     val gsPort: Int = NvHTTP.DEFAULT_HTTP_PORT,
     val pairMode: String? = null,
     val mediaPort: Int? = null,
+    val mediaRevision: Int? = null,
     val protocolVersion: Int = HttpHostProtocolClient.PROTOCOL_VERSION,
     val gsId: String? = null,
 ) {
@@ -56,6 +56,7 @@ data class DiscoveredHost(
             val gsPort = txt["gs"]?.trim()?.toIntOrNull()?.takeIf { it in 1..65535 } ?: NvHTTP.DEFAULT_HTTP_PORT
             val pairMode = txt["pair"]?.trim()?.takeIf { it.isNotEmpty() }
             val mediaPort = txt["media"]?.trim()?.toIntOrNull()?.takeIf { it in 1..65535 }
+            val mediaRevision = txt["mrev"]?.trim()?.toIntOrNull()?.takeIf { it > 0 }
             val gsId = txt["gsid"]?.trim()?.takeIf { it.isNotEmpty() }
             return DiscoveredHost(
                 id = id,
@@ -65,6 +66,7 @@ data class DiscoveredHost(
                 gsPort = gsPort,
                 pairMode = pairMode,
                 mediaPort = mediaPort,
+                mediaRevision = mediaRevision,
                 protocolVersion = version,
                 gsId = gsId,
             )
@@ -265,16 +267,19 @@ class HostDiscovery(context: Context) {
 
     companion object {
         /**
-         * The address to dial out of everything mDNS answered with. The system reports addresses
-         * as they arrive, and the first answer is often only IPv6 link-local (`fe80::`), which
-         * OkHttp 5 cannot parse or dial even with a `%scope` zone id (#4). So return IPv4 first,
-         * then a routable (non-link-local) IPv6, and otherwise null until a routable address arrives.
+         * Selects the IPv4 address to dial out of everything mDNS answered with.
+         * Per `docs/specs/host-protocol.md`, all control API and GameStream pairing connections to
+         * a depth3d Host must share the same IPv4 address; if mDNS has only reported IPv6 so far,
+         * return null and wait for the next update containing IPv4.
          */
-        internal fun chooseAddress(addrs: List<InetAddress>): String? {
-            val usable = addrs.filter { !it.isLoopbackAddress && !it.isAnyLocalAddress && !it.isMulticastAddress }
-            usable.firstOrNull { it is Inet4Address && !it.isLinkLocalAddress }?.let { return it.hostAddress }
-            return usable.firstOrNull { it is Inet6Address && !it.isLinkLocalAddress }?.hostAddress
-        }
+        internal fun chooseAddress(addrs: List<InetAddress>): String? =
+            addrs.firstOrNull {
+                it is Inet4Address &&
+                    !it.isLoopbackAddress &&
+                    !it.isAnyLocalAddress &&
+                    !it.isMulticastAddress &&
+                    !it.isLinkLocalAddress
+            }?.hostAddress
 
         /**
          * Deduplicates announced services by `(id, address, controlPort)` instead of `id` alone so

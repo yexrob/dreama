@@ -58,11 +58,22 @@ class StreamErrorMapperTest {
             StreamErrorMapper.forPairState(strings, PairState.NOT_PAIRED, false),
             StreamErrorMapper.forAutoPair(strings, AutoPairResult.Rejected),
             StreamErrorMapper.forAutoPair(strings, AutoPairResult.TimedOut),
+            StreamErrorMapper.forAutoPair(strings, AutoPairResult.Busy),
+            StreamErrorMapper.forAutoPair(strings, AutoPairResult.Cooldown(23)),
+            StreamErrorMapper.forAutoPair(strings, AutoPairResult.Cooldown(null)),
             StreamErrorMapper.forAutoPair(strings, AutoPairResult.UpgradeRequired),
-            StreamErrorMapper.forAutoPair(strings, AutoPairResult.StreamServiceUnavailable),
-            StreamErrorMapper.forAutoPair(strings, AutoPairResult.StreamServiceUnavailable, "请在电脑上开启屏幕录制权限"),
+            StreamErrorMapper.forAutoPair(strings, AutoPairResult.StreamServiceUnavailable()),
+            StreamErrorMapper.forAutoPair(strings, AutoPairResult.StreamServiceUnavailable("请在电脑上开启屏幕录制权限")),
+            StreamErrorMapper.forAutoPair(strings, AutoPairResult.StreamServiceUnavailable(), "请在电脑上开启屏幕录制权限"),
             StreamErrorMapper.forAutoPair(strings, AutoPairResult.CertificateChanged("id", "aaa", "bbb")),
             StreamErrorMapper.forAutoPair(strings, AutoPairResult.Failed("java.net.ConnectException: refused")),
+            StreamErrorMapper.forPairComplete(strings, PairCompleteResult.NotPaired),
+            StreamErrorMapper.forPairComplete(strings, PairCompleteResult.TicketExpired),
+            StreamErrorMapper.forPairComplete(strings, PairCompleteResult.Unauthorized),
+            StreamErrorMapper.forPairComplete(strings, PairCompleteResult.Forbidden),
+            StreamErrorMapper.forPairComplete(strings, PairCompleteResult.UpgradeRequired),
+            StreamErrorMapper.forPairComplete(strings, PairCompleteResult.CertificateChanged("id", "aaa", "bbb")),
+            StreamErrorMapper.forPairComplete(strings, PairCompleteResult.Failed("socket reset")),
             StreamErrorMapper.forHostNotReady(strings, null),
             StreamErrorMapper.forHostNotReady(strings, "请在系统设置中授予屏幕录制权限"),
             StreamErrorMapper.forHostUpgradeRequired(strings),
@@ -95,14 +106,26 @@ class StreamErrorMapperTest {
         assertFalse(StreamErrorMapper.forHostUpgradeRequired(strings).retryable)
         assertFalse(StreamErrorMapper.forWakeNoMac(strings).retryable)
 
-        // 503 with stream.reason preserves the Mac host's reason and stays retryable
-        val err503 = StreamErrorMapper.forAutoPair(
+        // 503 with stream_not_ready reason preserves the Mac host's Chinese reason and stays retryable
+        val err503FromBody = StreamErrorMapper.forAutoPair(
             strings,
-            AutoPairResult.StreamServiceUnavailable,
-            streamReason = "请在 Mac 系统设置里开启屏幕录制",
+            AutoPairResult.StreamServiceUnavailable("请在 Mac 系统设置里开启屏幕录制"),
         )
-        assertEquals("请在 Mac 系统设置里开启屏幕录制", err503.detail)
-        assertTrue(err503.retryable)
+        assertEquals("请在 Mac 系统设置里开启屏幕录制", err503FromBody.detail)
+        assertTrue(err503FromBody.retryable)
+
+        // 429 cooldown with retryAfterSec includes the exact seconds and stays retryable
+        val errCooldown = StreamErrorMapper.forAutoPair(strings, AutoPairResult.Cooldown(25))
+        assertTrue("Cooldown detail should mention 25 seconds: ${errCooldown.detail}", errCooldown.detail.contains("25"))
+        assertTrue(errCooldown.retryable)
+
+        // 429 busy, 409 not_paired, 410 ticket expired are retryable; 426 upgrade is not
+        assertTrue(StreamErrorMapper.forAutoPair(strings, AutoPairResult.Busy).retryable)
+        assertTrue(StreamErrorMapper.forPairComplete(strings, PairCompleteResult.NotPaired).retryable)
+        assertTrue(StreamErrorMapper.forPairComplete(strings, PairCompleteResult.TicketExpired).retryable)
+        val err426Complete = StreamErrorMapper.forPairComplete(strings, PairCompleteResult.UpgradeRequired)
+        assertEquals("请更新电脑上的 depth3d Host", err426Complete.title)
+        assertFalse(err426Complete.retryable)
     }
 
     @Test
