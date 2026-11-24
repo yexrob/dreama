@@ -35,12 +35,14 @@ import com.limelight.nvstream.input.MouseButtonPacket;
 import com.limelight.nvstream.jni.MoonBridge;
 import com.limelight.preferences.GlPreferences;
 import com.limelight.preferences.PreferenceConfiguration;
+import com.limelight.local.stream.StreamControlBar;
+import com.limelight.local.stream.StreamErrorMapper;
+import com.limelight.local.stream.StreamSessionBridge;
+import com.limelight.local.stream.UserFacingError;
+import com.limelight.local.wall.WallActivity;
 import com.limelight.ui.GameGestures;
 import com.limelight.ui.StreamView;
-import com.limelight.utils.Dialog;
 import com.limelight.utils.ServerHelper;
-import com.limelight.utils.ShortcutHelper;
-import com.limelight.utils.SpinnerDialog;
 import com.limelight.utils.UiHelper;
 
 import android.annotation.SuppressLint;
@@ -86,7 +88,6 @@ import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.TextView;
-import android.widget.Toast;
 
 import java.io.ByteArrayInputStream;
 import java.lang.reflect.InvocationTargetException;
@@ -129,7 +130,6 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     private SharedPreferences tombstonePrefs;
 
     private NvConnection conn;
-    private SpinnerDialog spinner;
     private boolean displayedFailureDialog = false;
     private boolean connecting = false;
     private boolean connected = false;
@@ -137,10 +137,25 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     private boolean surfaceCreated = false;
     private boolean attemptedConnection = false;
     private int suppressPipRefCount = 0;
+    private String pcUuid;
     private String pcName;
     private String appName;
     private NvApp app;
     private float desiredRefreshRate;
+
+    // depth3d VR streaming bar state (rendered on XrRenderer's transport layer)
+    private StreamControlBar streamControlBar;
+    private final Handler streamBarHandler = new Handler(Looper.getMainLooper());
+    private volatile int liveRttMs = 0;
+    private volatile float livePacketLossPct = 0f;
+    private volatile boolean livePoorConnection = false;
+    private volatile boolean liveGamepadMode = false;
+    private long streamBarIntroUntilMs = 0L;
+    private long streamBarWarnUntilMs = 0L;
+    private static final long STREAM_BAR_INTRO_MS = 4500L;
+    private static final long STREAM_BAR_WARN_LINGER_MS = 2500L;
+    private static final long STREAM_BAR_TICK_MS = 500L;
+    private final Runnable streamBarTick = this::tickStreamBar;
 
     private InputCaptureProvider inputCaptureProvider;
     private int modifierFlags = 0;
@@ -213,7 +228,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
     // Click timings go out under the renderer's tag, so one logcat filter
     // catches these and the native side together
-    private static final String VR_CLICK_TAG = "moonlight-xr";
+    private static final String VR_CLICK_TAG = "depth3d";
 
     private WifiManager.WifiLock highPerfWifiLock;
     private WifiManager.WifiLock lowLatencyWifiLock;
@@ -290,12 +305,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         // Inflate the content
         setContentView(R.layout.activity_game);
 
-        // Start the spinner
-        spinner = SpinnerDialog.displayDialog(this, getResources().getString(R.string.conn_establishing_title),
-                getResources().getString(R.string.conn_establishing_msg), true);
-
-        // Read the stream preferences
+        // Read the stream preferences (depth3d always streams in immersive VR mode)
         prefConfig = PreferenceConfiguration.readPreferences(this);
+        prefConfig.enableVrMode = true;
         tombstonePrefs = Game.this.getSharedPreferences("DecoderTombstone", 0);
         doffHold = new XrDoffHold(prefConfig.vrDoffGrace, new XrDoffHold.Owner() {
             @Override
@@ -397,34 +409,23 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         // Make sure Wi-Fi is fully powered up
         WifiManager wifiMgr = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         try {
-            highPerfWifiLock = wifiMgr.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "Moonlight High Perf Lock");
+            highPerfWifiLock = wifiMgr.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "depth3d High Perf Lock");
             highPerfWifiLock.setReferenceCounted(false);
             highPerfWifiLock.acquire();
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                lowLatencyWifiLock = wifiMgr.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "Moonlight Low Latency Lock");
+                lowLatencyWifiLock = wifiMgr.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "depth3d Low Latency Lock");
                 lowLatencyWifiLock.setReferenceCounted(false);
                 lowLatencyWifiLock.acquire();
             }
         } catch (SecurityException e) {
-            // Some Samsung Galaxy S10+/S10e devices throw a SecurityException from
-            // WifiLock.acquire() even though we have android.permission.WAKE_LOCK in our manifest.
             e.printStackTrace();
         }
 
         appName = Game.this.getIntent().getStringExtra(EXTRA_APP_NAME);
         pcName = Game.this.getIntent().getStringExtra(EXTRA_PC_NAME);
-        returnToPcView = Game.this.getIntent().getBooleanExtra(EXTRA_RETURN_TO_PC_VIEW, false);
-        if (Game.this.getIntent().getBooleanExtra(EXTRA_VR_UNAVAILABLE, false)) {
-            String reason = Game.this.getIntent().getStringExtra(EXTRA_VR_REASON);
-            String notice = reason != null
-                    ? getResources().getString(R.string.vr_unavailable_flat_reason, reason)
-                    : getResources().getString(R.string.vr_unavailable_flat);
-            Toast.makeText(this, notice, Toast.LENGTH_LONG).show();
-            // A headset's shell was seen not to show that toast at all, but it
-            // does show this panel, so the panel says it too for a while
-            showFlatNotice(notice, VR_UNAVAILABLE_NOTICE_MS);
-        }
+        pcUuid = Game.this.getIntent().getStringExtra(EXTRA_PC_UUID);
+        returnToPcView = Game.this.getIntent().getBooleanExtra(EXTRA_RETURN_TO_PC_VIEW, true);
 
         String host = Game.this.getIntent().getStringExtra(EXTRA_HOST);
         int port = Game.this.getIntent().getIntExtra(EXTRA_PORT, NvHTTP.DEFAULT_HTTP_PORT);
@@ -475,12 +476,11 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 }
 
                 if (!willStreamHdr) {
-                    // Nope, no HDR for us :(
-                    Toast.makeText(this, "Display does not support HDR10", Toast.LENGTH_LONG).show();
+                    LimeLog.info("depth3d: display does not support HDR10, using SDR");
                 }
             }
             else {
-                Toast.makeText(this, "HDR requires Android 7.0 or later", Toast.LENGTH_LONG).show();
+                LimeLog.info("depth3d: HDR requires Android 7.0 or later, using SDR");
             }
         }
 
@@ -495,10 +495,6 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 new CrashListener() {
                     @Override
                     public void notifyCrash(Exception e) {
-                        // The MediaCodec instance is going down due to a crash
-                        // let's tell the user something when they open the app again
-
-                        // We must use commit because the app will crash when we return from this function
                         tombstonePrefs.edit().putInt("CrashCount", tombstonePrefs.getInt("CrashCount", 0) + 1).commit();
                         reportedCrash = true;
                     }
@@ -508,21 +504,24 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 willStreamHdr,
                 glPrefs.glRenderer,
                 this);
+        decoderRenderer.setStreamHostName(pcName);
+        decoderRenderer.setStreamStatsListener((rttMs, lossPct) -> {
+            liveRttMs = rttMs;
+            livePacketLossPct = lossPct;
+        });
 
         // Don't stream HDR if the decoder can't support it
         if (willStreamHdr && !decoderRenderer.isHevcMain10Hdr10Supported() && !decoderRenderer.isAv1Main10Supported()) {
             willStreamHdr = false;
-            Toast.makeText(this, "Decoder does not support HDR10 profile", Toast.LENGTH_LONG).show();
+            LimeLog.info("depth3d: decoder does not support HDR10 profile, using SDR");
         }
 
-        // Display a message to the user if HEVC was forced on but we still didn't find a decoder
         if (prefConfig.videoFormat == PreferenceConfiguration.FormatOption.FORCE_HEVC && !decoderRenderer.isHevcSupported()) {
-            Toast.makeText(this, "No HEVC decoder found", Toast.LENGTH_LONG).show();
+            LimeLog.warning("depth3d: HEVC requested but no HEVC decoder found");
         }
 
-        // Display a message to the user if AV1 was forced on but we still didn't find a decoder
         if (prefConfig.videoFormat == PreferenceConfiguration.FormatOption.FORCE_AV1 && !decoderRenderer.isAv1Supported()) {
-            Toast.makeText(this, "No AV1 decoder found", Toast.LENGTH_LONG).show();
+            LimeLog.warning("depth3d: AV1 requested but no AV1 decoder found");
         }
 
         // H.264 is always supported
@@ -700,14 +699,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         }
 
         if (!decoderRenderer.isAvcSupported()) {
-            if (spinner != null) {
-                spinner.dismiss();
-                spinner = null;
-            }
-
-            // If we can't find an AVC decoder, we can't proceed
-            Dialog.displayDialog(this, getResources().getString(R.string.conn_error_title),
-                    "This device or ROM doesn't support hardware accelerated H.264 playback.", true);
+            recordSessionErrorAndFinish(StreamErrorMapper.INSTANCE.forStageFailed("video"));
             return;
         }
 
@@ -1222,13 +1214,45 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         if (returnToPcView && !pcViewStarted) {
             pcViewStarted = true;
 
-            Intent i = new Intent(this, PcView.class);
+            Intent i = new Intent(this, WallActivity.class);
             i.setAction(Intent.ACTION_MAIN);
-            i.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+            i.putExtra(StreamSessionBridge.EXTRA_INITIAL_TAB, StreamSessionBridge.TAB_CAST);
+            i.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
             startActivity(i);
         }
 
         super.finish();
+    }
+
+    private void recordSessionErrorAndFinish(UserFacingError error) {
+        int appId = app != null ? app.getAppId() : 0;
+        StreamSessionBridge.recordError(pcUuid, pcName != null ? pcName : "", appId, appName, error);
+        finish();
+    }
+
+    private void tickStreamBar() {
+        streamBarHandler.removeCallbacks(streamBarTick);
+        if (!connected || isFinishing() || isDestroyed()) {
+            return;
+        }
+        XrRenderer r = decoderRenderer != null ? decoderRenderer.getXrRenderer() : null;
+        if (r != null) {
+            long now = SystemClock.uptimeMillis();
+            boolean warn = StreamControlBar.shouldWarnNetwork(liveRttMs, livePacketLossPct, livePoorConnection);
+            if (warn) {
+                streamBarWarnUntilMs = now + STREAM_BAR_WARN_LINGER_MS;
+            }
+            boolean show = warn || now < streamBarIntroUntilMs || now < streamBarWarnUntilMs;
+            r.setTransportVisible(show);
+            if (show) {
+                if (streamControlBar == null) {
+                    streamControlBar = new StreamControlBar();
+                }
+                r.postTransport(streamControlBar.draw(
+                        pcName, liveRttMs, livePacketLossPct, livePoorConnection, liveGamepadMode));
+            }
+        }
+        streamBarHandler.postDelayed(streamBarTick, STREAM_BAR_TICK_MS);
     }
 
     @Override
@@ -1236,6 +1260,13 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         super.onDestroy();
 
         FileLog.event("session ended");
+
+        streamBarHandler.removeCallbacks(streamBarTick);
+        if (streamControlBar != null) {
+            streamControlBar.release();
+            streamControlBar = null;
+        }
+        StreamSessionBridge.resetTelemetry();
 
         // The stream may still have been starting up when this activity went
         // away, in which case the normal decoder teardown never runs and the
@@ -1368,61 +1399,13 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             doffHold.cancel();
         }
 
-        SpinnerDialog.closeDialogs(this);
-        Dialog.closeDialogs();
-
         if (virtualController != null) {
             virtualController.hide();
         }
 
         if (conn != null) {
-            int videoFormat = decoderRenderer.getActiveVideoFormat();
-
             displayedFailureDialog = true;
             stopConnection();
-
-            if (prefConfig.enableLatencyToast) {
-                int averageEndToEndLat = decoderRenderer.getAverageEndToEndLatency();
-                int averageDecoderLat = decoderRenderer.getAverageDecoderLatency();
-                String message = null;
-                if (averageEndToEndLat > 0) {
-                    message = getResources().getString(R.string.conn_client_latency)+" "+averageEndToEndLat+" ms";
-                    if (averageDecoderLat > 0) {
-                        message += " ("+getResources().getString(R.string.conn_client_latency_hw)+" "+averageDecoderLat+" ms)";
-                    }
-                }
-                else if (averageDecoderLat > 0) {
-                    message = getResources().getString(R.string.conn_hardware_latency)+" "+averageDecoderLat+" ms";
-                }
-
-                // Add the video codec to the post-stream toast
-                if (message != null) {
-                    message += " [";
-
-                    if ((videoFormat & MoonBridge.VIDEO_FORMAT_MASK_H264) != 0) {
-                        message += "H.264";
-                    }
-                    else if ((videoFormat & MoonBridge.VIDEO_FORMAT_MASK_H265) != 0) {
-                        message += "HEVC";
-                    }
-                    else if ((videoFormat & MoonBridge.VIDEO_FORMAT_MASK_AV1) != 0) {
-                        message += "AV1";
-                    }
-                    else {
-                        message += "UNKNOWN";
-                    }
-
-                    if ((videoFormat & MoonBridge.VIDEO_FORMAT_MASK_10BIT) != 0) {
-                        message += " HDR";
-                    }
-
-                    message += "]";
-                }
-
-                if (message != null) {
-                    Toast.makeText(this, message, Toast.LENGTH_LONG).show();
-                }
-            }
 
             // Clear the tombstone count if we terminated normally
             if (!reportedCrash && tombstonePrefs.getInt("CrashCount", 0) != 0) {
@@ -2501,15 +2484,6 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     @Override
     public void stageStarting(final String stage) {
         FileLog.event("stage: " + stage);
-
-        runOnUiThread(new Runnable() {
-            @Override
-            public void run() {
-                if (spinner != null) {
-                    spinner.setMessage(getResources().getString(R.string.conn_starting) + " " + stage);
-                }
-            }
-        });
     }
 
     @Override
@@ -2548,39 +2522,14 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     public void stageFailed(final String stage, final int portFlags, final int errorCode) {
         FileLog.event("stage failed: " + stage + ", error " + errorCode);
 
-        // Perform a connection test if the failure could be due to a blocked port
-        // This does network I/O, so don't do it on the main thread.
-        final int portTestResult = MoonBridge.testClientConnectivity(ServerHelper.CONNECTION_TEST_SERVER, 443, portFlags);
-
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
-                if (spinner != null) {
-                    spinner.dismiss();
-                    spinner = null;
-                }
-
                 if (!displayedFailureDialog) {
                     displayedFailureDialog = true;
-                    LimeLog.severe(stage + " failed: " + errorCode);
-
-                    // If video initialization failed and the surface is still valid, display extra information for the user
-                    if (stage.contains("video") && streamView.getHolder().getSurface().isValid()) {
-                        Toast.makeText(Game.this, getResources().getText(R.string.video_decoder_init_failed), Toast.LENGTH_LONG).show();
-                    }
-
-                    String dialogText = getResources().getString(R.string.conn_error_msg) + " " + stage +" (error "+errorCode+")";
-
-                    if (portFlags != 0) {
-                        dialogText += "\n\n" + getResources().getString(R.string.check_ports_msg) + "\n" +
-                                MoonBridge.stringifyPortFlags(portFlags, "\n");
-                    }
-
-                    if (portTestResult != MoonBridge.ML_TEST_RESULT_INCONCLUSIVE && portTestResult != 0)  {
-                        dialogText += "\n\n" + getResources().getString(R.string.nettest_text_blocked);
-                    }
-
-                    Dialog.displayDialog(Game.this, getResources().getString(R.string.conn_error_title), dialogText, true);
+                    LimeLog.severe("depth3d: stream stage failed: " + stage + " (" + errorCode + ")");
+                    stopConnection();
+                    recordSessionErrorAndFinish(StreamErrorMapper.INSTANCE.forStageFailed(stage));
                 }
             }
         });
@@ -2591,100 +2540,21 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         FileLog.event("connection terminated: " + errorCode
                 + (errorCode == MoonBridge.ML_ERROR_GRACEFUL_TERMINATION ? " (graceful)" : ""));
 
-        // Perform a connection test if the failure could be due to a blocked port
-        // This does network I/O, so don't do it on the main thread.
-        final int portFlags = MoonBridge.getPortFlagsFromTerminationErrorCode(errorCode);
-        final int portTestResult = MoonBridge.testClientConnectivity(ServerHelper.CONNECTION_TEST_SERVER,443, portFlags);
-
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
-                // Let the display go to sleep now
                 getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-
-                // Stop processing controller input
                 controllerHandler.stop();
-
-                // Ungrab input
                 setInputGrabState(false);
 
                 if (!displayedFailureDialog) {
                     displayedFailureDialog = true;
-                    LimeLog.severe("Connection terminated: " + errorCode);
-                    // A VR session never shows the dialog's window, so it says
-                    // the same on its own toast, and the stream is only
-                    // stopped once that has been up long enough to read,
-                    // since stopping it ends the session
-                    final boolean vrNotice = errorCode != MoonBridge.ML_ERROR_GRACEFUL_TERMINATION
-                            && vrSessionUp();
-                    if (!vrNotice) {
-                        stopConnection();
-                    }
+                    LimeLog.severe("depth3d: connection terminated: " + errorCode);
+                    streamBarHandler.removeCallbacks(streamBarTick);
+                    stopConnection();
 
-                    // Display the error dialog if it was an unexpected termination.
-                    // Otherwise, just finish the activity immediately.
                     if (errorCode != MoonBridge.ML_ERROR_GRACEFUL_TERMINATION) {
-                        String message;
-
-                        if (portTestResult != MoonBridge.ML_TEST_RESULT_INCONCLUSIVE && portTestResult != 0) {
-                            // If we got a blocked result, that supersedes any other error message
-                            message = getResources().getString(R.string.nettest_text_blocked);
-                        }
-                        else {
-                            switch (errorCode) {
-                                case MoonBridge.ML_ERROR_NO_VIDEO_TRAFFIC:
-                                    message = getResources().getString(R.string.no_video_received_error);
-                                    break;
-
-                                case MoonBridge.ML_ERROR_NO_VIDEO_FRAME:
-                                    message = getResources().getString(R.string.no_frame_received_error);
-                                    break;
-
-                                case MoonBridge.ML_ERROR_UNEXPECTED_EARLY_TERMINATION:
-                                case MoonBridge.ML_ERROR_PROTECTED_CONTENT:
-                                    message = getResources().getString(R.string.early_termination_error);
-                                    break;
-
-                                case MoonBridge.ML_ERROR_FRAME_CONVERSION:
-                                    message = getResources().getString(R.string.frame_conversion_error);
-                                    break;
-
-                                default:
-                                    String errorCodeString;
-                                    // We'll assume large errors are hex values
-                                    if (Math.abs(errorCode) > 1000) {
-                                        errorCodeString = Integer.toHexString(errorCode);
-                                    }
-                                    else {
-                                        errorCodeString = Integer.toString(errorCode);
-                                    }
-                                    message = getResources().getString(R.string.conn_terminated_msg) + "\n\n" +
-                                            getResources().getString(R.string.error_code_prefix) + " " + errorCodeString;
-                                    break;
-                            }
-                        }
-
-                        if (portFlags != 0) {
-                            message += "\n\n" + getResources().getString(R.string.check_ports_msg) + "\n" +
-                                    MoonBridge.stringifyPortFlags(portFlags, "\n");
-                        }
-
-                        final String title = getResources().getString(R.string.conn_terminated_title);
-                        final String dialogMessage = message;
-                        if (vrNotice) {
-                            showVrNotice(title, message.replaceAll("\\s*\\n+\\s*", " ").trim());
-                            FileLog.event("connection error said on the VR toast");
-                            new Handler().postDelayed(new Runnable() {
-                                @Override
-                                public void run() {
-                                    stopConnection();
-                                    Dialog.displayDialog(Game.this, title, dialogMessage, true);
-                                }
-                            }, VR_NOTICE_MS);
-                        }
-                        else {
-                            Dialog.displayDialog(Game.this, title, dialogMessage, true);
-                        }
+                        recordSessionErrorAndFinish(StreamErrorMapper.INSTANCE.forConnectionTerminated(errorCode));
                     }
                     else {
                         finish();
@@ -2699,26 +2569,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
-                if (prefConfig.disableWarnings) {
-                    return;
-                }
-
-                if (connectionStatus == MoonBridge.CONN_STATUS_POOR) {
-                    if (prefConfig.bitrate > 5000) {
-                        notificationOverlayView.setText(getResources().getString(R.string.slow_connection_msg));
-                    }
-                    else {
-                        notificationOverlayView.setText(getResources().getString(R.string.poor_connection_msg));
-                    }
-
-                    requestedNotificationOverlayVisibility = View.VISIBLE;
-                }
-                else if (connectionStatus == MoonBridge.CONN_STATUS_OKAY) {
-                    requestedNotificationOverlayVisibility = View.GONE;
-                }
-
-                if (!isHidingOverlays) {
-                    notificationOverlayView.setVisibility(requestedNotificationOverlayVisibility);
+                livePoorConnection = (connectionStatus == MoonBridge.CONN_STATUS_POOR);
+                if (connected) {
+                    tickStreamBar();
                 }
             }
         });
@@ -2731,21 +2584,11 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
-                if (spinner != null) {
-                    spinner.dismiss();
-                    spinner = null;
-                }
-
                 connected = true;
                 connecting = false;
                 updatePipAutoEnter();
 
-                // Hide the mouse cursor now after a short delay.
-                // Doing it before dismissing the spinner seems to be undone
-                // when the spinner gets displayed. On Android Q, even now
-                // is too early to capture. We will delay a second to allow
-                // the spinner to dismiss before capturing.
-                Handler h = new Handler();
+                Handler h = new Handler(Looper.getMainLooper());
                 h.postDelayed(new Runnable() {
                     @Override
                     public void run() {
@@ -2753,48 +2596,25 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                     }
                 }, 500);
 
-                // Keep the display on
                 getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-
-                // Update GameManager state to indicate we're in game
                 UiHelper.notifyStreamConnected(Game.this);
-
                 hideSystemUi(1000);
+
+                // Show depth3d streaming status pill briefly on connect, then automatically on poor network
+                streamBarIntroUntilMs = SystemClock.uptimeMillis() + STREAM_BAR_INTRO_MS;
+                tickStreamBar();
             }
         });
-
-        // Report this shortcut being used (off the main thread to prevent ANRs)
-        ComputerDetails computer = new ComputerDetails();
-        computer.name = pcName;
-        computer.uuid = Game.this.getIntent().getStringExtra(EXTRA_PC_UUID);
-        ShortcutHelper shortcutHelper = new ShortcutHelper(this);
-        shortcutHelper.reportComputerShortcutUsed(computer);
-        if (appName != null) {
-            // This may be null if launched from the "Resume Session" PC context menu item
-            shortcutHelper.reportGameLaunched(computer, app);
-        }
     }
 
     @Override
     public void displayMessage(final String message) {
-        runOnUiThread(new Runnable() {
-            @Override
-            public void run() {
-                Toast.makeText(Game.this, message, Toast.LENGTH_LONG).show();
-            }
-        });
+        LimeLog.info("depth3d: stream message: " + message);
     }
 
     @Override
     public void displayTransientMessage(final String message) {
-        if (!prefConfig.disableWarnings) {
-            runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
-                    Toast.makeText(Game.this, message, Toast.LENGTH_LONG).show();
-                }
-            });
-        }
+        LimeLog.info("depth3d: stream notice: " + message);
     }
 
     @Override
@@ -3125,6 +2945,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     // in before it is up is heard of with its first state, as a real one is.
     @Override
     public void onVrGamepadPlugged(final boolean plugged) {
+        liveGamepadMode = plugged;
         final ControllerHandler handler = controllerHandler;
         if (handler == null) {
             return;
@@ -3135,6 +2956,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             }
             else {
                 handler.detachXrPad();
+            }
+            if (connected) {
+                streamBarIntroUntilMs = SystemClock.uptimeMillis() + 2500L;
+                tickStreamBar();
             }
         });
     }
@@ -3205,24 +3030,13 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
-                if (!(Game.this instanceof GameXR) || relaunchedFlat || isFinishing()
-                        || !PreferenceConfiguration.isHeadset(Game.this)) {
+                if (relaunchedFlat || isFinishing()) {
                     return;
                 }
                 relaunchedFlat = true;
-                FileLog.event("VR session unavailable, restarting the stream on a flat panel");
-
-                Intent flat = new Intent(getIntent());
-                flat.setClass(Game.this, Game.class);
-                flat.removeCategory("com.oculus.intent.category.VR");
-                flat.putExtra(EXTRA_VR_UNAVAILABLE, true);
-                flat.putExtra(EXTRA_VR_REASON, vrFailureReason(failure));
-                startActivity(flat);
-
-                // The flat activity inherits the trip back to the PC list, so
-                // this one must not make it as well on the way out
-                pcViewStarted = true;
-                finish();
+                FileLog.event("VR session unavailable: " + failure);
+                stopConnection();
+                recordSessionErrorAndFinish(StreamErrorMapper.INSTANCE.forVrUnavailable());
             }
         });
     }

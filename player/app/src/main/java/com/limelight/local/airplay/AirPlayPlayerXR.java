@@ -186,7 +186,7 @@ public class AirPlayPlayerXR extends Activity
     public void onVrUnavailable(XrStartFailure failure) {
         LimeLog.warning("AirPlay: VR unavailable: " + failure);
         main.post(() -> {
-            Toast.makeText(this, "无法进入 VR：" + failure, Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "无法进入沉浸式 3D 画面，请重试", Toast.LENGTH_LONG).show();
             finish();
         });
     }

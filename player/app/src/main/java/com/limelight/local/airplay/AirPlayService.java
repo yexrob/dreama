@@ -161,6 +161,18 @@ public class AirPlayService extends Service implements AirPlayNative.Listener {
         c.stopService(new Intent(c, AirPlayService.class));
     }
 
+    /** Restarts the AirPlay receiver when the user renames the headset in Settings. */
+    public static void reloadName(Context c) {
+        if (instance != null) {
+            stop(c);
+            start(c);
+        }
+    }
+
+    private String advertisedName() {
+        return com.limelight.local.dlna.CastReceiver.name(this);
+    }
+
     /** Ends the mirroring here: the device is let go and told it ended. */
     public static void disconnect() {
         AirPlayService s = instance;
@@ -272,8 +284,9 @@ public class AirPlayService extends Service implements AirPlayNative.Listener {
         if (dir != null && !dir.isDirectory() && !dir.mkdirs()) {
             LimeLog.warning("AirPlay: cannot make " + dir);
         }
+        String receiverName = advertisedName();
         AirPlayNative.setListener(this);
-        int port = AirPlayNative.nativeStart(DEFAULT_NAME.getBytes(StandardCharsets.UTF_8), deviceId(),
+        int port = AirPlayNative.nativeStart(receiverName.getBytes(StandardCharsets.UTF_8), deviceId(),
                 OFFER_WIDTH, OFFER_HEIGHT, OFFER_FPS, h265, key.getAbsolutePath(), PORT, LOG_LEVEL);
         if (port <= 0) {
             AirPlayNative.clearListener(this);
@@ -282,7 +295,7 @@ public class AirPlayService extends Service implements AirPlayNative.Listener {
             return;
         }
         serverUp = true;
-        LimeLog.info("AirPlay: receiver \"" + DEFAULT_NAME + "\" on port " + port + (h265 ? ", H.265 offered" : ""));
+        LimeLog.info("depth3d: AirPlay receiver \"" + receiverName + "\" on port " + port + (h265 ? ", H.265 offered" : ""));
         nsd = (NsdManager) getSystemService(Context.NSD_SERVICE);
         announce(port);
         main.post(() -> {
@@ -455,7 +468,7 @@ public class AirPlayService extends Service implements AirPlayNative.Listener {
     // ---- main thread ----
 
     private void publish() {
-        AirPlayState.publish(new AirPlayState.Status(phase, DEFAULT_NAME, client, session, problem));
+        AirPlayState.publish(new AirPlayState.Status(phase, advertisedName(), client, session, problem));
     }
 
     private AirPlayState.Phase idlePhase() {
@@ -686,7 +699,7 @@ public class AirPlayService extends Service implements AirPlayNative.Listener {
                     .putExtra(AirPlayPlayerXR.EXTRA_SESSION, session);
         } else {
             b.setContentTitle("可以接收投屏");
-            b.setContentText("在 iPad 或 iPhone 的「屏幕镜像」里选「" + DEFAULT_NAME + "」");
+            b.setContentText("在 iPad 或 iPhone 的「屏幕镜像」里选「" + advertisedName() + "」");
             open = new Intent(this, WallActivity.class);
         }
         open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);

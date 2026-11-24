@@ -1,0 +1,256 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Navigation -->
+    <string name="nav_home">首页</string>
+    <string name="nav_library">媒体库</string>
+    <string name="nav_cast">投屏</string>
+    <string name="nav_settings">设置</string>
+
+    <!-- Common actions -->
+    <string name="action_cancel">取消</string>
+    <string name="action_retry">重试</string>
+    <string name="action_back">返回</string>
+    <string name="action_close">关闭</string>
+    <string name="action_confirm">确定</string>
+    <string name="action_save">保存</string>
+    <string name="action_add">添加</string>
+    <string name="action_remove">移除</string>
+    <string name="action_open_wifi">打开 Wi-Fi 设置</string>
+
+    <!-- Cast page (AirPlay + DLNA + PC streaming) -->
+    <string name="cast_subtitle">在同一个 Wi-Fi 里，从 iPad、iPhone 或手机 App 选择这个名字。</string>
+    <string name="cast_howto_apple_title">iPad / iPhone</string>
+    <string name="cast_howto_apple_body">控制中心 › 屏幕镜像 › 选这个名字</string>
+    <string name="cast_howto_phone_title">手机里的视频 App</string>
+    <string name="cast_howto_phone_body">播放时点「投屏」› 选「%1$s」</string>
+    <string name="cast_waiting">正在等待投屏</string>
+    <string name="cast_preparing">正在准备投屏…</string>
+    <string name="cast_no_wifi_title">还没连上 Wi-Fi</string>
+    <string name="cast_no_wifi_body">投屏和电脑串流需要头显与手机、电脑在同一个 Wi-Fi 里。</string>
+    <string name="cast_connecting_body">画面一出来就会自动进入 3D 播放。</string>
+
+    <!-- PC streaming section -->
+    <string name="stream_section_title">电脑串流</string>
+    <string name="stream_section_subtitle">整个桌面，也能玩游戏</string>
+    <string name="stream_home_section_title">电脑</string>
+    <string name="stream_discovering">正在搜索同一 Wi-Fi 里的电脑…</string>
+    <string name="stream_empty_hint">同一 Wi-Fi 里还没有发现电脑，请确认电脑已打开串流服务，或手动添加。</string>
+    <string name="stream_add_pc_title">添加电脑</string>
+    <string name="stream_add_pc_sub">同一 Wi-Fi 自动发现，也可扫码输入地址</string>
+    <string name="stream_status_paired">已配对 · 点一下连接</string>
+    <string name="stream_status_streaming">正在串流 · 点一下恢复</string>
+    <string name="stream_status_unpaired">还没配对 · 点一下配对</string>
+    <string name="stream_status_unpaired_auto">一键配对 · 点一下连接</string>
+    <string name="stream_status_offline">已离线</string>
+    <string name="stream_status_discovering">正在刷新状态…</string>
+    <string name="stream_status_not_ready">暂未就绪 · %1$s</string>
+    <string name="stream_more_actions">更多</string>
+
+    <!-- PC action sheet -->
+    <string name="pc_action_connect">连接桌面</string>
+    <string name="pc_action_resume">恢复串流</string>
+    <string name="pc_action_apps">全部应用</string>
+    <string name="pc_action_quit_app">结束运行中的应用</string>
+    <string name="pc_action_pair">配对这台电脑</string>
+    <string name="pc_action_wake">唤醒电脑</string>
+    <string name="pc_action_remove">移除电脑</string>
+    <string name="pc_action_remove_confirm_title">确认移除「%1$s」？</string>
+    <string name="pc_action_remove_confirm_body">移除后如果还想连接这台电脑，重新发现或添加即可。</string>
+    <string name="pc_action_remove_confirm_btn">确认移除</string>
+
+    <!-- Pairing & Connecting screens -->
+    <string name="pair_auto_title">正在请求配对「%1$s」</string>
+    <string name="pair_pin_title">在「%1$s」上输入这 4 个数字</string>
+    <string name="pair_pin_waiting">正在等待电脑确认…</string>
+    <string name="pair_fallback_manual">改用 4 位配对码</string>
+    <string name="pair_cert_title">「%1$s」的安全证书变了</string>
+    <string name="pair_cert_body">如果电脑刚重装过系统或更新了服务，点「信任并继续」；否则请取消。</string>
+    <string name="pair_cert_fingerprint">新证书指纹：%1$s</string>
+    <string name="pair_cert_trust">信任并继续</string>
+    <string name="stream_connecting_title">正在连接「%1$s」…</string>
+    <string name="stream_connecting_app_title">正在打开「%1$s」…</string>
+
+    <!-- Phone QR input sheet -->
+    <string name="phone_input_add_pc_title">用手机输入电脑地址</string>
+    <string name="phone_input_add_pc_sub">用手机扫码，或在浏览器打开下面的地址填写电脑 IP。</string>
+    <string name="phone_input_device_name_title">用手机修改设备名称</string>
+    <string name="phone_input_device_name_sub">用手机扫码，或在浏览器打开下面的地址输入新名称。</string>
+    <string name="phone_input_code_label">4 位验证码</string>
+    <string name="phone_input_use_headset_kb">用头显键盘输入</string>
+    <string name="phone_input_back_to_qr">返回手机扫码</string>
+    <string name="phone_input_no_wifi">还没连上 Wi-Fi，暂时无法开启手机扫码输入，可先连接网络或改用头显键盘。</string>
+    <string name="phone_input_addr_label">电脑局域网地址</string>
+    <string name="phone_input_addr_placeholder">例如 192.168.1.20</string>
+    <string name="phone_input_name_label">头显投屏名称</string>
+    <string name="phone_input_name_placeholder">例如 客厅的 depth3d</string>
+    <string name="phone_input_connecting">正在连接电脑…</string>
+
+    <!-- PC App Grid -->
+    <string name="pc_apps_count">%1$d 个应用</string>
+    <string name="pc_apps_running_badge">运行中</string>
+    <string name="pc_apps_empty">这台电脑里还没有可串流的应用。</string>
+    <string name="pc_apps_quit_running">结束运行中应用</string>
+
+    <!-- Home empty state -->
+    <string name="home_empty_cast_title">投屏与串流</string>
+    <string name="home_empty_cast_sub">iPad、手机投屏，或连接电脑桌面</string>
+
+    <!-- Settings categories -->
+    <string name="settings_cat_stream">串流</string>
+    <string name="settings_cat_stream_sub">分辨率、帧率、码率、输入</string>
+    <string name="settings_cat_3d">播放与 3D</string>
+    <string name="settings_cat_3d_sub">实时 3D 强度、深度计算、画质</string>
+    <string name="settings_cat_screen">屏幕与环境</string>
+    <string name="settings_cat_screen_sub">屏幕尺寸、距离、影院场景</string>
+    <string name="settings_cat_cast">投屏</string>
+    <string name="settings_cat_cast_sub">设备名称</string>
+    <string name="settings_cat_input">手柄与手势</string>
+    <string name="settings_cat_input_sub">手势、射线、指针与音效</string>
+    <string name="settings_cat_privacy">隐私</string>
+    <string name="settings_cat_privacy_sub">运行日志与崩溃报告</string>
+    <string name="settings_cat_about">关于</string>
+    <string name="settings_cat_about_sub">版本、开源许可与第三方组件</string>
+
+    <!-- Settings: Streaming -->
+    <string name="settings_resolution_title">分辨率</string>
+    <string name="settings_resolution_sub">更高分辨率更清晰，但会增加网络和 3D 计算压力</string>
+    <string name="settings_res_720p">720p</string>
+    <string name="settings_res_1080p">1080p</string>
+    <string name="settings_res_1440p">1440p</string>
+    <string name="settings_res_4k">4K</string>
+    <string name="settings_fps_title">帧率</string>
+    <string name="settings_fps_sub">72 fps 兼顾流畅和实时 3D 稳定</string>
+    <string name="settings_fps_60">60</string>
+    <string name="settings_fps_72">72</string>
+    <string name="settings_fps_90">90</string>
+    <string name="settings_3d_lag_warning">选到 4K 或 90 fps 时，开启实时 3D 会变卡，推荐使用 1440p / 72 fps。</string>
+    <string name="settings_bitrate_title">码率</string>
+    <string name="settings_bitrate_sub">当前约 %1$d Mbps，网络不稳定时可选「流畅」</string>
+    <string name="settings_bitrate_auto">自动</string>
+    <string name="settings_bitrate_smooth">流畅</string>
+    <string name="settings_bitrate_sharp">清晰</string>
+    <string name="settings_bitrate_custom">自定义</string>
+    <string name="settings_bitrate_custom_title">自定义码率（高级）</string>
+    <string name="settings_bitrate_custom_sub">适合高带宽 Wi-Fi 环境手动微调</string>
+    <string name="settings_bitrate_mbps">%1$d Mbps</string>
+    <string name="settings_codec_title">视频编码</string>
+    <string name="settings_codec_sub">自动优先选择头显和电脑都支持的低延迟编码</string>
+    <string name="settings_codec_auto">自动</string>
+    <string name="settings_codec_h264">H.264</string>
+    <string name="settings_codec_hevc">HEVC</string>
+    <string name="settings_mouse_title">鼠标模式</string>
+    <string name="settings_mouse_sub">桌面操作推荐绝对定位，第一人称游戏推荐相对移动</string>
+    <string name="settings_mouse_relative">相对</string>
+    <string name="settings_mouse_absolute">绝对</string>
+    <string name="settings_gamepad_shortcut_title">手柄模式切换快捷键</string>
+    <string name="settings_gamepad_shortcut_sub">在串流中快速切换射线指针与 Xbox 手柄模式</string>
+    <string name="settings_shortcut_menu_grip">左菜单 + 左握键</string>
+    <string name="settings_shortcut_sticks">双摇杆按下</string>
+    <string name="settings_shortcut_triggers">双扳机 + 双握键</string>
+    <string name="settings_multi_controller_title">自动检测外接手柄</string>
+    <string name="settings_multi_controller_sub">关闭后始终向电脑模拟一个在线手柄</string>
+    <string name="settings_flip_buttons_title">交换 A/B 与 X/Y 按键</string>
+    <string name="settings_flip_buttons_sub">适配任天堂布局手柄的按键习惯</string>
+
+    <!-- Settings: Playback & 3D -->
+    <string name="settings_depth_strength_title">默认 3D 强度</string>
+    <string name="settings_depth_strength_sub">进入播放或串流时的立体景深，播放中也可随时调节</string>
+    <string name="settings_depth_off">关闭</string>
+    <string name="settings_depth_soft">柔和</string>
+    <string name="settings_depth_standard">标准</string>
+    <string name="settings_depth_strong">强烈</string>
+    <string name="settings_depth_quality_title">深度计算策略</string>
+    <string name="settings_depth_quality_sub">流畅优先减少发热与掉帧，画质优先提高深度刷新频率</string>
+    <string name="settings_depth_smooth">流畅优先</string>
+    <string name="settings_depth_quality">画质优先</string>
+    <string name="settings_sharpening_title">画面锐化</string>
+    <string name="settings_sharpening_sub">增强文字和画面边缘清晰度，几乎不增加功耗</string>
+    <string name="settings_supersampling_title">画面超采样</string>
+    <string name="settings_supersampling_sub">减少远距离屏幕的细纹闪烁，会略微增加 GPU 负载</string>
+
+    <!-- Settings: Screen & Environment -->
+    <string name="settings_screen_size_title">默认屏幕大小</string>
+    <string name="settings_screen_size_sub">进入沉浸模式时的初始屏幕宽度</string>
+    <string name="settings_size_small">小</string>
+    <string name="settings_size_medium">中</string>
+    <string name="settings_size_large">大</string>
+    <string name="settings_size_giant">巨幕</string>
+    <string name="settings_screen_dist_title">默认观看距离</string>
+    <string name="settings_screen_dist_sub">屏幕距离眼睛的默认远近</string>
+    <string name="settings_dist_near">近</string>
+    <string name="settings_dist_medium">中</string>
+    <string name="settings_dist_far">远</string>
+    <string name="settings_curved_title">曲面屏幕</string>
+    <string name="settings_curved_sub">让巨幕两侧微微环绕视线，大屏观看更舒适</string>
+    <string name="settings_env_title">默认环境</string>
+    <string name="settings_env_sub">播放和串流时的周围场景，会话中也可随时切换</string>
+    <string name="settings_env_passthrough">透视</string>
+    <string name="settings_env_void">纯黑</string>
+    <string name="settings_env_theater">家庭影院</string>
+    <string name="settings_env_cinema">大影院</string>
+    <string name="settings_env_synthwave">合成波</string>
+    <string name="settings_ambilight_title">屏幕环境光</string>
+    <string name="settings_ambilight_sub">根据画面边缘颜色柔化屏幕四周氛围</string>
+    <string name="settings_doff_title">摘下头显保留连接</string>
+    <string name="settings_doff_sub">临时摘下头显时静音保留串流 60 秒，戴回后继续</string>
+    <string name="settings_reset_pose_title">重置屏幕位置</string>
+    <string name="settings_reset_pose_sub">恢复默认的距离、角度和宽度</string>
+    <string name="settings_reset_pose_btn">重置</string>
+    <string name="settings_reset_pose_done">已恢复默认屏幕位置</string>
+
+    <!-- Settings: Cast -->
+    <string name="settings_device_name_title">设备名称</string>
+    <string name="settings_device_name_sub">手机投屏列表和电脑配对提示里显示的名字</string>
+    <string name="settings_device_name_edit">修改名称</string>
+
+    <!-- Settings: Input & Gestures -->
+    <string name="settings_hand_tracking_title">手势追踪</string>
+    <string name="settings_hand_tracking_sub">放下手柄时用双手指向并捏合点击，连续捏合三次可锁定防误触</string>
+    <string name="settings_show_ray_title">显示手柄射线</string>
+    <string name="settings_show_ray_sub">关闭后只保留屏幕上的落点光斑</string>
+    <string name="settings_pointer_sleep_title">静止时隐藏指针</string>
+    <string name="settings_pointer_sleep_sub">手柄放着不动几秒后自动收起指针，移动时恢复</string>
+    <string name="settings_head_aim_title">头部瞄准</string>
+    <string name="settings_head_aim_sub">仅在屏幕锁定视角时生效，转头即可控制鼠标视角</string>
+    <string name="settings_click_sound_title">界面点击音效</string>
+    <string name="settings_click_sound_sub">点击 VR 快捷面板和虚拟键盘时播放轻快提示音</string>
+
+    <!-- Settings: Privacy -->
+    <string name="settings_log_title">运行日志</string>
+    <string name="settings_log_sub">仅保存在头显本地的 Download/depth3d 目录，重启应用生效</string>
+    <string name="settings_log_off">关闭</string>
+    <string name="settings_log_basic">基础</string>
+    <string name="settings_log_verbose">详细</string>
+    <string name="settings_crash_report_title">自动发送崩溃报告</string>
+    <string name="settings_crash_report_sub">默认关闭，不会向任何外部服务器自动上传数据</string>
+
+    <!-- Settings: About -->
+    <string name="settings_about_product">depth3d</string>
+    <string name="settings_about_tagline">头显端实时 3D 影院与电脑串流</string>
+    <string name="settings_about_version_title">当前版本</string>
+    <string name="settings_about_license_title">开源许可</string>
+    <string name="settings_about_license_sub">GNU General Public License v3.0 (GPLv3)</string>
+    <string name="settings_about_license_view">查看全文</string>
+    <string name="settings_about_third_party_title">第三方开源组件</string>
+    <string name="settings_about_third_party_sub">depth3d 基于以下优秀开源项目构建，特此致谢</string>
+
+    <!-- VR in-session streaming bar & quick menu -->
+    <string name="vr_stream_status_live">串流中</string>
+    <string name="vr_stream_net_warn">延迟 %1$d ms · 丢包 %2$d%%</string>
+    <string name="vr_stream_net_warn_rtt">网络延迟偏高 · %1$d ms</string>
+    <string name="vr_stream_net_warn_poor">当前网络较差，画面可能卡顿</string>
+    <string name="vr_stream_tab_title">串流</string>
+    <string name="vr_stream_info_host">当前电脑：%1$s</string>
+    <string name="vr_stream_info_video">画面设置：%1$s · %2$d fps · %3$d Mbps</string>
+    <string name="vr_stream_info_mouse_abs">鼠标模式：绝对定位（桌面）</string>
+    <string name="vr_stream_info_mouse_rel">鼠标模式：相对移动（游戏）</string>
+    <string name="vr_stream_info_controls_hint">键盘、手柄与退出按钮位于屏幕下方操作栏</string>
+    <string name="vr_stream_info_net_ok">网络状态：良好</string>
+
+    <!-- Services -->
+    <string name="service_airplay_label">depth3d 屏幕镜像接收</string>
+    <string name="service_dlna_label">depth3d 投屏接收</string>
+    <string name="service_discovery_label">depth3d 局域网发现服务</string>
+    <string name="service_computer_manager_label">depth3d 电脑连接管理服务</string>
+    <string name="service_usb_driver_label">depth3d USB 手柄服务</string>
+</resources>

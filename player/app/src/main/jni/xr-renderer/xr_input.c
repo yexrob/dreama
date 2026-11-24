@@ -288,8 +288,8 @@ static int suggestHandBindings(XrCtx* ctx, const char* profile, const char* aim,
 
 int initXrInput(XrCtx* ctx) {
     XrActionSetCreateInfo setInfo = { XR_TYPE_ACTION_SET_CREATE_INFO };
-    strncpy(setInfo.actionSetName, "moonlight", XR_MAX_ACTION_SET_NAME_SIZE - 1);
-    strncpy(setInfo.localizedActionSetName, "Moonlight", XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE - 1);
+    strncpy(setInfo.actionSetName, "depth3d", XR_MAX_ACTION_SET_NAME_SIZE - 1);
+    strncpy(setInfo.localizedActionSetName, "depth3d", XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE - 1);
     if (!checkXr(xrCreateActionSet(ctx->instance, &setInfo, &ctx->actionSet), "create action set")) {
         return 0;
     }
@@ -2135,7 +2135,7 @@ static void updatePicker(XrCtx* ctx, InputFrame* f) {
 // Puts the settings panel away for the report sheet, with the keyboard up
 // under it on its letters and nothing held. The sheet shows once Java has
 // drawn it for this opening, which the event says to do.
-static void openReport(XrCtx* ctx, InputFrame* f) {
+static __attribute__((unused)) void openReport(XrCtx* ctx, InputFrame* f) {
     ctx->cogOpen = 0;
     ctx->reportOpen = 1;
     ctx->reportReady = 0;
@@ -2206,7 +2206,7 @@ static void pressReport(XrCtx* ctx, InputFrame* f, int zone) {
 // Puts the settings panel away for the Ko-fi sheet. Its art is drawn at the
 // start of the session; until it has arrived the button does nothing, since a
 // modal nobody can see would eat every press.
-static void openKofi(XrCtx* ctx) {
+static __attribute__((unused)) void openKofi(XrCtx* ctx) {
     if (!ctx->kofiReady) {
         LOGI("Ko-fi pressed on the About tab before its sheet's art arrived");
         return;
@@ -2379,21 +2379,11 @@ static void updateCogPanel(XrCtx* ctx, InputFrame* f) {
             break;
         }
 
-        // The About tab has no rows, only the two buttons that open the
-        // report sheet and the Ko-fi sheet in the panel's place
+        // depth3d: tab 4 displays streaming session details (or app info in local playback)
+        // without upstream Ko-fi or external bug report triggers.
         if (face == COG_TAB_ABOUT) {
-            ctx->cogReportHot = cogReportButtonAt(pu, pv);
-            ctx->cogKofiHot = cogKofiButtonAt(pu, pv);
-            if (ctx->cogReportHot && ctx->triggerEdge[h]) {
-                ctx->clickPending = 1;
-                openReport(ctx, f);
-                swallowTrigger(ctx, h);
-            }
-            else if (ctx->cogKofiHot && ctx->triggerEdge[h]) {
-                ctx->clickPending = 1;
-                openKofi(ctx);
-                swallowTrigger(ctx, h);
-            }
+            ctx->cogReportHot = 0;
+            ctx->cogKofiHot = 0;
             break;
         }
 

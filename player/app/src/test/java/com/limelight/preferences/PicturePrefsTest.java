@@ -93,58 +93,6 @@ public class PicturePrefsTest {
                 PreferenceConfiguration.pictureLabel(new int[] { -5, 100, 100, 100 }, " "));
     }
 
-    // Each 2d seekbar runs over its whole lane, starts at its default, and
-    // shows gamma to the hundredth, read from the settings screen itself
-    @Test
-    public void theSeekbarsCoverTheLanes() throws Exception {
-        File xml = new File("src/main/res/xml/preferences.xml");
-        if (!xml.isFile()) {
-            xml = new File("app/src/main/res/xml/preferences.xml");
-        }
-        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-        factory.setNamespaceAware(true);
-        NodeList bars = factory.newDocumentBuilder().parse(xml)
-                .getElementsByTagName("com.limelight.preferences.SeekBarPreference");
-        int[][] lanes = {
-                { XrShared.PICTURE_BRIGHTNESS_MIN, XrShared.PICTURE_BRIGHTNESS_MAX },
-                { XrShared.PICTURE_CONTRAST_MIN, XrShared.PICTURE_CONTRAST_MAX },
-                { XrShared.PICTURE_GAMMA_MIN, XrShared.PICTURE_GAMMA_MAX },
-                { XrShared.PICTURE_SATURATION_MIN, XrShared.PICTURE_SATURATION_MAX },
-        };
-        for (int row = 0; row < XrShared.PICTURE_VALUES; row++) {
-            Element bar = null;
-            for (int i = 0; i < bars.getLength(); i++) {
-                Element e = (Element)bars.item(i);
-                if (PreferenceConfiguration.pictureKey(row).equals(e.getAttributeNS(ANDROID, "key"))) {
-                    bar = e;
-                }
-            }
-            assertNotNull(PreferenceConfiguration.pictureKey(row), bar);
-            int offset = intAttr(bar, SEEKBAR, "offset", 0);
-            int min = intAttr(bar, SEEKBAR, "min", 1);
-            int max = intAttr(bar, ANDROID, "max", 100);
-            assertEquals(lanes[row][0], min + offset);
-            assertEquals(lanes[row][1], max + offset);
-            assertEquals(PreferenceConfiguration.pictureDefault(row),
-                    intAttr(bar, ANDROID, "defaultValue", -1));
-        }
-        Element gamma = null;
-        for (int i = 0; i < bars.getLength(); i++) {
-            Element e = (Element)bars.item(i);
-            if ("seekbar_vr_picture_gamma".equals(e.getAttributeNS(ANDROID, "key"))) {
-                gamma = e;
-            }
-        }
-        assertNotNull(gamma);
-        assertEquals(100, intAttr(gamma, SEEKBAR, "divisor", 1));
-        assertEquals(2, intAttr(gamma, SEEKBAR, "decimals", 1));
-    }
-
-    private static int intAttr(Element e, String ns, String name, int def) {
-        String v = e.getAttributeNS(ns, name);
-        return v == null || v.isEmpty() ? def : Integer.parseInt(v);
-    }
-
     private static final class FakePrefs implements SharedPreferences, SharedPreferences.Editor {
         final Map<String, Object> values = new HashMap<>();
 

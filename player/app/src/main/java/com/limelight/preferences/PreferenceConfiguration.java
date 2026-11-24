@@ -189,8 +189,8 @@ public class PreferenceConfiguration {
     private static final boolean DEFAULT_SOPS = true;
     private static final boolean DEFAULT_DISABLE_TOASTS = false;
     private static final boolean DEFAULT_HOST_AUDIO = false;
-    static final boolean DEFAULT_AUTO_DESKTOP = false;
-    static final boolean DEFAULT_CHECK_UPDATES = true;
+    static final boolean DEFAULT_AUTO_DESKTOP = true;
+    static final boolean DEFAULT_CHECK_UPDATES = false;
     private static final int DEFAULT_DEADZONE = 7;
     private static final int DEFAULT_OPACITY = 90;
     public static final String DEFAULT_LANGUAGE = "default";

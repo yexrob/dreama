@@ -293,7 +293,7 @@ public class NvHTTP {
                 // Special case handling an audio capture error which GFE doesn't
                 // provide any useful status message for.
                 statusCode = 418;
-                statusMsg = "Missing audio capture device. Reinstall GeForce Experience.";
+                statusMsg = "Missing audio capture device on host computer.";
             }
             throw new HostHttpResponseException(statusCode, statusMsg);
         }

@@ -16,265 +16,79 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
-    <!-- Android 13 and later ask for videos by type -->
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CAPTURE_KEYBOARD" />
-    <uses-permission android:name="com.android.providers.tv.permission.READ_EPG_DATA"/>
-    <uses-permission android:name="com.android.providers.tv.permission.WRITE_EPG_DATA"/>
 
     <!-- mDNS uses NsdManager on API level 34+, but the DLNA receiver's SSDP
          discovery needs a MulticastLock on every version -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
-    <!-- The DLNA cast receiver runs as a media playback foreground service -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
 
-    <uses-feature
-        android:name="android.hardware.touchscreen"
-        android:required="false" />
-    <uses-feature
-        android:name="android.hardware.wifi"
-        android:required="false" />
-    <uses-feature
-        android:name="android.hardware.gamepad"
-        android:required="false" />
-    <uses-feature
-        android:name="android.hardware.usb.host"
-        android:required="false" />
-    <uses-feature
-        android:name="android.software.leanback"
-        android:required="false" />
-    <uses-feature
-        android:name="android.hardware.sensor.accelerometer"
-        android:required="false" />
-    <uses-feature
-        android:name="android.hardware.sensor.gyroscope"
-        android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.wifi" android:required="false" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+    <uses-feature android:name="android.hardware.sensor.accelerometer" android:required="false" />
+    <uses-feature android:name="android.hardware.sensor.gyroscope" android:required="false" />
+    <uses-feature android:name="android.hardware.type.pc" android:required="false" />
 
-    <!-- Disable legacy input emulation on ChromeOS -->
-    <uses-feature
-        android:name="android.hardware.type.pc"
-        android:required="false"/>
-
-    <!-- VR headsets. Optional so phones and TVs are unaffected -->
-    <uses-feature
-        android:name="android.hardware.vr.headtracking"
-        android:version="1"
-        android:required="false"/>
-    <!-- Meta gates the passthrough cameras on this. Not required, since the
-         other headset does passthrough as a blend mode instead -->
-    <uses-feature
-        android:name="com.oculus.feature.PASSTHROUGH"
-        android:required="false"/>
-    <!-- Hand tracking. Meta wants the feature and the permission together, and
-         Pico reads its own key. All optional: controllers still work without -->
-    <uses-feature
-        android:name="oculus.software.handtracking"
-        android:required="false"/>
+    <!-- VR headsets -->
+    <uses-feature android:name="android.hardware.vr.headtracking" android:version="1" android:required="false" />
+    <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="false" />
+    <uses-feature android:name="oculus.software.handtracking" android:required="false" />
     <uses-permission android:name="com.oculus.permission.HAND_TRACKING" />
-    <uses-feature
-        android:name="pvr.software.handtracking"
-        android:required="false"/>
-    <!-- Eye tracking, for headsets that point by looking. Optional again, and
-         only ever used to aim the existing pointer -->
-    <uses-feature
-        android:name="oculus.software.eye_tracking"
-        android:required="false"/>
+    <uses-feature android:name="pvr.software.handtracking" android:required="false" />
+    <uses-feature android:name="oculus.software.eye_tracking" android:required="false" />
     <uses-permission android:name="com.oculus.permission.EYE_TRACKING" />
-    <uses-feature
-        android:name="pvr.software.eyetracking"
-        android:required="false"/>
+    <uses-feature android:name="pvr.software.eyetracking" android:required="false" />
     <uses-permission android:name="com.picovr.permission.EYE_TRACKING" />
-    <!-- Android XR. The OpenXR feature is optional here so Meta and Pico
-         installs are unaffected; 1.0 is the API version the instance asks
-         for. Hand joints and eye gaze are runtime permissions there, asked
-         for with the eye tracking one above -->
-    <uses-feature
-        android:name="android.software.xr.api.openxr"
-        android:version="0x00010000"
-        android:required="false"/>
-    <uses-feature
-        android:name="android.hardware.xr.input.controller"
-        android:required="false"/>
-    <uses-feature
-        android:name="android.hardware.xr.input.hand_tracking"
-        android:required="false"/>
-    <uses-feature
-        android:name="android.hardware.xr.input.eye_tracking"
-        android:required="false"/>
+    <uses-feature android:name="android.software.xr.api.openxr" android:version="0x00010000" android:required="false" />
+    <uses-feature android:name="android.hardware.xr.input.controller" android:required="false" />
+    <uses-feature android:name="android.hardware.xr.input.hand_tracking" android:required="false" />
+    <uses-feature android:name="android.hardware.xr.input.eye_tracking" android:required="false" />
     <uses-permission android:name="android.permission.HAND_TRACKING" />
     <uses-permission android:name="android.permission.EYE_TRACKING_FINE" />
 
     <application
         android:name=".MoonlightApplication"
+        android:label="@string/app_label"
         android:requestLegacyExternalStorage="true"
         android:allowBackup="true"
         android:fullBackupContent="@xml/backup_rules"
         android:dataExtractionRules="@xml/backup_rules_s"
         android:networkSecurityConfig="@xml/network_security_config"
-        android:isGame="true"
-        android:banner="@drawable/atv_banner"
-        android:appCategory="game"
+        android:appCategory="video"
         android:icon="@mipmap/ic_launcher"
         android:installLocation="auto"
         android:gwpAsanMode="always"
-        android:localeConfig="@xml/locales_config"
         android:enableOnBackInvokedCallback="false"
         android:theme="@style/AppTheme">
 
-        <!-- Pico classifies the whole app from this. The 2d activities
-             override it individually below -->
         <meta-data
             android:name="pvr.app.type"
             android:value="vr" />
-        <!-- Meta Quest device gate for the VR activity -->
         <meta-data
             android:name="com.oculus.supportedDevices"
             android:value="quest2|questpro|quest3" />
-        <!-- Android XR's OpenXR runtime is a vendor library, which an app
-             targeting Android 12 or later may only load if it names it here.
-             Without this the loader finds no runtime at all -->
         <uses-native-library
             android:name="libopenxr.google.so"
             android:required="false" />
 
-        <provider
-            android:name=".PosterContentProvider"
-            android:authorities="poster.${applicationId}"
-            android:enabled="true"
-            android:exported="true">
-        </provider>
-
-        <!-- Samsung multi-window support -->
-        <uses-library
-            android:name="com.sec.android.app.multiwindow"
-            android:required="false" />
-        <meta-data
-            android:name="com.sec.android.support.multiwindow"
-            android:value="true" />
-
-        <!-- Disable Game Mode downscaling since it can break our UI dialogs and doesn't benefit
-             performance much for us since we don't use GL/Vulkan for rendering anyway -->
         <meta-data
             android:name="com.android.graphics.intervention.wm.allowDownscale"
-            android:value="false"/>
-        
-        <!-- Game Mode configuration -->
-        <meta-data
-            android:name="android.game_mode_config"
-            android:resource="@xml/game_mode_config" />
+            android:value="false" />
 
-        <!-- Samsung DeX support requires explicit placement of android:resizeableActivity="true"
-             in each activity even though it is implied by targeting API 24+ -->
-
-        <activity
-            android:name=".PcView"
-            android:exported="true"
-            android:resizeableActivity="true"
-            android:enableOnBackInvokedCallback="true"
-            android:configChanges="mcc|mnc|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection">
-
-            <meta-data android:name="WindowManagerPreference:FreeformWindowSize" android:value="system-default" />
-            <meta-data android:name="WindowManagerPreference:FreeformWindowOrientation" android:value="landscape" />
-
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-
-                
-                <category android:name="android.intent.category.MULTIWINDOW_LAUNCHER" />
-                
-                <category android:name="tv.ouya.intent.category.APP" />
-            </intent-filter>
-            <meta-data android:name="pvr.app.type" android:value="2d" />
-        </activity>
-        <!-- Small hack to support launcher shortcuts without relaunching over and over again when the back button is pressed -->
-        <activity
-            android:name=".ShortcutTrampoline"
-            android:noHistory="true"
-            android:exported="true"
-            android:resizeableActivity="true"
-            android:enableOnBackInvokedCallback="true"
-            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection">
-            <meta-data android:name="WindowManagerPreference:FreeformWindowSize" android:value="system-default" />
-            <meta-data android:name="WindowManagerPreference:FreeformWindowOrientation" android:value="landscape" />
-            <meta-data android:name="pvr.app.type" android:value="2d" />
-        </activity>
-        <activity
-            android:name=".AppView"
-            android:resizeableActivity="true"
-            android:enableOnBackInvokedCallback="true"
-            android:configChanges="mcc|mnc|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection">
-            <meta-data android:name="WindowManagerPreference:FreeformWindowSize" android:value="system-default" />
-            <meta-data android:name="WindowManagerPreference:FreeformWindowOrientation" android:value="landscape" />
-            <meta-data android:name="pvr.app.type" android:value="2d" />
-        </activity>
-        <activity
-            android:name=".preferences.StreamSettings"
-            android:resizeableActivity="true"
-            android:enableOnBackInvokedCallback="true"
-            android:configChanges="mcc|mnc|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection"
-            android:label="Streaming Settings">
-            <meta-data android:name="WindowManagerPreference:FreeformWindowSize" android:value="system-default" />
-            <meta-data android:name="WindowManagerPreference:FreeformWindowOrientation" android:value="landscape" />
-            <meta-data android:name="pvr.app.type" android:value="2d" />
-        </activity>
-        <activity
-            android:name=".preferences.AddComputerManually"
-            android:resizeableActivity="true"
-            android:windowSoftInputMode="stateVisible"
-            android:enableOnBackInvokedCallback="true"
-            android:configChanges="mcc|mnc|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection"
-            android:label="Add Computer Manually">
-            <meta-data android:name="WindowManagerPreference:FreeformWindowSize" android:value="system-default" />
-            <meta-data android:name="WindowManagerPreference:FreeformWindowOrientation" android:value="landscape" />
-            <meta-data android:name="pvr.app.type" android:value="2d" />
-        </activity>
-        <activity
-            android:name=".Game"
-            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection"
-            android:noHistory="true"
-            android:supportsPictureInPicture="true"
-            android:resizeableActivity="true"
-            android:enableOnBackInvokedCallback="false"
-            android:launchMode="singleTask"
-            android:excludeFromRecents="true"
-            android:theme="@style/StreamTheme"
-            android:preferMinimalPostProcessing="true">
-
-            <meta-data android:name="WindowManagerPreference:FreeformWindowSize" android:value="system-default" />
-            <meta-data android:name="WindowManagerPreference:FreeformWindowOrientation" android:value="landscape" />
-
-            <!-- Special metadata for NVIDIA Shield devices to prevent input buffering
-                 and most importantly, opt out of mouse acceleration while streaming -->
-            <meta-data
-                android:name="com.nvidia.immediateInput"
-                android:value="true" />
-            <meta-data
-                android:name="com.nvidia.rawCursorInput"
-                android:value="true" />
-            <!-- Flat streaming draws to a SurfaceView and never submits XR
-                 frames, so without this Pico hands it an immersive container
-                 and the loading screen waits forever -->
-            <meta-data android:name="pvr.app.type" android:value="2d" />
-        </activity>
-        <!-- The same activity subclassed, so the immersive path can be marked
-             vr while the flat one above stays a panel. An alias cannot do this:
-             Pico reads the app type from the target activity, so whichever
-             value Game carried won both launches. Unlike Game it keeps its
-             history: a boundary prompt stops it before the session starts,
-             and a no history activity is finished by the system on any stop.
-             Game.onStop still ends the stream once the session is through -->
-        <!-- depth3d: the play wall (2d panel) and the immersive player. The
-             wall is Compose and redraws itself on a resize or a keyboard
-             coming up, so those do not recreate it -->
+        <!-- depth3d 2D panel: Home, Library, Cast & PC Streaming, Settings -->
         <activity
             android:name=".local.wall.WallActivity"
-            android:label="depth3d"
+            android:label="@string/app_label"
             android:exported="true"
+            android:launchMode="singleTop"
             android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|density|fontScale">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -282,6 +96,8 @@
             </intent-filter>
             <meta-data android:name="pvr.app.type" android:value="2d" />
         </activity>
+
+        <!-- Immersive 3D local & cast video player -->
         <activity
             android:name=".local.LocalPlayerXR"
             android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection"
@@ -302,6 +118,8 @@
             </intent-filter>
             <meta-data android:name="pvr.app.type" android:value="vr" />
         </activity>
+
+        <!-- Immersive 3D PC streaming session -->
         <activity
             android:name=".GameXR"
             android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection"
@@ -316,18 +134,13 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="com.oculus.intent.category.VR" />
             </intent-filter>
-            <meta-data
-                android:name="pvr.app.type"
-                android:value="vr" />
-            <!-- Android XR's equivalent of the VR category: start in Full
-                 Space with the app drawing it through OpenXR. Only this
-                 activity, so the 2d ones stay panels -->
+            <meta-data android:name="pvr.app.type" android:value="vr" />
             <property
                 android:name="android.window.PROPERTY_XR_ACTIVITY_START_MODE"
                 android:value="XR_ACTIVITY_START_MODE_FULL_SPACE_UNMANAGED" />
         </activity>
-        <!-- AirPlay screen mirroring: the receiver runs while the wall is
-             open and brings the player up when an iPad starts mirroring -->
+
+        <!-- Immersive 3D AirPlay screen mirroring session -->
         <activity
             android:name=".local.airplay.AirPlayPlayerXR"
             android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection"
@@ -340,55 +153,38 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="com.oculus.intent.category.VR" />
             </intent-filter>
-            <meta-data
-                android:name="pvr.app.type"
-                android:value="vr" />
+            <meta-data android:name="pvr.app.type" android:value="vr" />
             <property
                 android:name="android.window.PROPERTY_XR_ACTIVITY_START_MODE"
                 android:value="XR_ACTIVITY_START_MODE_FULL_SPACE_UNMANAGED" />
         </activity>
+
         <service
             android:name=".local.airplay.AirPlayService"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback"
-            android:label="AirPlay Receiver" />
+            android:label="@string/service_airplay_label" />
 
         <service
             android:name=".discovery.DiscoveryService"
-            android:label="mDNS PC Auto-Discovery Service" />
+            android:exported="false"
+            android:label="@string/service_discovery_label" />
+
         <service
             android:name=".computers.ComputerManagerService"
-            android:label="Computer Management Service" />
+            android:exported="false"
+            android:label="@string/service_computer_manager_label" />
+
         <service
             android:name=".binding.input.driver.UsbDriverService"
-            android:label="Usb Driver Service" />
-        <!-- depth3d: the DLNA cast receiver, only while the app is open -->
+            android:exported="false"
+            android:label="@string/service_usb_driver_label" />
+
         <service
             android:name=".local.dlna.DlnaService"
-            android:label="投屏接收"
+            android:label="@string/service_dlna_label"
             android:foregroundServiceType="mediaPlayback"
             android:exported="false" />
-
-        <activity
-            android:name=".BugReportActivity"
-            android:resizeableActivity="true"
-            android:enableOnBackInvokedCallback="true"
-            android:label="@string/title_bug_report"
-            android:windowSoftInputMode="adjustResize"
-            android:configChanges="mcc|mnc|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection">
-            <meta-data android:name="WindowManagerPreference:FreeformWindowSize" android:value="system-default" />
-            <meta-data android:name="WindowManagerPreference:FreeformWindowOrientation" android:value="landscape" />
-            <meta-data android:name="pvr.app.type" android:value="2d" />
-        </activity>
-        <activity
-            android:name=".HelpActivity"
-            android:resizeableActivity="true"
-            android:enableOnBackInvokedCallback="true"
-            android:configChanges="mcc|mnc|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection">
-            <meta-data android:name="WindowManagerPreference:FreeformWindowSize" android:value="system-default" />
-            <meta-data android:name="WindowManagerPreference:FreeformWindowOrientation" android:value="landscape" />
-            <meta-data android:name="pvr.app.type" android:value="2d" />
-        </activity>
     </application>
 
 </manifest>

@@ -51,8 +51,6 @@ final class XrPanels {
     // ENV_CELL_ values in XrShared, which is what the native side hit tests
     // against.
     private static final String IMAGE_DIR = "images";
-    // The Ko-fi sheet's QR code, as tools/make_qr.py writes it
-    private static final String KOFI_QR = "kofi_qr.png";
     // A baked room shows a picture of itself on its tile, at the cell's own size
     private static final String THEATER_THUMB = "rooms/thumbs/home_theater.jpg";
     private static final String GRAND_CINEMA_THUMB = "rooms/thumbs/grand_cinema.jpg";
@@ -142,8 +140,8 @@ final class XrPanels {
     private static final int[] COG_PICTURE_ROWS =
             { R.string.vr_panel_brightness, R.string.vr_panel_contrast, R.string.vr_panel_gamma,
               R.string.vr_panel_saturation };
-    // About tab: the app, its version and its log, over the report button
-    private static final String COG_ABOUT_NAME = "Moonlight XR";
+    // About / Streaming tab header name
+    private static final String COG_ABOUT_NAME = "depth3d";
 
     // The in world keyboard. Four sheets of the same layout, one per state,
     // handed over in state order, along with the geometry that goes with them:
@@ -266,25 +264,18 @@ final class XrPanels {
     // sit on it are the EXIT_ values in XrShared.
     private static final int EXIT_QUESTION = R.string.vr_exit_question;
 
-    // The launch splash: the logo over the app's name, a product name and so
-    // never translated, Moonlight in white and XR in lavender
-    private static final String SPLASH_NAME = "Moonlight";
-    private static final String SPLASH_NAME_XR = "XR";
-    // The logo's colours: a navy ground with a purple glow, the disc a light
-    // slate, and the two colours of the name
-    private static final int SPLASH_NAVY = 0xFF070B16;
-    private static final int SPLASH_PURPLE = 0x8B5CF6;
-    private static final int SPLASH_DISC = 0xFFCBD5E1;
-    private static final int SPLASH_WHITE = 0xFFF8FAFC;
-    private static final int SPLASH_LAVENDER = 0xFFC4B5FD;
-    // Each row, as fractions of its height: the disc's radius, the gap under
-    // it and the name's size, the three centred together with the name's
-    // descender left out. The space between Moonlight and XR is a fraction of
-    // the name's size.
+    // The launch splash: depth3d brand mark on warm dark #0E0F12 ground with #E3A857 accent glow
+    private static final String SPLASH_NAME = "depth";
+    private static final String SPLASH_NAME_XR = "3d";
+    private static final int SPLASH_NAVY = 0xFF0E0F12;
+    private static final int SPLASH_PURPLE = 0xE3A857;
+    private static final int SPLASH_DISC = 0xFFDADDE2;
+    private static final int SPLASH_WHITE = 0xFFECECEE;
+    private static final int SPLASH_LAVENDER = 0xFFE3A857;
     private static final float SPLASH_DISC_R = 0.32f;
     private static final float SPLASH_GAP = 0.082f;
     private static final float SPLASH_NAME_SIZE = 0.18f;
-    private static final float SPLASH_NAME_SPACE = 0.28f;
+    private static final float SPLASH_NAME_SPACE = 0.04f;
     // The glow on the ground, purple's opacity over the navy, with distances
     // in disc radii: a wide one fading to a quarter by 0.55 of its reach and
     // to nothing at it, and a halo, flat out to its inner radius, then fading
@@ -299,6 +290,13 @@ final class XrPanels {
     // The gamepad mode shortcut chosen, a PAD_SHORTCUT_ value, which the
     // Display tab names under its controllers row
     private final int gamepadShortcut;
+    private final boolean streamingMode;
+    private final String streamHostName;
+    private final int streamWidth;
+    private final int streamHeight;
+    private final int streamFps;
+    private final int streamBitrateMbps;
+    private final boolean streamAbsoluteMouse;
 
     // The words above in the language the app is in, looked up once here,
     // since a panel only ever lives as long as one session
@@ -324,12 +322,23 @@ final class XrPanels {
     private final String[] kbModNames;
     private final String exitQuestion;
 
-    XrPanels(Context context, int gamepadShortcut) {
+    XrPanels(Context context, int gamepadShortcut, boolean streamingMode, String streamHostName,
+             com.limelight.preferences.PreferenceConfiguration prefs) {
         this.context = context;
         this.gamepadShortcut = gamepadShortcut;
+        this.streamingMode = streamingMode;
+        this.streamHostName = streamHostName;
+        this.streamWidth = prefs != null ? prefs.width : 0;
+        this.streamHeight = prefs != null ? prefs.height : 0;
+        this.streamFps = prefs != null ? prefs.fps : 0;
+        this.streamBitrateMbps = prefs != null ? Math.max(1, Math.round(prefs.bitrate / 1000f)) : 0;
+        this.streamAbsoluteMouse = prefs != null && prefs.absoluteMouseMode;
         pickerHeaders = words(PICKER_HEADERS);
         pickerNames = words(PICKER_NAMES);
         cogTabs = words(COG_TABS);
+        if (streamingMode && cogTabs.length > COG_TAB_ABOUT) {
+            cogTabs[COG_TAB_ABOUT] = context.getString(R.string.vr_stream_tab_title);
+        }
         cogRoomTab = context.getString(COG_ROOM_TAB);
         sliderRows = words(COG_SLIDER_ROWS);
         needsHeadLock = context.getString(COG_NEEDS_HEAD_LOCK);
@@ -1420,49 +1429,66 @@ final class XrPanels {
                 reset.centerY() - (text.ascent() + text.descent()) * 0.5f, text);
     }
 
-    // About tab: the app's name and version, where its log is, then the button
-    // that opens the Ko-fi sheet over the one that opens the report sheet,
-    // both drawn the way the reset buttons are, each with a quiet line under
-    // it. The ring under the ray is the native side's.
+    // Tab 4: in streaming mode shows live stream configuration ("串流"); in local playback shows
+    // clean depth3d version & local log status without upstream Ko-fi or external report actions.
     private void drawCogAbout(Canvas canvas) {
         final float mid = COG_TEX_W * 0.5f;
-        final float room = COG_TEX_W - 80.0f;
-        Paint name = new Paint(Paint.ANTI_ALIAS_FLAG);
-        name.setTextSize(30.0f);
-        name.setTextAlign(Paint.Align.CENTER);
-        name.setColor(Color.WHITE);
-        canvas.drawText(COG_ABOUT_NAME, mid, 0.25f * COG_TEX_H, name);
+        final float room = COG_TEX_W - 96.0f;
 
-        Paint line = new Paint(Paint.ANTI_ALIAS_FLAG);
-        line.setTextSize(19.0f);
-        line.setTextAlign(Paint.Align.CENTER);
-        line.setColor(0xB0FFFFFF);
-        String version = BuildConfig.GIT_HASH.isEmpty()
-                ? context.getString(R.string.vr_panel_version_no_commit, BuildConfig.VERSION_NAME)
-                : context.getString(R.string.vr_panel_version, BuildConfig.VERSION_NAME,
-                        BuildConfig.GIT_HASH);
-        canvas.drawText(Toast.fit(version, line, room), mid, 0.32f * COG_TEX_H, line);
-        String log = FileLog.getLogPath();
-        canvas.drawText(Toast.fit(log != null
-                        ? context.getString(R.string.vr_panel_log_file, BugReport.shortPath(log))
-                        : context.getString(R.string.vr_panel_log_file_off),
-                line, room), mid, 0.38f * COG_TEX_H, line);
+        Paint titlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        titlePaint.setTextSize(32.0f);
+        titlePaint.setTypeface(Typeface.DEFAULT_BOLD);
+        titlePaint.setTextAlign(Paint.Align.CENTER);
+        titlePaint.setColor(0xFFECECEE);
 
-        // Each button's line, where the other tabs say why a row is dead
-        Paint hint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        hint.setTextSize(17.0f);
-        hint.setTextAlign(Paint.Align.CENTER);
-        hint.setColor(0x80FFFFFF);
+        Paint bodyPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        bodyPaint.setTextSize(22.0f);
+        bodyPaint.setTextAlign(Paint.Align.CENTER);
+        bodyPaint.setColor(0xD0ECECEE);
 
-        drawAboutButton(canvas, COG_KOFI_L, COG_KOFI_T, COG_KOFI_R, COG_KOFI_B,
-                context.getString(R.string.vr_kofi_title));
-        canvas.drawText(Toast.fit(context.getString(R.string.vr_kofi_free), hint, room),
-                mid, (COG_KOFI_B + 0.05f) * COG_TEX_H, hint);
+        Paint subPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        subPaint.setTextSize(19.0f);
+        subPaint.setTextAlign(Paint.Align.CENTER);
+        subPaint.setColor(0x99A6A9B0);
 
-        drawAboutButton(canvas, COG_REPORT_L, COG_REPORT_T, COG_REPORT_R, COG_REPORT_B,
-                context.getString(R.string.title_bug_report));
-        canvas.drawText(Toast.fit(context.getString(R.string.vr_panel_report_sends), hint, room),
-                mid, (COG_REPORT_B + 0.05f) * COG_TEX_H, hint);
+        if (streamingMode) {
+            String host = (streamHostName != null && !streamHostName.trim().isEmpty())
+                    ? streamHostName.trim() : context.getString(R.string.vr_stream_tab_title);
+            canvas.drawText(Toast.fit(host + " · " + context.getString(R.string.vr_stream_status_live),
+                    titlePaint, room), mid, 0.27f * COG_TEX_H, titlePaint);
+
+            String videoLine = context.getString(
+                    R.string.vr_stream_info_video,
+                    streamWidth + "×" + streamHeight,
+                    streamFps,
+                    streamBitrateMbps);
+            canvas.drawText(Toast.fit(videoLine, bodyPaint, room), mid, 0.39f * COG_TEX_H, bodyPaint);
+
+            String mouseLine = context.getString(streamAbsoluteMouse
+                    ? R.string.vr_stream_info_mouse_abs : R.string.vr_stream_info_mouse_rel);
+            canvas.drawText(Toast.fit(mouseLine, bodyPaint, room), mid, 0.49f * COG_TEX_H, bodyPaint);
+
+            String hintLine = context.getString(R.string.vr_stream_info_controls_hint);
+            canvas.drawText(Toast.fit(hintLine, subPaint, room), mid, 0.63f * COG_TEX_H, subPaint);
+
+            String version = "depth3d " + BuildConfig.VERSION_NAME;
+            canvas.drawText(Toast.fit(version, subPaint, room), mid, 0.80f * COG_TEX_H, subPaint);
+        }
+        else {
+            canvas.drawText(COG_ABOUT_NAME, mid, 0.30f * COG_TEX_H, titlePaint);
+
+            String version = BuildConfig.GIT_HASH.isEmpty()
+                    ? context.getString(R.string.vr_panel_version_no_commit, BuildConfig.VERSION_NAME)
+                    : context.getString(R.string.vr_panel_version, BuildConfig.VERSION_NAME,
+                            BuildConfig.GIT_HASH);
+            canvas.drawText(Toast.fit(version, bodyPaint, room), mid, 0.42f * COG_TEX_H, bodyPaint);
+
+            String log = FileLog.getLogPath();
+            canvas.drawText(Toast.fit(log != null
+                            ? context.getString(R.string.vr_panel_log_file, BugReport.shortPath(log))
+                            : context.getString(R.string.vr_panel_log_file_off),
+                    subPaint, room), mid, 0.54f * COG_TEX_H, subPaint);
+        }
     }
 
     // One of the About tab's buttons, plain like the reset buttons
@@ -2369,93 +2395,6 @@ final class XrPanels {
     }
 
     /**
-     * The Ko-fi sheet the About tab opens: the title, the page's QR code with
-     * its address and a line beside it, and one Close button, on the exit
-     * prompt's dark sheet with its white strokes. Drawn once, since the ring
-     * over the button under the ray is a quad of the native side's. The code
-     * goes on a pixel for a pixel, unfiltered, on white even if it failed to
-     * load, so every module stays sharp for a phone to read.
-     */
-    ByteBuffer buildKofiSheet(String url) {
-        Bitmap bitmap = Bitmap.createBitmap(KOFI_TEX_W, KOFI_TEX_H, Bitmap.Config.ARGB_8888);
-        Canvas canvas = new Canvas(bitmap);
-        canvas.drawColor(0, PorterDuff.Mode.CLEAR);
-        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        paint.setColor(0xF0141416);
-        canvas.drawRoundRect(new RectF(1.0f, 1.0f, KOFI_TEX_W - 1.0f, KOFI_TEX_H - 1.0f),
-                32.0f, 32.0f, paint);
-
-        final int qrLeft = Math.round(KOFI_QR_L * KOFI_TEX_W);
-        final int qrTop = Math.round(KOFI_QR_T * KOFI_TEX_H);
-        final float right = KOFI_CLOSE_R * KOFI_TEX_W;
-        Paint title = new Paint(Paint.ANTI_ALIAS_FLAG);
-        title.setColor(Color.WHITE);
-        title.setTextSize(40.0f);
-        canvas.drawText(Toast.fit(context.getString(R.string.vr_kofi_title), title,
-                right - qrLeft), qrLeft, 0.14f * KOFI_TEX_H, title);
-
-        Rect code = new Rect(qrLeft, qrTop, qrLeft + KOFI_QR_PX, qrTop + KOFI_QR_PX);
-        Paint white = new Paint();
-        white.setColor(Color.WHITE);
-        canvas.drawRect(code, white);
-        Bitmap qr = loadIcon(KOFI_QR, KOFI_QR_PX);
-        if (qr != null) {
-            canvas.drawBitmap(qr, null, code, new Paint());
-            qr.recycle();
-        }
-
-        // Beside the code: the address, then what to do with it and the
-        // quiet line, smaller if a language needs more lines than fit
-        final float column = code.right + 48.0f;
-        final float width = right - column;
-        Paint address = new Paint(Paint.ANTI_ALIAS_FLAG);
-        address.setColor(Color.WHITE);
-        address.setTextSize(30.0f);
-        // No ligatures in something to be typed: the font joins the f and i
-        address.setFontFeatureSettings("'liga' 0");
-        canvas.drawText(Toast.fit(url, address, width), column, qrTop + 36.0f, address);
-
-        Paint body = new Paint(Paint.ANTI_ALIAS_FLAG);
-        String said = context.getString(R.string.vr_kofi_scan) + "\n"
-                + context.getString(R.string.vr_kofi_free);
-        final float top = qrTop + 72.0f;
-        final float room = (KOFI_BTN_T - 0.04f) * KOFI_TEX_H - top;
-        float size = 28.0f;
-        List<String> lines;
-        while (true) {
-            body.setTextSize(size);
-            lines = wrap(said, body, width);
-            if (lines.size() * size * 1.3f <= room || size <= 20.0f) {
-                break;
-            }
-            size -= 2.0f;
-        }
-        int scanLines = wrap(context.getString(R.string.vr_kofi_scan), body, width).size();
-        for (int i = 0; i < lines.size(); i++) {
-            body.setColor(i < scanLines ? 0xDDFFFFFF : 0x99FFFFFF);
-            canvas.drawText(lines.get(i), column, top + size + i * size * 1.3f, body);
-        }
-
-        RectF box = new RectF(KOFI_CLOSE_L * KOFI_TEX_W, KOFI_BTN_T * KOFI_TEX_H,
-                KOFI_CLOSE_R * KOFI_TEX_W, KOFI_BTN_B * KOFI_TEX_H);
-        paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeWidth(3.0f);
-        paint.setColor(0xEEFFFFFF);
-        canvas.drawRoundRect(box, 16.0f, 16.0f, paint);
-        Paint label = new Paint(Paint.ANTI_ALIAS_FLAG);
-        label.setTextAlign(Paint.Align.CENTER);
-        label.setColor(0xEEFFFFFF);
-        label.setTextSize(30.0f);
-        canvas.drawText(Toast.fit(context.getString(R.string.vr_kofi_close), label,
-                box.width() - 24.0f), box.centerX(),
-                box.centerY() - (label.ascent() + label.descent()) * 0.5f, label);
-
-        ByteBuffer pixels = toBuffer(bitmap);
-        bitmap.recycle();
-        return pixels;
-    }
-
-    /**
      * The launch splash: the logo over the app's name, once for each number of
      * wedges open, none to all of them, one under the other, so the native
      * side ticks the wedges by showing another row. The rows sit on nothing:
@@ -2625,8 +2564,8 @@ final class XrPanels {
             }
             Paint cut = cutPaint();
             cut.setTypeface(Typeface.DEFAULT_BOLD);
-            cutLetter(canvas, "X", X_BOX, cx, cy, radius, cut);
-            cutLetter(canvas, "R", R_BOX, cx, cy, radius, cut);
+            cutLetter(canvas, "3", X_BOX, cx, cy, radius, cut);
+            cutLetter(canvas, "D", R_BOX, cx, cy, radius, cut);
             canvas.restoreToCount(saved);
         }
 

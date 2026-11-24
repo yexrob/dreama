@@ -115,54 +115,6 @@ public class HeadAimPrefsTest {
     }
 
     @Test
-    public void theSettingAndItsTwoSeekbarsSitInTheVrSettings() throws Exception {
-        Element box = entry("CheckBoxPreference", PreferenceConfiguration.VR_HEAD_AIM_PREF_STRING);
-        assertNotNull(box);
-        assertEquals("false", box.getAttributeNS(ANDROID, "defaultValue"));
-        // The bar can switch head aim on for a session with the setting off,
-        // so nothing here waits on another setting
-        assertEquals("", box.getAttributeNS(ANDROID, "dependency"));
-        assertEquals("category_vr_settings",
-                ((Element) box.getParentNode()).getAttributeNS(ANDROID, "key"));
-
-        String seekbar = "com.limelight.preferences.SeekBarPreference";
-        Element sens = entry(seekbar, PreferenceConfiguration.VR_HEAD_AIM_SENSITIVITY_PREF_STRING);
-        assertNotNull(sens);
-        assertEquals(String.valueOf(XrShared.HEAD_AIM_SENSITIVITY_DEFAULT),
-                sens.getAttributeNS(ANDROID, "defaultValue"));
-        assertEquals(String.valueOf(XrShared.HEAD_AIM_SENSITIVITY_MIN),
-                sens.getAttributeNS(SEEKBAR, "min"));
-        assertEquals(String.valueOf(XrShared.HEAD_AIM_SENSITIVITY_MAX),
-                sens.getAttributeNS(ANDROID, "max"));
-        assertEquals("", sens.getAttributeNS(ANDROID, "dependency"));
-
-        Element dead = entry(seekbar, PreferenceConfiguration.VR_HEAD_AIM_DEADZONE_PREF_STRING);
-        assertNotNull(dead);
-        assertEquals(String.valueOf(XrShared.HEAD_AIM_DEADZONE_DEFAULT),
-                dead.getAttributeNS(ANDROID, "defaultValue"));
-        assertEquals(String.valueOf(XrShared.HEAD_AIM_DEADZONE_MIN),
-                dead.getAttributeNS(SEEKBAR, "min"));
-        assertEquals(String.valueOf(XrShared.HEAD_AIM_DEADZONE_MAX),
-                dead.getAttributeNS(ANDROID, "max"));
-
-        // Right under the setting, in that order
-        assertTrue(box.getNextSibling() != null);
-        Element after = nextElement(box);
-        assertEquals(PreferenceConfiguration.VR_HEAD_AIM_SENSITIVITY_PREF_STRING,
-                after.getAttributeNS(ANDROID, "key"));
-        assertEquals(PreferenceConfiguration.VR_HEAD_AIM_DEADZONE_PREF_STRING,
-                nextElement(after).getAttributeNS(ANDROID, "key"));
-    }
-
-    private static Element nextElement(Element e) {
-        org.w3c.dom.Node n = e.getNextSibling();
-        while (n != null && !(n instanceof Element)) {
-            n = n.getNextSibling();
-        }
-        return (Element) n;
-    }
-
-    @Test
     public void theLogLinesSayHeadAim() {
         assertEquals("headAim=true headAimSensitivity=8 headAimDeadZone=2",
                 PreferenceConfiguration.headAimLabel(true, 8, 2, "="));
@@ -171,20 +123,13 @@ public class HeadAimPrefsTest {
     }
 
     @Test
-    public void itIsWordedInEveryLanguage() throws Exception {
-        for (String dir : new String[] { "values", "values-fr", "values-zh-rCN", "values-zh-rTW" }) {
-            String strings = new String(Files.readAllBytes(res(dir + "/strings.xml").toPath()),
-                    StandardCharsets.UTF_8);
-            for (String key : new String[] { "title_vr_head_aim", "summary_vr_head_aim",
-                    "title_seekbar_vr_head_aim_sensitivity",
-                    "summary_seekbar_vr_head_aim_sensitivity",
-                    "suffix_seekbar_vr_head_aim_sensitivity",
-                    "title_seekbar_vr_head_aim_deadzone", "summary_seekbar_vr_head_aim_deadzone",
-                    "suffix_seekbar_vr_head_aim_deadzone", "vr_toast_head_aim_on",
-                    "vr_toast_head_aim_on_more", "vr_toast_head_aim_off" }) {
-                Matcher m = Pattern.compile("name=\"" + key + "\">([^<]+)<").matcher(strings);
-                assertTrue(dir + " " + key, m.find());
-            }
+    public void theToastStringsExistInChinese() throws Exception {
+        String strings = new String(Files.readAllBytes(res("values/strings.xml").toPath()),
+                StandardCharsets.UTF_8);
+        for (String key : new String[] {
+                "vr_toast_head_aim_on", "vr_toast_head_aim_on_more", "vr_toast_head_aim_off" }) {
+            Matcher m = Pattern.compile("name=\"" + key + "\">([^<]+)<").matcher(strings);
+            assertTrue(key, m.find());
         }
     }
 

@@ -454,9 +454,12 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     // How long a start is waited for before it counts as failed
     private static final int INIT_WAIT_SECONDS = 5;
 
-    // The page the Ko-fi sheet's code points at, which the sheet writes out
-    // beside it as well
-    static final String SUPPORT_URL = "https://ko-fi.com/moonlightxr";
+    private volatile String streamHostName;
+
+    /** Before start(): names the PC being streamed for the VR quick menu's Streaming tab. */
+    public void setStreamHostName(String hostName) {
+        streamHostName = hostName;
+    }
 
     private static native void nativeSetFileLog(String path, int level);
     // Where the last start that failed stopped, as XrStartFailure reads it, or
@@ -1337,7 +1340,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
      * screen.
      */
     private void startEnvironment(PreferenceConfiguration prefs) {
-        panels = new XrPanels(prefsContext, prefs.vrGamepadToggle);
+        panels = new XrPanels(prefsContext, prefs.vrGamepadToggle, !localMedia, streamHostName, prefs);
 
         SharedPreferences saved = PreferenceManager.getDefaultSharedPreferences(prefsContext);
         int id = saved.getInt(PreferenceConfiguration.VR_ENVIRONMENT_ID_PREF_STRING, -1);
@@ -1434,7 +1437,6 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         if (handHint) {
             pendingHandHint.set(panels.buildHandHint());
         }
-        pendingKofi.set(panels.buildKofiSheet(SUPPORT_URL));
 
         // Curvature needs a layer type the runtime may not offer, and a slider
         // that cannot do anything is better shown greyed than hidden

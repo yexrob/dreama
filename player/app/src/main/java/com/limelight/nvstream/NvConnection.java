@@ -267,7 +267,7 @@ public class NvConnection {
         }
         else if (context.streamConfig.getHeight() >= 2160 && !h.supports4K(serverInfo)) {
             // Client wants 4K but the server can't do it
-            context.connListener.displayTransientMessage("You must update GeForce Experience to stream in 4K. The stream will be 1080p.");
+            context.connListener.displayTransientMessage("Host computer does not support 4K streaming; falling back to 1080p.");
             
             // Lower resolution to 1080p
             context.negotiatedWidth = 1920;

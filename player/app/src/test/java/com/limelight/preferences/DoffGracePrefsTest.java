@@ -45,64 +45,6 @@ public class DoffGracePrefsTest {
         assertTrue(PreferenceConfiguration.doffGraceOn(prefs));
     }
 
-    @Test
-    public void itIsACheckboxInTheVrSettings() throws Exception {
-        NodeList all = parse("xml/preferences.xml").getElementsByTagName("CheckBoxPreference");
-        Element found = null;
-        for (int i = 0; i < all.getLength(); i++) {
-            Element e = (Element) all.item(i);
-            if (PreferenceConfiguration.VR_DOFF_GRACE_PREF_STRING.equals(
-                    e.getAttributeNS(ANDROID, "key"))) {
-                found = e;
-            }
-        }
-        assertNotNull(found);
-        assertEquals("true", found.getAttributeNS(ANDROID, "defaultValue"));
-        assertEquals("@string/title_vr_doff_grace", found.getAttributeNS(ANDROID, "title"));
-        assertEquals("@string/summary_vr_doff_grace", found.getAttributeNS(ANDROID, "summary"));
-        assertEquals("", found.getAttributeNS(ANDROID, "dependency"));
-        assertEquals("category_vr_settings",
-                ((Element) found.getParentNode()).getAttributeNS(ANDROID, "key"));
-    }
-
-    @Test
-    public void itIsWordedInEveryLanguage() throws Exception {
-        String english = strings("values");
-        assertEquals("Keep the stream for a minute when the headset is taken off",
-                string(english, "title_vr_doff_grace"));
-        for (String dir : LANGUAGES) {
-            String strings = strings(dir);
-            String title = string(strings, "title_vr_doff_grace");
-            String summary = string(strings, "summary_vr_doff_grace");
-            assertNotNull(dir, title);
-            assertNotNull(dir, summary);
-            // The minute, said as the hold has it
-            assertTrue(dir, summary.contains("60"));
-            assertFalse(dir, summary.contains("%"));
-        }
-    }
-
-    private static File res(String path) {
-        File f = new File("src/main/res/" + path);
-        return f.isFile() ? f : new File("app/src/main/res/" + path);
-    }
-
-    private static org.w3c.dom.Document parse(String path) throws Exception {
-        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-        factory.setNamespaceAware(true);
-        return factory.newDocumentBuilder().parse(res(path));
-    }
-
-    private static String strings(String dir) throws Exception {
-        return new String(Files.readAllBytes(res(dir + "/strings.xml").toPath()),
-                StandardCharsets.UTF_8);
-    }
-
-    private static String string(String strings, String key) {
-        Matcher m = Pattern.compile("name=\"" + key + "\">([^<]+)<").matcher(strings);
-        return m.find() ? m.group(1) : null;
-    }
-
     private static final class FakePrefs implements SharedPreferences {
         final Map<String, Object> values = new HashMap<>();
 

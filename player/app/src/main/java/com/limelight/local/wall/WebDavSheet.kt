@@ -88,7 +88,7 @@ fun WebDavSheet(model: WallModel, nav: WallNav, suggested: String) {
                                 pass.text.trim().toString())
                             nav.closeWebDav()
                         } catch (e: Exception) {
-                            error = "连不上：" + (e.message ?: e.toString())
+                            error = "连不上这个地址，请检查网络、地址和密码是否正确。"
                         } finally {
                             busy = false
                         }
