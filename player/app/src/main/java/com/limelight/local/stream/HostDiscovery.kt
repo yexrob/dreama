@@ -9,6 +9,7 @@ import com.limelight.nvstream.http.NvHTTP
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.net.Inet4Address
+import java.net.Inet6Address
 import java.net.InetAddress
 import java.nio.charset.StandardCharsets
 import java.util.ArrayDeque
@@ -246,15 +247,29 @@ class HostDiscovery(context: Context) {
     }
 
     private fun pickAddress(info: NsdServiceInfo): String? {
+        val addrs = ArrayList<InetAddress>()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            val addrs = info.hostAddresses
-            val v4 = addrs.firstOrNull { it is Inet4Address && !it.isLoopbackAddress }
-            val chosen = v4 ?: addrs.firstOrNull { !it.isLoopbackAddress }
-            if (chosen != null) return chosen.hostAddress
+            addrs.addAll(info.hostAddresses)
         }
         @Suppress("DEPRECATION")
-        val legacy: InetAddress? = info.host
-        return legacy?.hostAddress
+        info.host?.let { addrs.add(it) }
+        return chooseAddress(addrs)
+    }
+
+    companion object {
+        /**
+         * The address to dial out of everything mDNS answered with. The system reports addresses
+         * as they arrive, and the first answer is often only the IPv6 link-local one, which cannot
+         * be dialled without a scope. So: IPv4 first, then a routable IPv6, then a link-local one
+         * only when it carries its interface; otherwise null, and the next update is waited for.
+         */
+        internal fun chooseAddress(addrs: List<InetAddress>): String? {
+            val usable = addrs.filter { !it.isLoopbackAddress && !it.isAnyLocalAddress && !it.isMulticastAddress }
+            usable.firstOrNull { it is Inet4Address && !it.isLinkLocalAddress }?.let { return it.hostAddress }
+            usable.firstOrNull { it is Inet6Address && !it.isLinkLocalAddress }?.let { return it.hostAddress }
+            return usable.firstOrNull { it is Inet6Address && it.isLinkLocalAddress && (it.scopeId != 0 || it.scopedInterface != null) }
+                ?.hostAddress
+        }
     }
 
     private fun removeCallbackLocked(key: String) {
