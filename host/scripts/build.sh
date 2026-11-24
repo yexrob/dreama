@@ -133,9 +133,20 @@ cp "${ENGINE_STAGE}/ENGINE-MANIFEST.json" "${APP_OUT}/Contents/Resources/ENGINE-
 #    For future Developer ID distribution, set DEPTH3D_CODESIGN_IDENTITY to
 #    "Developer ID Application: <Team Name> (<Team ID>)".
 echo "depth3d: signing bundle..."
-SIGN_IDENTITY="${DEPTH3D_CODESIGN_IDENTITY:--}"
+#    Without it, the first "Apple Development" identity in the keychain is used,
+#    so macOS keeps the Screen Recording and Local Network grants from one build
+#    to the next; an ad-hoc signature changes every build and loses them.
+SIGN_IDENTITY="${DEPTH3D_CODESIGN_IDENTITY:-}"
+if [[ -z "$SIGN_IDENTITY" ]]; then
+  SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+    | awk '/"Apple Development: / { print $2; exit }')"
+  SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+fi
+if [[ "$SIGN_IDENTITY" == "-" ]]; then
+  echo "depth3d: no signing identity found, signing ad hoc (macOS will ask for permissions again after each build)"
+fi
 SIGN_ARGS=(--force --sign "$SIGN_IDENTITY")
-if [[ "$SIGN_IDENTITY" != "-" ]]; then
+if [[ "$SIGN_IDENTITY" == "Developer ID"* ]]; then
   SIGN_ARGS+=(--options runtime --timestamp)
 fi
 
