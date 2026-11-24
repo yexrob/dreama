@@ -3,3 +3,11 @@ __pycache__/
 proto/checkpoints/*.pth
 proto/samples/
 .DS_Store
+
+player/local.properties
+player/.gradle/
+player/build/
+player/app/build/
+player/.cxx/
+player/app/.cxx/
+proto/samples/
