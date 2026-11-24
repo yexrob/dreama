@@ -642,8 +642,17 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 // before any of it is built. The test patterns run at the
                 // default model's size.
                 MidasDepthSource.Spec depthSpec = MidasDepthSource.specFor(prefs.vrDepthModel);
-                MidasDepthSource.Route depthRoute =
-                        depthSpec.route(PreferenceConfiguration.isXr2Gen1Headset());
+                // depth3d: a film leaves this GPU room for the larger map,
+                // 20 a second measured on a Pico 4. A stream does not: its
+                // maps fell to 5 a second, 150 ms behind the picture, so a
+                // stream on a Gen 1 headset takes the CPU route it was given.
+                boolean gen1 = PreferenceConfiguration.isXr2Gen1Headset();
+                boolean cpuRoute = gen1 && !localMedia;
+                LimeLog.info("depth3d: depth route "+(cpuRoute ? "gen1 (cpu)" : "gen2 (gpu)")
+                        +", gen1 headset "+gen1+", local media "+localMedia
+                        +" ("+android.os.Build.MANUFACTURER+" "+android.os.Build.MODEL
+                        +"/"+android.os.Build.DEVICE+")");
+                MidasDepthSource.Route depthRoute = depthSpec.route(cpuRoute);
                 DepthSize mapSize = depthRoute.size;
                 nativeCtx = nativeInit(activity, videoWidth, videoHeight, prefs.fps,
                         prefs.vrDepthMode, mapSize.width, mapSize.height,

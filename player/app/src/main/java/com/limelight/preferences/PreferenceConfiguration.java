@@ -556,7 +556,11 @@ public class PreferenceConfiguration {
         // Pico ships a model number rather than a name. The 4 and the 4
         // Enterprise are A81xx, the later headsets are not.
         boolean isPico = "pico".equalsIgnoreCase(Build.MANUFACTURER) || "pico".equalsIgnoreCase(Build.BRAND);
-        return isPico && model.regionMatches(true, 0, "A81", 0, 3);
+        // depth3d: the device name carries the same number, for a build whose
+        // model reads as something else
+        String device = Build.DEVICE != null ? Build.DEVICE : "";
+        return isPico && (model.regionMatches(true, 0, "A81", 0, 3)
+                || device.regionMatches(true, 0, "PICOA81", 0, 7));
     }
 
     // The stored supersampling choice as the renderer takes it: 0 off, 1

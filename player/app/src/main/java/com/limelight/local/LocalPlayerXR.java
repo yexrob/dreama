@@ -87,6 +87,9 @@ public class LocalPlayerXR extends Activity
         // The display rate is picked from the content's rate: 24 and 30 land
         // on 72 and 90 Hz rather than a rate that judders against the video
         prefs.fps = Math.max(1, Math.round(fps));
+        // The Gen 1 profile's 12 maps a second is a stream's budget; a film
+        // held 20 on a Pico 4 with no missed refreshes
+        prefs.vrDepthRate = Math.max(prefs.vrDepthRate, com.limelight.binding.video.XrShared.DEPTH_RATE_DEFAULT);
         LimeLog.info(String.format(Locale.US, "depth3d: %s %dx%d @ %.2f", uri, size[0], size[1], fps));
 
         XrRenderer r = new XrRenderer();
