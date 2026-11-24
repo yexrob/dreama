@@ -227,3 +227,38 @@ interface Track { id: string, url: string, backupUrls?: string[], mime: string, 
 
 ## 10. 以后的版本可能加（现在不做，但 v1 的结构不挡路）
 WebSocket 与直播弹幕推送、下载到本地、插件间共享的刮削器（TMDB）、原生（APK + AIDL）插件、DRM、插件自带设置页之外的自定义操作按钮（`actions`）。
+
+## 11. 补充规定（第一版实现审查后加入；与前文冲突时以本节为准）
+
+### 11.1 调用与运行时
+- 同一实例的调用串行执行。`reportProgress` 在实例忙时可以被宿主丢弃。
+- 一次调用在它返回的 Promise 落定时结束；此时还没完成的定时器和 `fetch` 一律取消，不会拖住调用。`clearTimeout` 必须真正取消。
+- `ctx.storage.*` 和 `ctx.cookies.*` 全部是异步的，必须 `await`。开发工具里它们返回 Promise，忘了 `await` 在开发时就会出错。
+- `init` 失败等同于该次调用失败，下次调用重新 `init`。内存超限或超时后运行时被销毁重建，`ctx.storage` 之外的状态全部丢失。
+- 运行时堆上限 64 MB。`fetch` 响应体上限 8 MB；每实例同时最多 4 个 `fetch`、在途字节合计不超过 16 MB；`bytes()` 返回 `ArrayBuffer`。`ctx.parse` 每次调用最多 8 个文档、单个不超过 4 MB，查询结果是惰性句柄，不整体序列化。cookie 罐上限 256 KB。
+- `ctx.fetch` 的 `responseType` 参数取消（用返回值上的 `text()/json()/bytes()`）。
+- `new ctx.Error(code, message?, { retryAfterSec? })`。
+- `ctx.cookies.get(url)` 返回可直接放进 `Cookie` 请求头的字符串（`"k1=v1; k2=v2"`）；`set(url, cookie)` 接受一条 `Set-Cookie` 文本或 `"k=v"`。`ctx.fetch` 里显式写的 `Cookie` 头与罐里的合并，同名时显式的优先。
+
+### 11.2 数据
+- 可选字段的值为 `null` 等同于没写。枚举出现宿主不认识的值时：`kind` 不认识的条目被丢弃，其余枚举回落到默认值；任何情况下都不得因此让整次结果失败。数值字段超出合理范围时忽略该字段。Schema 只对必需字段和类型从严。
+- `manifest.author` 可选。
+- `Option = { value: string, label: string }`；`browse` 的 `sort` 是某个 `sorts[].value`，`filters` 是 `{ [key]: value }`。
+- `PlaybackInfo` 增加 `durationMs?`（`dash` 模式必须给）。`expiresAt` 是 epoch 毫秒；宿主在过期前 60 秒重新取，离过期不足 60 秒的地址取到后直接用、不循环重取。
+- `PlaybackInfo.title?` 可选；没有时宿主用条目标题。
+- 字幕的 `headers` 叠加在 `PlaybackInfo.headers` 之上（同名覆盖）。
+- `live: true` 与 `dash` 同时出现在 v1 不支持，宿主报 `Unsupported`；直播用 `url`（HLS 等）。
+- 弹幕的 `color` 是 `"#RRGGBB"` 字符串或 0xRRGGBB 整数，两者都接受。
+
+### 11.3 网络边界（改写 §7 的相关条目）
+- `hosts` 限制的是插件代码能**读**到哪些站点的数据，不是保密边界：安装界面的措辞是「这个插件会访问：…」，不承诺数据不会去别处。
+- `lan: true` 只放开 `hosts` 和用户填写的主机（`userHosts`）中位于局域网的那些，以及对它们使用 http；不是放开整个局域网。
+- 用户在 `url` 类型配置项里亲手填的主机允许 http（自建服务器常见），表单上提示「这个地址没有加密」。
+- 播放器替插件拉取的一切——播放地址、备用地址、MPD/HLS 清单里出现的每个地址、分片、字幕、图片，以及它们的每一跳重定向——都只允许 http(s)，并在**每个请求**上按解析后的实际地址检查：回环、链路本地、保留地址一律拒绝；私有网段只有在该主机属于 `lan` 放开的范围时才允许。地址的各种写法（省略写法、十六进制、八进制、IPv4 映射/兼容的 IPv6、NAT64）都按解析结果判断，并且连接的就是检查过的那个地址。https 不得降级重定向到 http。
+- `PlaybackInfo.headers` 只发给插件明确给出的地址（主地址、备用地址、清单里与它们同源的地址）；跨源重定向时去掉 `Authorization`、`Cookie` 及插件自定的头。
+- 图片地址同上规则；`file:`、`content:` 等一律拒绝。
+
+### 11.4 安装与更新
+- 插件的身份是「id + 来源」：来源是安装它的仓库地址（或单包地址的源）。同 id 但来源不同的包不是更新，而是替换，必须由用户确认，并且**不继承**原实例的配置、存储和 cookie。
+- 仓库地址必须是 https；下载不跟随到私有网段；有总超时和包体积上限（8 MB）。
+- 校验 id、版本等字符串时必须整串匹配（不接受末尾换行等）。宿主和开发工具必须读取 zip 的同一份目录结构，并拒绝中央目录与本地文件头不一致的包。
