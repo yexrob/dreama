@@ -14,8 +14,11 @@ public struct RcloneAvailability: Equatable, Sendable {
     }
 }
 
-/// Runtime status of an individual configured `CloudRemoteEntry` mounted via `rclone serve webdav`.
+/// Explicit runtime status of an individual configured `CloudRemoteEntry` mounted via `rclone serve webdav`.
+/// Every configured cloud remote ALWAYS maps to a non-empty status so the UI never displays a blank row.
 public enum RcloneRemoteStatus: Equatable, Sendable {
+    case paused
+    case rcloneNotInstalled
     case starting
     case running
     case error(message: String)
@@ -42,25 +45,26 @@ public struct RcloneBackendEndpoint: Sendable {
 ///
 /// Safety guarantees:
 /// - Passes `RCLONE_USER` and `RCLONE_PASS` strictly via child environment (NEVER CLI args)
-/// - Wraps child launch with `depth3d-child-guard` + `ChildProcessLedger` to prevent orphan processes
-/// - Serializes all `syncRemotes` / restart / stop operations on a dedicated serial queue
+/// - Wraps child launch with `depth3d-child-guard` + `ChildProcessLedger` recording BOTH guard and
+///   real rclone PID + kernel start time, escalating to process-group `SIGKILL` if child ignores `SIGTERM`
+/// - Serializes ALL `syncRemotes` / `syncRemotesAsync` / `pauseAll` / restart / stop operations on a
+///   single FIFO serial queue so newer remote lists can never be overwritten by older concurrent calls
 /// - Deduplicates duplicate remote display names without crashing
-/// - Captures stderr to classify auth expiry, missing remotes, and network failures in Chinese
-/// - Automatically restarts crashed backends with exponential backoff
+/// - Classifies errors strictly from the latest launch's exit stderr (never misclassifying runtime 404/401)
+/// - Publishes explicit statuses (`.paused`, `.rcloneNotInstalled`, `.starting`, `.running`, `.error`)
 public final class RcloneBridgeManager: @unchecked Sendable {
     private final class StderrBuffer: @unchecked Sendable {
         private let lock = NSLock()
         private var text = ""
         private let maxChars = 8192
 
-        func append(_ chunk: String) -> String {
+        func append(_ chunk: String) {
             lock.lock()
-            defer { lock.unlock() }
             text += chunk
             if text.count > maxChars {
                 text = String(text.suffix(maxChars))
             }
-            return text
+            lock.unlock()
         }
 
         func snapshot() -> String {
@@ -73,7 +77,10 @@ public final class RcloneBridgeManager: @unchecked Sendable {
     private final class ManagedRemote {
         let entry: CloudRemoteEntry
         var process: Process?
-        var trackedPID: Int32 = -1
+        var usedGuard: Bool = false
+        var trackedGuardPID: Int32 = -1
+        var trackedChildPID: Int32 = -1
+        var childPIDFileURL: URL?
         var endpoint: RcloneBackendEndpoint?
         var status: RcloneRemoteStatus = .starting
         var consecutiveFailures: Int = 0
@@ -173,6 +180,7 @@ public final class RcloneBridgeManager: @unchecked Sendable {
 
     private func resolvedExecutablePath() -> String? {
         if let override = executableOverride {
+            guard !override.isEmpty else { return nil }
             return FileManager.default.isExecutableFile(atPath: override) ? override : nil
         }
         return Self.locateRclone()
@@ -193,11 +201,11 @@ public final class RcloneBridgeManager: @unchecked Sendable {
 
         do {
             try proc.run()
+            let data = out.fileHandleForReading.readDataToEndOfFile()
             proc.waitUntilExit()
             guard proc.terminationStatus == 0 else {
                 return RcloneAvailability(executablePath: bin, availableRemotes: [])
             }
-            let data = out.fileHandleForReading.readDataToEndOfFile()
             let text = String(data: data, encoding: .utf8) ?? ""
             let remotes = text
                 .components(separatedBy: .newlines)
@@ -209,28 +217,27 @@ public final class RcloneBridgeManager: @unchecked Sendable {
         }
     }
 
-    /// Classifies raw `rclone` stderr output into actionable Simplified Chinese copy and indicates
-    /// whether the failure is a permanent configuration/auth issue that requires user intervention.
+    /// Classifies `rclone` exit stderr strictly for fatal configuration/auth issues vs transient
+    /// network/process errors. Deliberately avoids overly broad substrings like bare `unauthorized`
+    /// or `directory not found` that can occur during normal runtime WebDAV requests.
     public static func classifyStderr(_ stderr: String, remoteSpec: String) -> (message: String, isPermanentConfigError: Bool) {
         let lower = stderr.lowercased()
         let remoteName = remoteSpec.split(separator: ":").first.map(String.init) ?? remoteSpec
 
         if lower.contains("invalid_grant")
-            || lower.contains("token expired")
             || lower.contains("couldn't fetch token")
-            || lower.contains("oauth2")
-            || lower.contains("unauthorized")
+            || lower.contains("oauth2: cannot fetch token")
+            || lower.contains("token expired")
             || lower.contains("access_denied")
-            || lower.contains("re-authenticate")
             || lower.contains("rclone config reconnect")
+            || lower.contains("failed to configure")
         {
             return (HostStrings.format("rclone.error.auth_expired", remoteName), true)
         }
 
         if lower.contains("didn't find section in config file")
-            || lower.contains("config file") && lower.contains("not found")
+            || (lower.contains("config file") && lower.contains("not found"))
             || lower.contains("unknown remote")
-            || lower.contains("directory not found")
         {
             return (HostStrings.format("rclone.error.remote_not_found", remoteName), true)
         }
@@ -248,11 +255,27 @@ public final class RcloneBridgeManager: @unchecked Sendable {
         return (HostStrings.string("rclone.error.generic"), false)
     }
 
-    /// Reconciles active loopback rclone backends with the user's configured `CloudRemoteEntry` list.
-    /// Executed strictly serially so concurrent calls can never race or launch duplicate processes.
+    /// Synchronously reconciles active loopback rclone backends on the serial queue (for tests).
     public func syncRemotes(_ remotes: [CloudRemoteEntry]) {
         syncQueue.sync {
             self.syncRemotesOnQueue(remotes)
+        }
+    }
+
+    /// Asynchronously enqueues reconciliation directly onto the serial FIFO `syncQueue`
+    /// so calls from `@MainActor` execute strictly in submission order (newer lists can never
+    /// be overwritten by an older list racing on a concurrent queue).
+    public func syncRemotesAsync(_ remotes: [CloudRemoteEntry]) {
+        syncQueue.async { [weak self] in
+            self?.syncRemotesOnQueue(remotes)
+        }
+    }
+
+    /// Stops all active backends and marks configured remotes explicitly as `.paused`
+    /// (used when the user toggles off Media Service).
+    public func pauseAllAsync(configuredRemotes: [CloudRemoteEntry]) {
+        syncQueue.async { [weak self] in
+            self?.pauseAllOnQueue(configuredRemotes: configuredRemotes)
         }
     }
 
@@ -260,9 +283,12 @@ public final class RcloneBridgeManager: @unchecked Sendable {
     public func retryRemote(displayName: String) {
         syncQueue.async { [weak self] in
             guard let self else { return }
-            guard let bin = self.resolvedExecutablePath(),
-                  let managed = self.remotesByName[displayName]
-            else { return }
+            guard let managed = self.remotesByName[displayName] else { return }
+            guard let bin = self.resolvedExecutablePath() else {
+                managed.status = .rcloneNotInstalled
+                self.publishSnapshots()
+                return
+            }
             managed.consecutiveFailures = 0
             managed.pendingRestart?.cancel()
             managed.pendingRestart = nil
@@ -297,22 +323,41 @@ public final class RcloneBridgeManager: @unchecked Sendable {
 
     // MARK: - Serial Queue Implementation
 
-    private func syncRemotesOnQueue(_ remotes: [CloudRemoteEntry]) {
-        guard let bin = resolvedExecutablePath() else {
-            stopAllOnQueue()
-            return
-        }
-
-        // Deduplicate by `displayName` safely so duplicate names in settings NEVER crash the app.
-        var desiredOrdered: [CloudRemoteEntry] = []
-        var desiredByName: [String: CloudRemoteEntry] = [:]
+    private func deduplicateRemotes(_ remotes: [CloudRemoteEntry]) -> ([CloudRemoteEntry], [String: CloudRemoteEntry]) {
+        var ordered: [CloudRemoteEntry] = []
+        var byName: [String: CloudRemoteEntry] = [:]
         for remote in remotes {
-            if desiredByName[remote.displayName] == nil {
-                desiredByName[remote.displayName] = remote
-                desiredOrdered.append(remote)
+            if byName[remote.displayName] == nil {
+                byName[remote.displayName] = remote
+                ordered.append(remote)
             } else {
                 HostLogger.warning("Ignoring duplicate cloud remote displayName '\(remote.displayName)'", category: "media")
             }
+        }
+        return (ordered, byName)
+    }
+
+    private func syncRemotesOnQueue(_ remotes: [CloudRemoteEntry]) {
+        let (desiredOrdered, desiredByName) = deduplicateRemotes(remotes)
+
+        guard let bin = resolvedExecutablePath() else {
+            // Stop any active processes and explicitly publish `.rcloneNotInstalled` for every configured remote!
+            for managed in remotesByName.values {
+                managed.generation &+= 1
+                managed.pendingRestart?.cancel()
+                managed.pendingRestart = nil
+                managed.pendingConfirm?.cancel()
+                managed.pendingConfirm = nil
+                terminateManagedProcess(managed)
+            }
+            remotesByName.removeAll()
+            for remote in desiredOrdered {
+                let placeholder = ManagedRemote(entry: remote)
+                placeholder.status = .rcloneNotInstalled
+                remotesByName[remote.displayName] = placeholder
+            }
+            publishSnapshots()
+            return
         }
 
         // Stop and remove backends no longer desired or whose `remoteSpec` changed.
@@ -330,15 +375,15 @@ public final class RcloneBridgeManager: @unchecked Sendable {
             }
         }
 
-        // Start newly added remotes or remotes whose process is dead and not awaiting retry.
+        // Start newly added remotes or remotes previously `.paused` / `.rcloneNotInstalled`.
         for remote in desiredOrdered {
             if let existing = remotesByName[remote.displayName] {
                 let running = existing.process?.isRunning ?? false
                 if !running && existing.pendingRestart == nil {
                     if case .error = existing.status {
-                        // Stay in user-actionable error state until user clicks retry or config changes.
                         continue
                     }
+                    existing.consecutiveFailures = 0
                     launchManaged(existing, executablePath: bin)
                 }
             } else {
@@ -348,6 +393,25 @@ public final class RcloneBridgeManager: @unchecked Sendable {
             }
         }
 
+        publishSnapshots()
+    }
+
+    private func pauseAllOnQueue(configuredRemotes: [CloudRemoteEntry]) {
+        let (desiredOrdered, _) = deduplicateRemotes(configuredRemotes)
+        for managed in remotesByName.values {
+            managed.generation &+= 1
+            managed.pendingRestart?.cancel()
+            managed.pendingRestart = nil
+            managed.pendingConfirm?.cancel()
+            managed.pendingConfirm = nil
+            terminateManagedProcess(managed)
+        }
+        remotesByName.removeAll()
+        for remote in desiredOrdered {
+            let placeholder = ManagedRemote(entry: remote)
+            placeholder.status = .paused
+            remotesByName[remote.displayName] = placeholder
+        }
         publishSnapshots()
     }
 
@@ -371,6 +435,7 @@ public final class RcloneBridgeManager: @unchecked Sendable {
         managed.pendingRestart = nil
         managed.pendingConfirm?.cancel()
         managed.pendingConfirm = nil
+        // Fresh stderr buffer for every launch attempt so past failures never taint new launches.
         managed.stderrBuffer = StderrBuffer()
         managed.endpoint = nil
         managed.status = .starting
@@ -388,8 +453,7 @@ public final class RcloneBridgeManager: @unchecked Sendable {
 
         let proc = Process()
         let guardURL = childGuardOverride ?? ChildProcessLedger.locateChildGuard()
-        // Never pass `--user` or `--pass` on CLI! Supply `RCLONE_USER` / `RCLONE_PASS` via environment
-        // so credentials never appear in `ps aux` or crash logs.
+        // Never pass `--user` or `--pass` on CLI! Supply `RCLONE_USER` / `RCLONE_PASS` via environment.
         let rcloneArgs = [
             "serve", "webdav", managed.entry.remoteSpec,
             "--addr", "127.0.0.1:\(port)",
@@ -408,9 +472,16 @@ public final class RcloneBridgeManager: @unchecked Sendable {
             guardURL: guardURL
         )
 
+        let childPIDFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("depth3d-rclone-child-\(UUID().uuidString).pid")
+        try? FileManager.default.removeItem(at: childPIDFile)
+
         var env = ProcessInfo.processInfo.environment
         env["RCLONE_USER"] = user
         env["RCLONE_PASS"] = pass
+        if usedGuard {
+            env["DEPTH3D_CHILD_PID_FILE"] = childPIDFile.path
+        }
         proc.environment = env
 
         let stderrPipe = Pipe()
@@ -419,36 +490,25 @@ public final class RcloneBridgeManager: @unchecked Sendable {
 
         let stderrBuf = managed.stderrBuffer
         let displayName = managed.entry.displayName
-        let remoteSpec = managed.entry.remoteSpec
 
-        stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        // Capture stderr purely for exit diagnosis; do NOT mark a healthy running process permanently
+        // errored on transient runtime HTTP/404 logs (S6).
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty else {
                 handle.readabilityHandler = nil
                 return
             }
             if let chunk = String(data: data, encoding: .utf8) {
-                let full = stderrBuf.append(chunk)
-                let classified = Self.classifyStderr(full, remoteSpec: remoteSpec)
-                if classified.isPermanentConfigError {
-                    self?.syncQueue.async {
-                        guard let self,
-                              let current = self.remotesByName[displayName],
-                              current.generation == generation
-                        else { return }
-                        current.status = .error(message: classified.message)
-                        self.publishSnapshots()
-                    }
-                }
+                stderrBuf.append(chunk)
             }
         }
 
         proc.terminationHandler = { [weak self] finished in
             stderrPipe.fileHandleForReading.readabilityHandler = nil
-            // Drain any remaining stderr bytes buffered in pipe before classifying.
             let remaining = (try? stderrPipe.fileHandleForReading.readToEnd()) ?? Data()
             if !remaining.isEmpty, let tail = String(data: remaining, encoding: .utf8) {
-                _ = stderrBuf.append(tail)
+                stderrBuf.append(tail)
             }
             self?.syncQueue.async {
                 self?.handleBackendTerminated(
@@ -461,7 +521,14 @@ public final class RcloneBridgeManager: @unchecked Sendable {
 
         do {
             try proc.run()
-            let pid = proc.processIdentifier
+            let topPID = proc.processIdentifier
+            let realChildPID: Int32
+            if usedGuard {
+                realChildPID = ChildProcessLedger.waitForGuardedChildPID(pidFileURL: childPIDFile) ?? -1
+            } else {
+                realChildPID = topPID
+            }
+
             let endpoint = RcloneBackendEndpoint(
                 mountName: managed.entry.displayName,
                 remoteSpec: managed.entry.remoteSpec,
@@ -469,7 +536,10 @@ public final class RcloneBridgeManager: @unchecked Sendable {
                 authHeader: authHeader
             )
             managed.process = proc
-            managed.trackedPID = pid
+            managed.usedGuard = usedGuard
+            managed.trackedGuardPID = usedGuard ? topPID : -1
+            managed.trackedChildPID = realChildPID
+            managed.childPIDFileURL = usedGuard ? childPIDFile : nil
             managed.endpoint = endpoint
             managed.lastLaunchDate = Date()
 
@@ -477,34 +547,47 @@ public final class RcloneBridgeManager: @unchecked Sendable {
             launchCounter += 1
             stateLock.unlock()
 
-            ledger?.register(
-                pid: pid,
-                kind: .rclone,
-                executableHint: usedGuard
-                    ? (guardURL?.lastPathComponent ?? "depth3d-child-guard")
-                    : (executablePath as NSString).lastPathComponent
-            )
+            if usedGuard {
+                ledger?.register(
+                    pid: topPID,
+                    pgid: topPID,
+                    kind: .childGuard,
+                    executableHint: guardURL?.lastPathComponent ?? "depth3d-child-guard"
+                )
+                if realChildPID > 1 {
+                    ledger?.register(
+                        pid: realChildPID,
+                        pgid: topPID,
+                        kind: .rclone,
+                        executableHint: (executablePath as NSString).lastPathComponent
+                    )
+                }
+            } else {
+                ledger?.register(
+                    pid: topPID,
+                    kind: .rclone,
+                    executableHint: (executablePath as NSString).lastPathComponent
+                )
+            }
 
-            // Mark running once process survives the brief startup probe window without permanent stderr errors.
             let confirmWork = DispatchWorkItem { [weak self] in
                 guard let self,
                       let current = self.remotesByName[displayName],
                       current.generation == generation,
                       current.process?.isRunning == true
                 else { return }
-                if case .starting = current.status {
-                    current.status = .running
-                    self.publishSnapshots()
-                }
+                current.status = .running
+                self.publishSnapshots()
             }
             managed.pendingConfirm = confirmWork
             syncQueue.asyncAfter(deadline: .now() + startupConfirmDelay, execute: confirmWork)
 
             HostLogger.info(
-                "Started loopback cloud remote backend '\(displayName)' on 127.0.0.1:\(port) (pid=\(pid), guarded=\(usedGuard))",
+                "Started loopback cloud remote backend '\(displayName)' on 127.0.0.1:\(port) (pid=\(topPID), childPid=\(realChildPID), guarded=\(usedGuard))",
                 category: "media"
             )
         } catch {
+            try? FileManager.default.removeItem(at: childPIDFile)
             HostLogger.error("Failed to launch cloud remote backend '\(displayName)': \(error.localizedDescription)", category: "media")
             managed.status = .error(message: HostStrings.string("rclone.error.generic"))
         }
@@ -515,17 +598,23 @@ public final class RcloneBridgeManager: @unchecked Sendable {
             return
         }
 
-        let pidToClear = managed.trackedPID
+        let guardPID = managed.trackedGuardPID
+        let childPID = managed.trackedChildPID
+        let pidFile = managed.childPIDFileURL
         managed.process = nil
-        managed.trackedPID = -1
+        managed.usedGuard = false
+        managed.trackedGuardPID = -1
+        managed.trackedChildPID = -1
+        managed.childPIDFileURL = nil
         managed.endpoint = nil
         managed.pendingConfirm?.cancel()
         managed.pendingConfirm = nil
 
-        if pidToClear > 0 {
-            ledger?.unregister(pid: pidToClear)
-        }
+        if guardPID > 1 { ledger?.unregister(pid: guardPID) }
+        if childPID > 1 { ledger?.unregister(pid: childPID) }
+        if let pidFile { try? FileManager.default.removeItem(at: pidFile) }
 
+        // Classify strictly from THIS launch attempt's stderr output.
         let stderrText = managed.stderrBuffer.snapshot()
         let classified = Self.classifyStderr(stderrText, remoteSpec: managed.entry.remoteSpec)
         HostLogger.warning(
@@ -559,10 +648,14 @@ public final class RcloneBridgeManager: @unchecked Sendable {
         let work = DispatchWorkItem { [weak self] in
             guard let self,
                   let current = self.remotesByName[displayName],
-                  current.generation == generation,
-                  let bin = self.resolvedExecutablePath()
+                  current.generation == generation
             else { return }
             current.pendingRestart = nil
+            guard let bin = self.resolvedExecutablePath() else {
+                current.status = .rcloneNotInstalled
+                self.publishSnapshots()
+                return
+            }
             self.launchManaged(current, executablePath: bin)
             self.publishSnapshots()
         }
@@ -573,26 +666,35 @@ public final class RcloneBridgeManager: @unchecked Sendable {
 
     private func terminateManagedProcess(_ managed: ManagedRemote) {
         let proc = managed.process
-        let pidToClear = managed.trackedPID
+        let usedGuard = managed.usedGuard
+        let guardPID = managed.trackedGuardPID
+        var childPID = managed.trackedChildPID
+        let pidFile = managed.childPIDFileURL
         managed.process = nil
-        managed.trackedPID = -1
+        managed.usedGuard = false
+        managed.trackedGuardPID = -1
+        managed.trackedChildPID = -1
+        managed.childPIDFileURL = nil
         managed.endpoint = nil
 
-        if let proc, proc.isRunning {
-            let pid = proc.processIdentifier
-            proc.terminate()
-            let deadline = Date().addingTimeInterval(1.5)
-            while proc.isRunning && Date() < deadline {
-                Thread.sleep(forTimeInterval: 0.05)
-            }
-            if proc.isRunning {
-                kill(pid, SIGKILL)
-                proc.waitUntilExit()
-            }
+        if childPID <= 1, let pidFile,
+           let text = try? String(contentsOf: pidFile, encoding: .utf8),
+           let parsed = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)), parsed > 1
+        {
+            childPID = parsed
         }
-        if pidToClear > 0 {
-            ledger?.unregister(pid: pidToClear)
+
+        if let proc {
+            ChildProcessLedger.terminateManagedProcess(
+                process: proc,
+                usedGuard: usedGuard,
+                realChildPID: childPID > 1 ? childPID : nil,
+                graceSeconds: 2.0
+            )
         }
+        if guardPID > 1 { ledger?.unregister(pid: guardPID) }
+        if childPID > 1 { ledger?.unregister(pid: childPID) }
+        if let pidFile { try? FileManager.default.removeItem(at: pidFile) }
     }
 
     private func publishSnapshots() {

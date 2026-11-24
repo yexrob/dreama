@@ -759,24 +759,34 @@ public final class HostRuntime: ObservableObject {
         return true
     }
 
-    /// Completes an approved `/depth3d/v1/pair` request:
+    internal func knownBoundCertFingerprint(forDeviceId deviceId: String) -> String? {
+        guard let fp = pairedDevices.first(where: { $0.deviceId == deviceId })?.certFingerprint,
+              !fp.isEmpty
+        else {
+            return nil
+        }
+        return fp
+    }
+
+    /// Completes an approved `/depth3d/v1/pair` request deterministically:
     /// - Fails immediately (`false` -> HTTP `503`) if the streaming engine is not ready or unreachable
     /// - Submits the PIN ONLY to the single GameStream pending pairing matching `clientAddress`
-    /// - Saves `PairedDeviceRecord` ONLY AFTER GameStream pairing truly succeeds and binds the
-    ///   exact client certificate produced by that pairing session
+    /// - Waits for GameStream pairing to finish AND for the client certificate to be written to
+    ///   `state.json` and bound to `PairedDeviceRecord` BEFORE returning `true` (`200 OK`)
+    /// - Never returns a speculative `200` before completion and never saves a device on failure
     internal func handleApprovedPairing(
         deviceName: String,
         deviceId: String,
         pin: String,
         clientAddress: String,
         autoAllowFuture: Bool,
-        backgroundWaitSeconds: TimeInterval = 25.0
+        pairingWaitSeconds: TimeInterval = 25.0
     ) async -> Bool {
         guard let store, let api = engineAPIClient, engineState.isReadyForClients else {
             return false
         }
 
-        // Ensure the engine management API is actually reachable right now.
+        // Verify the engine management API is reachable right now.
         guard let pending = try? await api.fetchPendingPairings() else {
             HostLogger.warning("Engine API unreachable while handling approved pairing", category: "pair")
             return false
@@ -784,63 +794,36 @@ public final class HostRuntime: ObservableObject {
 
         let targetIP = IPAddressNormalizer.normalize(clientAddress)
         let matching = pending.filter { $0.normalizedAddress == targetIP }
-        let existing = pairedDevices.first(where: { $0.deviceId == deviceId })
-        let existingFP = existing?.certFingerprint
-        let stateFileURL = store.paths.engineStateFile
-
         if matching.count > 1 {
             HostLogger.warning("Refusing ambiguous pairing: \(matching.count) pending sessions from \(targetIP)", category: "pair")
             return false
         }
 
-        // Case A: Headset already initiated GameStream `/pair` before/concurrently with `/depth3d/v1/pair`.
-        // Complete synchronously and bind the exact certificate before returning `200 OK`.
-        if matching.count == 1 {
-            guard let verified = await api.completeMatchedPairing(
-                pin: pin,
-                deviceName: deviceName,
-                clientAddress: targetIP,
-                stateFileURL: stateFileURL,
-                existingBoundFingerprint: existingFP,
-                maxWait: 5.0
-            ) else {
-                return false
-            }
-            persistVerifiedPairing(
-                deviceName: deviceName,
-                deviceId: deviceId,
-                verified: verified,
-                autoAllowFuture: autoAllowFuture
-            )
-            refreshPairedClientsFromEngine()
-            return true
+        let existing = pairedDevices.first(where: { $0.deviceId == deviceId })
+        let existingFP = existing?.certFingerprint
+        let stateFileURL = store.paths.engineStateFile
+
+        // Wait synchronously (inside cooperative Swift Task, never blocking GCD worker threads)
+        // for the matching GameStream pairing session from `targetIP` to complete and produce its cert.
+        guard let verified = await api.completeMatchedPairing(
+            pin: pin,
+            deviceName: deviceName,
+            clientAddress: targetIP,
+            stateFileURL: stateFileURL,
+            existingBoundFingerprint: existingFP,
+            maxWait: pairingWaitSeconds
+        ) else {
+            HostLogger.warning("GameStream pairing failed or timed out for \(deviceName) (\(targetIP)); not saving device", category: "pair")
+            return false
         }
 
-        // Case B: Headset waits for `200 {"ok":true}` from `/depth3d/v1/pair` and immediately starts
-        // GameStream `/pair`. Do NOT save `PairedDeviceRecord` yet — wait in background strictly for
-        // `targetIP` and persist ONLY once the GameStream pairing truly succeeds and yields its cert.
-        Task.detached { [weak self, api] in
-            guard let verified = await api.completeMatchedPairing(
-                pin: pin,
-                deviceName: deviceName,
-                clientAddress: targetIP,
-                stateFileURL: stateFileURL,
-                existingBoundFingerprint: existingFP,
-                maxWait: backgroundWaitSeconds
-            ) else {
-                return
-            }
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                self.persistVerifiedPairing(
-                    deviceName: deviceName,
-                    deviceId: deviceId,
-                    verified: verified,
-                    autoAllowFuture: autoAllowFuture
-                )
-                self.refreshPairedClientsFromEngine()
-            }
-        }
+        persistVerifiedPairing(
+            deviceName: deviceName,
+            deviceId: deviceId,
+            verified: verified,
+            autoAllowFuture: autoAllowFuture
+        )
+        refreshPairedClientsFromEngine()
         return true
     }
 
@@ -852,14 +835,32 @@ public final class HostRuntime: ObservableObject {
     ) {
         guard let store else { return }
         let existing = pairedDevices.first(where: { $0.deviceId == deviceId })
-        let shouldAutoAllow = autoAllowFuture || (existing?.autoAllow ?? false)
+        let isSameBoundIdentity: Bool = {
+            guard let oldFP = existing?.certFingerprint, !oldFP.isEmpty else { return false }
+            return oldFP.caseInsensitiveCompare(verified.certFingerprintSHA256) == .orderedSame
+        }()
+        let isIdentityChange: Bool = {
+            guard let oldFP = existing?.certFingerprint, !oldFP.isEmpty else { return false }
+            return !isSameBoundIdentity
+        }()
+
+        // Security rule (S3 & S7):
+        // - Exact same bound certificate -> preserve pairedAt and allow inheriting existing autoAllow.
+        // - Changed certificate fingerprint -> treat as a BRAND NEW device; NEVER inherit autoAllow!
+        // - Legacy unbound record (certFingerprint == nil) -> upgrade in-place with new cert; do NOT
+        //   silently inherit unverified autoAllow (respect explicit `autoAllowFuture` from this prompt).
+        let shouldAutoAllow = isSameBoundIdentity
+            ? (autoAllowFuture || (existing?.autoAllow ?? false))
+            : autoAllowFuture
+        let pairedAt: Date = isIdentityChange ? Date() : (existing?.pairedAt ?? Date())
+
         let record = PairedDeviceRecord(
             deviceId: deviceId,
             name: deviceName,
             engineUUID: verified.engineUUID,
             certFingerprint: verified.certFingerprintSHA256,
             autoAllow: shouldAutoAllow,
-            pairedAt: existing?.pairedAt ?? Date(),
+            pairedAt: pairedAt,
             lastSeenAt: Date()
         )
         if let saved = try? store.upsertPairedDevice(record) {
@@ -924,10 +925,9 @@ public final class HostRuntime: ObservableObject {
         davHandler.updateConfiguration(localMounts: mounts)
 
         if settings.mediaServiceEnabled {
-            let remotes = settings.cloudRemotes
-            DispatchQueue.global(qos: .utility).async {
-                rclone.syncRemotes(remotes)
-            }
+            // Enqueue directly on RcloneBridgeManager's serial FIFO queue so rapid updates
+            // never race on a concurrent global queue and overwrite newer lists with stale ones.
+            rclone.syncRemotesAsync(settings.cloudRemotes)
             if !davServer.isRunning {
                 let desired = overrides.webDAVPort ?? HostPortDefaults.defaultWebDAVPort
                 do {
@@ -943,7 +943,7 @@ public final class HostRuntime: ObservableObject {
             }
         } else {
             davServer.stop()
-            rclone.stopAll()
+            rclone.pauseAllAsync(configuredRemotes: settings.cloudRemotes)
             self.webDAVPort = nil
         }
     }
@@ -1072,6 +1072,12 @@ private final class RuntimeControlProtocolAdapter: ControlProtocolDelegate, @unc
     func authorizeMediaClient(deviceId: String, peerCertFingerprintSHA256: String) async -> Bool {
         await MainActor.run {
             runtime?.authorizeMediaClient(deviceId: deviceId, peerCertFingerprintSHA256: peerCertFingerprintSHA256) ?? false
+        }
+    }
+
+    func knownBoundCertFingerprint(forDeviceId deviceId: String) async -> String? {
+        await MainActor.run {
+            runtime?.knownBoundCertFingerprint(forDeviceId: deviceId)
         }
     }
 

@@ -2,7 +2,8 @@ import Darwin
 import Foundation
 
 /// Record of a child process spawned by depth3d Host so orphans left by a crash or `SIGKILL`
-/// can be safely identified (via `proc_pidpath`) and cleaned up on next launch.
+/// can be safely identified (via BOTH `proc_pidpath` AND kernel process start time) and cleaned
+/// up across their entire process group on next launch.
 public struct TrackedChildProcess: Codable, Equatable, Sendable {
     public enum Kind: String, Codable, Sendable {
         case engine
@@ -11,12 +12,25 @@ public struct TrackedChildProcess: Codable, Equatable, Sendable {
     }
 
     public let pid: Int32
+    /// Process group ID (`pgid`) if this process owns a dedicated process group; nil when unknown.
+    public let pgid: Int32?
+    /// Kernel process creation timestamp (`proc_bsdinfo.pbi_start_tvsec`) to guard against PID reuse.
+    public let startTimeSec: UInt64?
     public let kind: Kind
     public let executableHint: String
     public let recordedAt: Date
 
-    public init(pid: Int32, kind: Kind, executableHint: String, recordedAt: Date = Date()) {
+    public init(
+        pid: Int32,
+        pgid: Int32? = nil,
+        startTimeSec: UInt64? = nil,
+        kind: Kind,
+        executableHint: String,
+        recordedAt: Date = Date()
+    ) {
         self.pid = pid
+        self.pgid = pgid
+        self.startTimeSec = startTimeSec
         self.kind = kind
         self.executableHint = executableHint
         self.recordedAt = recordedAt
@@ -24,7 +38,7 @@ public struct TrackedChildProcess: Codable, Equatable, Sendable {
 }
 
 /// Manages a persistent PID ledger (`running-children.json`) and wraps child process spawning
-/// with `depth3d-child-guard` (kqueue `NOTE_EXIT` parent-death watchdog) when bundled.
+/// with `depth3d-child-guard` (kqueue `NOTE_EXIT` parent-death watchdog + dedicated process group).
 public final class ChildProcessLedger: @unchecked Sendable {
     private let ledgerURL: URL
     private let lock = NSLock()
@@ -40,17 +54,32 @@ public final class ChildProcessLedger: @unchecked Sendable {
         self.decoder.dateDecodingStrategy = .iso8601
     }
 
-    public func register(pid: Int32, kind: TrackedChildProcess.Kind, executableHint: String) {
+    public func register(
+        pid: Int32,
+        pgid: Int32? = nil,
+        startTimeSec: UInt64? = nil,
+        kind: TrackedChildProcess.Kind,
+        executableHint: String
+    ) {
         guard pid > 1 else { return }
+        let resolvedStart = startTimeSec ?? Self.processStartTimeSec(pid: pid)
+        let resolvedPGID = pgid ?? Self.processGroupID(pid: pid)
         lock.lock()
         defer { lock.unlock() }
         var entries = readLocked()
         entries.removeAll { $0.pid == pid }
-        entries.append(TrackedChildProcess(pid: pid, kind: kind, executableHint: executableHint))
+        entries.append(TrackedChildProcess(
+            pid: pid,
+            pgid: resolvedPGID,
+            startTimeSec: resolvedStart,
+            kind: kind,
+            executableHint: executableHint
+        ))
         writeLocked(entries)
     }
 
     public func unregister(pid: Int32) {
+        guard pid > 1 else { return }
         lock.lock()
         defer { lock.unlock() }
         var entries = readLocked()
@@ -65,7 +94,9 @@ public final class ChildProcessLedger: @unchecked Sendable {
     }
 
     /// Terminates any leftover processes recorded by a previous crashed Host instance,
-    /// verifying each PID's executable path via `proc_pidpath` so PID reuse never kills an unrelated process.
+    /// verifying BOTH each PID's executable path (`proc_pidpath`) AND kernel process start time
+    /// (`pbi_start_tvsec`) so PID reuse can never kill an unrelated process.
+    /// Escalates to process-group `SIGKILL` when a process ignores `SIGTERM`.
     @discardableResult
     public func cleanupStaleChildren(kinds: Set<TrackedChildProcess.Kind>? = nil) -> Int {
         lock.lock()
@@ -75,6 +106,7 @@ public final class ChildProcessLedger: @unchecked Sendable {
         var terminated = 0
         var surviving: [TrackedChildProcess] = []
         let myPID = getpid()
+        let myPGID = getpgrp()
 
         for entry in entries {
             if let kinds, !kinds.contains(entry.kind) {
@@ -84,7 +116,7 @@ public final class ChildProcessLedger: @unchecked Sendable {
             guard entry.pid > 1, entry.pid != myPID else { continue }
             guard kill(entry.pid, 0) == 0 else { continue }
 
-            // Verify process path matches expected executable hint before signalling.
+            // 1. Verify executable path matches expected hint.
             guard let actualPath = Self.processExecutablePath(pid: entry.pid),
                   Self.matchesHint(actualPath: actualPath, hint: entry.executableHint)
             else {
@@ -92,7 +124,24 @@ public final class ChildProcessLedger: @unchecked Sendable {
                 continue
             }
 
+            // 2. Verify kernel start time matches recorded start time (tolerance ±2s) if recorded.
+            if let recordedStart = entry.startTimeSec,
+               let actualStart = Self.processStartTimeSec(pid: entry.pid)
+            {
+                let diff = recordedStart > actualStart ? (recordedStart - actualStart) : (actualStart - recordedStart)
+                if diff > 2 {
+                    HostLogger.info("Skipping stale ledger pid=\(entry.pid) (PID reused; start time mismatch)", category: "watchdog")
+                    continue
+                }
+            }
+
             HostLogger.warning("Cleaning up orphaned child process pid=\(entry.pid) (\(entry.kind.rawValue))", category: "watchdog")
+            let targetPGID: Int32? = {
+                if let p = entry.pgid, p > 1, p != myPGID { return p }
+                if let live = Self.processGroupID(pid: entry.pid), live > 1, live != myPGID { return live }
+                return nil
+            }()
+
             _ = kill(entry.pid, SIGTERM)
             let deadline = Date().addingTimeInterval(1.5)
             while Date() < deadline {
@@ -102,6 +151,9 @@ public final class ChildProcessLedger: @unchecked Sendable {
                 Thread.sleep(forTimeInterval: 0.05)
             }
             if kill(entry.pid, 0) == 0 {
+                if let pgid = targetPGID {
+                    _ = kill(-pgid, SIGKILL)
+                }
                 _ = kill(entry.pid, SIGKILL)
             }
             terminated += 1
@@ -111,6 +163,60 @@ public final class ChildProcessLedger: @unchecked Sendable {
         writeLocked(surviving)
         lock.unlock()
         return terminated
+    }
+
+    /// Terminates a live managed process cleanly with `SIGTERM`, escalating to process-group
+    /// `SIGKILL` + explicit real-child `SIGKILL` if the process or child ignores `SIGTERM`.
+    public static func terminateManagedProcess(
+        process: Process,
+        usedGuard: Bool,
+        realChildPID: Int32?,
+        graceSeconds: TimeInterval = 2.0
+    ) {
+        let topPID = process.processIdentifier
+        let myPGID = getpgrp()
+
+        if process.isRunning {
+            process.terminate()
+            let deadline = Date().addingTimeInterval(graceSeconds)
+            while process.isRunning && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.04)
+            }
+            if process.isRunning {
+                // Escalate: kill the ENTIRE process group so a slow/SIGTERM-ignoring child never becomes an orphan.
+                if usedGuard && topPID > 1 && topPID != myPGID {
+                    _ = kill(-topPID, SIGKILL)
+                } else if let pgid = processGroupID(pid: topPID), pgid > 1, pgid != myPGID {
+                    _ = kill(-pgid, SIGKILL)
+                }
+                _ = kill(topPID, SIGKILL)
+                process.waitUntilExit()
+            }
+        }
+
+        // Belt-and-suspenders: if the real child was tracked and somehow changed process group / survived, kill it too.
+        if let childPID = realChildPID, childPID > 1, kill(childPID, 0) == 0 {
+            if let childPGID = processGroupID(pid: childPID), childPGID > 1, childPGID != myPGID {
+                _ = kill(-childPGID, SIGKILL)
+            }
+            _ = kill(childPID, SIGKILL)
+        }
+    }
+
+    /// Reads the child PID written by `depth3d-child-guard` into `DEPTH3D_CHILD_PID_FILE`,
+    /// waiting briefly for `posix_spawn` to complete.
+    public static func waitForGuardedChildPID(pidFileURL: URL, timeout: TimeInterval = 0.8) -> Int32? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let text = try? String(contentsOf: pidFileURL, encoding: .utf8),
+               let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+               pid > 1
+            {
+                return pid
+            }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        return nil
     }
 
     /// Locates the bundled `depth3d-child-guard` executable if available.
@@ -151,6 +257,20 @@ public final class ChildProcessLedger: @unchecked Sendable {
         let len = proc_pidpath(pid, &buf, UInt32(buf.count))
         guard len > 0 else { return nil }
         return String(cString: buf)
+    }
+
+    /// Queries kernel BSD info for a PID's creation timestamp in seconds (`pbi_start_tvsec`).
+    public static func processStartTimeSec(pid: Int32) -> UInt64? {
+        var info = proc_bsdinfo()
+        let expected = Int32(MemoryLayout<proc_bsdinfo>.size)
+        let n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, expected)
+        guard n == expected else { return nil }
+        return info.pbi_start_tvsec
+    }
+
+    public static func processGroupID(pid: Int32) -> Int32? {
+        let pgid = getpgid(pid)
+        return pgid > 0 ? pgid : nil
     }
 
     public static func matchesHint(actualPath: String, hint: String) -> Bool {

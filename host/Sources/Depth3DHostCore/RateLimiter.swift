@@ -123,4 +123,12 @@ public final class IPRateLimiter: @unchecked Sendable {
     public func recordEvent(key rawKey: String, now: TimeInterval = Date().timeIntervalSinceReferenceDate) {
         _ = allow(key: rawKey, now: now)
     }
+
+    /// Clears failure history for `key` (e.g., after a client successfully authenticates).
+    public func reset(key rawKey: String) {
+        let key = IPAddressNormalizer.normalize(rawKey)
+        lock.lock()
+        timestampsByKey.removeValue(forKey: key)
+        lock.unlock()
+    }
 }

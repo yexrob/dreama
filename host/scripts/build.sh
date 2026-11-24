@@ -67,14 +67,15 @@ if [[ ! -f "${ICONSET_DIR}/icon_512x512@2x.png" ]]; then
 fi
 
 # 2. Fetch & stage built-in streaming engine (mandatory — never build an unusable app)
+#    Even with --skip-engine-fetch, strictly verify ENGINE-MANIFEST.json and all extracted file SHA-256 hashes.
 if [[ "$SKIP_ENGINE_FETCH" != "1" ]]; then
   "${SCRIPT_DIR}/fetch-engine.sh" --arch "$ARCH" --out "$ENGINE_STAGE"
-fi
-
-if [[ ! -x "${ENGINE_STAGE}/MacOS/depth3d-stream-engine" ]]; then
-  echo "depth3d: error: built-in streaming engine missing at ${ENGINE_STAGE}/MacOS/depth3d-stream-engine" >&2
-  echo "depth3d: run host/scripts/fetch-engine.sh --arch ${ARCH} or omit --skip-engine-fetch" >&2
-  exit 1
+else
+  if ! "${SCRIPT_DIR}/fetch-engine.sh" --verify-only --arch "$ARCH" --out "$ENGINE_STAGE"; then
+    echo "depth3d: error: staged streaming engine failed manifest/hash verification at ${ENGINE_STAGE}" >&2
+    echo "depth3d: run host/scripts/fetch-engine.sh --arch ${ARCH} or omit --skip-engine-fetch" >&2
+    exit 1
+  fi
 fi
 
 # 3. Generate Xcode project via XcodeGen

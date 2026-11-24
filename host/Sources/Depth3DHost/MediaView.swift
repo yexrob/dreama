@@ -135,10 +135,59 @@ struct MediaView: View {
                 .disabled(runtime.isRefreshingCloudRemotes)
             }
 
+            // Always show configured cloud remotes with an explicit status regardless of rclone/toggle state.
+            if !runtime.settings.cloudRemotes.isEmpty {
+                VStack(spacing: 8) {
+                    ForEach(runtime.settings.cloudRemotes) { remote in
+                        let resolvedStatus = effectiveStatus(for: remote)
+                        HostCard {
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(spacing: 12) {
+                                    Image(systemName: cloudIconName(for: resolvedStatus))
+                                        .font(.system(size: 17))
+                                        .foregroundColor(cloudIconColor(for: resolvedStatus))
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(remote.displayName)
+                                            .font(.system(size: 14, weight: .semibold))
+                                            .foregroundColor(HostTheme.text)
+                                        Text(remote.remoteSpec)
+                                            .font(.system(size: 12))
+                                            .foregroundColor(HostTheme.text2)
+                                    }
+                                    Spacer()
+                                    cloudStatusBadge(for: resolvedStatus)
+                                    if case .error = resolvedStatus {
+                                        Button(L10n.string("action.retry")) {
+                                            runtime.retryCloudRemote(remote)
+                                        }
+                                        .buttonStyle(HostSecondaryButtonStyle())
+                                    }
+                                    Button(L10n.string("action.remove")) {
+                                        runtime.removeCloudRemote(remote)
+                                    }
+                                    .buttonStyle(HostDangerButtonStyle())
+                                }
+
+                                if case .error(let message) = resolvedStatus {
+                                    Text(message)
+                                        .font(.system(size: 12))
+                                        .foregroundColor(HostTheme.danger)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                } else if case .rcloneNotInstalled = resolvedStatus {
+                                    Text(L10n.string("media.cloud.not_installed.hint"))
+                                        .font(.system(size: 12))
+                                        .foregroundColor(HostTheme.danger)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             if runtime.isRefreshingCloudRemotes {
                 LoadingCardView(message: L10n.string("media.cloud.loading"))
             } else if !runtime.rcloneAvailability.isInstalled {
-                // Friendly setup guide when rclone is not installed (no raw error!)
                 HostCard {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 8) {
@@ -159,52 +208,6 @@ struct MediaView: View {
                     }
                 }
             } else {
-                // Active cloud remotes with live health & actionable error recovery
-                if !runtime.settings.cloudRemotes.isEmpty {
-                    VStack(spacing: 8) {
-                        ForEach(runtime.settings.cloudRemotes) { remote in
-                            let remoteStatus = runtime.rcloneStatuses[remote.displayName]
-                            HostCard {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    HStack(spacing: 12) {
-                                        Image(systemName: cloudIconName(for: remoteStatus))
-                                            .font(.system(size: 17))
-                                            .foregroundColor(cloudIconColor(for: remoteStatus))
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(remote.displayName)
-                                                .font(.system(size: 14, weight: .semibold))
-                                                .foregroundColor(HostTheme.text)
-                                            Text(remote.remoteSpec)
-                                                .font(.system(size: 12))
-                                                .foregroundColor(HostTheme.text2)
-                                        }
-                                        Spacer()
-                                        cloudStatusBadge(for: remoteStatus)
-                                        if case .error = remoteStatus {
-                                            Button(L10n.string("action.retry")) {
-                                                runtime.retryCloudRemote(remote)
-                                            }
-                                            .buttonStyle(HostSecondaryButtonStyle())
-                                        }
-                                        Button(L10n.string("action.remove")) {
-                                            runtime.removeCloudRemote(remote)
-                                        }
-                                        .buttonStyle(HostDangerButtonStyle())
-                                    }
-
-                                    if case .error(let message) = remoteStatus {
-                                        Text(message)
-                                            .font(.system(size: 12))
-                                            .foregroundColor(HostTheme.danger)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Discovered but not yet added remotes
                 let addedSpecs = Set(runtime.settings.cloudRemotes.map(\.remoteSpec))
                 let unadded = runtime.rcloneAvailability.availableRemotes.filter { !addedSpecs.contains($0) }
 
@@ -239,22 +242,40 @@ struct MediaView: View {
         }
     }
 
-    private func cloudIconName(for status: RcloneRemoteStatus?) -> String {
-        if case .error = status {
-            return "exclamationmark.icloud.fill"
+    private func effectiveStatus(for remote: CloudRemoteEntry) -> RcloneRemoteStatus {
+        if !runtime.settings.mediaServiceEnabled {
+            return .paused
         }
-        return "cloud.fill"
+        if let status = runtime.rcloneStatuses[remote.displayName] {
+            return status
+        }
+        return runtime.rcloneAvailability.isInstalled ? .starting : .rcloneNotInstalled
     }
 
-    private func cloudIconColor(for status: RcloneRemoteStatus?) -> Color {
-        if case .error = status {
-            return HostTheme.danger
+    private func cloudIconName(for status: RcloneRemoteStatus) -> String {
+        switch status {
+        case .error, .rcloneNotInstalled:
+            return "exclamationmark.icloud.fill"
+        case .paused:
+            return "icloud.slash"
+        case .starting, .running:
+            return "cloud.fill"
         }
-        return HostTheme.accent
+    }
+
+    private func cloudIconColor(for status: RcloneRemoteStatus) -> Color {
+        switch status {
+        case .error, .rcloneNotInstalled:
+            return HostTheme.danger
+        case .paused:
+            return HostTheme.text3
+        case .starting, .running:
+            return HostTheme.accent
+        }
     }
 
     @ViewBuilder
-    private func cloudStatusBadge(for status: RcloneRemoteStatus?) -> some View {
+    private func cloudStatusBadge(for status: RcloneRemoteStatus) -> some View {
         switch status {
         case .running:
             Text(L10n.string("media.cloud.status.running"))
@@ -272,8 +293,27 @@ struct MediaView: View {
                     .font(.system(size: 11.5))
                     .foregroundColor(HostTheme.text2)
             }
-        case .error, .none:
-            EmptyView()
+        case .paused:
+            Text(L10n.string("media.cloud.status.paused"))
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundColor(HostTheme.text2)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(HostTheme.fill))
+        case .rcloneNotInstalled:
+            Text(L10n.string("media.cloud.status.not_installed"))
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundColor(HostTheme.danger)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(HostTheme.danger.opacity(0.14)))
+        case .error:
+            Text(L10n.string("media.cloud.status.error"))
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundColor(HostTheme.danger)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(HostTheme.danger.opacity(0.14)))
         }
     }
 

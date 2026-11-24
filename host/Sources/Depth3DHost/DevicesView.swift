@@ -50,28 +50,36 @@ struct DevicesView: View {
                             .foregroundColor(HostTheme.accent)
                         ForEach(runtime.pendingPairings) { prompt in
                             HostCard {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text(L10n.format("pair.prompt.title", prompt.deviceName))
-                                            .font(.system(size: 14, weight: .semibold))
-                                            .foregroundColor(HostTheme.text)
-                                        Text(L10n.format("pair.prompt.source_ip", prompt.clientAddress))
-                                            .font(.system(size: 11.5).monospacedDigit())
-                                            .foregroundColor(HostTheme.accent)
-                                        Text(L10n.string("pair.prompt.subtitle"))
-                                            .font(.system(size: 12))
-                                            .foregroundColor(HostTheme.text2)
+                                VStack(alignment: .leading, spacing: 10) {
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            Text(L10n.format("pair.prompt.title", prompt.deviceName))
+                                                .font(.system(size: 14, weight: .semibold))
+                                                .foregroundColor(HostTheme.text)
+                                            Text(L10n.format("pair.prompt.source_ip", prompt.clientAddress))
+                                                .font(.system(size: 11.5).monospacedDigit())
+                                                .foregroundColor(HostTheme.accent)
+                                            Text(L10n.string("pair.prompt.subtitle"))
+                                                .font(.system(size: 12))
+                                                .foregroundColor(HostTheme.text2)
+                                        }
+                                        Spacer()
+                                        Button(L10n.string("pair.prompt.reject")) {
+                                            runtime.rejectPairing(promptId: prompt.id)
+                                        }
+                                        .buttonStyle(HostSecondaryButtonStyle())
+                                        Button(L10n.string("pair.prompt.allow")) {
+                                            // Default rememberAutoAllow=false to match safe confirmation rules.
+                                            runtime.approvePairing(promptId: prompt.id, rememberAutoAllow: false)
+                                        }
+                                        .buttonStyle(HostPrimaryButtonStyle())
                                     }
-                                    Spacer()
-                                    Button(L10n.string("pair.prompt.reject")) {
-                                        runtime.rejectPairing(promptId: prompt.id)
+
+                                    if prompt.identityChanged {
+                                        Text(L10n.string("pair.prompt.identity_changed_warning"))
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundColor(HostTheme.danger)
                                     }
-                                    .buttonStyle(HostSecondaryButtonStyle())
-                                    Button(L10n.string("pair.prompt.allow")) {
-                                        // Default rememberAutoAllow=false to match safe confirmation rules.
-                                        runtime.approvePairing(promptId: prompt.id, rememberAutoAllow: false)
-                                    }
-                                    .buttonStyle(HostPrimaryButtonStyle())
                                 }
                             }
                         }
@@ -143,20 +151,30 @@ struct DevicesView: View {
                                         .foregroundColor(HostTheme.text2)
                                 }
                                 Spacer()
-                                Toggle(
-                                    L10n.string("devices.auto_allow"),
-                                    isOn: Binding(
-                                        get: { device.autoAllow },
-                                        set: { runtime.setAutoAllow($0, for: device.deviceId) }
+                                if let fp = device.certFingerprint, !fp.isEmpty {
+                                    Toggle(
+                                        L10n.string("devices.auto_allow"),
+                                        isOn: Binding(
+                                            get: { device.autoAllow },
+                                            set: { runtime.setAutoAllow($0, for: device.deviceId) }
+                                        )
                                     )
-                                )
-                                .toggleStyle(.switch)
-                                .tint(HostTheme.accent)
-                                .labelsHidden()
-                                .disabled(device.certFingerprint == nil)
-                                Text(L10n.string("devices.auto_allow"))
-                                    .font(.system(size: 12))
-                                    .foregroundColor(HostTheme.text2)
+                                    .toggleStyle(.switch)
+                                    .tint(HostTheme.accent)
+                                    .labelsHidden()
+                                    Text(L10n.string("devices.auto_allow"))
+                                        .font(.system(size: 12))
+                                        .foregroundColor(HostTheme.text2)
+                                } else {
+                                    Text(L10n.string("devices.needs_reconnect_upgrade"))
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundColor(HostTheme.accent)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(
+                                            Capsule().fill(HostTheme.accent.opacity(0.14))
+                                        )
+                                }
 
                                 Button(L10n.string("action.remove")) {
                                     devicePendingRemoval = device

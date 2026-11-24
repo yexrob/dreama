@@ -9,6 +9,8 @@ import SwiftUI
 /// - "以后自动允许这台设备" is UNCHECKED by default
 /// - No default action shortcut (pressing Return/Enter CANNOT approve)
 /// - Displays the requester's IP address clearly
+/// - Displays an explicit coral warning when a previously bound `deviceId` presents a changed/missing cert
+/// - Closing the panel (`×` / `Cmd+W`) immediately rejects the pairing request
 /// - Non-activating floating panel that NEVER steals keyboard focus from the user's active app
 struct PairingPromptView: View {
     let prompt: PendingPairingPrompt
@@ -21,7 +23,7 @@ struct PairingPromptView: View {
     private let timer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 12) {
                 DepthLayersEmblem(size: 40)
                 VStack(alignment: .leading, spacing: 3) {
@@ -35,6 +37,24 @@ struct PairingPromptView: View {
                         .font(.system(size: 12))
                         .foregroundColor(HostTheme.text2)
                 }
+            }
+
+            if prompt.identityChanged {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.shield.fill")
+                        .font(.system(size: 14))
+                        .foregroundColor(HostTheme.danger)
+                    Text(L10n.string("pair.prompt.identity_changed_warning"))
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(HostTheme.danger)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(HostTheme.danger.opacity(0.14))
+                )
             }
 
             Toggle(isOn: $rememberAutoAllow) {
@@ -64,7 +84,7 @@ struct PairingPromptView: View {
             }
         }
         .padding(20)
-        .frame(width: 420)
+        .frame(width: 430)
         .background(HostTheme.sheet)
         .preferredColorScheme(.dark)
         .onAppear {
@@ -82,10 +102,13 @@ struct PairingPromptView: View {
 
 /// Manages a standalone non-activating floating `NSPanel` for incoming pairing prompts so the user
 /// sees them immediately even when the main window is closed, WITHOUT stealing keyboard focus.
+/// Closing the panel via its window close button immediately triggers `onReject`.
 @MainActor
-final class PairingPanelController {
+final class PairingPanelController: NSObject, NSWindowDelegate {
     private var panel: NSPanel?
     private var displayedPromptId: UUID?
+    private var activeRejectHandler: ((UUID) -> Void)?
+    private var isClosingProgrammatically: Bool = false
 
     func sync(
         prompts: [PendingPairingPrompt],
@@ -102,11 +125,20 @@ final class PairingPanelController {
 
         closePanel()
         displayedPromptId = next.id
+        activeRejectHandler = onReject
 
         let rootView = PairingPromptView(
             prompt: next,
-            onApprove: { remember in onApprove(next.id, remember) },
-            onReject: { onReject(next.id) }
+            onApprove: { [weak self] remember in
+                self?.displayedPromptId = nil
+                self?.activeRejectHandler = nil
+                onApprove(next.id, remember)
+            },
+            onReject: { [weak self] in
+                self?.displayedPromptId = nil
+                self?.activeRejectHandler = nil
+                onReject(next.id)
+            }
         )
 
         let hosting = NSHostingController(rootView: rootView)
@@ -120,6 +152,7 @@ final class PairingPanelController {
         newPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         newPanel.isReleasedWhenClosed = false
         newPanel.backgroundColor = NSColor(HostTheme.sheet)
+        newPanel.delegate = self
         newPanel.center()
         // Never call `makeKeyAndOrderFront` or `NSApp.activate` so keyboard focus stays in the user's app.
         newPanel.orderFrontRegardless()
@@ -128,8 +161,21 @@ final class PairingPanelController {
     }
 
     func closePanel() {
+        isClosingProgrammatically = true
+        panel?.delegate = nil
         panel?.close()
         panel = nil
         displayedPromptId = nil
+        activeRejectHandler = nil
+        isClosingProgrammatically = false
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard !isClosingProgrammatically else { return }
+        guard let promptId = displayedPromptId, let reject = activeRejectHandler else { return }
+        displayedPromptId = nil
+        activeRejectHandler = nil
+        panel = nil
+        reject(promptId)
     }
 }

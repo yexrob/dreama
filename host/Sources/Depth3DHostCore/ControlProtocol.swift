@@ -316,6 +316,7 @@ public struct ControlProtocolSnapshot: Sendable {
 public protocol ControlProtocolDelegate: Sendable {
     func currentSnapshot() async -> ControlProtocolSnapshot
     func authorizeMediaClient(deviceId: String, peerCertFingerprintSHA256: String) async -> Bool
+    func knownBoundCertFingerprint(forDeviceId deviceId: String) async -> String?
     func handleApprovedPairing(
         deviceName: String,
         deviceId: String,
@@ -323,6 +324,10 @@ public protocol ControlProtocolDelegate: Sendable {
         clientAddress: String,
         autoAllowFuture: Bool
     ) async -> Bool
+}
+
+public extension ControlProtocolDelegate {
+    func knownBoundCertFingerprint(forDeviceId deviceId: String) async -> String? { nil }
 }
 
 /// Pure, unit-testable HTTP router implementing `docs/specs/host-protocol.md` (v1).
@@ -413,11 +418,13 @@ public final class ControlProtocolRouter: Sendable {
             ])
         }
 
+        let knownBoundFP = await delegate.knownBoundCertFingerprint(forDeviceId: deviceId)
         let decision = await pairingCoordinator.requestApproval(
             deviceName: device,
             deviceId: deviceId,
             clientAddress: request.remoteAddress,
-            peerCertFingerprintSHA256: request.peerCertificateFingerprintSHA256
+            peerCertFingerprintSHA256: request.peerCertificateFingerprintSHA256,
+            knownBoundCertFingerprint: knownBoundFP
         )
 
         switch decision {

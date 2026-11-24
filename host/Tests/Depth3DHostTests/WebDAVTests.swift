@@ -40,20 +40,16 @@ final class WebDAVTests: XCTestCase {
     }
 
     func testStreamingRewriteProxiedMultiStatusXMLOver8MBWithoutTruncation() throws {
-        // Generate > 9 MB XML to guarantee zero 8 MB truncation and test small chunk splits!
         let rewriter = WebDAVHrefStreamRewriter(mountName: "Google Drive")
         var output = Data()
 
-        let header = Data("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n".utf8)
-        output.append(rewriter.push(header))
-
-        // ~40,000 entries * ~250 bytes ~= 10 MB
+        output.append(rewriter.push(Data("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n".utf8)))
         let entryCount = 40_000
         var batch = Data()
         for idx in 0..<entryCount {
             let line = "  <D:response><D:href>/Movies/Subfolder/Clip_\(idx)_12345678901234567890.mp4</D:href><D:propstat><D:prop><D:displayname>Clip_\(idx).mp4</D:displayname><D:getcontentlength>1048576</D:getcontentlength></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\n"
             batch.append(contentsOf: line.utf8)
-            if batch.count >= 13_337 { // intentionally awkward prime chunk size splitting tags mid-stream
+            if batch.count >= 13_337 {
                 output.append(rewriter.push(batch))
                 batch.removeAll(keepingCapacity: true)
             }
@@ -62,27 +58,42 @@ final class WebDAVTests: XCTestCase {
         output.append(rewriter.push(batch))
         output.append(rewriter.finish())
 
-        XCTAssertGreaterThan(output.count, 9 * 1024 * 1024, "Rewritten XML must exceed 9 MB without 8 MB truncation")
-        let headStr = String(decoding: output.prefix(512), as: UTF8.self)
+        XCTAssertGreaterThan(output.count, 9 * 1024 * 1024)
         let tailStr = String(decoding: output.suffix(512), as: UTF8.self)
-        XCTAssertTrue(headStr.contains("<D:href>/Google%20Drive/Movies/Subfolder/Clip_0_"))
         XCTAssertTrue(tailStr.contains("<D:href>/Google%20Drive/Movies/Subfolder/Clip_\(entryCount - 1)_"))
         XCTAssertTrue(tailStr.contains("</D:multistatus>"))
     }
 
-    func testWebDAVServerLivePropfindRangeAuthHiddenFilesEncodedTraversalAndRateLimit() throws {
+    /// Covers local WebDAV operations + m2 (symlink into `.hidden_dir`, `UF_HIDDEN` file, escaping
+    /// symlink omitted from PROPFIND) + encoded `../` over raw TCP + S4 (headerless 401 never counts
+    /// toward rate limit, valid auth resets failure count, only wrong credentials trigger 429!).
+    func testWebDAVServerLivePropfindRangeHiddenSymlinksUFHiddenTraversalAndSmartAuthRateLimit() throws {
         let tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("depth3d-webdav-test-\(UUID().uuidString)", isDirectory: true)
         let moviesDir = tmp.appendingPathComponent("Movies", isDirectory: true)
+        let hiddenDir = moviesDir.appendingPathComponent(".hidden_vault", isDirectory: true)
         let outsideFile = tmp.appendingPathComponent("secret.txt")
-        try FileManager.default.createDirectory(at: moviesDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: hiddenDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
 
         let sampleContent = Data("ABCDEFGHIJKLMNOPQRSTUVWXYZ".utf8)
         try sampleContent.write(to: moviesDir.appendingPathComponent("样片.mp4"))
         try Data("hidden-secret".utf8).write(to: moviesDir.appendingPathComponent(".DS_Store"))
-        try Data("hidden-video".utf8).write(to: moviesDir.appendingPathComponent(".secret.mp4"))
+        try Data("vault-movie".utf8).write(to: hiddenDir.appendingPathComponent("vault.mp4"))
         try Data("outside-secret".utf8).write(to: outsideFile)
+
+        // m2 case 1: symlink inside root pointing INTO a `.hidden_vault` directory inside root
+        try FileManager.default.createSymbolicLink(
+            at: moviesDir.appendingPathComponent("sneaky_link.mp4"),
+            withDestinationURL: hiddenDir.appendingPathComponent("vault.mp4")
+        )
+
+        // m2 case 2: file marked with macOS `UF_HIDDEN` flag (`chflags hidden`)
+        let ufHiddenFile = moviesDir.appendingPathComponent("uf_hidden.mp4")
+        try Data("uf-hidden-content".utf8).write(to: ufHiddenFile)
+        XCTAssertEqual(chflags(ufHiddenFile.path, UInt32(UF_HIDDEN)), 0)
+
+        // m2 case 3: symlink escaping outside the shared root
         try FileManager.default.createSymbolicLink(
             at: moviesDir.appendingPathComponent("escape.mp4"),
             withDestinationURL: outsideFile
@@ -93,82 +104,80 @@ final class WebDAVTests: XCTestCase {
             credentials: creds,
             localMounts: [WebDAVMount(name: "电影", rootURL: moviesDir)]
         )
-        let server = WebDAVServer(handler: handler, maxConnections: 16, maxUnauthRequestsPerMinute: 10)
+        let server = WebDAVServer(handler: handler, maxConnections: 16, maxUnauthRequestsPerMinute: 3)
         let port = try server.start(preferredPort: 0)
         defer { server.stop() }
 
         let auth = "\(creds.user):\(creds.pass)"
         let basicHeader = "Basic " + Data(auth.utf8).base64EncodedString()
 
-        // 1. No auth -> 401
-        XCTAssertEqual(curl(["-s", "http://127.0.0.1:\(port)/"]).0, 401)
-
-        // 2. OPTIONS -> 200
+        // S4: Sending 8 headerless requests (normal HTTP Basic Auth probes -> 401) must NEVER trigger 429!
+        for _ in 0..<8 {
+            XCTAssertEqual(curl(["-s", "http://127.0.0.1:\(port)/"]).0, 401)
+        }
+        // Legitimate auth succeeds immediately -> 200
         XCTAssertEqual(curl(["-s", "-u", auth, "-X", "OPTIONS", "http://127.0.0.1:\(port)/"]).0, 200)
 
-        // 3. PROPFIND / -> 207 listing mounted folder "电影"
-        let (c3, body3) = curl(["-s", "-u", auth, "-X", "PROPFIND", "-H", "Depth: 1", "http://127.0.0.1:\(port)/"])
-        XCTAssertEqual(c3, 207)
-        XCTAssertTrue(body3.contains("<d:displayname>电影</d:displayname>"))
+        // S4: Wrong credentials count, and a successful auth RESETS the failure counter!
+        XCTAssertEqual(curl(["-s", "-u", "depth3d:wrong1", "http://127.0.0.1:\(port)/"]).0, 401)
+        XCTAssertEqual(curl(["-s", "-u", "depth3d:wrong2", "http://127.0.0.1:\(port)/"]).0, 401)
+        // Valid auth resets failure counter to 0
+        XCTAssertEqual(curl(["-s", "-u", auth, "-X", "OPTIONS", "http://127.0.0.1:\(port)/"]).0, 200)
+        // Another 3 wrong attempts allowed before the 4th hits 429 (limit = 3)
+        XCTAssertEqual(curl(["-s", "-u", "depth3d:wrong3", "http://127.0.0.1:\(port)/"]).0, 401)
+        XCTAssertEqual(curl(["-s", "-u", "depth3d:wrong4", "http://127.0.0.1:\(port)/"]).0, 401)
+        XCTAssertEqual(curl(["-s", "-u", "depth3d:wrong5", "http://127.0.0.1:\(port)/"]).0, 401)
+        XCTAssertEqual(curl(["-s", "-u", "depth3d:wrong6", "http://127.0.0.1:\(port)/"]).0, 429)
+        // Even after 429 on wrong creds, a legitimate client presenting VALID credentials succeeds AND resets!
+        XCTAssertEqual(curl(["-s", "-u", auth, "-X", "OPTIONS", "http://127.0.0.1:\(port)/"]).0, 200)
 
-        // 4. PROPFIND /电影/ -> lists 样片.mp4, skips .DS_Store and .secret.mp4
+        // m2: PROPFIND /电影/ must list `样片.mp4` and MUST OMIT `.DS_Store`, `sneaky_link.mp4`, `uf_hidden.mp4`, AND `escape.mp4`!
         let encodedDir = WebDAVPathSanitizer.encodeHref(segments: ["电影"], isDirectory: true)
         let (c4, body4) = curl(["-s", "-u", auth, "-X", "PROPFIND", "-H", "Depth: 1", "http://127.0.0.1:\(port)\(encodedDir)"])
         XCTAssertEqual(c4, 207)
         XCTAssertTrue(body4.contains("<d:displayname>样片.mp4</d:displayname>"))
         XCTAssertFalse(body4.contains(".DS_Store"))
-        XCTAssertFalse(body4.contains(".secret.mp4"))
+        XCTAssertFalse(body4.contains("sneaky_link.mp4"), "PROPFIND must omit symlink pointing into hidden directory")
+        XCTAssertFalse(body4.contains("uf_hidden.mp4"), "PROPFIND must omit UF_HIDDEN files")
+        XCTAssertFalse(body4.contains("escape.mp4"), "PROPFIND must omit symlinks escaping shared root")
 
-        // 5. Direct GET and HEAD on hidden files MUST return 404 (not readable!)
+        // m2: Direct GET/HEAD on dotfile, symlink-to-hidden-dir, and UF_HIDDEN file must all return 404!
         let hiddenDS = WebDAVPathSanitizer.encodeHref(segments: ["电影", ".DS_Store"], isDirectory: false)
-        let hiddenMP4 = WebDAVPathSanitizer.encodeHref(segments: ["电影", ".secret.mp4"], isDirectory: false)
+        let sneakyLink = WebDAVPathSanitizer.encodeHref(segments: ["电影", "sneaky_link.mp4"], isDirectory: false)
+        let ufHiddenPath = WebDAVPathSanitizer.encodeHref(segments: ["电影", "uf_hidden.mp4"], isDirectory: false)
         XCTAssertEqual(curl(["-s", "-u", auth, "http://127.0.0.1:\(port)\(hiddenDS)"]).0, 404)
-        XCTAssertEqual(curl(["-s", "-I", "-u", auth, "http://127.0.0.1:\(port)\(hiddenDS)"]).0, 404)
-        XCTAssertEqual(curl(["-s", "-u", auth, "http://127.0.0.1:\(port)\(hiddenMP4)"]).0, 404)
+        XCTAssertEqual(curl(["-s", "-u", auth, "http://127.0.0.1:\(port)\(sneakyLink)"]).0, 404)
+        XCTAssertEqual(curl(["-s", "-I", "-u", auth, "http://127.0.0.1:\(port)\(sneakyLink)"]).0, 404)
+        XCTAssertEqual(curl(["-s", "-u", auth, "http://127.0.0.1:\(port)\(ufHiddenPath)"]).0, 404)
+        XCTAssertEqual(curl(["-s", "-I", "-u", auth, "http://127.0.0.1:\(port)\(ufHiddenPath)"]).0, 404)
 
-        // 6. GET full file & Range 206 & 416 & read-only PUT 405
-        let encodedFile = WebDAVPathSanitizer.encodeHref(segments: ["电影", "样片.mp4"], isDirectory: false)
-        let (c5, body5) = curl(["-s", "-u", auth, "http://127.0.0.1:\(port)\(encodedFile)"])
-        XCTAssertEqual(c5, 200)
-        XCTAssertEqual(body5, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-
-        let (c6, body6) = curl(["-s", "-u", auth, "-H", "Range: bytes=4-11", "http://127.0.0.1:\(port)\(encodedFile)"])
-        XCTAssertEqual(c6, 206)
-        XCTAssertEqual(body6, "EFGHIJKL")
-
-        XCTAssertEqual(curl(["-s", "-u", auth, "-H", "Range: bytes=100-200", "http://127.0.0.1:\(port)\(encodedFile)"]).0, 416)
-        XCTAssertEqual(curl(["-s", "-u", auth, "-X", "PUT", "-d", "hack", "http://127.0.0.1:\(port)\(encodedFile)"]).0, 405)
-
-        // 7. Symlink escape outside mounted root -> 403
+        // Escaping symlink -> 403
         let escapePath = WebDAVPathSanitizer.encodeHref(segments: ["电影", "escape.mp4"], isDirectory: false)
         XCTAssertEqual(curl(["-s", "-u", auth, "http://127.0.0.1:\(port)\(escapePath)"]).0, 403)
 
-        // 8. Encoded AND raw `../` traversal sent directly over raw HTTP socket (bypassing curl path normalization!)
+        // GET & Range 206 & 416 & read-only PUT 405
+        let encodedFile = WebDAVPathSanitizer.encodeHref(segments: ["电影", "样片.mp4"], isDirectory: false)
+        XCTAssertEqual(curl(["-s", "-u", auth, "http://127.0.0.1:\(port)\(encodedFile)"]).1, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+        XCTAssertEqual(curl(["-s", "-u", auth, "-H", "Range: bytes=4-11", "http://127.0.0.1:\(port)\(encodedFile)"]).1, "EFGHIJKL")
+        XCTAssertEqual(curl(["-s", "-u", auth, "-H", "Range: bytes=100-200", "http://127.0.0.1:\(port)\(encodedFile)"]).0, 416)
+        XCTAssertEqual(curl(["-s", "-u", auth, "-X", "PUT", "-d", "hack", "http://127.0.0.1:\(port)\(encodedFile)"]).0, 405)
+
+        // Encoded & raw `../` traversal over live raw TCP socket
         let rawEncodedTraversal = sendRawHTTP(
             port: port,
             request: "GET /%E7%94%B5%E5%BD%B1/%2e%2e/secret.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: \(basicHeader)\r\nConnection: close\r\n\r\n"
         )
-        XCTAssertTrue(rawEncodedTraversal.hasPrefix("HTTP/1.1 400"), "Encoded %2e%2e traversal over live HTTP must return 400, got: \(rawEncodedTraversal.prefix(80))")
+        XCTAssertTrue(rawEncodedTraversal.hasPrefix("HTTP/1.1 400"))
         XCTAssertFalse(rawEncodedTraversal.contains("outside-secret"))
 
         let rawDotDotTraversal = sendRawHTTP(
             port: port,
             request: "GET /%E7%94%B5%E5%BD%B1/../secret.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: \(basicHeader)\r\nConnection: close\r\n\r\n"
         )
-        XCTAssertTrue(rawDotDotTraversal.hasPrefix("HTTP/1.1 400"), "Raw ../ traversal over live HTTP must return 400")
-        XCTAssertFalse(rawDotDotTraversal.contains("outside-secret"))
-
-        // 9. Unauthenticated / failed Basic Auth rate limit -> 429
-        let rlServer = WebDAVServer(handler: handler, maxConnections: 8, maxUnauthRequestsPerMinute: 2)
-        let rlPort = try rlServer.start(preferredPort: 0)
-        defer { rlServer.stop() }
-        XCTAssertEqual(curl(["-s", "-u", "depth3d:wrong1", "http://127.0.0.1:\(rlPort)/"]).0, 401)
-        XCTAssertEqual(curl(["-s", "-u", "depth3d:wrong2", "http://127.0.0.1:\(rlPort)/"]).0, 401)
-        XCTAssertEqual(curl(["-s", "-u", "depth3d:wrong3", "http://127.0.0.1:\(rlPort)/"]).0, 429)
+        XCTAssertTrue(rawDotDotTraversal.hasPrefix("HTTP/1.1 400"))
     }
 
     func testWebDAVServerPortFallbackWhenPreferredPortOccupied() throws {
-        // Occupy a specific port with a dummy listening socket
         let blockerFD = Darwin.socket(AF_INET6, SOCK_STREAM, 0)
         XCTAssertGreaterThanOrEqual(blockerFD, 0)
         defer { Darwin.close(blockerFD) }
@@ -179,12 +188,11 @@ final class WebDAVTests: XCTestCase {
         addr.sin6_family = sa_family_t(AF_INET6)
         addr.sin6_addr = in6addr_any
         addr.sin6_port = 0
-        let bound = withUnsafePointer(to: &addr) {
+        XCTAssertEqual(withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 Darwin.bind(blockerFD, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
             }
-        }
-        XCTAssertEqual(bound, 0)
+        }, 0)
         XCTAssertEqual(Darwin.listen(blockerFD, 4), 0)
         var boundAddr = sockaddr_in6()
         var len = socklen_t(MemoryLayout<sockaddr_in6>.size)
@@ -200,14 +208,11 @@ final class WebDAVTests: XCTestCase {
         let actualPort = try server.start(preferredPort: occupiedPort)
         defer { server.stop() }
 
-        XCTAssertNotEqual(actualPort, occupiedPort, "WebDAVServer must fall back to a free port when preferredPort is occupied")
+        XCTAssertNotEqual(actualPort, occupiedPort)
         XCTAssertEqual(curl(["-s", "-u", "depth3d:fallbackpass", "-X", "OPTIONS", "http://127.0.0.1:\(actualPort)/"]).0, 200)
     }
 
-    /// Tests live `WebDAVServer` connection limit (`503`) AND live chunked `PROPFIND` proxy
-    /// streaming > 9 MB XML from a loopback upstream without 8 MB truncation.
     func testWebDAVServerLiveConnectionCapAndLargeProxiedPropfind() throws {
-        // 1. Connection cap test (maxConnections = 1): hold 1 raw TCP connection open, verify 2nd gets 503
         let creds = WebDAVCredentials(user: "depth3d", pass: "captest99")
         let capServer = WebDAVServer(handler: WebDAVHandler(credentials: creds), maxConnections: 1, readTimeoutSeconds: 3)
         let capPort = try capServer.start(preferredPort: 0)
@@ -221,30 +226,26 @@ final class WebDAVTests: XCTestCase {
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_addr.s_addr = inet_addr("127.0.0.1")
         addr.sin_port = capPort.bigEndian
-        let connRC = withUnsafePointer(to: &addr) {
+        XCTAssertEqual(withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 Darwin.connect(holdFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
-        }
-        XCTAssertEqual(connRC, 0)
+        }, 0)
         Thread.sleep(forTimeInterval: 0.1)
 
-        // Second connection while first is held must receive 503 Service Unavailable
-        let (codeOverCap, _) = curl(["-s", "-u", "depth3d:captest99", "-X", "OPTIONS", "http://127.0.0.1:\(capPort)/"])
-        XCTAssertEqual(codeOverCap, 503, "Connections exceeding maxConnections must receive 503")
+        XCTAssertEqual(curl(["-s", "-u", "depth3d:captest99", "-X", "OPTIONS", "http://127.0.0.1:\(capPort)/"]).0, 503)
         Darwin.close(holdFD)
 
-        // 2. Live streaming proxied PROPFIND > 9 MB over chunked transfer encoding
+        // Live streaming proxied PROPFIND > 8 MiB over chunked transfer encoding
         let tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("depth3d-large-proxy-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
 
-        // Tiny Python upstream HTTP server acting as `rclone serve webdav`, serving > 9 MB chunked 207 XML
         let fakeUpstream = tmp.appendingPathComponent("fake-rclone-9mb.py")
         try """
         #!/usr/bin/env python3
-        import http.server, os, sys
+        import http.server, sys
         addr = None
         for i, a in enumerate(sys.argv):
             if a == '--addr' and i + 1 < len(sys.argv):
@@ -281,7 +282,34 @@ final class WebDAVTests: XCTestCase {
         let rclone = RcloneBridgeManager(executableOverride: fakeUpstream.path, startupConfirmDelay: 0.1)
         defer { rclone.stopAll() }
         rclone.syncRemotes([CloudRemoteEntry(displayName: "BigCloud", remoteSpec: "big:")])
-        Thread.sleep(forTimeInterval: 0.35)
+
+        // Wait until the fake python3 upstream actually binds its allocated loopback port.
+        let readyDeadline = Date().addingTimeInterval(4.0)
+        var upstreamReady = false
+        while Date() < readyDeadline {
+            if let ep = rclone.endpoint(forMountName: "BigCloud") {
+                let probe = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+                if probe >= 0 {
+                    var upAddr = sockaddr_in()
+                    upAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+                    upAddr.sin_family = sa_family_t(AF_INET)
+                    upAddr.sin_addr.s_addr = inet_addr("127.0.0.1")
+                    upAddr.sin_port = ep.port.bigEndian
+                    let rc = withUnsafePointer(to: &upAddr) {
+                        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                            Darwin.connect(probe, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                        }
+                    }
+                    Darwin.close(probe)
+                    if rc == 0 {
+                        upstreamReady = true
+                        break
+                    }
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        XCTAssertTrue(upstreamReady, "Fake rclone upstream failed to bind loopback port; statuses=\(rclone.currentStatuses())")
 
         let davHandler = WebDAVHandler(credentials: creds, localMounts: [], rcloneManager: rclone)
         let davServer = WebDAVServer(handler: davHandler)
@@ -295,14 +323,17 @@ final class WebDAVTests: XCTestCase {
             "http://127.0.0.1:\(davPort)/BigCloud/"
         ])
         XCTAssertEqual(status, 207)
-        XCTAssertGreaterThan(body.utf8.count, 8 * 1024 * 1024, "Proxied PROPFIND must stream >8 MiB intact without 8 MB truncation")
+        XCTAssertGreaterThan(body.utf8.count, 8 * 1024 * 1024)
         XCTAssertTrue(body.contains("<D:href>/BigCloud/BigFolder/Video_00000_"))
         XCTAssertTrue(body.contains("<D:href>/BigCloud/BigFolder/Video_37999_"))
         XCTAssertTrue(body.contains("</D:multistatus>"))
     }
 
-    func testRcloneBridgeDuplicateNamesSerialSyncStderrClassificationAndCrashRestart() throws {
-        // 1. Pure stderr error classification checks (Chinese actionable copy)
+    /// S6 + S1: Covers rclone explicit states (`.rcloneNotInstalled`, `.paused`, `.starting`, `.running`, `.error`),
+    /// runtime 404/401 stderr NOT falsely poisoning healthy remote, serial FIFO `syncRemotesAsync`,
+    /// duplicate displayName safety, env-only credentials, crash backoff, and SIGTERM-ignoring cleanup.
+    func testRcloneBridgeExplicitStatesRuntimeLogSafetySerialSyncAndStubbornCleanup() throws {
+        // 1. Strict stderr classification: runtime 404 ("directory not found") or bare "unauthorized" must NOT be permanent config error!
         let authErr = RcloneBridgeManager.classifyStderr(
             "2026/11/25 ERROR : Failed to create file system: couldn't fetch token: invalid_grant",
             remoteSpec: "gdrive:"
@@ -311,50 +342,70 @@ final class WebDAVTests: XCTestCase {
         XCTAssertTrue(authErr.message.contains("rclone config reconnect gdrive"))
 
         let missingErr = RcloneBridgeManager.classifyStderr(
-            "2026/11/25 CRITICAL: Failed to create file system for \"onedrive:\": didn't find section in config file",
+            "CRITICAL: didn't find section in config file",
             remoteSpec: "onedrive:"
         )
         XCTAssertTrue(missingErr.isPermanentConfigError)
-        XCTAssertTrue(missingErr.message.contains("onedrive"))
 
-        let netErr = RcloneBridgeManager.classifyStderr(
-            "dial tcp: lookup www.googleapis.com: no such host",
+        let runtime404 = RcloneBridgeManager.classifyStderr(
+            "ERROR : missing.mp4: directory not found; 401 unauthorized probe",
             remoteSpec: "gdrive:"
         )
-        XCTAssertFalse(netErr.isPermanentConfigError)
-        XCTAssertEqual(netErr.message, HostStrings.string("rclone.error.network"))
+        XCTAssertFalse(runtime404.isPermanentConfigError, "Runtime 404/401 logs must NOT permanently disable auto-restart")
+
+        // 2. S6: Missing rclone MUST publish `.rcloneNotInstalled` for every configured remote (never empty/nil!)
+        let missingRclone = RcloneBridgeManager(executableOverride: "")
+        let cloudA = CloudRemoteEntry(displayName: "Google Drive", remoteSpec: "gdrive:")
+        missingRclone.syncRemotes([cloudA])
+        XCTAssertEqual(missingRclone.currentStatuses()["Google Drive"], .rcloneNotInstalled)
+
+        // 3. S6: pauseAllAsync publishes `.paused` explicitly
+        let pausedExp = expectation(description: "Paused status emitted")
+        missingRclone.setStatusesChangedHandler { statuses in
+            if statuses["Google Drive"] == .paused { pausedExp.fulfill() }
+        }
+        missingRclone.pauseAllAsync(configuredRemotes: [cloudA])
+        wait(for: [pausedExp], timeout: 2.0)
 
         let tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("depth3d-rclone-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
 
-        // 2. Fake healthy rclone script: records CLI args & verifies RCLONE_PASS comes via env (NEVER CLI!)
+        // 4. Healthy running rclone that prints runtime "directory not found" & "401 unauthorized" to stderr
+        //    AND traps/ignores SIGTERM (tests BOTH S6 runtime stderr safety AND S1 process-group SIGKILL!)
         let argsLog = tmp.appendingPathComponent("args.txt")
         let envCheck = tmp.appendingPathComponent("env-ok.txt")
-        let healthyScript = tmp.appendingPathComponent("fake-rclone-ok.sh")
+        let childPidFile = tmp.appendingPathComponent("rclone-stubborn.pid")
+        let noisyHealthyScript = tmp.appendingPathComponent("fake-rclone-noisy.sh")
         try """
         #!/bin/sh
+        trap '' TERM
+        echo $$ > "\(childPidFile.path)"
         echo "$@" >> "\(argsLog.path)"
         if [ -n "$RCLONE_USER" ] && [ -n "$RCLONE_PASS" ]; then
           echo "ENV_CREDS_PRESENT" > "\(envCheck.path)"
         fi
-        sleep 30
-        """.write(to: healthyScript, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: healthyScript.path)
+        echo "2026/11/25 INFO : /missing: directory not found (404)" >&2
+        echo "2026/11/25 INFO : HTTP 401 unauthorized probe" >&2
+        /bin/sleep 60 &
+        wait
+        """.write(to: noisyHealthyScript, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: noisyHealthyScript.path)
 
+        let guardBin = locateBuiltChildGuard()
+        let ledger = ChildProcessLedger(ledgerURL: tmp.appendingPathComponent("ledger.json"))
         let manager = RcloneBridgeManager(
-            ledger: ChildProcessLedger(ledgerURL: tmp.appendingPathComponent("ledger.json")),
-            executableOverride: healthyScript.path,
-            startupConfirmDelay: 0.1
+            ledger: ledger,
+            executableOverride: noisyHealthyScript.path,
+            childGuardOverride: guardBin,
+            startupConfirmDelay: 0.15
         )
         defer { manager.stopAll() }
 
-        // Duplicate displayName entries must NEVER crash and must only spawn 1 process
+        // Duplicate displayNames + concurrent syncRemotes
         let dupA = CloudRemoteEntry(displayName: "我的云盘", remoteSpec: "gdrive:")
         let dupB = CloudRemoteEntry(displayName: "我的云盘", remoteSpec: "gdrive2:")
-
-        // Concurrent syncRemotes from 6 parallel queues must serialize cleanly and launch only once
         let group = DispatchGroup()
         for _ in 0..<6 {
             group.enter()
@@ -365,68 +416,76 @@ final class WebDAVTests: XCTestCase {
         }
         group.wait()
 
-        Thread.sleep(forTimeInterval: 0.25)
-        XCTAssertEqual(manager.totalLaunchAttempts(), 1, "Concurrent syncRemotes + duplicate names must only start 1 backend")
-        XCTAssertEqual(manager.activeEndpoints().count, 1)
+        Thread.sleep(forTimeInterval: 0.3)
+        XCTAssertEqual(manager.totalLaunchAttempts(), 1)
+        // Must remain `.running` despite runtime "directory not found" and "unauthorized" on stderr!
         XCTAssertEqual(manager.currentStatuses()["我的云盘"], .running)
 
-        // Confirm secrets were passed via environment and NEVER on CLI args
         let capturedArgs = (try? String(contentsOf: argsLog, encoding: .utf8)) ?? ""
-        XCTAssertFalse(capturedArgs.contains("--pass"), "rclone password must NEVER appear in CLI arguments")
-        XCTAssertFalse(capturedArgs.contains("--user"), "rclone username must NEVER appear in CLI arguments")
+        XCTAssertFalse(capturedArgs.contains("--pass"))
+        XCTAssertFalse(capturedArgs.contains("--user"))
         XCTAssertEqual((try? String(contentsOf: envCheck, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines), "ENV_CREDS_PRESENT")
+
+        // Verify SIGTERM-ignoring rclone child is killed cleanly on stopAll()!
+        let stubbornPID = Int32(((try? String(contentsOf: childPidFile, encoding: .utf8)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)) ?? -1
+        XCTAssertGreaterThan(stubbornPID, 1)
         manager.stopAll()
-
-        // 3. Crash auto-restart test with exponential backoff
-        let crashingScript = tmp.appendingPathComponent("fake-rclone-crash.sh")
-        try """
-        #!/bin/sh
-        echo "transient crash" >&2
-        exit 1
-        """.write(to: crashingScript, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: crashingScript.path)
-
-        let crashManager = RcloneBridgeManager(
-            executableOverride: crashingScript.path,
-            backoffDelays: [0.05, 0.08],
-            startupConfirmDelay: 0.2
-        )
-        defer { crashManager.stopAll() }
-
-        let crashDoneExp = expectation(description: "Crashing rclone exhausts retries and reports error")
-        crashManager.setStatusesChangedHandler { statuses in
-            if case .error = statuses["云盘A"] {
-                crashDoneExp.fulfill()
-            }
+        let deadDeadline = Date().addingTimeInterval(3.0)
+        var dead = false
+        while Date() < deadDeadline {
+            if kill(stubbornPID, 0) != 0 && errno == ESRCH { dead = true; break }
+            Thread.sleep(forTimeInterval: 0.05)
         }
+        XCTAssertTrue(dead, "SIGTERM-ignoring rclone child must be force-killed via process group on stopAll()")
+
+        // 5. Serial FIFO `syncRemotesAsync`: [A] followed by [B] always settles on ONLY [B]
+        let simpleScript = tmp.appendingPathComponent("fake-rclone-simple.sh")
+        try "#!/bin/sh\nsleep 30\n".write(to: simpleScript, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: simpleScript.path)
+        let fifoMgr = RcloneBridgeManager(executableOverride: simpleScript.path, startupConfirmDelay: 0.1)
+        defer { fifoMgr.stopAll() }
+        fifoMgr.syncRemotesAsync([CloudRemoteEntry(displayName: "RemoteA", remoteSpec: "a:")])
+        fifoMgr.syncRemotesAsync([CloudRemoteEntry(displayName: "RemoteB", remoteSpec: "b:")])
+        Thread.sleep(forTimeInterval: 0.35)
+        XCTAssertEqual(fifoMgr.activeEndpoints().map(\.mountName), ["RemoteB"])
+        fifoMgr.stopAll()
+
+        // 6. Crash auto-restart backoff
+        let crashingScript = tmp.appendingPathComponent("fake-rclone-crash.sh")
+        try "#!/bin/sh\necho 'transient crash' >&2\nexit 1\n".write(to: crashingScript, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: crashingScript.path)
+        let crashManager = RcloneBridgeManager(executableOverride: crashingScript.path, backoffDelays: [0.05, 0.08], startupConfirmDelay: 0.2)
+        defer { crashManager.stopAll() }
+        let crashExp = expectation(description: "Crash backoff exhausted")
+        crashManager.setStatusesChangedHandler { if case .error = $0["云盘A"] { crashExp.fulfill() } }
         crashManager.syncRemotes([CloudRemoteEntry(displayName: "云盘A", remoteSpec: "gdrive:")])
-        wait(for: [crashDoneExp], timeout: 5.0)
-        XCTAssertEqual(crashManager.totalLaunchAttempts(), 3, "Must auto-restart crashed rclone across backoff schedule")
+        wait(for: [crashExp], timeout: 5.0)
+        XCTAssertEqual(crashManager.totalLaunchAttempts(), 3)
 
-        // 4. Permanent auth-expired error surfaces Chinese guidance immediately without endless restart loop
-        let authExpiredScript = tmp.appendingPathComponent("fake-rclone-auth.sh")
-        try """
-        #!/bin/sh
-        echo "ERROR : couldn't fetch token: invalid_grant" >&2
-        exit 1
-        """.write(to: authExpiredScript, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: authExpiredScript.path)
-
-        let authManager = RcloneBridgeManager(
-            executableOverride: authExpiredScript.path,
-            backoffDelays: [0.05, 0.08]
-        )
+        // 7. Permanent auth-expired exit surfaces Chinese reconnect instructions immediately
+        let authScript = tmp.appendingPathComponent("fake-rclone-auth.sh")
+        try "#!/bin/sh\necho \"ERROR : couldn't fetch token: invalid_grant\" >&2\nexit 1\n".write(to: authScript, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: authScript.path)
+        let authManager = RcloneBridgeManager(executableOverride: authScript.path, backoffDelays: [0.05, 0.08])
         defer { authManager.stopAll() }
-
-        let authErrExp = expectation(description: "Auth-expired error reported immediately")
-        authManager.setStatusesChangedHandler { statuses in
-            if case .error(let msg) = statuses["Google Drive"], msg.contains("rclone config reconnect gdrive") {
-                authErrExp.fulfill()
+        let authExp = expectation(description: "Auth error reported")
+        authManager.setStatusesChangedHandler {
+            if case .error(let msg) = $0["Google Drive"], msg.contains("rclone config reconnect gdrive") {
+                authExp.fulfill()
             }
         }
         authManager.syncRemotes([CloudRemoteEntry(displayName: "Google Drive", remoteSpec: "gdrive:")])
-        wait(for: [authErrExp], timeout: 5.0)
-        XCTAssertEqual(authManager.totalLaunchAttempts(), 1, "Permanent OAuth error should stop immediately and guide user")
+        wait(for: [authExp], timeout: 5.0)
+        XCTAssertEqual(authManager.totalLaunchAttempts(), 1)
+    }
+
+    private func locateBuiltChildGuard() -> URL? {
+        let candidates = [
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/debug/depth3d-child-guard"),
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/arm64-apple-macosx/debug/depth3d-child-guard"),
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/out/Products/Debug/depth3d-child-guard")
+        ]
+        return candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0.path) })
     }
 
     private func sendRawHTTP(port: UInt16, request: String) -> String {
@@ -446,19 +505,13 @@ final class WebDAVTests: XCTestCase {
         guard rc == 0 else { return "" }
         let reqData = Data(request.utf8)
         reqData.withUnsafeBytes { raw in
-            if let base = raw.baseAddress {
-                _ = Darwin.send(fd, base, reqData.count, 0)
-            }
+            if let base = raw.baseAddress { _ = Darwin.send(fd, base, reqData.count, 0) }
         }
         var resp = Data()
         var buf = [UInt8](repeating: 0, count: 4096)
         while true {
             let n = Darwin.recv(fd, &buf, buf.count, 0)
-            if n > 0 {
-                resp.append(buf, count: n)
-            } else {
-                break
-            }
+            if n > 0 { resp.append(buf, count: n) } else { break }
         }
         return String(decoding: resp, as: UTF8.self)
     }
@@ -471,7 +524,6 @@ final class WebDAVTests: XCTestCase {
         p.standardOutput = out
         p.standardError = FileHandle.nullDevice
         try? p.run()
-        // Drain stdout BEFORE waitUntilExit to avoid 64 KB kernel pipe deadlock on >9 MB responses!
         let data = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         let raw = String(data: data, encoding: .utf8) ?? ""

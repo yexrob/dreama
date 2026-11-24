@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fetch and extract the pinned built-in streaming engine (Sunshine, GPL-3.0-only)
+# Fetch, verify, and extract the pinned built-in streaming engine (Sunshine, GPL-3.0-only)
 # for bundling inside depth3d Host.app.
 #
 # Upstream provenance:
@@ -9,10 +9,11 @@
 # Strict integrity guarantees:
 #   - Every supported architecture MUST have a hardcoded, pinned SHA-256 digest below.
 #   - Environment overrides to bypass or weaken SHA-256 verification are NOT supported.
-#   - Missing or mismatched checksums always fail with non-zero exit code.
+#   - Extracted files are recorded with per-file SHA-256 digests inside ENGINE-MANIFEST.json
+#     and re-verified both on cached reuse AND via `--verify-only` (used by build.sh --skip-engine-fetch).
 #
 # Usage:
-#   host/scripts/fetch-engine.sh [--arch arm64|x86_64] [--out <dir>]
+#   host/scripts/fetch-engine.sh [--arch arm64|x86_64] [--out <dir>] [--verify-only]
 
 set -euo pipefail
 
@@ -32,6 +33,7 @@ readonly SHA256_X86_64="764b11674babac0cd838c2883359207a481c462f355ccbfd1ec91f6d
 
 ARCH="$(uname -m)"
 OUT_DIR=""
+VERIFY_ONLY="0"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -43,8 +45,12 @@ while [[ $# -gt 0 ]]; do
       OUT_DIR="$2"
       shift 2
       ;;
+    --verify-only)
+      VERIFY_ONLY="1"
+      shift
+      ;;
     -h|--help)
-      echo "Usage: $0 [--arch arm64|x86_64] [--out <dir>]"
+      echo "Usage: $0 [--arch arm64|x86_64] [--out <dir>] [--verify-only]"
       exit 0
       ;;
     *)
@@ -80,8 +86,7 @@ CACHE_DIR="${HOST_DIR}/.cache"
 OUT_DIR="${OUT_DIR:-${HOST_DIR}/build/engine-${ARCH}/stream-engine}"
 DMG_PATH="${CACHE_DIR}/${DMG_NAME}"
 DOWNLOAD_URL="${BASE_URL}/${DMG_NAME}"
-
-mkdir -p "$CACHE_DIR"
+MANIFEST_PATH="${OUT_DIR}/ENGINE-MANIFEST.json"
 
 verify_sha256() {
   local file="$1"
@@ -101,6 +106,94 @@ verify_sha256() {
   echo "$actual"
 }
 
+verify_extracted_manifest() {
+  local dir="$1"
+  local expected_arch="$2"
+  local expected_dmg_sha="$3"
+  python3 - "$dir" "$expected_arch" "$expected_dmg_sha" <<'PY'
+import hashlib, json, os, sys
+
+out_dir, expected_arch, expected_dmg_sha = sys.argv[1], sys.argv[2], sys.argv[3]
+manifest_path = os.path.join(out_dir, "ENGINE-MANIFEST.json")
+if not os.path.isfile(manifest_path):
+    sys.stderr.write(f"depth3d: missing manifest at {manifest_path}\n")
+    sys.exit(1)
+
+try:
+    manifest = json.loads(open(manifest_path, "r", encoding="utf-8").read())
+except Exception as e:
+    sys.stderr.write(f"depth3d: invalid ENGINE-MANIFEST.json: {e}\n")
+    sys.exit(1)
+
+if manifest.get("arch") != expected_arch:
+    sys.stderr.write(f"depth3d: manifest arch mismatch (expected {expected_arch}, got {manifest.get('arch')})\n")
+    sys.exit(1)
+
+if manifest.get("sha256") != expected_dmg_sha:
+    sys.stderr.write(f"depth3d: manifest DMG sha256 mismatch (expected {expected_dmg_sha}, got {manifest.get('sha256')})\n")
+    sys.exit(1)
+
+files = manifest.get("files")
+if not isinstance(files, dict) or "MacOS/depth3d-stream-engine" not in files:
+    sys.stderr.write("depth3d: manifest missing per-file SHA-256 inventory\n")
+    sys.exit(1)
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+seen = set()
+for root, _, filenames in os.walk(out_dir):
+    for name in filenames:
+        full = os.path.join(root, name)
+        if os.path.islink(full):
+            continue
+        rel = os.path.relpath(full, out_dir).replace(os.sep, "/")
+        if rel == "ENGINE-MANIFEST.json":
+            continue
+        seen.add(rel)
+
+expected_set = set(files.keys())
+missing = sorted(expected_set - seen)
+extra = sorted(seen - expected_set)
+if missing:
+    sys.stderr.write(f"depth3d: extracted engine missing files: {missing[:5]}\n")
+    sys.exit(1)
+if extra:
+    sys.stderr.write(f"depth3d: extracted engine contains unexpected files: {extra[:5]}\n")
+    sys.exit(1)
+
+engine_bin = os.path.join(out_dir, "MacOS/depth3d-stream-engine")
+if not os.access(engine_bin, os.X_OK):
+    sys.stderr.write(f"depth3d: engine binary not executable: {engine_bin}\n")
+    sys.exit(1)
+
+for rel in sorted(expected_set):
+    full = os.path.join(out_dir, rel)
+    actual = sha256_file(full)
+    if actual != files[rel]:
+        sys.stderr.write(f"depth3d: extracted file hash mismatch for {rel}\n")
+        sys.stderr.write(f"  expected: {files[rel]}\n")
+        sys.stderr.write(f"  actual:   {actual}\n")
+        sys.exit(1)
+
+print(f"depth3d: verified {len(expected_set)} extracted engine files against ENGINE-MANIFEST.json")
+PY
+}
+
+if [[ "$VERIFY_ONLY" == "1" ]]; then
+  verify_extracted_manifest "$OUT_DIR" "$ARCH" "$EXPECTED_SHA"
+  exit 0
+fi
+
+mkdir -p "$CACHE_DIR"
+
 if [[ ! -f "$DMG_PATH" ]]; then
   echo "depth3d: downloading streaming engine ${ENGINE_VERSION} (${ARCH})..."
   TMP_DMG="${DMG_PATH}.tmp.$$"
@@ -119,11 +212,12 @@ fi
 ACTUAL_SHA="$(verify_sha256 "$DMG_PATH" "$EXPECTED_SHA")"
 echo "depth3d: verified ${DMG_NAME} sha256=${ACTUAL_SHA}"
 
-MANIFEST_PATH="${OUT_DIR}/ENGINE-MANIFEST.json"
-if [[ -f "$MANIFEST_PATH" ]] && grep -q "\"sha256\": \"${ACTUAL_SHA}\"" "$MANIFEST_PATH" \
-   && [[ -x "${OUT_DIR}/MacOS/depth3d-stream-engine" ]]; then
-  echo "depth3d: extracted engine already up to date at ${OUT_DIR}"
-  exit 0
+if [[ -f "$MANIFEST_PATH" ]]; then
+  if verify_extracted_manifest "$OUT_DIR" "$ARCH" "$ACTUAL_SHA"; then
+    echo "depth3d: extracted engine verified and up to date at ${OUT_DIR}"
+    exit 0
+  fi
+  echo "depth3d: extracted engine failed integrity check; re-extracting cleanly from verified DMG..." >&2
 fi
 
 MNT_DIR="${CACHE_DIR}/mnt-sunshine-${ARCH}-$$"
@@ -169,17 +263,44 @@ if [[ -n "$BAD_LINKS" ]]; then
   exit 1
 fi
 
-cat > "$MANIFEST_PATH" <<EOF
-{
-  "component": "Sunshine",
-  "organization": "SunshineStream (formerly LizardByte)",
-  "version": "${ENGINE_VERSION}",
-  "commit": "${ENGINE_COMMIT}",
-  "arch": "${ARCH}",
-  "license": "${ENGINE_LICENSE}",
-  "sourceUrl": "${DOWNLOAD_URL}",
-  "sha256": "${ACTUAL_SHA}"
-}
-EOF
+# Record complete per-file SHA-256 inventory in ENGINE-MANIFEST.json for tamper detection.
+python3 - "$OUT_DIR" "$ENGINE_VERSION" "$ENGINE_COMMIT" "$ARCH" "$ENGINE_LICENSE" "$DOWNLOAD_URL" "$ACTUAL_SHA" <<'PY'
+import hashlib, json, os, sys
 
+out_dir, version, commit, arch, lic, url, dmg_sha = sys.argv[1:8]
+files = {}
+for root, _, filenames in os.walk(out_dir):
+    for name in filenames:
+        full = os.path.join(root, name)
+        if os.path.islink(full):
+            continue
+        rel = os.path.relpath(full, out_dir).replace(os.sep, "/")
+        if rel == "ENGINE-MANIFEST.json":
+            continue
+        h = hashlib.sha256()
+        with open(full, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        files[rel] = h.hexdigest()
+
+manifest = {
+    "component": "Sunshine",
+    "organization": "SunshineStream (formerly LizardByte)",
+    "version": version,
+    "commit": commit,
+    "arch": arch,
+    "license": lic,
+    "sourceUrl": url,
+    "sha256": dmg_sha,
+    "files": dict(sorted(files.items())),
+}
+with open(os.path.join(out_dir, "ENGINE-MANIFEST.json"), "w", encoding="utf-8") as f:
+    json.dump(manifest, f, indent=2)
+    f.write("\n")
+PY
+
+verify_extracted_manifest "$OUT_DIR" "$ARCH" "$ACTUAL_SHA"
 echo "depth3d: extracted streaming engine to ${OUT_DIR}"

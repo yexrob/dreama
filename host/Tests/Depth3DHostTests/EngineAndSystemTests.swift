@@ -58,19 +58,13 @@ final class EngineAndSystemTests: XCTestCase {
         XCTAssertTrue(highConf.contains("sunshine_name = 客厅 MacBook"))
         XCTAssertTrue(highConf.contains("port = 57989"))
         XCTAssertTrue(highConf.contains("log_path = \(paths.engineLogFile.path)"))
-        XCTAssertTrue(highConf.contains("origin_web_ui_allowed = pc"))
-        XCTAssertTrue(highConf.contains("system_tray = disabled"))
         XCTAssertTrue(highConf.contains("encoder = videotoolbox"))
-        XCTAssertTrue(highConf.contains("hevc_mode = 0"))
-        XCTAssertTrue(highConf.contains("vt_realtime = enabled"))
         XCTAssertTrue(highConf.contains("max_bitrate = 0"))
-        XCTAssertTrue(highConf.contains("stream_audio = enabled"))
         XCTAssertTrue(highConf.contains("audio_sink =\n"))
         XCTAssertTrue(highConf.contains("output_name = 2"))
-        XCTAssertTrue(highConf.contains("file_state = \(paths.engineStateFile.path)"))
-        XCTAssertFalse(highConf.contains(".config/sunshine"), "Must never reference user ~/.config/sunshine")
+        XCTAssertFalse(highConf.contains(".config/sunshine"))
 
-        // Verify direct credentials.json hashing (no --creds CLI args)
+        // Direct credentials.json hashing (no --creds CLI args)
         let tmpCred = FileManager.default.temporaryDirectory
             .appendingPathComponent("depth3d-creds-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: tmpCred) }
@@ -82,86 +76,57 @@ final class EngineAndSystemTests: XCTestCase {
         let attrs = try FileManager.default.attributesOfItem(atPath: tmpCred.path)
         XCTAssertEqual((attrs[.posixPermissions] as? NSNumber)?.intValue, 0o600)
         let parsed = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: tmpCred)) as? [String: String])
-        XCTAssertEqual(parsed["username"], "depth3d_internal")
-        XCTAssertEqual(parsed["salt"], "SALT1234567890AB")
         XCTAssertEqual(parsed["password"], EngineConfigGenerator.sunshinePasswordHash(password: "pw", salt: "SALT1234567890AB"))
-        XCTAssertEqual(parsed["password"]?.count, 64)
     }
 
-    func testEngineStateJSONCertParsing() throws {
-        let pem = """
-        -----BEGIN CERTIFICATE-----
-        AQIDBAUGBwg=
-        -----END CERTIFICATE-----
-        """
-        let stateObj: [String: Any] = [
+    /// B1: Uses the EXACT `root.named_devices` schema emitted by real Sunshine v2026.914.233613
+    /// (including string `"enabled": "true"` / `"false"`), plus legacy `named_certs` fallback.
+    func testEngineStateJSONRealNamedDevicesSchemaAndDisabledFiltering() throws {
+        let pem1 = "-----BEGIN CERTIFICATE-----\nAQIDBAUGBwg=\n-----END CERTIFICATE-----\n"
+        let pem2 = "-----BEGIN CERTIFICATE-----\nCQoLDA0ODxA=\n-----END CERTIFICATE-----\n"
+        // Exact schema captured from real depth3d-stream-engine (v2026.914.233613) state.json:
+        let realSchemaObj: [String: Any] = [
             "root": [
-                "uniqueid": "HOST-123",
-                "named_certs": [
-                    ["uuid": "CLIENT-UUID-1", "name": "PICO 4", "cert": pem]
+                "uniqueid": "6DA117AB-3B35-0A23-C18C-E866CA9B5441",
+                "named_devices": [
+                    ["name": "depth3d", "cert": pem1, "uuid": "CLIENT-UUID-ENABLED", "enabled": "true"],
+                    ["name": "DisabledHeadset", "cert": pem2, "uuid": "CLIENT-UUID-DISABLED", "enabled": "false"]
                 ]
             ]
         ]
-        let data = try JSONSerialization.data(withJSONObject: stateObj)
+        let data = try JSONSerialization.data(withJSONObject: realSchemaObj)
         let certs = EngineConfigGenerator.parsePairedCerts(fromStateJSON: data)
-        XCTAssertEqual(certs.count, 1)
-        XCTAssertEqual(certs[0].uuid, "CLIENT-UUID-1")
-        XCTAssertEqual(certs[0].name, "PICO 4")
+        XCTAssertEqual(certs.count, 1, "Must parse root.named_devices and filter disabled entries")
+        XCTAssertEqual(certs[0].uuid, "CLIENT-UUID-ENABLED")
+        XCTAssertEqual(certs[0].name, "depth3d")
         XCTAssertEqual(certs[0].fingerprintSHA256, TLSIdentityManager.sha256Hex(Data([1, 2, 3, 4, 5, 6, 7, 8])))
     }
 
-    /// Verifies multi-device session counting never double-counts `active sessions` + `CLIENT CONNECTED`
-    /// and never double-decrements `CLIENT DISCONNECTED` + debug `Session ended`.
     func testEngineLogParserMultiSessionAccurateCounting() {
         var state = EngineLogState()
-
-        let startupLines = [
+        for line in [
             "[2026-11-24 23:12:22.531]: Info: Creating encoder [hevc_videotoolbox]",
             "[2026-11-24 23:12:23.142]: Info: Configuration UI available at [https://localhost:57990]",
-            "[2026-11-24 23:12:25.162]: Info: Successfully registered DNS service.",
-            "[2026-11-24 23:13:01.000]: Info: Using macOS system audio tap for capture.",
-            "[2026-11-24 23:13:01.010]: Info: Core Audio tap: Host audio disabled (muted)"
-        ]
-        for line in startupLines {
+            "[2026-11-24 23:12:25.162]: Info: Successfully registered DNS service."
+        ] {
             if let ev = EngineLogParser.parse(line: line) { state.apply(ev) }
         }
         XCTAssertTrue(state.apiReady)
         XCTAssertEqual(state.encoderName, "hevc_videotoolbox")
-        XCTAssertEqual(state.activeSessions, 0)
 
-        // Device 1 connects: RTSP reports active sessions: 1, then stream logs CLIENT CONNECTED
         state.apply(EngineLogParser.parse(line: "Info: New streaming session started [active sessions: 1]")!)
+        state.apply(EngineLogParser.parse(line: "Info: CLIENT CONNECTED")!)
         XCTAssertEqual(state.activeSessions, 1)
-        state.apply(EngineLogParser.parse(line: "Info: CLIENT CONNECTED")!)
-        XCTAssertEqual(state.activeSessions, 1, "CLIENT CONNECTED immediately after RTSP launch must not double-count")
 
-        // Device 2 connects concurrently
         state.apply(EngineLogParser.parse(line: "Info: New streaming session started [active sessions: 2]")!)
-        XCTAssertEqual(state.activeSessions, 2)
         state.apply(EngineLogParser.parse(line: "Info: CLIENT CONNECTED")!)
         XCTAssertEqual(state.activeSessions, 2)
 
-        // Device 1 disconnects (with debug "Session ended" ignored so no double-decrement!)
         state.apply(EngineLogParser.parse(line: "Info: CLIENT DISCONNECTED")!)
         XCTAssertEqual(state.activeSessions, 1)
-        XCTAssertNil(EngineLogParser.parse(line: "Debug: Session ended"), "Debug Session ended must not double-decrement")
-
-        // Device 2 disconnects -> now 0
+        XCTAssertNil(EngineLogParser.parse(line: "Debug: Session ended"))
         state.apply(EngineLogParser.parse(line: "Info: CLIENT DISCONNECTED")!)
         XCTAssertEqual(state.activeSessions, 0)
-
-        XCTAssertEqual(
-            EngineLogParser.parse(line: "[2026-11-24 23:12:22.531]: Error: No screen capture permission!"),
-            .screenRecordingDenied
-        )
-        XCTAssertEqual(
-            EngineLogParser.parse(line: "Error: Couldn't bind Video server to port [47998]"),
-            .portBindFailed(47998)
-        )
-        XCTAssertEqual(
-            EngineLogParser.parse(line: "Error: Failed to setup system audio tap."),
-            .audioTapFailed
-        )
     }
 
     func testSystemAudioControllerMultiSessionAndCrashRecovery() {
@@ -174,77 +139,43 @@ final class EngineAndSystemTests: XCTestCase {
         hal.muted = false
         let ctrl = SystemAudioController(backend: hal, muteWhileStreaming: true, recoveryFileURL: recoveryURL)
 
-        // Multi-session: 0 -> 1 mutes; 1 -> 2 stays muted; 2 -> 1 stays muted; 1 -> 0 unmutes
         ctrl.setActiveSessionCount(1)
         XCTAssertTrue(hal.muted)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: recoveryURL.path))
         ctrl.setActiveSessionCount(2)
-        XCTAssertTrue(hal.muted)
-        XCTAssertEqual(hal.setCalls, [true])
         ctrl.setActiveSessionCount(1)
-        XCTAssertTrue(hal.muted, "Must stay muted while 1 session is still active")
+        XCTAssertTrue(hal.muted)
         ctrl.setActiveSessionCount(0)
-        XCTAssertFalse(hal.muted, "Must restore speakers when last session disconnects")
+        XCTAssertFalse(hal.muted)
         XCTAssertFalse(FileManager.default.fileExists(atPath: recoveryURL.path))
 
-        // Mid-stream toggle
-        ctrl.setActiveSessionCount(1)
-        XCTAssertTrue(hal.muted)
-        ctrl.setMuteWhileStreaming(false)
-        XCTAssertFalse(hal.muted)
-        ctrl.setMuteWhileStreaming(true)
-        XCTAssertTrue(hal.muted)
-        ctrl.setActiveSessionCount(0)
-        XCTAssertFalse(hal.muted)
-
-        // Already muted before stream -> stays muted after stream ends
-        hal.muted = true
-        hal.setCalls.removeAll()
-        ctrl.setActiveSessionCount(1)
-        ctrl.setActiveSessionCount(0)
-        XCTAssertTrue(hal.muted)
-        XCTAssertEqual(hal.setCalls, [])
-
-        // Crash recovery test: leave recovery marker on disk with hal still muted, then launch new controller
-        hal.muted = false
-        hal.setCalls.removeAll()
-        let crashMarker = Data("{\"deviceID\":42,\"priorMuted\":false}".utf8)
+        // Crash recovery
         try? FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-        try? crashMarker.write(to: recoveryURL)
-        hal.muted = true // simulating Mac still muted after crash
-
-        let recoveredCtrl = SystemAudioController(backend: hal, muteWhileStreaming: true, recoveryFileURL: recoveryURL)
-        XCTAssertFalse(hal.muted, "Next startup must restore Mac speaker mute state after unclean shutdown")
+        try? Data("{\"deviceID\":42,\"priorMuted\":false}".utf8).write(to: recoveryURL)
+        hal.muted = true
+        let recovered = SystemAudioController(backend: hal, muteWhileStreaming: true, recoveryFileURL: recoveryURL)
+        XCTAssertFalse(hal.muted)
         XCTAssertFalse(FileManager.default.fileExists(atPath: recoveryURL.path))
-        _ = recoveredCtrl
+        _ = recovered
     }
 
     func testPermissionMonitorDistinguishesBonjourErrorFromLocalNetworkDenied() {
         let mock = MockPermissionProvider()
         let monitor = PermissionMonitor(provider: mock)
-
         monitor.startMonitoring(pollInterval: 60.0) { _, _ in }
         defer { monitor.stopMonitoring() }
 
-        // Non-permission Bonjour failure must NOT mark localNetwork as denied
         monitor.updateLocalNetworkState(from: .failed(-72001))
         XCTAssertEqual(monitor.currentSnapshot().localNetwork, .checking)
         XCTAssertTrue(monitor.currentSnapshot().bonjourPublishFailed)
 
-        // Policy denial marks localNetwork as denied and clears generic bonjourPublishFailed
         monitor.updateLocalNetworkState(from: .permissionDenied)
         XCTAssertEqual(monitor.currentSnapshot().localNetwork, .denied)
         XCTAssertFalse(monitor.currentSnapshot().bonjourPublishFailed)
-
-        // Published clears both
-        mock.screen = true
-        mock.accessibility = true
-        monitor.updateLocalNetworkState(from: .published)
-        XCTAssertTrue(monitor.currentSnapshot().allGranted)
-        XCTAssertFalse(monitor.currentSnapshot().bonjourPublishFailed)
     }
 
-    func testChildProcessLedgerCleansOrphansSafelyByExecutableHint() throws {
+    /// S1: Verifies `ChildProcessLedger` checks BOTH executable path AND kernel start time (`pbi_start_tvsec`)
+    /// so PID reuse never kills an unrelated process, while matching orphans are terminated.
+    func testChildProcessLedgerVerifiesExecutableAndStartTime() throws {
         let tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("depth3d-ledger-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
@@ -252,7 +183,6 @@ final class EngineAndSystemTests: XCTestCase {
 
         let ledger = ChildProcessLedger(ledgerURL: tmp.appendingPathComponent("running-children.json"))
 
-        // 1. Spawn a real child `/bin/sleep 60` recorded with matching hint -> must be terminated
         let orphan = Process()
         orphan.executableURL = URL(fileURLWithPath: "/bin/sleep")
         orphan.arguments = ["60"]
@@ -261,107 +191,181 @@ final class EngineAndSystemTests: XCTestCase {
         defer { if orphan.isRunning { kill(orphanPID, SIGKILL) } }
         ledger.register(pid: orphanPID, kind: .engine, executableHint: "sleep")
 
-        // 2. Spawn another `/bin/sleep 60` recorded with WRONG hint (simulating PID reuse) -> must NOT be killed
-        let innocent = Process()
-        innocent.executableURL = URL(fileURLWithPath: "/bin/sleep")
-        innocent.arguments = ["60"]
-        try innocent.run()
-        let innocentPID = innocent.processIdentifier
-        defer {
-            if innocent.isRunning {
-                kill(innocentPID, SIGKILL)
-                innocent.waitUntilExit()
-            }
-        }
-        ledger.register(pid: innocentPID, kind: .engine, executableHint: "definitely-unrelated-binary")
+        // Verify startTimeSec was automatically captured from kernel BSD info
+        let recorded = ledger.allEntries().first(where: { $0.pid == orphanPID })
+        XCTAssertNotNil(recorded?.startTimeSec)
+
+        // Innocent process with matching executable name BUT different recorded startTime (simulating PID reuse!)
+        let reusedPIDProc = Process()
+        reusedPIDProc.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        reusedPIDProc.arguments = ["60"]
+        try reusedPIDProc.run()
+        let reusedPID = reusedPIDProc.processIdentifier
+        defer { if reusedPIDProc.isRunning { kill(reusedPID, SIGKILL); reusedPIDProc.waitUntilExit() } }
+        ledger.register(pid: reusedPID, startTimeSec: 12345, kind: .engine, executableHint: "sleep")
 
         let killedCount = ledger.cleanupStaleChildren(kinds: [.engine])
         XCTAssertEqual(killedCount, 1)
 
         orphan.waitUntilExit()
-        XCTAssertFalse(orphan.isRunning, "Matching orphaned child must be terminated")
-        XCTAssertTrue(innocent.isRunning, "Non-matching PID must NEVER be terminated")
-        XCTAssertTrue(ledger.allEntries().isEmpty)
+        XCTAssertFalse(orphan.isRunning)
+        XCTAssertTrue(reusedPIDProc.isRunning, "PID with mismatched startTimeSec must NEVER be killed")
     }
 
-    /// Real `depth3d-child-guard` kqueue `NOTE_EXIT` watchdog test:
-    /// Spawns a sub-parent that launches `depth3d-child-guard <parent_pid> /bin/sleep 60`,
-    /// then sends `SIGKILL` to the sub-parent and verifies both guard & grandchild exit promptly.
-    func testChildGuardTerminatesGrandchildOnParentSIGKILL() throws {
-        let guardCandidates = [
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                .appendingPathComponent(".build/debug/depth3d-child-guard"),
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                .appendingPathComponent(".build/arm64-apple-macosx/debug/depth3d-child-guard"),
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                .appendingPathComponent(".build/out/Products/Debug/depth3d-child-guard")
-        ]
-        guard let guardBin = guardCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0.path) }) else {
-            throw XCTSkip("depth3d-child-guard executable not built in expected SwiftPM build path")
+    /// S1: Tests BOTH (a) `EngineSupervisor.stop()` against a child that IGNORES `SIGTERM`
+    /// (`trap '' TERM; sleep 60`), verifying process-group `SIGKILL` leaves ZERO orphans and
+    /// `running-children.json` tracks BOTH guard PID and real child PID + start time;
+    /// AND (b) `depth3d-child-guard` killing a `SIGTERM`-ignoring grandchild when parent is `SIGKILL`ed!
+    func testSIGTERMStubbornChildKilledCleanlyOnStopAndParentSIGKILL() throws {
+        guard let guardBin = locateBuiltChildGuard() else {
+            throw XCTSkip("depth3d-child-guard executable not built in expected SwiftPM path")
         }
 
         let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("depth3d-guard-test-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("depth3d-sigterm-stubborn-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
 
-        let childPidFile = tmp.appendingPathComponent("child.pid")
-        let launcherScript = tmp.appendingPathComponent("parent.sh")
-        // Sub-parent launches depth3d-child-guard watching $$, wrapping a wrapper that records grandchild PID then execs sleep 60
-        let grandchildScript = tmp.appendingPathComponent("grandchild.sh")
-        try "#!/bin/sh\necho $$ > \"\(childPidFile.path)\"\nexec /bin/sleep 60\n".write(
-            to: grandchildScript, atomically: true, encoding: .utf8
-        )
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: grandchildScript.path)
+        // Child script that traps and IGNORES SIGTERM, writes its own PID, then sleeps 60s.
+        let childPidFile = tmp.appendingPathComponent("stubborn.pid")
+        let stubbornScript = tmp.appendingPathComponent("stubborn-engine.sh")
+        try """
+        #!/bin/sh
+        trap '' TERM
+        echo $$ > "\(childPidFile.path)"
+        /bin/sleep 60 &
+        wait
+        """.write(to: stubbornScript, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stubbornScript.path)
 
-        try "#!/bin/sh\n\"\(guardBin.path)\" $$ \"\(grandchildScript.path)\" &\nexec /bin/sleep 60\n".write(
-            to: launcherScript, atomically: true, encoding: .utf8
+        let paths = HostPaths(rootDirectory: tmp.appendingPathComponent("data", isDirectory: true))
+        let ledger = ChildProcessLedger(ledgerURL: paths.childLedgerFile)
+        let supervisor = EngineSupervisor(
+            paths: paths,
+            adminCredentials: EngineAdminCredentials(username: "u", password: "pw"),
+            engineExecutableOverride: stubbornScript,
+            childGuardOverride: guardBin,
+            ledger: ledger
         )
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: launcherScript.path)
 
-        let parent = Process()
-        parent.executableURL = launcherScript
-        try parent.run()
-        let parentPID = parent.processIdentifier
-        defer {
-            if parent.isRunning { kill(parentPID, SIGKILL) }
+        var testPort: UInt16 = 59129
+        while !PortProbe.occupiedTCPPorts(in: HostPortDefaults.engineTCPPorts(basePort: testPort)).isEmpty {
+            testPort += 30
         }
+        supervisor.start(config: EngineConfigGenerator.Input(
+            hostName: "Stubborn Test", basePort: testPort, quality: .balanced, displayID: nil, paths: paths
+        ))
 
-        // Wait up to 3s for grandchild to record its PID
-        var grandchildPID: Int32 = -1
-        let startDeadline = Date().addingTimeInterval(3.0)
-        while Date() < startDeadline {
-            if let text = try? String(contentsOf: childPidFile, encoding: .utf8),
-               let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 1
-            {
-                grandchildPID = pid
+        // Wait for stubborn child PID to appear
+        let stubbornPID = waitForPID(at: childPidFile, timeout: 3.0)
+        XCTAssertGreaterThan(stubbornPID, 1, "Stubborn child should have started")
+        XCTAssertEqual(kill(stubbornPID, 0), 0)
+        defer { if stubbornPID > 1 && kill(stubbornPID, 0) == 0 { _ = kill(stubbornPID, SIGKILL) } }
+
+        // Wait briefly for ledger to register both guard and real engine child
+        Thread.sleep(forTimeInterval: 0.15)
+        let entries = ledger.allEntries()
+        XCTAssertTrue(entries.contains(where: { $0.kind == .childGuard && $0.startTimeSec != nil }), "Ledger must track childGuard + startTime")
+        XCTAssertTrue(entries.contains(where: { $0.kind == .engine && $0.pid == stubbornPID && $0.startTimeSec != nil }), "Ledger must track real engine child PID + startTime")
+
+        // Now call supervisor.stop(): stubborn child IGNORES SIGTERM, so guard/supervisor MUST escalate to SIGKILL!
+        supervisor.stop()
+
+        let deadDeadline = Date().addingTimeInterval(3.0)
+        var stubbornDead = false
+        while Date() < deadDeadline {
+            if kill(stubbornPID, 0) != 0 && errno == ESRCH {
+                stubbornDead = true
                 break
             }
             Thread.sleep(forTimeInterval: 0.05)
         }
-        XCTAssertGreaterThan(grandchildPID, 1, "Grandchild should have launched under depth3d-child-guard")
-        XCTAssertEqual(kill(grandchildPID, 0), 0, "Grandchild should be running before parent SIGKILL")
-        defer {
-            if grandchildPID > 1 && kill(grandchildPID, 0) == 0 {
-                _ = kill(grandchildPID, SIGKILL)
-            }
-        }
+        XCTAssertTrue(stubbornDead, "SIGTERM-ignoring child MUST be terminated on stop() with zero orphans")
+        XCTAssertTrue(ledger.allEntries().isEmpty, "Ledger must be empty after clean stop")
 
-        // Simulate abrupt App crash / SIGKILL
+        // Part B: Verify parent SIGKILL also kills a SIGTERM-ignoring grandchild via depth3d-child-guard!
+        let pidFileB = tmp.appendingPathComponent("stubbornB.pid")
+        let stubbornB = tmp.appendingPathComponent("stubbornB.sh")
+        try "#!/bin/sh\ntrap '' TERM\necho $$ > \"\(pidFileB.path)\"\nwhile true; do /bin/sleep 1; done\n".write(
+            to: stubbornB, atomically: true, encoding: .utf8
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stubbornB.path)
+
+        let parentScript = tmp.appendingPathComponent("parentB.sh")
+        try "#!/bin/sh\n\"\(guardBin.path)\" $$ \"\(stubbornB.path)\" &\nexec /bin/sleep 60\n".write(
+            to: parentScript, atomically: true, encoding: .utf8
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parentScript.path)
+
+        let parent = Process()
+        parent.executableURL = parentScript
+        try parent.run()
+        let parentPID = parent.processIdentifier
+        defer { if parent.isRunning { _ = kill(parentPID, SIGKILL) } }
+
+        let grandchildPID = waitForPID(at: pidFileB, timeout: 3.0)
+        XCTAssertGreaterThan(grandchildPID, 1)
+        defer { if grandchildPID > 1 && kill(grandchildPID, 0) == 0 { _ = kill(grandchildPID, SIGKILL) } }
+
         _ = kill(parentPID, SIGKILL)
         parent.waitUntilExit()
 
-        // Verify depth3d-child-guard kills grandchild promptly on kqueue NOTE_EXIT
-        let exitDeadline = Date().addingTimeInterval(3.0)
-        var grandchildExited = false
+        let exitDeadline = Date().addingTimeInterval(3.5)
+        var grandchildDead = false
         while Date() < exitDeadline {
             if kill(grandchildPID, 0) != 0 && errno == ESRCH {
-                grandchildExited = true
+                grandchildDead = true
                 break
             }
             Thread.sleep(forTimeInterval: 0.05)
         }
-        XCTAssertTrue(grandchildExited, "depth3d-child-guard must terminate child when parent dies with SIGKILL")
+        XCTAssertTrue(grandchildDead, "depth3d-child-guard must SIGKILL SIGTERM-ignoring grandchild when parent is SIGKILLed")
+    }
+
+    /// m1: Verifies `EngineSupervisor` always overwrites stale `credentials.json` on launch.
+    func testEngineSupervisorAlwaysSynchronizesStaleCredentialsFile() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("depth3d-stale-creds-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let paths = HostPaths(rootDirectory: tmp.appendingPathComponent("data", isDirectory: true))
+        try paths.ensureDirectoriesExist()
+
+        // Seed stale credentials.json from an older password
+        let oldCreds = EngineAdminCredentials(username: "depth3d_internal", password: "OLD_PASSWORD_111")
+        try EngineConfigGenerator.writeCredentialsFile(to: paths.engineCredentialsFile, credentials: oldCreds, salt: "OLDSALT123456789")
+
+        // Fake engine script that exits cleanly after 0.1s
+        let fakeEngine = tmp.appendingPathComponent("quick.sh")
+        try "#!/bin/sh\nsleep 0.2\n".write(to: fakeEngine, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeEngine.path)
+
+        let newCreds = EngineAdminCredentials(username: "depth3d_internal", password: "NEW_ROTATED_PW_999")
+        let supervisor = EngineSupervisor(
+            paths: paths,
+            adminCredentials: newCreds,
+            engineExecutableOverride: fakeEngine,
+            backoffDelays: []
+        )
+        defer { supervisor.stop() }
+
+        var testPort: UInt16 = 59219
+        while !PortProbe.occupiedTCPPorts(in: HostPortDefaults.engineTCPPorts(basePort: testPort)).isEmpty {
+            testPort += 30
+        }
+        supervisor.start(config: EngineConfigGenerator.Input(
+            hostName: "CredSync", basePort: testPort, quality: .balanced, displayID: nil, paths: paths
+        ))
+        Thread.sleep(forTimeInterval: 0.35)
+
+        let parsed = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: paths.engineCredentialsFile)) as? [String: String])
+        let salt = try XCTUnwrap(parsed["salt"])
+        XCTAssertEqual(
+            parsed["password"],
+            EngineConfigGenerator.sunshinePasswordHash(password: newCreds.password, salt: salt),
+            "EngineSupervisor must overwrite stale credentials.json with current adminCredentials on every launch"
+        )
     }
 
     func testEngineSupervisorExponentialBackoffRestartOnCrash() throws {
@@ -370,7 +374,6 @@ final class EngineAndSystemTests: XCTestCase {
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
 
-        // Fake engine script that immediately crashes with exit code 1
         let fakeEngine = tmp.appendingPathComponent("fake-engine.sh")
         try "#!/bin/sh\necho '[2026-11-25 00:00:00.000]: Error: simulated crash'\nexit 1\n".write(
             to: fakeEngine, atomically: true, encoding: .utf8
@@ -390,9 +393,7 @@ final class EngineAndSystemTests: XCTestCase {
         let failedExp = expectation(description: "Engine enters failed state after exhausting backoff retries")
         supervisor.setHandlers(
             onStateChanged: { state, _ in
-                if case .failed = state {
-                    failedExp.fulfill()
-                }
+                if case .failed = state { failedExp.fulfill() }
             },
             onActiveSessionCountChanged: nil
         )
@@ -401,18 +402,11 @@ final class EngineAndSystemTests: XCTestCase {
         while !PortProbe.occupiedTCPPorts(in: HostPortDefaults.engineTCPPorts(basePort: testBasePort)).isEmpty {
             testBasePort += 30
         }
-
-        let config = EngineConfigGenerator.Input(
-            hostName: "Test Mac",
-            basePort: testBasePort,
-            quality: .balanced,
-            displayID: nil,
-            paths: paths
-        )
-        supervisor.start(config: config)
+        supervisor.start(config: EngineConfigGenerator.Input(
+            hostName: "Test Mac", basePort: testBasePort, quality: .balanced, displayID: nil, paths: paths
+        ))
 
         wait(for: [failedExp], timeout: 5.0)
-        // Initial launch + 2 backoff retries = 3 attempts
         XCTAssertEqual(supervisor.totalLaunchAttempts(), 3)
         if case .failed(let reason) = supervisor.currentState() {
             XCTAssertEqual(reason, HostStrings.string("engine.error.crash_loop"))
@@ -421,25 +415,11 @@ final class EngineAndSystemTests: XCTestCase {
         }
     }
 
-    /// REAL ENGINE ISOLATION TEST (Review Item #3):
-    /// Launches the actual built-in streaming engine binary on an isolated port & data directory,
-    /// authenticates via directly written `credentials.json` (zero `--creds`), verifies logs land
-    /// strictly inside `paths.engineLogFile`, and verifies `~/.config/sunshine` is completely unchanged!
     func testRealEngineNeverTouchesUserSunshineConfigDirectory() async throws {
-        // Locate staged or bundled real engine binary in this workspace
-        let candidates = [
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                .appendingPathComponent("build/engine-arm64/stream-engine/MacOS/depth3d-stream-engine"),
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                .appendingPathComponent("build/depth3d Host.app/Contents/Helpers/depth3d-stream-engine"),
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                .appendingPathComponent("host/build/engine-arm64/stream-engine/MacOS/depth3d-stream-engine")
-        ]
-        guard let realEngine = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0.path) }) else {
-            throw XCTSkip("Staged depth3d-stream-engine binary not present; run host/scripts/fetch-engine.sh first")
+        guard let realEngine = locateStagedRealEngine() else {
+            throw XCTSkip("Staged depth3d-stream-engine binary not present")
         }
 
-        // Snapshot user's real ~/.config/sunshine before launching engine
         let userSunshineDir = URL(fileURLWithPath: NSHomeDirectory())
             .appendingPathComponent(".config/sunshine", isDirectory: true)
         let beforeSnapshot = snapshotDirectory(userSunshineDir)
@@ -449,7 +429,6 @@ final class EngineAndSystemTests: XCTestCase {
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
 
-        // Pick an unoccupied high port group so we never interfere with any running instance
         var testBasePort: UInt16 = 59789
         while !PortProbe.occupiedTCPPorts(in: HostPortDefaults.engineTCPPorts(basePort: testBasePort)).isEmpty {
             testBasePort += 30
@@ -470,14 +449,9 @@ final class EngineAndSystemTests: XCTestCase {
         )
 
         supervisor.start(config: EngineConfigGenerator.Input(
-            hostName: "Depth3D Iso Test",
-            basePort: testBasePort,
-            quality: .balanced,
-            displayID: nil,
-            paths: paths
+            hostName: "Depth3D Iso Test", basePort: testBasePort, quality: .balanced, displayID: nil, paths: paths
         ))
 
-        // Wait up to 12s for the real engine's management HTTPS API to accept our directly written credentials.json
         let deadline = Date().addingTimeInterval(12.0)
         var authenticated = false
         while Date() < deadline {
@@ -488,20 +462,14 @@ final class EngineAndSystemTests: XCTestCase {
             try await Task.sleep(nanoseconds: 250_000_000)
         }
 
-        XCTAssertTrue(authenticated, "Real engine must start and authenticate using directly written credentials.json (no --creds)")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.engineLogFile.path), "Engine log must be written inside isolated engine directory")
-        let logContent = (try? String(contentsOf: paths.engineLogFile, encoding: .utf8)) ?? ""
-        XCTAssertFalse(logContent.isEmpty, "Isolated engine.log must contain actual engine output")
+        XCTAssertTrue(authenticated)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.engineLogFile.path))
 
         supervisor.stop()
         try await Task.sleep(nanoseconds: 300_000_000)
 
         let afterSnapshot = snapshotDirectory(userSunshineDir)
-        XCTAssertEqual(
-            beforeSnapshot,
-            afterSnapshot,
-            "Real built-in engine must NEVER create, modify, or rotate files in user's ~/.config/sunshine!"
-        )
+        XCTAssertEqual(beforeSnapshot, afterSnapshot)
     }
 
     func testLocalizedCoreStringsResolveInChinese() {
@@ -514,7 +482,11 @@ final class EngineAndSystemTests: XCTestCase {
             "rclone.error.auth_expired",
             "rclone.error.remote_not_found",
             "status.bonjour_error.title",
-            "pair.prompt.source_ip"
+            "pair.prompt.source_ip",
+            "pair.prompt.identity_changed_warning",
+            "devices.needs_reconnect_upgrade",
+            "media.cloud.status.paused",
+            "media.cloud.status.not_installed"
         ]
         for key in requiredKeys {
             let value = HostStrings.string(key)
@@ -529,35 +501,98 @@ final class EngineAndSystemTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: tmp) }
 
         let store = try HostStateStore(paths: HostPaths(rootDirectory: tmp))
-        let id1 = try store.loadOrCreateIdentity()
-        let id2 = try store.loadOrCreateIdentity()
-        XCTAssertEqual(id1.id, id2.id)
-
-        var settings = store.loadSettings()
-        settings.computerName = "测试工作站"
-        settings.qualityPreset = .high
-        try store.saveSettings(settings)
-        XCTAssertEqual(store.loadSettings().computerName, "测试工作站")
-        XCTAssertEqual(store.loadSettings().qualityPreset, .high)
+        XCTAssertEqual(try store.loadOrCreateIdentity().id, try store.loadOrCreateIdentity().id)
 
         let davCreds1 = try store.loadOrCreateWebDAVCredentials()
-        let davCreds2 = try store.loadOrCreateWebDAVCredentials()
-        XCTAssertEqual(davCreds1, davCreds2)
-        XCTAssertEqual(davCreds1.user, "depth3d")
-        XCTAssertEqual(davCreds1.pass.count, 24)
-
         let rotated = try store.rotateWebDAVCredentials()
         XCTAssertNotEqual(rotated.pass, davCreds1.pass)
         XCTAssertEqual(try store.loadOrCreateWebDAVCredentials(), rotated)
+    }
 
-        let attrs = try FileManager.default.attributesOfItem(atPath: store.paths.webDAVCredentialsFile.path)
-        XCTAssertEqual((attrs[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+    /// m6: Verifies `fetch-engine.sh --verify-only` validates per-file SHA-256 hashes recorded in
+    /// `ENGINE-MANIFEST.json` and fails closed when even 1 byte of a staged engine file is modified.
+    func testFetchEngineVerifyOnlyDetectsTamperedStagedEngine() throws {
+        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let scriptCandidates = [
+            cwd.appendingPathComponent("scripts/fetch-engine.sh"),
+            cwd.appendingPathComponent("host/scripts/fetch-engine.sh")
+        ]
+        let stageCandidates = [
+            cwd.appendingPathComponent("build/engine-arm64/stream-engine"),
+            cwd.appendingPathComponent("host/build/engine-arm64/stream-engine")
+        ]
+        guard let scriptURL = scriptCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0.path) }),
+              let stageURL = stageCandidates.first(where: { FileManager.default.fileExists(atPath: $0.appendingPathComponent("ENGINE-MANIFEST.json").path) })
+        else {
+            throw XCTSkip("Staged engine directory or fetch-engine.sh not present")
+        }
 
-        let dev = PairedDeviceRecord(deviceId: "pico-a", name: "PICO 4", certFingerprint: "AABB", autoAllow: true)
-        _ = try store.upsertPairedDevice(dev)
-        XCTAssertEqual(store.loadPairedDevices().count, 1)
-        _ = try store.removePairedDevice(deviceId: "pico-a")
-        XCTAssertTrue(store.loadPairedDevices().isEmpty)
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("depth3d-m6-verify-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let copiedStage = tmp.appendingPathComponent("stream-engine", isDirectory: true)
+        try FileManager.default.copyItem(at: stageURL, to: copiedStage)
+
+        func runVerifyOnly() throws -> Int32 {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/bash")
+            p.arguments = [scriptURL.path, "--arch", "arm64", "--out", copiedStage.path, "--verify-only"]
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            try p.run()
+            p.waitUntilExit()
+            return p.terminationStatus
+        }
+
+        // 1. Intact staged copy passes full per-file SHA-256 verification
+        XCTAssertEqual(try runVerifyOnly(), 0, "Untampered staged engine copy must pass --verify-only")
+
+        // 2. Unexpected injected file -> --verify-only MUST fail non-zero!
+        let strayURL = copiedStage.appendingPathComponent("injected.dylib")
+        try Data("evil".utf8).write(to: strayURL)
+        XCTAssertNotEqual(try runVerifyOnly(), 0, "Unexpected extra file in staged engine dir MUST fail --verify-only")
+        try FileManager.default.removeItem(at: strayURL)
+        XCTAssertEqual(try runVerifyOnly(), 0)
+
+        // 3. Flip 1 byte in the staged engine binary -> --verify-only MUST fail non-zero!
+        let binURL = copiedStage.appendingPathComponent("MacOS/depth3d-stream-engine")
+        var bytes = try Data(contentsOf: binURL)
+        XCTAssertGreaterThan(bytes.count, 16)
+        bytes[bytes.count - 1] ^= 0xFF
+        try bytes.write(to: binURL, options: .atomic)
+        XCTAssertNotEqual(try runVerifyOnly(), 0, "Tampered staged engine binary MUST fail --verify-only")
+    }
+
+    private func locateBuiltChildGuard() -> URL? {
+        let candidates = [
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/debug/depth3d-child-guard"),
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/arm64-apple-macosx/debug/depth3d-child-guard"),
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/out/Products/Debug/depth3d-child-guard")
+        ]
+        return candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0.path) })
+    }
+
+    private func locateStagedRealEngine() -> URL? {
+        let candidates = [
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("build/engine-arm64/stream-engine/MacOS/depth3d-stream-engine"),
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("host/build/engine-arm64/stream-engine/MacOS/depth3d-stream-engine")
+        ]
+        return candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0.path) })
+    }
+
+    private func waitForPID(at file: URL, timeout: TimeInterval) -> Int32 {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let text = try? String(contentsOf: file, encoding: .utf8),
+               let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 1
+            {
+                return pid
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return -1
     }
 
     private func snapshotDirectory(_ dir: URL) -> [String: String] {

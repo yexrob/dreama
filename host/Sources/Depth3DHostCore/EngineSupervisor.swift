@@ -53,10 +53,12 @@ public enum PortProbe {
 }
 
 /// Supervises the built-in streaming engine child process:
-/// - Writes isolated config & hashed credentials (`0600`) inside `Application Support/depth3d Host/engine/`
-///   (never passes passwords on CLI, never touches `~/.config/sunshine`)
-/// - Sets isolated `HOME` & `log_path` so all engine logs and appdata stay inside `engineDir`
-/// - Wraps child launch with `depth3d-child-guard` (kqueue `NOTE_EXIT`) + `ChildProcessLedger` pidfile cleanup
+/// - Writes isolated config & always-synced hashed credentials (`0600`) inside
+///   `Application Support/depth3d Host/engine/` (never passes `--creds`, never touches `~/.config/sunshine`)
+/// - Sets isolated `HOME` & `XDG_CONFIG_HOME` so all engine logs and appdata stay inside `engineDir`
+/// - Wraps child launch with `depth3d-child-guard` (kqueue `NOTE_EXIT` + dedicated process group)
+///   and records BOTH guard PID and real engine PID + kernel start time in `ChildProcessLedger`
+/// - Escalates to process-group `SIGKILL` if the child ignores `SIGTERM`
 /// - Parses logs accurately across multi-device streaming sessions
 /// - Automatically restarts on unexpected crashes with exponential backoff
 public final class EngineSupervisor: @unchecked Sendable {
@@ -71,7 +73,10 @@ public final class EngineSupervisor: @unchecked Sendable {
     private let queue = DispatchQueue(label: "dev.depth3d.host.engine.supervisor", qos: .userInitiated)
 
     private var process: Process?
-    private var trackedPID: Int32 = -1
+    private var usedGuardForCurrentProcess = false
+    private var trackedGuardPID: Int32 = -1
+    private var trackedChildPID: Int32 = -1
+    private var currentChildPIDFile: URL?
     private var logState = EngineLogState()
     private var currentConfig: EngineConfigGenerator.Input?
     private var shouldBeRunning = false
@@ -133,7 +138,7 @@ public final class EngineSupervisor: @unchecked Sendable {
         return launchCount
     }
 
-    /// Cleans up any orphaned streaming engine left behind by a previous crashed instance.
+    /// Cleans up any orphaned streaming engine or guard left behind by a previous crashed instance.
     @discardableResult
     public func cleanupOrphanedEngineProcesses() -> Int {
         ledger.cleanupStaleChildren(kinds: [.engine, .childGuard])
@@ -252,19 +257,17 @@ public final class EngineSupervisor: @unchecked Sendable {
             return
         }
 
-        // Write `credentials.json` directly with `0600` permissions — NEVER pass credentials via CLI args.
-        if !FileManager.default.fileExists(atPath: paths.engineCredentialsFile.path) {
-            do {
-                try EngineConfigGenerator.writeCredentialsFile(
-                    to: paths.engineCredentialsFile,
-                    credentials: adminCredentials
-                )
-                HostLogger.info("Initialized internal streaming engine credentials file", category: "engine")
-            } catch {
-                HostLogger.error("Failed to write internal engine credentials: \(error.localizedDescription)", category: "engine")
-                publishState(.failed(reason: HostStrings.string("engine.error.write_creds")))
-                return
-            }
+        // Always synchronize `credentials.json` (`0600`) with `adminCredentials` on every launch
+        // so rotated credentials never leave a stale hash on disk, and NEVER pass `--creds` on CLI.
+        do {
+            try EngineConfigGenerator.writeCredentialsFile(
+                to: paths.engineCredentialsFile,
+                credentials: adminCredentials
+            )
+        } catch {
+            HostLogger.error("Failed to write internal engine credentials: \(error.localizedDescription)", category: "engine")
+            publishState(.failed(reason: HostStrings.string("engine.error.write_creds")))
+            return
         }
 
         lock.lock()
@@ -284,11 +287,17 @@ public final class EngineSupervisor: @unchecked Sendable {
         )
         proc.currentDirectoryURL = paths.engineDirectory
 
+        let childPIDFileURL = paths.engineDirectory.appendingPathComponent("engine-child-\(UUID().uuidString).pid")
+        try? FileManager.default.removeItem(at: childPIDFileURL)
+
         // Isolate `HOME` & `XDG_CONFIG_HOME` into `Application Support/depth3d Host/engine/home`
         // so the engine NEVER reads, writes, or rotates files in the user's `~/.config/sunshine`.
         var env = ProcessInfo.processInfo.environment
         env["HOME"] = paths.engineHomeDirectory.path
         env["XDG_CONFIG_HOME"] = paths.engineHomeDirectory.appendingPathComponent(".config").path
+        if usedGuard {
+            env["DEPTH3D_CHILD_PID_FILE"] = childPIDFileURL.path
+        }
         proc.environment = env
 
         let outputPipe = Pipe()
@@ -330,22 +339,51 @@ public final class EngineSupervisor: @unchecked Sendable {
 
         do {
             try proc.run()
-            let pid = proc.processIdentifier
+            let topPID = proc.processIdentifier
+            let realChildPID: Int32
+            if usedGuard {
+                realChildPID = ChildProcessLedger.waitForGuardedChildPID(pidFileURL: childPIDFileURL) ?? -1
+            } else {
+                realChildPID = topPID
+            }
+
             lock.lock()
             self.process = proc
-            self.trackedPID = pid
+            self.usedGuardForCurrentProcess = usedGuard
+            self.trackedGuardPID = usedGuard ? topPID : -1
+            self.trackedChildPID = realChildPID
+            self.currentChildPIDFile = usedGuard ? childPIDFileURL : nil
             lock.unlock()
 
-            ledger.register(
-                pid: pid,
-                kind: usedGuard ? .childGuard : .engine,
-                executableHint: usedGuard ? (guardURL?.lastPathComponent ?? "depth3d-child-guard") : executableURL.lastPathComponent
-            )
+            if usedGuard {
+                ledger.register(
+                    pid: topPID,
+                    pgid: topPID,
+                    kind: .childGuard,
+                    executableHint: guardURL?.lastPathComponent ?? "depth3d-child-guard"
+                )
+                if realChildPID > 1 {
+                    ledger.register(
+                        pid: realChildPID,
+                        pgid: topPID,
+                        kind: .engine,
+                        executableHint: executableURL.lastPathComponent
+                    )
+                }
+            } else {
+                ledger.register(
+                    pid: topPID,
+                    kind: .engine,
+                    executableHint: executableURL.lastPathComponent
+                )
+            }
+
             HostLogger.info(
-                "Started built-in streaming engine (pid=\(pid), guarded=\(usedGuard), port=\(config.basePort))",
+                "Started built-in streaming engine (pid=\(topPID), childPid=\(realChildPID), guarded=\(usedGuard), port=\(config.basePort))",
                 category: "engine"
             )
         } catch {
+            try? FileManager.default.removeItem(at: childPIDFileURL)
             HostLogger.error("Failed to launch streaming engine: \(error.localizedDescription)", category: "engine")
             publishState(.failed(reason: HostStrings.string("engine.error.launch")))
         }
@@ -394,10 +432,15 @@ public final class EngineSupervisor: @unchecked Sendable {
     private func handleProcessTerminated(_ terminated: Process) {
         lock.lock()
         let isCurrent = (process === terminated)
-        let pidToClear = trackedPID
+        let guardPIDToClear = trackedGuardPID
+        let childPIDToClear = trackedChildPID
+        let pidFileToRemove = currentChildPIDFile
         if isCurrent {
             process = nil
-            trackedPID = -1
+            usedGuardForCurrentProcess = false
+            trackedGuardPID = -1
+            trackedChildPID = -1
+            currentChildPIDFile = nil
         }
         let wantRun = shouldBeRunning
         let launchedAt = lastLaunchDate
@@ -406,9 +449,9 @@ public final class EngineSupervisor: @unchecked Sendable {
         let sessionCB = onActiveSessionCountChanged
         lock.unlock()
 
-        if pidToClear > 0 {
-            ledger.unregister(pid: pidToClear)
-        }
+        if guardPIDToClear > 1 { ledger.unregister(pid: guardPIDToClear) }
+        if childPIDToClear > 1 { ledger.unregister(pid: childPIDToClear) }
+        if let pidFileToRemove { try? FileManager.default.removeItem(at: pidFileToRemove) }
         if hadSessions {
             sessionCB?(0)
         }
@@ -451,9 +494,15 @@ public final class EngineSupervisor: @unchecked Sendable {
     private func terminateCurrentProcessSync() {
         lock.lock()
         let proc = process
-        let pidToClear = trackedPID
+        let usedGuard = usedGuardForCurrentProcess
+        let guardPIDToClear = trackedGuardPID
+        var childPIDToClear = trackedChildPID
+        let pidFileToRemove = currentChildPIDFile
         process = nil
-        trackedPID = -1
+        usedGuardForCurrentProcess = false
+        trackedGuardPID = -1
+        trackedChildPID = -1
+        currentChildPIDFile = nil
         let hadSessions = lastReportedSessionCount > 0
         lastReportedSessionCount = 0
         let sessionCB = onActiveSessionCountChanged
@@ -463,23 +512,27 @@ public final class EngineSupervisor: @unchecked Sendable {
             sessionCB?(0)
         }
 
-        if let proc, proc.isRunning {
-            let pid = proc.processIdentifier
-            proc.terminate()
-            let deadline = Date().addingTimeInterval(2.0)
-            while proc.isRunning && Date() < deadline {
-                Thread.sleep(forTimeInterval: 0.05)
-            }
-            if proc.isRunning {
-                kill(pid, SIGKILL)
-                proc.waitUntilExit()
-            }
-            HostLogger.info("Terminated streaming engine (pid=\(pid))", category: "engine")
+        // Re-check pidfile in case child PID finished writing right before stop().
+        if childPIDToClear <= 1, let pidFileToRemove,
+           let text = try? String(contentsOf: pidFileToRemove, encoding: .utf8),
+           let parsed = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)), parsed > 1
+        {
+            childPIDToClear = parsed
         }
 
-        if pidToClear > 0 {
-            ledger.unregister(pid: pidToClear)
+        if let proc {
+            ChildProcessLedger.terminateManagedProcess(
+                process: proc,
+                usedGuard: usedGuard,
+                realChildPID: childPIDToClear > 1 ? childPIDToClear : nil,
+                graceSeconds: 2.0
+            )
+            HostLogger.info("Terminated streaming engine (pid=\(proc.processIdentifier), childPid=\(childPIDToClear))", category: "engine")
         }
+
+        if guardPIDToClear > 1 { ledger.unregister(pid: guardPIDToClear) }
+        if childPIDToClear > 1 { ledger.unregister(pid: childPIDToClear) }
+        if let pidFileToRemove { try? FileManager.default.removeItem(at: pidFileToRemove) }
     }
 
     private func publishState(_ next: EngineSupervisorState) {

@@ -1,33 +1,60 @@
 import Darwin
 import Foundation
 
-/// Lightweight parent-death watchdog helper (`depth3d-child-guard`).
+/// Parent-death & clean-shutdown watchdog helper (`depth3d-child-guard`).
 ///
 /// Usage:
 ///   depth3d-child-guard <parent-pid> <executable-path> [args...]
 ///
-/// Spawns `<executable-path>` as a direct child and monitors BOTH `<parent-pid>` and the child
-/// via BSD `kqueue` `EVFILT_PROC` (`NOTE_EXIT`) — zero polling. If the parent process crashes or
-/// is killed with `SIGKILL`, this guard immediately terminates the child (`SIGTERM`, then `SIGKILL`
-/// after 1.5 s) and exits so no orphan streaming engine or rclone process is ever left behind.
+/// Design:
+/// - Calls `setpgid(0, 0)` so this guard and its spawned child (plus grandchildren) share
+///   process group `pgid == guardPID`, allowing the host to atomically terminate the entire
+///   process group on escalation (`kill(-guardPID, SIGKILL)`).
+/// - If `DEPTH3D_CHILD_PID_FILE` is set in the environment, writes the real child's PID to it
+///   immediately after `posix_spawn` so the host's `ChildProcessLedger` tracks BOTH the guard
+///   and the real child process (with kernel start times).
+/// - Uses BSD `kqueue` (`EVFILT_PROC` `NOTE_EXIT` + `EVFILT_SIGNAL` `SIGTERM`/`SIGINT`) with
+///   zero busy-polling. On parent exit OR termination signal, sends `SIGTERM` to the child,
+///   waits up to 1.2s, and escalates to `SIGKILL` on the child (and process group) if the child
+///   ignores `SIGTERM`.
 
-private var gChildPID: pid_t = -1
+private func terminateChildAndGroup(childPID: pid_t, guardPGID: pid_t) {
+    guard childPID > 1 else { return }
 
-private func terminateChild(_ pid: pid_t) {
-    guard pid > 0 else { return }
-    _ = kill(pid, SIGTERM)
-    let deadline = Date().addingTimeInterval(1.5)
+    // Forward SIGTERM to child (and child's own group if it changed pgid).
+    _ = kill(childPID, SIGTERM)
+    let childPGID = getpgid(childPID)
+    if childPGID > 1 && childPGID != guardPGID {
+        _ = kill(-childPGID, SIGTERM)
+    }
+
+    let deadline = Date().addingTimeInterval(1.2)
     while Date() < deadline {
         var status: Int32 = 0
-        let r = waitpid(pid, &status, WNOHANG)
-        if r == pid || r < 0 {
+        let r = waitpid(childPID, &status, WNOHANG)
+        if r == childPID || (r < 0 && errno == ECHILD) {
             return
         }
-        usleep(50_000)
+        usleep(30_000)
     }
-    _ = kill(pid, SIGKILL)
+
+    // Child ignored SIGTERM or failed to exit promptly: force-kill child and its group.
+    _ = kill(childPID, SIGKILL)
+    if childPGID > 1 && childPGID != guardPGID {
+        _ = kill(-childPGID, SIGKILL)
+    }
     var status: Int32 = 0
-    _ = waitpid(pid, &status, 0)
+    _ = waitpid(childPID, &status, 0)
+}
+
+private func writeChildPIDFileIfConfigured(_ childPID: pid_t) {
+    guard let rawPath = getenv("DEPTH3D_CHILD_PID_FILE") else { return }
+    let path = String(cString: rawPath)
+    guard !path.isEmpty else { return }
+    let url = URL(fileURLWithPath: path)
+    let text = "\(childPID)\n"
+    try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? Data(text.utf8).write(to: url, options: .atomic)
 }
 
 private func main() -> Int32 {
@@ -40,24 +67,31 @@ private func main() -> Int32 {
     let execPath = args[2]
     let childArgs = Array(args.dropFirst(2))
 
+    // Become our own process group leader so our spawned child inherits `pgid == getpid()`.
+    _ = setpgid(0, 0)
+    let guardPGID = getpid()
+
     // If parent is already gone before we even spawn, exit immediately.
     if kill(parentPID, 0) != 0 && errno == ESRCH {
         return 0
     }
 
-    // Forward SIGTERM/SIGINT cleanly to the child.
-    signal(SIGTERM) { _ in
-        if gChildPID > 0 {
-            _ = kill(gChildPID, SIGTERM)
-        }
-    }
-    signal(SIGINT) { _ in
-        if gChildPID > 0 {
-            _ = kill(gChildPID, SIGTERM)
-        }
-    }
+    // Ignore default SIGTERM/SIGINT disposition so kqueue EVFILT_SIGNAL delivers them safely.
+    signal(SIGTERM, SIG_IGN)
+    signal(SIGINT, SIG_IGN)
 
-    // Spawn child inheriting stdin/stdout/stderr and environment.
+    // Spawn child inheriting stdin/stdout/stderr, environment, and process group (`guardPGID`).
+    // Restore default SIGTERM/SIGINT disposition in child via posix_spawnattr so child can handle them normally.
+    var attr: posix_spawnattr_t?
+    posix_spawnattr_init(&attr)
+    defer { posix_spawnattr_destroy(&attr) }
+    var defSigs = sigset_t()
+    sigemptyset(&defSigs)
+    sigaddset(&defSigs, SIGTERM)
+    sigaddset(&defSigs, SIGINT)
+    posix_spawnattr_setsigdefault(&attr, &defSigs)
+    posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSIGDEF))
+
     var cArgs: [UnsafeMutablePointer<CChar>?] = childArgs.map { strdup($0) }
     cArgs.append(nil)
     defer {
@@ -67,16 +101,16 @@ private func main() -> Int32 {
     }
 
     var childPID: pid_t = 0
-    let spawnErr = posix_spawn(&childPID, execPath, nil, nil, &cArgs, environ)
+    let spawnErr = posix_spawn(&childPID, execPath, nil, &attr, &cArgs, environ)
     guard spawnErr == 0, childPID > 0 else {
         fputs("depth3d: child-guard failed to spawn \(execPath): \(spawnErr)\n", stderr)
         return 127
     }
-    gChildPID = childPID
+
+    writeChildPIDFileIfConfigured(childPID)
 
     let kq = kqueue()
     guard kq >= 0 else {
-        // Fallback: wait on child directly
         var st: Int32 = 0
         _ = waitpid(childPID, &st, 0)
         return (st & 0x7f) == 0 ? ((st >> 8) & 0xff) : 1
@@ -99,21 +133,36 @@ private func main() -> Int32 {
             fflags: UInt32(NOTE_EXIT),
             data: 0,
             udata: nil
+        ),
+        kevent(
+            ident: UInt(SIGTERM),
+            filter: Int16(EVFILT_SIGNAL),
+            flags: UInt16(EV_ADD | EV_ENABLE),
+            fflags: 0,
+            data: 0,
+            udata: nil
+        ),
+        kevent(
+            ident: UInt(SIGINT),
+            filter: Int16(EVFILT_SIGNAL),
+            flags: UInt16(EV_ADD | EV_ENABLE),
+            fflags: 0,
+            data: 0,
+            udata: nil
         )
     ]
 
     let reg = kevent(kq, &changes, Int32(changes.count), nil, 0, nil)
     if reg < 0 {
-        // If parent already vanished while registering, terminate child immediately.
         if kill(parentPID, 0) != 0 && errno == ESRCH {
-            terminateChild(childPID)
+            terminateChildAndGroup(childPID: childPID, guardPGID: guardPGID)
             return 0
         }
     }
 
-    // Re-check parent liveness after registration to close any tiny race window.
+    // Re-check parent liveness after kqueue registration to close any race window.
     if kill(parentPID, 0) != 0 && errno == ESRCH {
-        terminateChild(childPID)
+        terminateChildAndGroup(childPID: childPID, guardPGID: guardPGID)
         return 0
     }
 
@@ -122,41 +171,40 @@ private func main() -> Int32 {
         var ts = timespec(tv_sec: 1, tv_nsec: 0)
         let n = kevent(kq, nil, 0, &event, 1, &ts)
         if n < 0 {
-            if errno == EINTR {
-                // Check if child exited due to forwarded signal.
-                var st: Int32 = 0
-                if waitpid(childPID, &st, WNOHANG) == childPID {
-                    return (st & 0x7f) == 0 ? ((st >> 8) & 0xff) : 1
-                }
-                continue
-            }
+            if errno == EINTR { continue }
             break
         }
         if n == 0 {
-            // Periodic liveness safety check in case NOTE_EXIT wasn't attached.
             if getppid() != parentPID || (kill(parentPID, 0) != 0 && errno == ESRCH) {
-                terminateChild(childPID)
+                terminateChildAndGroup(childPID: childPID, guardPGID: guardPGID)
                 return 0
             }
             var st: Int32 = 0
             if waitpid(childPID, &st, WNOHANG) == childPID {
-                return (st & 0x7f) == 0 ? ((st >> 8) & 0xff) : 1
+                return (st & 0x7f) == 0 ? ((st >> 8) & 0xff) : (128 + (st & 0x7f))
             }
             continue
         }
 
-        if pid_t(event.ident) == parentPID {
-            terminateChild(childPID)
+        if event.filter == Int16(EVFILT_SIGNAL) {
+            terminateChildAndGroup(childPID: childPID, guardPGID: guardPGID)
             return 0
         }
-        if pid_t(event.ident) == childPID {
-            var st: Int32 = 0
-            _ = waitpid(childPID, &st, 0)
-            return (st & 0x7f) == 0 ? ((st >> 8) & 0xff) : (128 + (st & 0x7f))
+
+        if event.filter == Int16(EVFILT_PROC) {
+            if pid_t(event.ident) == parentPID {
+                terminateChildAndGroup(childPID: childPID, guardPGID: guardPGID)
+                return 0
+            }
+            if pid_t(event.ident) == childPID {
+                var st: Int32 = 0
+                _ = waitpid(childPID, &st, 0)
+                return (st & 0x7f) == 0 ? ((st >> 8) & 0xff) : (128 + (st & 0x7f))
+            }
         }
     }
 
-    terminateChild(childPID)
+    terminateChildAndGroup(childPID: childPID, guardPGID: guardPGID)
     return 1
 }
 

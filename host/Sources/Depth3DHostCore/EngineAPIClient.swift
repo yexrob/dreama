@@ -21,12 +21,15 @@ public struct EnginePendingPairing: Codable, Equatable, Identifiable, Sendable {
 public struct EngineClientRecord: Codable, Equatable, Identifiable, Sendable {
     public let uuid: String
     public let name: String
+    public let enabled: Bool?
 
     public var id: String { uuid }
+    public var isEnabled: Bool { enabled ?? true }
 
-    public init(uuid: String, name: String) {
+    public init(uuid: String, name: String, enabled: Bool? = true) {
         self.uuid = uuid
         self.name = name
+        self.enabled = enabled
     }
 }
 
@@ -312,16 +315,23 @@ public final class EngineAPIClient: @unchecked Sendable {
         )
     }
 
+    /// Fetches paired clients from Sunshine's `GET /api/clients/list`.
+    /// Empirically verified against Sunshine v2026.914.233613: returns
+    /// `{"named_certs":[{"enabled":true,"name":"...","uuid":"..."}],"status":true}`
+    /// (with defensive fallback to `named_devices` if an upstream update renames the API key).
     public func listPairedClients() async throws -> [EngineClientRecord] {
         struct ClientsResponse: Decodable {
             let status: Bool?
             let named_certs: [EngineClientRecord]?
+            let named_devices: [EngineClientRecord]?
         }
         let (data, resp) = try await session.data(for: makeRequest(path: "/api/clients/list"))
         guard let http = resp as? HTTPURLResponse else { throw EngineAPIError.invalidResponse }
         if http.statusCode == 401 { throw EngineAPIError.unauthorized }
         guard http.statusCode == 200 else { throw EngineAPIError.httpError(http.statusCode) }
-        return try JSONDecoder().decode(ClientsResponse.self, from: data).named_certs ?? []
+        let decoded = try JSONDecoder().decode(ClientsResponse.self, from: data)
+        let list = decoded.named_certs ?? decoded.named_devices ?? []
+        return list.filter(\.isEnabled)
     }
 
     public func unpairClient(uuid: String) async throws -> Bool {

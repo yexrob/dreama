@@ -6,12 +6,14 @@ public struct EnginePairedCert: Equatable, Sendable {
     public let uuid: String
     public let name: String
     public let certPEM: String
+    public let enabled: Bool
     public let fingerprintSHA256: String?
 
-    public init(uuid: String, name: String, certPEM: String) {
+    public init(uuid: String, name: String, certPEM: String, enabled: Bool = true) {
         self.uuid = uuid
         self.name = name
         self.certPEM = certPEM
+        self.enabled = enabled
         self.fingerprintSHA256 = TLSIdentityManager.sha256Hex(fromPEM: certPEM)
     }
 }
@@ -137,45 +139,73 @@ public enum EngineConfigGenerator {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
+    /// Locates the bundled built-in streaming engine executable.
+    /// In Release builds, ONLY bundled paths inside `.app/Contents/Helpers/` are allowed;
+    /// relative `build/` paths and `override` injection exist strictly in `#if DEBUG`.
     public static func locateEngineExecutable(override: URL? = nil, bundle: Bundle = .main) -> URL? {
         let fm = FileManager.default
+        #if DEBUG
         if let override, fm.isExecutableFile(atPath: override.path) {
             return override
         }
+        #endif
+
         let bundleURL = bundle.bundleURL
-        let candidates: [URL] = [
+        var candidates: [URL] = [
             bundleURL.appendingPathComponent("Contents/Helpers/depth3d-stream-engine"),
             bundleURL.appendingPathComponent("Contents/Helpers/stream-engine/MacOS/depth3d-stream-engine"),
             bundleURL.deletingLastPathComponent().appendingPathComponent("Helpers/depth3d-stream-engine"),
-            bundleURL.deletingLastPathComponent().appendingPathComponent("Helpers/stream-engine/MacOS/depth3d-stream-engine"),
+            bundleURL.deletingLastPathComponent().appendingPathComponent("Helpers/stream-engine/MacOS/depth3d-stream-engine")
+        ]
+        #if DEBUG
+        candidates.append(contentsOf: [
             URL(fileURLWithPath: fm.currentDirectoryPath)
                 .appendingPathComponent("build/engine-arm64/stream-engine/MacOS/depth3d-stream-engine"),
             URL(fileURLWithPath: fm.currentDirectoryPath)
                 .appendingPathComponent("build/engine-x86_64/stream-engine/MacOS/depth3d-stream-engine")
-        ]
+        ])
+        #endif
+
         for candidate in candidates where fm.isExecutableFile(atPath: candidate.path) {
             return candidate
         }
         return nil
     }
 
+    /// Parses paired client certificates from Sunshine's real `state.json` schema:
+    /// Sunshine v2026.914.233613 writes `root.named_devices` (`[{name, cert, uuid, enabled}]`,
+    /// where `enabled` is Boost property_tree string `"true"` / `"false"` or JSON bool).
+    /// Falls back to legacy `root.named_certs` only if `named_devices` is absent.
+    /// Disabled entries (`enabled == false` / `"false"`) are excluded.
     public static func parsePairedCerts(fromStateJSON data: Data) -> [EnginePairedCert] {
         guard let rootObj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let root = rootObj["root"] as? [String: Any],
-              let namedCerts = root["named_certs"] as? [[String: Any]]
+              let root = rootObj["root"] as? [String: Any]
         else {
             return []
         }
 
+        let rawDevices = (root["named_devices"] as? [[String: Any]])
+            ?? (root["named_certs"] as? [[String: Any]])
+            ?? []
+
         let fallbackName = HostStrings.string("device.default_name")
-        return namedCerts.compactMap { entry in
+        return rawDevices.compactMap { entry in
             guard let uuid = entry["uuid"] as? String,
                   let cert = entry["cert"] as? String
             else {
                 return nil
             }
+            let enabled: Bool
+            if let boolVal = entry["enabled"] as? Bool {
+                enabled = boolVal
+            } else if let strVal = entry["enabled"] as? String {
+                enabled = strVal.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "false"
+            } else {
+                enabled = true
+            }
+            guard enabled else { return nil }
             let name = (entry["name"] as? String) ?? fallbackName
-            return EnginePairedCert(uuid: uuid, name: name, certPEM: cert)
+            return EnginePairedCert(uuid: uuid, name: name, certPEM: cert, enabled: enabled)
         }
     }
 

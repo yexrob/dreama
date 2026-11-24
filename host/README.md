@@ -52,7 +52,13 @@ host/scripts/build.sh --arch arm64 --config Release
 ### 3. 媒体服务为何选择「Swift 原生只读 WebDAV + 按需代理本机 rclone」？
 
 - **零额外体积 & 零外部依赖支持本机目录**：内置约 85 MB 的 `rclone` 二进制会让只需共享本地文件夹的用户付出额外体积代价；Swift 原生只读 WebDAV（支持 Basic Auth、连接数上限与认证失败限速、`OPTIONS`/`PROPFIND`/`GET`/`HEAD`、`Range` 206 分段流式读取、路径越权与隐藏文件拒绝）体积几乎为零，64 KB 分块直读大文件内存占用极低。
-- **统一入口兼顾网盘与移除即失效**：当用户本机已安装 `rclone` 并添加网盘时，`RcloneBridgeManager` 通过环境变量 `RCLONE_USER`/`RCLONE_PASS`（不在命令行传递密码）拉起仅监听 `127.0.0.1` 随机端口的只读 `rclone serve webdav`，由 Swift WebDAV 服务流式重写任意大小 `PROPFIND` `<href>`（无 8 MB 截断）并代理到 `/<网盘名>/`；Host 不向局域网广播 `_webdav._tcp`，在「设备」页移除任一设备时自动轮换 WebDAV 凭据并更新 `_depth3d-host._tcp` TXT 通知仍配对头显重新获取。
+- **统一入口兼顾网盘与移除即失效**：当用户本机已安装 `rclone` 并添加网盘时，`RcloneBridgeManager` 通过环境变量 `RCLONE_USER`/`RCLONE_PASS`（不在命令行传递密码）拉起仅监听 `127.0.0.1` 随机端口的只读 `rclone serve webdav`，由 Swift WebDAV 服务流式重写任意大小 `PROPFIND` `<href>`（无 8 MB 截断）并代理到 `/<网盘名>/`；Host 不向局域网广播 `_webdav._tcp`，在「设备」页移除任一设备时自动轮换 WebDAV 凭据并递增 `_depth3d-host._tcp` 的 `mrev` TXT 通知仍配对头显重新获取。
+
+### 4. 控制接口 TLS 栈与 Network.framework 评估
+
+- 控制接口 `/depth3d/v1/*` 需在同一 HTTPS 端口上实现「可选客户端证书认证」：`/info` 与首次 `/pair` 允许无客户端证书访问，而二次 `/pair` 与 `/media` 需要头显出示并证明其持有客户端证书私钥。
+- 实测当前 macOS SDK（`Security.framework/Headers/SecProtocolOptions.h`）中 `sec_protocol_options_set_peer_authentication_optional` 仍标记为 `API_UNAVAILABLE(macos, ios, watchos, tvos)`：`Network.framework` 的 `peer_authentication_required = false` 不会发送 `CertificateRequest`，而 `true` 会直接拒绝无证书客户端（破坏 `/info` 与首次 `/pair`）。
+- 因此当前版本继续使用系统自带的 SecureTransport `SSLSetClientSideAuthenticate(.tryAuthenticate)`（TLS 1.2，不引入额外 C/C++ TLS 依赖，并由自动化测试验证服务端确实校验了客户端 `CertificateVerify` 私钥签名而非仅接收证书）。未来若需升级单端口 TLS 1.3 可选 mTLS，可选方案为：① 将协议拆分为匿名 TLS 1.3 端口与强制 mTLS TLS 1.3 端口；或 ② 引入 SwiftNIO SSL（BoringSSL）。
 
 ## 后续发布步骤（Developer ID 签名、公证、Sparkle 自动更新）
 

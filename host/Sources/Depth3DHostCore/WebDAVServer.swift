@@ -13,7 +13,8 @@ public struct WebDAVMount: Equatable, Sendable {
 }
 
 /// Pure, unit-testable handler for read-only WebDAV requests (`OPTIONS`, `PROPFIND`, `HEAD`, `GET` + `Range`).
-/// Handles virtual root listing, local folders (with strict path containment and hidden-file blocking),
+/// Handles virtual root listing, local folders (strict symlink containment, dot-file & `UF_HIDDEN`
+/// blocking across every resolved segment, and filtering escaping symlinks from `PROPFIND`),
 /// and optional proxied rclone backends.
 public final class WebDAVHandler: @unchecked Sendable {
     public enum StreamPlan: Sendable {
@@ -58,6 +59,13 @@ public final class WebDAVHandler: @unchecked Sendable {
         lock.unlock()
     }
 
+    public func verifyAuth(_ request: HTTPRequest) -> Bool {
+        lock.lock()
+        let creds = credentials
+        lock.unlock()
+        return WebDAVAuth.verify(authorizationHeader: request.header("authorization"), credentials: creds)
+    }
+
     public func route(_ request: HTTPRequest) -> StreamPlan {
         lock.lock()
         let creds = credentials
@@ -67,14 +75,7 @@ public final class WebDAVHandler: @unchecked Sendable {
 
         // Enforce HTTP Basic Auth on every request.
         guard WebDAVAuth.verify(authorizationHeader: request.header("authorization"), credentials: creds) else {
-            return .immediate(HTTPResponse(
-                statusCode: 401,
-                headers: [
-                    ("WWW-Authenticate", "Basic realm=\"depth3d\""),
-                    ("Content-Type", "text/plain; charset=utf-8")
-                ],
-                body: Data("Unauthorized".utf8)
-            ))
+            return .immediate(Self.unauthorizedResponse())
         }
 
         switch request.method {
@@ -135,7 +136,6 @@ public final class WebDAVHandler: @unchecked Sendable {
 
         // 2. Check active rclone cloud remote mounts
         if let endpoint = rclone?.endpoint(forMountName: mountName) {
-            // Also block dot-prefixed hidden paths on cloud mounts for consistency.
             if resolved.relativeSegments.contains(where: { $0.hasPrefix(".") }) {
                 return .immediate(HTTPResponse(statusCode: 404))
             }
@@ -154,6 +154,17 @@ public final class WebDAVHandler: @unchecked Sendable {
         }
 
         return .immediate(HTTPResponse(statusCode: 404))
+    }
+
+    public static func unauthorizedResponse() -> HTTPResponse {
+        HTTPResponse(
+            statusCode: 401,
+            headers: [
+                ("WWW-Authenticate", "Basic realm=\"depth3d\""),
+                ("Content-Type", "text/plain; charset=utf-8")
+            ],
+            body: Data("Unauthorized".utf8)
+        )
     }
 
     private func handleVirtualRootPropfind(
@@ -191,33 +202,80 @@ public final class WebDAVHandler: @unchecked Sendable {
         )
     }
 
+    /// Validates that `targetURL` (and every intermediate component strictly inside `rootReal`
+    /// both before and after symlink resolution) neither escapes `rootReal` nor traverses any
+    /// hidden file/directory (dot-prefixed OR macOS `UF_HIDDEN` / `isHiddenKey`).
+    private enum ContainmentCheck {
+        case allowed(resolvedURL: URL)
+        case escapedRoot
+        case hidden
+    }
+
+    private func checkContainmentAndVisibility(
+        rootReal: URL,
+        relativeSegments: [String]
+    ) -> ContainmentCheck {
+        let rootPrefix = rootReal.path.hasSuffix("/") ? rootReal.path : rootReal.path + "/"
+
+        // 1. Check requested (un-resolved) segments below rootReal for dot-prefix or UF_HIDDEN.
+        var walkRaw = rootReal
+        for seg in relativeSegments {
+            if seg.hasPrefix(".") { return .hidden }
+            walkRaw.appendPathComponent(seg, isDirectory: false)
+            if Self.hasHiddenFlag(at: walkRaw) { return .hidden }
+        }
+
+        // 2. Resolve symlinks and verify strict containment inside rootReal.
+        let resolvedTarget = walkRaw.resolvingSymlinksInPath()
+        guard resolvedTarget.path == rootReal.path || resolvedTarget.path.hasPrefix(rootPrefix) else {
+            return .escapedRoot
+        }
+
+        // 3. Check EVERY resolved segment strictly inside rootReal (catches symlinks targeting
+        //    files inside a `.hidden_dir` OR inside a `UF_HIDDEN` directory/file!).
+        if resolvedTarget.path != rootReal.path {
+            let relResolved = String(resolvedTarget.path.dropFirst(rootPrefix.count))
+            let resolvedSegments = relResolved.split(separator: "/").map(String.init)
+            var walkResolved = rootReal
+            for seg in resolvedSegments {
+                if seg.hasPrefix(".") { return .hidden }
+                walkResolved.appendPathComponent(seg, isDirectory: false)
+                if Self.hasHiddenFlag(at: walkResolved) { return .hidden }
+            }
+        }
+
+        return .allowed(resolvedURL: resolvedTarget)
+    }
+
+    private static func hasHiddenFlag(at url: URL) -> Bool {
+        var st = stat()
+        if lstat(url.path, &st) == 0 {
+            if (st.st_flags & UInt32(UF_HIDDEN)) != 0 {
+                return true
+            }
+        }
+        if let vals = try? url.resourceValues(forKeys: [.isHiddenKey]), vals.isHidden == true {
+            return true
+        }
+        return false
+    }
+
     private func handleLocalMount(
         mount: WebDAVMount,
         relativeSegments: [String],
         request: HTTPRequest
     ) -> StreamPlan {
-        // Hidden files (`.`-prefixed) are never listed AND must never be readable via GET/HEAD/PROPFIND.
-        if relativeSegments.contains(where: { $0.hasPrefix(".") }) {
-            return .immediate(HTTPResponse(statusCode: 404))
-        }
-
         let fm = FileManager.default
         let rootReal = mount.rootURL.resolvingSymlinksInPath()
-        var targetURL = rootReal
-        for seg in relativeSegments {
-            targetURL.appendPathComponent(seg, isDirectory: false)
-        }
-        let resolvedTarget = targetURL.resolvingSymlinksInPath()
 
-        // Strictly prevent escaping the shared root folder via symlinks or traversal.
-        let rootPrefix = rootReal.path.hasSuffix("/") ? rootReal.path : rootReal.path + "/"
-        guard resolvedTarget.path == rootReal.path || resolvedTarget.path.hasPrefix(rootPrefix) else {
+        let resolvedTarget: URL
+        switch checkContainmentAndVisibility(rootReal: rootReal, relativeSegments: relativeSegments) {
+        case .escapedRoot:
             return .immediate(HTTPResponse(statusCode: 403))
-        }
-
-        // Also reject symlinks inside the mount that point to a hidden dot-file.
-        if !relativeSegments.isEmpty && resolvedTarget.lastPathComponent.hasPrefix(".") {
+        case .hidden:
             return .immediate(HTTPResponse(statusCode: 404))
+        case .allowed(let url):
+            resolvedTarget = url
         }
 
         var isDirObjC: ObjCBool = false
@@ -229,6 +287,7 @@ public final class WebDAVHandler: @unchecked Sendable {
         if request.method == "PROPFIND" {
             return .immediate(handleLocalPropfind(
                 mount: mount,
+                rootReal: rootReal,
                 relativeSegments: relativeSegments,
                 targetURL: resolvedTarget,
                 isDirectory: isDir,
@@ -291,6 +350,7 @@ public final class WebDAVHandler: @unchecked Sendable {
 
     private func handleLocalPropfind(
         mount: WebDAVMount,
+        rootReal: URL,
         relativeSegments: [String],
         targetURL: URL,
         isDirectory: Bool,
@@ -327,17 +387,32 @@ public final class WebDAVHandler: @unchecked Sendable {
             for child in sorted {
                 let name = child.lastPathComponent
                 if name.hasPrefix(".") { continue }
-                let vals = try? child.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey])
-                let childIsDir = vals?.isDirectory ?? false
-                let childSize = vals?.fileSize.map { UInt64(max(0, $0)) }
-                let childMod = vals?.contentModificationDate
+
+                // Enforce identical containment & hidden-target filtering as GET/HEAD:
+                // never list symlinks that escape rootReal or point into hidden files/directories!
+                let childResolvedURL: URL
+                switch checkContainmentAndVisibility(rootReal: rootReal, relativeSegments: relativeSegments + [name]) {
+                case .allowed(let resolved):
+                    childResolvedURL = resolved
+                case .escapedRoot, .hidden:
+                    continue
+                }
+
+                var childIsDirObjC: ObjCBool = false
+                guard fm.fileExists(atPath: childResolvedURL.path, isDirectory: &childIsDirObjC) else {
+                    continue
+                }
+                let childIsDir = childIsDirObjC.boolValue
+                let attrs = (try? fm.attributesOfItem(atPath: childResolvedURL.path)) ?? [:]
+                let childSize = (attrs[.size] as? NSNumber)?.uint64Value
+                let childMod = attrs[.modificationDate] as? Date
                 entries.append(WebDAVEntry(
                     href: WebDAVPathSanitizer.encodeHref(segments: fullSegments + [name], isDirectory: childIsDir),
                     displayName: name,
                     isDirectory: childIsDir,
                     contentLength: childIsDir ? nil : childSize,
                     lastModified: childMod,
-                    contentType: childIsDir ? nil : WebDAVXMLBuilder.mimeType(forPath: child.path)
+                    contentType: childIsDir ? nil : WebDAVXMLBuilder.mimeType(forPath: childResolvedURL.path)
                 ))
             }
         }
@@ -353,14 +428,15 @@ public final class WebDAVHandler: @unchecked Sendable {
 
 /// Embedded read-only HTTP/1.1 WebDAV server with:
 /// - Connection concurrency limit (`ConnectionGuard`)
-/// - Header read & socket write timeouts
-/// - Per-IP rate limiting on unauthenticated / failed-auth requests (`429`)
+/// - Per-connection absolute request-read deadline & socket write timeouts
+/// - Smart Basic Auth brute-force rate limiting: counts ONLY requests carrying wrong credentials,
+///   never penalizes headerless challenge probes, and resets failure count on successful auth
 /// - Streaming `Range` support for local video files
 /// - Zero-truncation streaming `PROPFIND` `<href>` rewriting and byte-for-byte streaming proxy for rclone
 public final class WebDAVServer: @unchecked Sendable {
     public let handler: WebDAVHandler
     private let connectionGuard: ConnectionGuard
-    private let unauthRateLimiter: IPRateLimiter
+    private let authFailureLimiter: IPRateLimiter
     private let readTimeoutSeconds: Int
     private let writeTimeoutSeconds: Int
 
@@ -392,7 +468,7 @@ public final class WebDAVServer: @unchecked Sendable {
     ) {
         self.handler = handler
         self.connectionGuard = ConnectionGuard(maxConnections: maxConnections)
-        self.unauthRateLimiter = IPRateLimiter(maxEvents: maxUnauthRequestsPerMinute, windowSeconds: 60.0)
+        self.authFailureLimiter = IPRateLimiter(maxEvents: maxUnauthRequestsPerMinute, windowSeconds: 60.0)
         self.readTimeoutSeconds = max(1, readTimeoutSeconds)
         self.writeTimeoutSeconds = max(1, writeTimeoutSeconds)
     }
@@ -589,27 +665,39 @@ public final class WebDAVServer: @unchecked Sendable {
     }
 
     private func handleClient(fd: Int32, peerIP: String) {
-        if unauthRateLimiter.isLimited(key: peerIP) {
-            let limited = HTTPResponse(
-                statusCode: 429,
-                headers: [("Retry-After", "60"), ("Content-Type", "text/plain; charset=utf-8")],
-                body: Data("Too Many Requests".utf8)
-            )
-            _ = writeAll(fd: fd, data: limited.serialize())
+        guard let request = readPlainHTTPRequest(fd: fd, peerIP: peerIP) else {
+            _ = writeAll(fd: fd, data: HTTPResponse(statusCode: 400).serialize())
             return
         }
 
-        guard let request = readPlainHTTPRequest(fd: fd, peerIP: peerIP) else {
-            unauthRateLimiter.recordEvent(key: peerIP)
-            _ = writeAll(fd: fd, data: HTTPResponse(statusCode: 400).serialize())
+        // Smart Basic Auth rate limiting (S4):
+        // - Missing `Authorization` header is a normal HTTP Basic Auth challenge probe -> return 401 WITHOUT counting.
+        // - Valid credentials ALWAYS succeed and clear prior failure history for `peerIP`.
+        // - Wrong credentials increment the per-IP counter; exceeding the threshold returns 429.
+        let rawAuth = request.header("authorization")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if rawAuth.isEmpty {
+            _ = writeAll(fd: fd, data: WebDAVHandler.unauthorizedResponse().serialize(includeBody: request.method != "HEAD"))
+            return
+        }
+
+        if handler.verifyAuth(request) {
+            authFailureLimiter.reset(key: peerIP)
+        } else {
+            if !authFailureLimiter.allow(key: peerIP) {
+                let limited = HTTPResponse(
+                    statusCode: 429,
+                    headers: [("Retry-After", "60"), ("Content-Type", "text/plain; charset=utf-8")],
+                    body: Data("Too Many Requests".utf8)
+                )
+                _ = writeAll(fd: fd, data: limited.serialize(includeBody: request.method != "HEAD"))
+                return
+            }
+            _ = writeAll(fd: fd, data: WebDAVHandler.unauthorizedResponse().serialize(includeBody: request.method != "HEAD"))
             return
         }
 
         switch handler.route(request) {
         case .immediate(let response):
-            if response.statusCode == 401 {
-                unauthRateLimiter.recordEvent(key: peerIP)
-            }
             _ = writeAll(fd: fd, data: response.serialize(includeBody: request.method != "HEAD"))
 
         case .localFileRange(let statusCode, let headers, let fileURL, let offset, let length, let includeBody):
@@ -735,7 +823,6 @@ public final class WebDAVServer: @unchecked Sendable {
         if method == "PROPFIND" {
             streamRewrittenPropfind(upFD: upFD, clientFD: clientFD, mountName: mountName)
         } else {
-            // Stream GET/HEAD directly byte-for-byte without buffering multi-GB video files.
             var buf = [UInt8](repeating: 0, count: 65536)
             while true {
                 let n = Darwin.recv(upFD, &buf, buf.count, 0)
@@ -754,9 +841,6 @@ public final class WebDAVServer: @unchecked Sendable {
         }
     }
 
-    /// Streams an upstream `PROPFIND` response of arbitrary size (no 8 MB cap!) while
-    /// incrementally rewriting `<href>` tags to include `/<mountName>` and forwarding via
-    /// HTTP/1.1 chunked transfer encoding.
     private func streamRewrittenPropfind(upFD: Int32, clientFD: Int32, mountName: String) {
         let delim = Data("\r\n\r\n".utf8)
         var headBuffer = Data()
@@ -844,9 +928,9 @@ public final class WebDAVServer: @unchecked Sendable {
         var buffer = Data()
         var chunk = [UInt8](repeating: 0, count: 8192)
         var parsedHead: HTTPParser.ParsedHead?
-        let deadline = Date().addingTimeInterval(TimeInterval(readTimeoutSeconds))
+        let deadline = ProcessInfo.processInfo.systemUptime + TimeInterval(readTimeoutSeconds)
 
-        while Date() < deadline {
+        while true {
             if parsedHead == nil {
                 do {
                     parsedHead = try HTTPParser.parseHead(from: buffer)
@@ -866,6 +950,20 @@ public final class WebDAVServer: @unchecked Sendable {
                         remoteAddress: peerIP
                     )
                 }
+            }
+
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            if remaining <= 0 {
+                return nil
+            }
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let waitMs = Int32(max(1, min(ceil(remaining * 1000.0), 60_000.0)))
+            let pr = Darwin.poll(&pfd, 1, waitMs)
+            if pr == 0 {
+                return nil
+            } else if pr < 0 {
+                if errno == EINTR { continue }
+                return nil
             }
 
             let n = Darwin.recv(fd, &chunk, chunk.count, 0)
@@ -888,7 +986,6 @@ public final class WebDAVServer: @unchecked Sendable {
                 return nil
             }
         }
-        return nil
     }
 
     private func writeAll(fd: Int32, data: Data) -> Bool {

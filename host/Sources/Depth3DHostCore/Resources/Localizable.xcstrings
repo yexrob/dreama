@@ -341,6 +341,16 @@
         }
       }
     },
+    "devices.needs_reconnect_upgrade": {
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "需要在头显上重新连接一次"
+          }
+        }
+      }
+    },
     "devices.paired.date": {
       "localizations": {
         "zh-Hans": {
@@ -561,6 +571,16 @@
         }
       }
     },
+    "media.cloud.not_installed.hint": {
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "未检测到 rclone：请在“终端”运行 brew install rclone，完成后点击右上角“重新检测”。"
+          }
+        }
+      }
+    },
     "media.cloud.refresh": {
       "localizations": {
         "zh-Hans": {
@@ -571,12 +591,42 @@
         }
       }
     },
+    "media.cloud.status.error": {
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "连接失败"
+          }
+        }
+      }
+    },
+    "media.cloud.status.not_installed": {
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "未安装 rclone"
+          }
+        }
+      }
+    },
+    "media.cloud.status.paused": {
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已暂停"
+          }
+        }
+      }
+    },
     "media.cloud.status.running": {
       "localizations": {
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "已挂载"
+            "value": "已连接"
           }
         }
       }
@@ -1027,6 +1077,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "%d 秒后自动取消"
+          }
+        }
+      }
+    },
+    "pair.prompt.identity_changed_warning": {
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "这台设备的身份变了：该设备之前已绑定过其他证书，请确认是本人操作后再允许，本次不会继承自动允许。"
           }
         }
       }
