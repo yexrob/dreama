@@ -228,82 +228,146 @@ public final class EngineAPIClient: @unchecked Sendable {
         }
     }
 
-    /// Strictly pairs ONE incoming GameStream pairing session matching `clientAddress`, submits `pin`
-    /// ONLY to that single `pairing_id`, and returns the exact client certificate written to `stateFileURL`
-    /// by that completed pairing handshake.
+    /// Feeds `pin` in the background to the single GameStream pending pairing session originating
+    /// from `clientAddress` within `maxWait` seconds (protocol v1: 60s window after `/pair` returns).
     ///
-    /// Never sprays the PIN to unrelated pending pairings or blindly selects `pairings.first`.
-    public func completeMatchedPairing(
+    /// Safety rules (`docs/specs/host-protocol.md`):
+    /// - Never sprays `pin` to unrelated IPs.
+    /// - If multiple pending pairing sessions exist from `clientAddress`, cancels ALL of them
+    ///   and refuses to submit `pin`.
+    /// - On PIN rejection, failure, or timeout, cancels any leftover pending pairing sessions
+    ///   from `clientAddress` so an immediate retry never collides with a stale 5-minute session.
+    @discardableResult
+    public func feedPINForApprovedSession(
         pin: String,
         deviceName: String,
         clientAddress: String,
-        stateFileURL: URL,
-        existingBoundFingerprint: String? = nil,
-        maxWait: TimeInterval = 25.0,
+        maxWait: TimeInterval = 60.0,
         pollInterval: TimeInterval = 0.15
-    ) async -> VerifiedEnginePairing? {
+    ) async -> Bool {
         let targetIP = IPAddressNormalizer.normalize(clientAddress)
-        return await serializer.runSerialized { [self] in
-            let deadline = Date().addingTimeInterval(maxWait)
-            var attemptedIds = Set<String>()
+        let deadline = Date().addingTimeInterval(maxWait)
 
-            while Date() < deadline {
-                if let pairings = try? await self.fetchPendingPairings() {
-                    let matching = pairings.filter { pending in
-                        guard !attemptedIds.contains(pending.id) else { return false }
-                        guard let addr = pending.normalizedAddress else { return false }
-                        return addr == targetIP
+        while !Task.isCancelled && Date() < deadline {
+            if let pairings = try? await fetchPendingPairings() {
+                let matching = pairings.filter { $0.normalizedAddress == targetIP }
+                if matching.count > 1 {
+                    HostLogger.warning("Multiple (\(matching.count)) pending GameStream sessions from \(targetIP); cancelling all", category: "pair")
+                    for session in matching {
+                        try? await cancelPairing(pairingId: session.id)
                     }
-
-                    // Require an unambiguous single pending pairing from `clientAddress`.
-                    if matching.count == 1, let target = matching.first {
-                        attemptedIds.insert(target.id)
-                        let beforeCerts = EngineConfigGenerator.loadPairedCerts(at: stateFileURL)
-                        let beforeUUIDs = Set(beforeCerts.map(\.uuid))
-
-                        let ok = (try? await self.submitPIN(
-                            pairingId: target.id,
-                            pin: pin,
-                            deviceName: deviceName
-                        )) ?? false
-
-                        guard ok else {
-                            HostLogger.warning("Matched pairing session failed PIN verification for \(targetIP)", category: "pair")
-                            return nil
-                        }
-
-                        // Sunshine persists `state.json` before returning `status: true`.
-                        // Diff `state.json` to bind ONLY the exact cert that consumed this PIN.
-                        let afterCerts = EngineConfigGenerator.loadPairedCerts(at: stateFileURL)
-                        let newlyAdded = afterCerts.filter { !beforeUUIDs.contains($0.uuid) }
-                        if newlyAdded.count == 1, let cert = newlyAdded.first, let fp = cert.fingerprintSHA256 {
-                            HostLogger.info("Bound paired device \(deviceName) (\(targetIP)) to exact client certificate", category: "pair")
-                            return VerifiedEnginePairing(engineUUID: cert.uuid, certFingerprintSHA256: fp)
-                        }
-
-                        // Re-pairing an already-bound device whose existing cert remained in `state.json`.
-                        if newlyAdded.isEmpty,
-                           let existingFP = existingBoundFingerprint,
-                           let matched = afterCerts.first(where: {
-                               $0.fingerprintSHA256?.caseInsensitiveCompare(existingFP) == .orderedSame
-                           }),
-                           let fp = matched.fingerprintSHA256
-                        {
-                            HostLogger.info("Verified re-pairing of existing cert-bound device \(deviceName)", category: "pair")
-                            return VerifiedEnginePairing(engineUUID: matched.uuid, certFingerprintSHA256: fp)
-                        }
-
-                        HostLogger.warning("Pairing succeeded in engine but exact certificate diff was ambiguous (added=\(newlyAdded.count))", category: "pair")
-                        return nil
-                    }
+                    return false
                 }
-
-                let sleepNs = UInt64(max(0.05, pollInterval) * 1_000_000_000)
-                try? await Task.sleep(nanoseconds: sleepNs)
+                if matching.count == 1, let target = matching.first {
+                    let ok = (try? await submitPIN(
+                        pairingId: target.id,
+                        pin: pin,
+                        deviceName: deviceName
+                    )) ?? false
+                    if ok {
+                        HostLogger.info("Background PIN feeder completed GameStream pairing for \(deviceName) (\(targetIP))", category: "pair")
+                        return true
+                    }
+                    HostLogger.warning("Background PIN submission failed for \(targetIP); cancelling pending sessions", category: "pair")
+                    await cancelPendingPairings(forIP: targetIP)
+                    return false
+                }
             }
 
-            HostLogger.warning("Timed out waiting for GameStream pairing from \(targetIP)", category: "pair")
-            return nil
+            let sleepNs = UInt64(max(0.05, pollInterval) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: sleepNs)
+        }
+
+        if !Task.isCancelled {
+            HostLogger.warning("Background PIN feeder timed out after \(Int(maxWait))s for \(targetIP); cancelling pending sessions", category: "pair")
+            await cancelPendingPairings(forIP: targetIP)
+        }
+        return false
+    }
+
+    /// Cancels all pending GameStream pairing sessions in the streaming engine matching `clientAddress`.
+    public func cancelPendingPairings(forIP clientAddress: String) async {
+        let targetIP = IPAddressNormalizer.normalize(clientAddress)
+        guard let pairings = try? await fetchPendingPairings() else { return }
+        let matching = pairings.filter { $0.normalizedAddress == targetIP }
+        for session in matching {
+            HostLogger.info("Cancelling stale engine pending pairing \(session.id) for \(targetIP)", category: "pair")
+            try? await cancelPairing(pairingId: session.id)
+        }
+    }
+
+    /// Ensures `fingerprintSHA256` exists and is **unique & enabled** inside the streaming engine's
+    /// `state.json`. If Sunshine recorded duplicate entries for the same certificate (which causes
+    /// Sunshine's `is_client_enabled` to reject the headset!), keeps ONLY the newest enabled entry
+    /// and unpairs all older/duplicate entries via `POST /api/clients/unpair`.
+    ///
+    /// Returns the single kept enabled `EnginePairedCert`, or `nil` if no enabled entry exists yet.
+    public func ensureUniqueEnabledCert(
+        fingerprintSHA256: String,
+        stateFileURL: URL
+    ) async -> EnginePairedCert? {
+        return await serializer.runSerialized { [self] in
+            let all = EngineConfigGenerator.loadAllPairedCerts(at: stateFileURL)
+            let matches = all.filter {
+                $0.fingerprintSHA256?.caseInsensitiveCompare(fingerprintSHA256) == .orderedSame
+            }
+            let enabledMatches = matches.filter(\.enabled)
+            guard let newestEnabled = enabledMatches.last else {
+                return nil
+            }
+
+            if matches.count > 1 {
+                HostLogger.warning(
+                    "Detected \(matches.count) duplicate engine entries for client cert; keeping newest uuid=\(newestEnabled.uuid) and removing \(matches.count - 1) duplicate(s)",
+                    category: "pair"
+                )
+                for other in matches where other.uuid != newestEnabled.uuid {
+                    _ = try? await self.unpairClient(uuid: other.uuid)
+                }
+
+                // Wait briefly for Sunshine to flush state.json after unpair calls.
+                let flushDeadline = Date().addingTimeInterval(1.0)
+                while Date() < flushDeadline {
+                    if EngineConfigGenerator.isCertificateUniquelyEnabled(
+                        fingerprintSHA256: fingerprintSHA256,
+                        at: stateFileURL
+                    ) {
+                        break
+                    }
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                }
+            }
+
+            let finalAll = EngineConfigGenerator.loadAllPairedCerts(at: stateFileURL)
+            let finalMatches = finalAll.filter {
+                $0.fingerprintSHA256?.caseInsensitiveCompare(fingerprintSHA256) == .orderedSame
+            }
+            guard finalMatches.count == 1, finalMatches[0].enabled else {
+                return nil
+            }
+            return finalMatches[0]
+        }
+    }
+
+    /// Removes EVERY entry in the streaming engine matching `fingerprintSHA256` (including any
+    /// duplicates or entries without a stored `engineUUID`), plus `fallbackUUID` if provided.
+    public func unpairAllEntries(
+        forFingerprint fingerprintSHA256: String,
+        fallbackUUID: String? = nil,
+        stateFileURL: URL
+    ) async {
+        var uuidsToRemove: [String] = []
+        let all = EngineConfigGenerator.loadAllPairedCerts(at: stateFileURL)
+        for cert in all where cert.fingerprintSHA256?.caseInsensitiveCompare(fingerprintSHA256) == .orderedSame {
+            if !uuidsToRemove.contains(cert.uuid) {
+                uuidsToRemove.append(cert.uuid)
+            }
+        }
+        if let fallbackUUID, !fallbackUUID.isEmpty, !uuidsToRemove.contains(fallbackUUID) {
+            uuidsToRemove.append(fallbackUUID)
+        }
+        for uuid in uuidsToRemove {
+            _ = try? await unpairClient(uuid: uuid)
         }
     }
 

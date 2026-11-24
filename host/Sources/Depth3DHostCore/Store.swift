@@ -52,15 +52,28 @@ public final class HostStateStore: @unchecked Sendable {
         try writeJSON(devices, to: paths.pairedDevicesFile, restricted: true)
     }
 
+    /// Inserts or updates a paired device keyed strictly by primary key `record.id`
+    /// (its certificate SHA-256 fingerprint, or `"legacy:<deviceId>"` for unmigrated records).
+    /// Never overwrites a distinct certificate that happens to share the same `deviceId` label.
     public func upsertPairedDevice(_ record: PairedDeviceRecord) throws -> [PairedDeviceRecord] {
         lock.lock()
         defer { lock.unlock() }
         var devices: [PairedDeviceRecord] = readJSON(paths.pairedDevicesFile) ?? []
-        if let idx = devices.firstIndex(where: { $0.deviceId == record.deviceId }) {
+        if let idx = devices.firstIndex(where: { $0.id == record.id }) {
             devices[idx] = record
         } else {
             devices.append(record)
         }
+        try writeJSON(devices, to: paths.pairedDevicesFile, restricted: true)
+        return devices
+    }
+
+    /// Removes a single paired device record by its primary key (`PairedDeviceRecord.id`).
+    public func removePairedDevice(id: String) throws -> [PairedDeviceRecord] {
+        lock.lock()
+        defer { lock.unlock() }
+        var devices: [PairedDeviceRecord] = readJSON(paths.pairedDevicesFile) ?? []
+        devices.removeAll { $0.id == id }
         try writeJSON(devices, to: paths.pairedDevicesFile, restricted: true)
         return devices
     }

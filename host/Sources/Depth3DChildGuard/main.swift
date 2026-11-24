@@ -7,44 +7,76 @@ import Foundation
 ///   depth3d-child-guard <parent-pid> <executable-path> [args...]
 ///
 /// Design:
-/// - Calls `setpgid(0, 0)` so this guard and its spawned child (plus grandchildren) share
-///   process group `pgid == guardPID`, allowing the host to atomically terminate the entire
-///   process group on escalation (`kill(-guardPID, SIGKILL)`).
-/// - If `DEPTH3D_CHILD_PID_FILE` is set in the environment, writes the real child's PID to it
-///   immediately after `posix_spawn` so the host's `ChildProcessLedger` tracks BOTH the guard
-///   and the real child process (with kernel start times).
+/// - Places the spawned child in its OWN dedicated process group (`POSIX_SPAWN_SETPGROUP`,
+///   `pgroup = 0` -> `childPGID == childPID != guardPGID`), so every grandchild spawned by
+///   the child inherits `childPGID` while this guard remains outside `childPGID`.
+/// - Writes the real child PID to `DEPTH3D_CHILD_PID_FILE` immediately after `posix_spawn`
+///   so the host's `ChildProcessLedger` tracks BOTH the guard and real child (with `pgid = childPID`
+///   and kernel start time).
 /// - Uses BSD `kqueue` (`EVFILT_PROC` `NOTE_EXIT` + `EVFILT_SIGNAL` `SIGTERM`/`SIGINT`) with
-///   zero busy-polling. On parent exit OR termination signal, sends `SIGTERM` to the child,
-///   waits up to 1.2s, and escalates to `SIGKILL` on the child (and process group) if the child
-///   ignores `SIGTERM`.
+///   zero busy-polling.
+/// - On normal stop (`SIGTERM`/`SIGINT`), parent exit (`NOTE_EXIT`), OR child exit:
+///   signals the ENTIRE child process group (`-childPGID`) with `SIGTERM`, waits up to 1.2s
+///   until BOTH the child is reaped AND zero processes remain in `childPGID` (catching any
+///   grandchildren!), then escalates `-childPGID` to `SIGKILL` if any process survives.
 
-private func terminateChildAndGroup(childPID: pid_t, guardPGID: pid_t) {
+private func isProcessGroupAlive(_ pgid: pid_t) -> Bool {
+    guard pgid > 1 else { return false }
+    if kill(-pgid, 0) == 0 { return true }
+    return errno != ESRCH
+}
+
+private func terminateChildProcessGroup(childPID: pid_t, alreadyReaped: Bool = false) {
     guard childPID > 1 else { return }
+    let childPGID = childPID
+    var reaped = alreadyReaped
 
-    // Forward SIGTERM to child (and child's own group if it changed pgid).
-    _ = kill(childPID, SIGTERM)
-    let childPGID = getpgid(childPID)
-    if childPGID > 1 && childPGID != guardPGID {
-        _ = kill(-childPGID, SIGTERM)
+    if !reaped {
+        var st: Int32 = 0
+        let r = waitpid(childPID, &st, WNOHANG)
+        if r == childPID || (r < 0 && errno == ECHILD) {
+            reaped = true
+        }
+    }
+
+    if reaped && !isProcessGroupAlive(childPGID) {
+        return
+    }
+
+    // Send SIGTERM to the ENTIRE child process group (child + all grandchildren).
+    _ = kill(-childPGID, SIGTERM)
+    if !reaped {
+        _ = kill(childPID, SIGTERM)
     }
 
     let deadline = Date().addingTimeInterval(1.2)
     while Date() < deadline {
-        var status: Int32 = 0
-        let r = waitpid(childPID, &status, WNOHANG)
-        if r == childPID || (r < 0 && errno == ECHILD) {
+        if !reaped {
+            var status: Int32 = 0
+            let r = waitpid(childPID, &status, WNOHANG)
+            if r == childPID || (r < 0 && errno == ECHILD) {
+                reaped = true
+            }
+        }
+        if reaped && !isProcessGroupAlive(childPGID) {
             return
         }
         usleep(30_000)
     }
 
-    // Child ignored SIGTERM or failed to exit promptly: force-kill child and its group.
-    _ = kill(childPID, SIGKILL)
-    if childPGID > 1 && childPGID != guardPGID {
-        _ = kill(-childPGID, SIGKILL)
+    // Child or any grandchild ignored SIGTERM / failed to exit promptly: force-kill entire group.
+    _ = kill(-childPGID, SIGKILL)
+    if !reaped {
+        _ = kill(childPID, SIGKILL)
+        var status: Int32 = 0
+        _ = waitpid(childPID, &status, 0)
     }
-    var status: Int32 = 0
-    _ = waitpid(childPID, &status, 0)
+
+    // Brief drain so kernel finishes reaping killed grandchildren before guard returns.
+    let killDrain = Date().addingTimeInterval(0.3)
+    while Date() < killDrain && isProcessGroupAlive(childPGID) {
+        usleep(20_000)
+    }
 }
 
 private func writeChildPIDFileIfConfigured(_ childPID: pid_t) {
@@ -67,9 +99,8 @@ private func main() -> Int32 {
     let execPath = args[2]
     let childArgs = Array(args.dropFirst(2))
 
-    // Become our own process group leader so our spawned child inherits `pgid == getpid()`.
+    // Guard owns its own process group (`guardPGID`), separate from the child's process group (`childPID`).
     _ = setpgid(0, 0)
-    let guardPGID = getpid()
 
     // If parent is already gone before we even spawn, exit immediately.
     if kill(parentPID, 0) != 0 && errno == ESRCH {
@@ -80,8 +111,8 @@ private func main() -> Int32 {
     signal(SIGTERM, SIG_IGN)
     signal(SIGINT, SIG_IGN)
 
-    // Spawn child inheriting stdin/stdout/stderr, environment, and process group (`guardPGID`).
-    // Restore default SIGTERM/SIGINT disposition in child via posix_spawnattr so child can handle them normally.
+    // Spawn child atomically in its OWN process group (`pgroup = 0` -> `childPGID == childPID`)
+    // and restore default SIGTERM/SIGINT disposition so child handles normal termination cleanly.
     var attr: posix_spawnattr_t?
     posix_spawnattr_init(&attr)
     defer { posix_spawnattr_destroy(&attr) }
@@ -90,7 +121,8 @@ private func main() -> Int32 {
     sigaddset(&defSigs, SIGTERM)
     sigaddset(&defSigs, SIGINT)
     posix_spawnattr_setsigdefault(&attr, &defSigs)
-    posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSIGDEF))
+    posix_spawnattr_setpgroup(&attr, 0)
+    posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETPGROUP))
 
     var cArgs: [UnsafeMutablePointer<CChar>?] = childArgs.map { strdup($0) }
     cArgs.append(nil)
@@ -113,6 +145,7 @@ private func main() -> Int32 {
     guard kq >= 0 else {
         var st: Int32 = 0
         _ = waitpid(childPID, &st, 0)
+        terminateChildProcessGroup(childPID: childPID, alreadyReaped: true)
         return (st & 0x7f) == 0 ? ((st >> 8) & 0xff) : 1
     }
     defer { close(kq) }
@@ -155,14 +188,14 @@ private func main() -> Int32 {
     let reg = kevent(kq, &changes, Int32(changes.count), nil, 0, nil)
     if reg < 0 {
         if kill(parentPID, 0) != 0 && errno == ESRCH {
-            terminateChildAndGroup(childPID: childPID, guardPGID: guardPGID)
+            terminateChildProcessGroup(childPID: childPID)
             return 0
         }
     }
 
     // Re-check parent liveness after kqueue registration to close any race window.
     if kill(parentPID, 0) != 0 && errno == ESRCH {
-        terminateChildAndGroup(childPID: childPID, guardPGID: guardPGID)
+        terminateChildProcessGroup(childPID: childPID)
         return 0
     }
 
@@ -176,35 +209,37 @@ private func main() -> Int32 {
         }
         if n == 0 {
             if getppid() != parentPID || (kill(parentPID, 0) != 0 && errno == ESRCH) {
-                terminateChildAndGroup(childPID: childPID, guardPGID: guardPGID)
+                terminateChildProcessGroup(childPID: childPID)
                 return 0
             }
             var st: Int32 = 0
             if waitpid(childPID, &st, WNOHANG) == childPID {
+                terminateChildProcessGroup(childPID: childPID, alreadyReaped: true)
                 return (st & 0x7f) == 0 ? ((st >> 8) & 0xff) : (128 + (st & 0x7f))
             }
             continue
         }
 
         if event.filter == Int16(EVFILT_SIGNAL) {
-            terminateChildAndGroup(childPID: childPID, guardPGID: guardPGID)
+            terminateChildProcessGroup(childPID: childPID)
             return 0
         }
 
         if event.filter == Int16(EVFILT_PROC) {
             if pid_t(event.ident) == parentPID {
-                terminateChildAndGroup(childPID: childPID, guardPGID: guardPGID)
+                terminateChildProcessGroup(childPID: childPID)
                 return 0
             }
             if pid_t(event.ident) == childPID {
                 var st: Int32 = 0
                 _ = waitpid(childPID, &st, 0)
+                terminateChildProcessGroup(childPID: childPID, alreadyReaped: true)
                 return (st & 0x7f) == 0 ? ((st >> 8) & 0xff) : (128 + (st & 0x7f))
             }
         }
     }
 
-    terminateChildAndGroup(childPID: childPID, guardPGID: guardPGID)
+    terminateChildProcessGroup(childPID: childPID)
     return 1
 }
 

@@ -6,9 +6,9 @@ public struct PendingPairingPrompt: Identifiable, Equatable, Sendable {
     public let deviceName: String
     public let deviceId: String
     public let clientAddress: String
-    /// True when `deviceId` was previously bound to a different TLS client certificate
-    /// (e.g. spoofing attempt or factory-reset headset). UI displays an explicit warning
-    /// and never inherits previous `autoAllow`.
+    /// True when `deviceId` already has a bound certificate fingerprint, but this request
+    /// carries no client certificate or a different fingerprint. UI displays an explicit warning
+    /// and approval creates a brand-new record without overwriting or inheriting auto-allow.
     public let identityChanged: Bool
     public let requestedAt: Date
     public let expiresAt: Date
@@ -38,13 +38,14 @@ public enum PairingDecision: Equatable, Sendable {
     case autoApproved
     case rejected
     case timedOut
-    case busy
-    case rateLimited
+    case busy(retryAfterSec: Int)
+    case cooldown(retryAfterSec: Int)
     case cancelled
 }
 
-/// Manages incoming auto-pairing requests, user approval prompts, certificate-bound
-/// auto-allow memory, single-prompt serialization, per-IP cooldown, and 60s timeout.
+/// Manages incoming auto-pairing requests, user approval prompts, certificate-fingerprint
+/// auto-allow memory, single-prompt serialization, per-IP cooldown, per-IP prompt fairness,
+/// and 60s timeout.
 public actor PairingCoordinator {
     private struct ActiveWaiter {
         let prompt: PendingPairingPrompt
@@ -54,13 +55,24 @@ public actor PairingCoordinator {
 
     private let timeout: TimeInterval
     private let cooldownDuration: TimeInterval
-    /// Maps `deviceId` -> uppercase SHA-256 hex fingerprint of the paired TLS client certificate.
-    /// Auto-allow NEVER trusts `deviceId` alone without a matching TLS client certificate!
-    private var autoAllowedCertByDeviceId: [String: String]
+    private let fairnessYieldDuration: TimeInterval
+
+    /// Uppercase SHA-256 hex fingerprints of bound client certificates that have "以后自动允许" enabled.
+    /// Auto-allow NEVER depends on `deviceId`; it trusts ONLY the TLS handshake certificate fingerprint.
+    private var autoAllowedFingerprints: Set<String>
+
     /// Cooldown expiration timestamps keyed STRICTLY by normalized source IP (`ip:<addr>`).
     /// Intentionally NEVER keyed by `deviceId` so a LAN attacker spoofing a victim's `deviceId`
     /// cannot lock out the legitimate headset.
     private var cooldownUntilByIP: [String: Date] = [:]
+
+    /// Per-IP fairness tracking (S-5):
+    /// - Records other source IPs that recently got `.busy` while a prompt was occupied.
+    /// - When a prompt completes, if another IP was waiting, briefly yields the prompt slot so
+    ///   the IP that just occupied the prompt cannot monopolize consecutive prompts back-to-back.
+    private var recentBlockedIPs: [String: Date] = [:]
+    private var fairnessYieldUntilByIP: [String: Date] = [:]
+
     /// Only ONE confirmation prompt may be active on screen at a time to prevent prompt flooding.
     private var activeWaiter: ActiveWaiter?
     private var onPendingChanged: (@Sendable ([PendingPairingPrompt]) -> Void)?
@@ -68,13 +80,16 @@ public actor PairingCoordinator {
     public init(
         timeout: TimeInterval = 60.0,
         cooldownDuration: TimeInterval = 30.0,
-        autoAllowedCertByDeviceId: [String: String] = [:]
+        fairnessYieldDuration: TimeInterval = 10.0,
+        autoAllowedFingerprints: Set<String> = []
     ) {
         self.timeout = timeout
         self.cooldownDuration = max(0, cooldownDuration)
-        self.autoAllowedCertByDeviceId = Dictionary(
-            autoAllowedCertByDeviceId.map { ($0.key, $0.value.uppercased()) },
-            uniquingKeysWith: { first, _ in first }
+        self.fairnessYieldDuration = max(0, fairnessYieldDuration)
+        self.autoAllowedFingerprints = Set(
+            autoAllowedFingerprints
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
+                .filter { !$0.isEmpty }
         )
     }
 
@@ -83,29 +98,32 @@ public actor PairingCoordinator {
         notifyPending()
     }
 
-    public func setAutoAllowed(deviceId: String, certFingerprintSHA256: String?) {
-        if let fp = certFingerprintSHA256?.trimmingCharacters(in: .whitespacesAndNewlines), !fp.isEmpty {
-            autoAllowedCertByDeviceId[deviceId] = fp.uppercased()
+    public func setAutoAllowed(certFingerprintSHA256: String?, enabled: Bool) {
+        guard let fp = certFingerprintSHA256?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased(),
+              !fp.isEmpty
+        else { return }
+        if enabled {
+            autoAllowedFingerprints.insert(fp)
         } else {
-            autoAllowedCertByDeviceId.removeValue(forKey: deviceId)
+            autoAllowedFingerprints.remove(fp)
         }
     }
 
-    public func replaceAutoAllowedDevices(_ mapping: [String: String]) {
-        autoAllowedCertByDeviceId = Dictionary(
-            mapping.map { ($0.key, $0.value.uppercased()) },
-            uniquingKeysWith: { first, _ in first }
+    public func replaceAutoAllowedFingerprints(_ fingerprints: Set<String>) {
+        autoAllowedFingerprints = Set(
+            fingerprints
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
+                .filter { !$0.isEmpty }
         )
     }
 
-    public func isAutoAllowed(deviceId: String, peerCertFingerprintSHA256: String?) -> Bool {
-        guard let peerFP = peerCertFingerprintSHA256?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !peerFP.isEmpty,
-              let boundFP = autoAllowedCertByDeviceId[deviceId]
+    public func isAutoAllowed(peerCertFingerprintSHA256: String?) -> Bool {
+        guard let peerFP = peerCertFingerprintSHA256?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased(),
+              !peerFP.isEmpty
         else {
             return false
         }
-        return boundFP.caseInsensitiveCompare(peerFP) == .orderedSame
+        return autoAllowedFingerprints.contains(peerFP)
     }
 
     public func pendingPrompts() -> [PendingPairingPrompt] {
@@ -116,51 +134,70 @@ public actor PairingCoordinator {
     }
 
     /// Evaluates an incoming pairing request:
-    /// 1. Auto-approves ONLY if `deviceId` has auto-allow enabled AND `peerCertFingerprintSHA256`
-    ///    matches the certificate bound when that device completed pairing.
-    /// 2. Rejects with `.rateLimited` if this source IP is in cooldown after a reject/timeout.
-    /// 3. Rejects with `.busy` if another confirmation prompt is already on screen (one prompt at a time).
-    /// 4. Detects identity change whenever `knownBoundCertFingerprint` exists for `deviceId` and does
-    ///    not match `peerCertFingerprintSHA256` (including missing cert on a previously bound `deviceId`).
-    /// 5. Presents a single confirmation prompt with `clientAddress` + `identityChanged` and waits up to `timeout`.
+    /// 1. Auto-approves ONLY if `peerCertFingerprintSHA256` matches a bound certificate with auto-allow enabled.
+    /// 2. Rejects with `.cooldown(retryAfterSec:)` if this source IP is in cooldown after reject/timeout.
+    /// 3. Rejects with `.busy(retryAfterSec:)` if another prompt is active OR if this IP must yield
+    ///    the prompt slot to another source IP that was recently blocked by `.busy` (S-5 fairness).
+    /// 4. Sets `identityChanged = true` whenever `knownBoundFingerprintsForDeviceId` is non-empty and
+    ///    does not contain `peerCertFingerprintSHA256` (including missing cert).
+    /// 5. Presents a single confirmation prompt and waits up to `timeout`.
     public func requestApproval(
         deviceName: String,
         deviceId: String,
         clientAddress: String,
         peerCertFingerprintSHA256: String?,
-        knownBoundCertFingerprint: String? = nil
+        knownBoundFingerprintsForDeviceId: Set<String> = []
     ) async -> PairingDecision {
-        if isAutoAllowed(deviceId: deviceId, peerCertFingerprintSHA256: peerCertFingerprintSHA256) {
+        if isAutoAllowed(peerCertFingerprintSHA256: peerCertFingerprintSHA256) {
             HostLogger.info("Auto-approved pairing for cert-verified device \(deviceName)", category: "pair")
             return .autoApproved
         }
 
         let normalizedIP = IPAddressNormalizer.normalize(clientAddress)
         let now = Date()
-        pruneExpiredCooldowns(now: now)
+        pruneExpiredTimers(now: now)
 
         let ipKey = "ip:\(normalizedIP)"
         if let exp = cooldownUntilByIP[ipKey], exp > now {
-            HostLogger.warning("Rate-limited pairing request from \(normalizedIP) during IP cooldown", category: "pair")
-            return .rateLimited
+            let remaining = max(1, Int(ceil(exp.timeIntervalSince(now))))
+            HostLogger.warning("Rate-limited pairing request from \(normalizedIP) during IP cooldown (\(remaining)s)", category: "pair")
+            return .cooldown(retryAfterSec: remaining)
         }
 
-        // Enforce single active prompt at a time.
-        if activeWaiter != nil {
+        // Enforce single active prompt at a time and record blocked peer IPs for fairness.
+        if let active = activeWaiter {
+            if active.prompt.clientAddress != normalizedIP {
+                recentBlockedIPs[normalizedIP] = now
+            }
+            let remaining = max(1, min(10, Int(ceil(active.prompt.expiresAt.timeIntervalSince(now)))))
             HostLogger.warning("Rejected concurrent pairing request from \(normalizedIP) while another prompt is active", category: "pair")
-            return .busy
+            return .busy(retryAfterSec: remaining)
         }
 
+        // Per-IP fairness yield: if this IP just finished occupying the prompt while another IP
+        // was waiting, yield briefly so the other IP can claim the prompt without starvation.
+        if let yieldExp = fairnessYieldUntilByIP[ipKey], yieldExp > now {
+            let remaining = max(1, Int(ceil(yieldExp.timeIntervalSince(now))))
+            HostLogger.warning("Yielding pairing prompt slot from \(normalizedIP) for fair access (\(remaining)s)", category: "pair")
+            return .busy(retryAfterSec: remaining)
+        }
+
+        // Claiming the prompt clears any pending fairness yields for other IPs and removes this IP from waiters.
+        recentBlockedIPs.removeValue(forKey: normalizedIP)
+        fairnessYieldUntilByIP.removeAll()
+
+        let normalizedKnown = Set(
+            knownBoundFingerprintsForDeviceId
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
+                .filter { !$0.isEmpty }
+        )
         let identityChanged: Bool
-        if let boundFP = knownBoundCertFingerprint?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !boundFP.isEmpty
-        {
-            if let peerFP = peerCertFingerprintSHA256?.trimmingCharacters(in: .whitespacesAndNewlines),
+        if !normalizedKnown.isEmpty {
+            if let peerFP = peerCertFingerprintSHA256?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased(),
                !peerFP.isEmpty
             {
-                identityChanged = (boundFP.caseInsensitiveCompare(peerFP) != .orderedSame)
+                identityChanged = !normalizedKnown.contains(peerFP)
             } else {
-                // Previously bound deviceId presented NO client certificate -> identity changed!
                 identityChanged = true
             }
         } else {
@@ -198,12 +235,14 @@ public actor PairingCoordinator {
 
     public func approve(promptId: UUID, rememberAutoAllow: Bool) {
         guard let waiter = activeWaiter, waiter.prompt.id == promptId else { return }
+        applyFairnessYieldIfNeeded(for: waiter.prompt.clientAddress)
         resolveInternal(decision: .approved(autoAllowFuture: rememberAutoAllow))
     }
 
     public func reject(promptId: UUID) {
         guard let waiter = activeWaiter, waiter.prompt.id == promptId else { return }
         applyCooldown(for: waiter.prompt)
+        applyFairnessYieldIfNeeded(for: waiter.prompt.clientAddress)
         resolveInternal(decision: .rejected)
     }
 
@@ -216,6 +255,7 @@ public actor PairingCoordinator {
         guard let waiter = activeWaiter, waiter.prompt.id == id else { return }
         HostLogger.info("Pairing prompt timed out for \(waiter.prompt.clientAddress)", category: "pair")
         applyCooldown(for: waiter.prompt)
+        applyFairnessYieldIfNeeded(for: waiter.prompt.clientAddress)
         resolveInternal(decision: .timedOut)
     }
 
@@ -224,8 +264,21 @@ public actor PairingCoordinator {
         cooldownUntilByIP["ip:\(prompt.clientAddress)"] = Date().addingTimeInterval(cooldownDuration)
     }
 
-    private func pruneExpiredCooldowns(now: Date) {
+    private func applyFairnessYieldIfNeeded(for clientIP: String) {
+        guard fairnessYieldDuration > 0 else { return }
+        let now = Date()
+        pruneExpiredTimers(now: now)
+        let otherIPWaiting = recentBlockedIPs.keys.contains { $0 != clientIP }
+        if otherIPWaiting {
+            fairnessYieldUntilByIP["ip:\(clientIP)"] = now.addingTimeInterval(fairnessYieldDuration)
+        }
+    }
+
+    private func pruneExpiredTimers(now: Date) {
         cooldownUntilByIP = cooldownUntilByIP.filter { $0.value > now }
+        fairnessYieldUntilByIP = fairnessYieldUntilByIP.filter { $0.value > now }
+        let waiterCutoff = now.addingTimeInterval(-max(60.0, timeout))
+        recentBlockedIPs = recentBlockedIPs.filter { $0.value > waiterCutoff }
     }
 
     private func resolveInternal(decision: PairingDecision) {

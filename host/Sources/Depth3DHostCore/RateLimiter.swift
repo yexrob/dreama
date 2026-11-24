@@ -36,20 +36,30 @@ public enum IPAddressNormalizer {
     }
 }
 
-/// Bounds the maximum number of simultaneous active TCP connections on a server.
+/// Bounds the maximum number of simultaneous active TCP connections globally and optionally per source IP.
 public final class ConnectionGuard: @unchecked Sendable {
     public let maxConnections: Int
+    public let maxConnectionsPerIP: Int?
     private let lock = NSLock()
     private var active: Int = 0
+    private var activeByIP: [String: Int] = [:]
 
-    public init(maxConnections: Int) {
+    public init(maxConnections: Int, maxConnectionsPerIP: Int? = nil) {
         self.maxConnections = max(1, maxConnections)
+        self.maxConnectionsPerIP = maxConnectionsPerIP.map { max(1, $0) }
     }
 
     public var activeCount: Int {
         lock.lock()
         defer { lock.unlock() }
         return active
+    }
+
+    public func activeCount(forIP rawIP: String) -> Int {
+        let ip = IPAddressNormalizer.normalize(rawIP)
+        lock.lock()
+        defer { lock.unlock() }
+        return activeByIP[ip] ?? 0
     }
 
     public func tryAcquire() -> Bool {
@@ -64,6 +74,34 @@ public final class ConnectionGuard: @unchecked Sendable {
         lock.lock()
         active = max(0, active - 1)
         lock.unlock()
+    }
+
+    public func tryAcquire(forIP rawIP: String) -> Bool {
+        let ip = IPAddressNormalizer.normalize(rawIP)
+        lock.lock()
+        defer { lock.unlock() }
+        guard active < maxConnections else { return false }
+        if let perIPLimit = maxConnectionsPerIP {
+            let currentIP = activeByIP[ip] ?? 0
+            guard currentIP < perIPLimit else { return false }
+            activeByIP[ip] = currentIP + 1
+        }
+        active += 1
+        return true
+    }
+
+    public func release(forIP rawIP: String) {
+        let ip = IPAddressNormalizer.normalize(rawIP)
+        lock.lock()
+        defer { lock.unlock() }
+        active = max(0, active - 1)
+        if maxConnectionsPerIP != nil, let current = activeByIP[ip] {
+            if current <= 1 {
+                activeByIP.removeValue(forKey: ip)
+            } else {
+                activeByIP[ip] = current - 1
+            }
+        }
     }
 }
 

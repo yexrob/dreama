@@ -172,12 +172,10 @@ public enum EngineConfigGenerator {
         return nil
     }
 
-    /// Parses paired client certificates from Sunshine's real `state.json` schema:
-    /// Sunshine v2026.914.233613 writes `root.named_devices` (`[{name, cert, uuid, enabled}]`,
-    /// where `enabled` is Boost property_tree string `"true"` / `"false"` or JSON bool).
-    /// Falls back to legacy `root.named_certs` only if `named_devices` is absent.
-    /// Disabled entries (`enabled == false` / `"false"`) are excluded.
-    public static func parsePairedCerts(fromStateJSON data: Data) -> [EnginePairedCert] {
+    /// Parses ALL paired client certificate entries from Sunshine's `state.json` (`root.named_devices`,
+    /// with legacy `root.named_certs` fallback), preserving original order and `enabled` state so
+    /// callers can detect duplicates and disabled entries accurately.
+    public static func parseAllPairedCerts(fromStateJSON data: Data) -> [EnginePairedCert] {
         guard let rootObj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let root = rootObj["root"] as? [String: Any]
         else {
@@ -203,14 +201,36 @@ public enum EngineConfigGenerator {
             } else {
                 enabled = true
             }
-            guard enabled else { return nil }
             let name = (entry["name"] as? String) ?? fallbackName
             return EnginePairedCert(uuid: uuid, name: name, certPEM: cert, enabled: enabled)
         }
     }
 
+    /// Parses enabled paired client certificates from Sunshine's real `state.json` schema.
+    public static func parsePairedCerts(fromStateJSON data: Data) -> [EnginePairedCert] {
+        parseAllPairedCerts(fromStateJSON: data).filter(\.enabled)
+    }
+
+    public static func loadAllPairedCerts(at stateFileURL: URL) -> [EnginePairedCert] {
+        guard let data = try? Data(contentsOf: stateFileURL) else { return [] }
+        return parseAllPairedCerts(fromStateJSON: data)
+    }
+
     public static func loadPairedCerts(at stateFileURL: URL) -> [EnginePairedCert] {
         guard let data = try? Data(contentsOf: stateFileURL) else { return [] }
         return parsePairedCerts(fromStateJSON: data)
+    }
+
+    /// Returns `true` iff `fingerprintSHA256` appears **exactly once** in `state.json` and is enabled.
+    /// (Sunshine's `is_client_enabled` returns false when duplicate entries exist for the same cert.)
+    public static func isCertificateUniquelyEnabled(
+        fingerprintSHA256: String,
+        at stateFileURL: URL
+    ) -> Bool {
+        let all = loadAllPairedCerts(at: stateFileURL)
+        let matches = all.filter {
+            $0.fingerprintSHA256?.caseInsensitiveCompare(fingerprintSHA256) == .orderedSame
+        }
+        return matches.count == 1 && matches[0].enabled
     }
 }

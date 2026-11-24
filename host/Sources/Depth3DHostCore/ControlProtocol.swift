@@ -134,6 +134,8 @@ public struct HTTPResponse: Equatable, Sendable {
         case 404: return "Not Found"
         case 405: return "Method Not Allowed"
         case 408: return "Request Timeout"
+        case 409: return "Conflict"
+        case 410: return "Gone"
         case 413: return "Payload Too Large"
         case 416: return "Range Not Satisfiable"
         case 426: return "Upgrade Required"
@@ -263,6 +265,41 @@ public struct PairRequestPayload: Codable, Equatable, Sendable {
     }
 }
 
+public struct PairApprovedResponse: Codable, Equatable, Sendable {
+    public let ok: Bool
+    /// `"gamestream"` (headset runs GameStream pairing next) or `"done"` (cert already uniquely enabled in engine).
+    public let next: String
+    public let ticket: String
+
+    public init(ok: Bool = true, next: String, ticket: String) {
+        self.ok = ok
+        self.next = next
+        self.ticket = ticket
+    }
+}
+
+public struct PairCompleteRequestPayload: Codable, Equatable, Sendable {
+    public let ticket: String
+    public let deviceId: String?
+    public let device: String?
+
+    public init(ticket: String, deviceId: String? = nil, device: String? = nil) {
+        self.ticket = ticket
+        self.deviceId = deviceId
+        self.device = device
+    }
+}
+
+public struct PairCompleteResponse: Codable, Equatable, Sendable {
+    public let ok: Bool
+    public let media: HostInfoResponse.MediaStatus?
+
+    public init(ok: Bool = true, media: HostInfoResponse.MediaStatus?) {
+        self.ok = ok
+        self.media = media
+    }
+}
+
 public struct MediaCredentialsResponse: Codable, Equatable, Sendable {
     public struct WebDAVInfo: Codable, Equatable, Sendable {
         public let port: Int
@@ -281,6 +318,19 @@ public struct MediaCredentialsResponse: Codable, Equatable, Sendable {
     public init(webdav: WebDAVInfo?) {
         self.webdav = webdav
     }
+}
+
+public enum PairTicketIssueResult: Equatable, Sendable {
+    case issued(next: String, ticket: String)
+    case streamNotReady(reason: String)
+}
+
+public enum PairCompleteOutcome: Equatable, Sendable {
+    case completed(mediaPort: UInt16?)
+    case notPaired
+    case ticketExpired
+    case sourceMismatch
+    case streamNotReady(reason: String)
 }
 
 /// Snapshot of current host runtime status supplied to `ControlProtocolRouter`.
@@ -312,22 +362,36 @@ public struct ControlProtocolSnapshot: Sendable {
     }
 }
 
-/// Delegate supplying live state and authorization checks to `ControlProtocolRouter`.
+/// Delegate supplying live state, certificate authorization, and two-step pairing lifecycle
+/// operations to `ControlProtocolRouter`.
 public protocol ControlProtocolDelegate: Sendable {
     func currentSnapshot() async -> ControlProtocolSnapshot
-    func authorizeMediaClient(deviceId: String, peerCertFingerprintSHA256: String) async -> Bool
-    func knownBoundCertFingerprint(forDeviceId deviceId: String) async -> String?
-    func handleApprovedPairing(
+    func isKnownPairedCertificate(fingerprintSHA256: String) async -> Bool
+    func authorizeMediaClient(peerCertFingerprintSHA256: String) async -> Bool
+    func knownBoundCertFingerprints(forDeviceId deviceId: String) async -> Set<String>
+    func issueApprovedPairingTicket(
         deviceName: String,
         deviceId: String,
         pin: String,
         clientAddress: String,
-        autoAllowFuture: Bool
-    ) async -> Bool
+        peerCertFingerprintSHA256: String?,
+        autoAllowFuture: Bool,
+        approvedViaAutoAllow: Bool
+    ) async -> PairTicketIssueResult
+    func completePairing(
+        ticket: String,
+        deviceName: String?,
+        deviceId: String?,
+        clientAddress: String,
+        peerCertFingerprintSHA256: String
+    ) async -> PairCompleteOutcome
+    func cancelPendingEnginePairings(forClientAddress clientAddress: String) async
 }
 
 public extension ControlProtocolDelegate {
-    func knownBoundCertFingerprint(forDeviceId deviceId: String) async -> String? { nil }
+    func isKnownPairedCertificate(fingerprintSHA256: String) async -> Bool { false }
+    func knownBoundCertFingerprints(forDeviceId deviceId: String) async -> Set<String> { [] }
+    func cancelPendingEnginePairings(forClientAddress clientAddress: String) async {}
 }
 
 /// Pure, unit-testable HTTP router implementing `docs/specs/host-protocol.md` (v1).
@@ -340,6 +404,12 @@ public final class ControlProtocolRouter: Sendable {
     public init(pairingCoordinator: PairingCoordinator, delegate: ControlProtocolDelegate) {
         self.pairingCoordinator = pairingCoordinator
         self.delegate = delegate
+    }
+
+    /// Used by `ControlHTTPSServer` so ONLY genuinely paired client certificates (NOT arbitrary
+    /// attacker-generated self-signed certs) bypass unauthenticated connection rate limiting.
+    public func isKnownPairedCertificate(fingerprintSHA256: String) async -> Bool {
+        await delegate.isKnownPairedCertificate(fingerprintSHA256: fingerprintSHA256)
     }
 
     public func handle(_ request: HTTPRequest) async -> HTTPResponse {
@@ -367,6 +437,12 @@ public final class ControlProtocolRouter: Sendable {
             }
             return await handlePair(request)
 
+        case "/depth3d/v1/pair/complete":
+            guard request.method == "POST" else {
+                return HTTPResponse(statusCode: 405, headers: [("Allow", "POST")])
+            }
+            return await handlePairComplete(request)
+
         case "/depth3d/v1/media":
             guard request.method == "GET" else {
                 return HTTPResponse(statusCode: 405, headers: [("Allow", "GET")])
@@ -392,104 +468,161 @@ public final class ControlProtocolRouter: Sendable {
             ),
             media: snap.mediaPort.map { .init(port: Int($0)) }
         )
-        return encodeJSONPreservingNulls(statusCode: 200, response)
+        return encodeInfoPreservingNulls(statusCode: 200, response)
     }
 
     private func handlePair(_ request: HTTPRequest) async -> HTTPResponse {
         guard let payload = try? JSONDecoder().decode(PairRequestPayload.self, from: request.body) else {
-            return HTTPResponse.json(400, object: ["ok": false, "error": "invalid_payload"])
+            return HTTPResponse.json(400, object: ["error": "invalid_request"])
         }
         let device = payload.device.trimmingCharacters(in: .whitespacesAndNewlines)
         let deviceId = payload.deviceId.trimmingCharacters(in: .whitespacesAndNewlines)
         let pin = payload.pin.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard !device.isEmpty, !deviceId.isEmpty, Self.isValidPIN(pin) else {
-            return HTTPResponse.json(400, object: ["ok": false, "error": "invalid_fields"])
+            return HTTPResponse.json(400, object: ["error": "invalid_request"])
         }
 
-        // Reject immediately with 503 when the streaming engine is not ready (port conflict,
-        // paused, crashed, missing permission) — never prompt the user for an uncompletable pair.
         let preflight = await delegate.currentSnapshot()
         guard preflight.streamReady else {
             return HTTPResponse.json(503, object: [
-                "ok": false,
-                "error": "engine_unavailable",
+                "error": "stream_not_ready",
                 "reason": preflight.streamNotReadyReason ?? HostStrings.string("protocol.stream.unavailable")
             ])
         }
 
-        let knownBoundFP = await delegate.knownBoundCertFingerprint(forDeviceId: deviceId)
+        let knownBoundFPs = await delegate.knownBoundCertFingerprints(forDeviceId: deviceId)
         let decision = await pairingCoordinator.requestApproval(
             deviceName: device,
             deviceId: deviceId,
             clientAddress: request.remoteAddress,
             peerCertFingerprintSHA256: request.peerCertificateFingerprintSHA256,
-            knownBoundCertFingerprint: knownBoundFP
+            knownBoundFingerprintsForDeviceId: knownBoundFPs
         )
 
         switch decision {
         case .approved(let rememberAutoAllow):
-            let submitted = await delegate.handleApprovedPairing(
-                deviceName: device,
+            return await issueTicketResponse(
+                device: device,
                 deviceId: deviceId,
                 pin: pin,
-                clientAddress: request.remoteAddress,
-                autoAllowFuture: rememberAutoAllow
+                request: request,
+                autoAllowFuture: rememberAutoAllow,
+                approvedViaAutoAllow: false
             )
-            if submitted {
-                return HTTPResponse.json(200, object: ["ok": true])
-            } else {
-                return HTTPResponse.json(503, object: ["ok": false, "error": "engine_unavailable"])
-            }
 
         case .autoApproved:
-            let submitted = await delegate.handleApprovedPairing(
-                deviceName: device,
+            return await issueTicketResponse(
+                device: device,
                 deviceId: deviceId,
                 pin: pin,
-                clientAddress: request.remoteAddress,
-                autoAllowFuture: true
+                request: request,
+                autoAllowFuture: true,
+                approvedViaAutoAllow: true
             )
-            if submitted {
-                return HTTPResponse.json(200, object: ["ok": true])
-            } else {
-                return HTTPResponse.json(503, object: ["ok": false, "error": "engine_unavailable"])
-            }
 
         case .rejected:
-            return HTTPResponse.json(403, object: ["ok": false, "error": "rejected"])
+            await delegate.cancelPendingEnginePairings(forClientAddress: request.remoteAddress)
+            return HTTPResponse.json(403, object: ["error": "rejected"])
 
         case .timedOut:
-            return HTTPResponse.json(408, object: ["ok": false, "error": "timeout"])
+            await delegate.cancelPendingEnginePairings(forClientAddress: request.remoteAddress)
+            return HTTPResponse.json(408, object: ["error": "timeout"])
 
-        case .busy:
+        case .busy(let retryAfterSec):
             return HTTPResponse.json(
                 429,
-                object: ["ok": false, "error": "pairing_busy"],
-                extraHeaders: [("Retry-After", "5")]
+                object: ["error": "busy", "retryAfterSec": retryAfterSec],
+                extraHeaders: [("Retry-After", String(retryAfterSec))]
             )
 
-        case .rateLimited:
+        case .cooldown(let retryAfterSec):
             return HTTPResponse.json(
                 429,
-                object: ["ok": false, "error": "cooldown"],
-                extraHeaders: [("Retry-After", "30")]
+                object: ["error": "cooldown", "retryAfterSec": retryAfterSec],
+                extraHeaders: [("Retry-After", String(retryAfterSec))]
             )
 
         case .cancelled:
-            return HTTPResponse.json(403, object: ["ok": false, "error": "cancelled"])
+            await delegate.cancelPendingEnginePairings(forClientAddress: request.remoteAddress)
+            return HTTPResponse.json(403, object: ["error": "rejected"])
+        }
+    }
+
+    private func issueTicketResponse(
+        device: String,
+        deviceId: String,
+        pin: String,
+        request: HTTPRequest,
+        autoAllowFuture: Bool,
+        approvedViaAutoAllow: Bool
+    ) async -> HTTPResponse {
+        let result = await delegate.issueApprovedPairingTicket(
+            deviceName: device,
+            deviceId: deviceId,
+            pin: pin,
+            clientAddress: request.remoteAddress,
+            peerCertFingerprintSHA256: request.peerCertificateFingerprintSHA256,
+            autoAllowFuture: autoAllowFuture,
+            approvedViaAutoAllow: approvedViaAutoAllow
+        )
+        switch result {
+        case .issued(let next, let ticket):
+            return HTTPResponse.jsonEncodable(200, PairApprovedResponse(ok: true, next: next, ticket: ticket))
+        case .streamNotReady(let reason):
+            await delegate.cancelPendingEnginePairings(forClientAddress: request.remoteAddress)
+            return HTTPResponse.json(503, object: ["error": "stream_not_ready", "reason": reason])
+        }
+    }
+
+    private func handlePairComplete(_ request: HTTPRequest) async -> HTTPResponse {
+        guard let certFP = request.peerCertificateFingerprintSHA256 else {
+            return HTTPResponse.json(401, object: ["error": "client_cert_required"])
+        }
+        guard let payload = try? JSONDecoder().decode(PairCompleteRequestPayload.self, from: request.body) else {
+            return HTTPResponse.json(400, object: ["error": "invalid_request"])
+        }
+        let ticket = payload.ticket.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !ticket.isEmpty else {
+            return HTTPResponse.json(400, object: ["error": "invalid_request"])
+        }
+
+        let outcome = await delegate.completePairing(
+            ticket: ticket,
+            deviceName: payload.device?.trimmingCharacters(in: .whitespacesAndNewlines),
+            deviceId: payload.deviceId?.trimmingCharacters(in: .whitespacesAndNewlines),
+            clientAddress: request.remoteAddress,
+            peerCertFingerprintSHA256: certFP
+        )
+
+        switch outcome {
+        case .completed(let mediaPort):
+            let mediaValue: Any = mediaPort.map { ["port": Int($0)] } ?? NSNull()
+            return HTTPResponse.json(200, object: ["ok": true, "media": mediaValue])
+
+        case .notPaired:
+            return HTTPResponse.json(409, object: ["error": "not_paired"])
+
+        case .ticketExpired:
+            await delegate.cancelPendingEnginePairings(forClientAddress: request.remoteAddress)
+            return HTTPResponse.json(410, object: ["error": "ticket_expired"])
+
+        case .sourceMismatch:
+            await delegate.cancelPendingEnginePairings(forClientAddress: request.remoteAddress)
+            return HTTPResponse.json(403, object: ["error": "source_mismatch"])
+
+        case .streamNotReady(let reason):
+            await delegate.cancelPendingEnginePairings(forClientAddress: request.remoteAddress)
+            return HTTPResponse.json(503, object: ["error": "stream_not_ready", "reason": reason])
         }
     }
 
     private func handleMedia(_ request: HTTPRequest) async -> HTTPResponse {
-        guard let deviceId = request.header("x-depth3d-device")?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !deviceId.isEmpty,
-              let certFP = request.peerCertificateFingerprintSHA256
-        else {
+        guard let certFP = request.peerCertificateFingerprintSHA256 else {
             return HTTPResponse.json(401, object: ["error": "unauthorized"])
         }
 
-        let allowed = await delegate.authorizeMediaClient(deviceId: deviceId, peerCertFingerprintSHA256: certFP)
+        let allowed = await delegate.authorizeMediaClient(peerCertFingerprintSHA256: certFP)
         guard allowed else {
             return HTTPResponse.json(401, object: ["error": "unauthorized"])
         }
@@ -513,7 +646,7 @@ public final class ControlProtocolRouter: Sendable {
         ])
     }
 
-    private func encodeJSONPreservingNulls(statusCode: Int, _ info: HostInfoResponse) -> HTTPResponse {
+    private func encodeInfoPreservingNulls(statusCode: Int, _ info: HostInfoResponse) -> HTTPResponse {
         let streamDict: [String: Any] = [
             "ready": info.stream.ready,
             "reason": info.stream.reason ?? NSNull()

@@ -62,6 +62,23 @@ public enum PortProbe {
 /// - Parses logs accurately across multi-device streaming sessions
 /// - Automatically restarts on unexpected crashes with exponential backoff
 public final class EngineSupervisor: @unchecked Sendable {
+    /// Immutable per-launch tracking record so delayed `terminationHandler` callbacks from a
+    /// restarted/stopped old process can NEVER unregister or delete a newer launch's PIDs or pidfile (S-1).
+    private final class LaunchRecord: @unchecked Sendable {
+        let process: Process
+        let usedGuard: Bool
+        let pidFileURL: URL?
+        var guardPID: Int32 = -1
+        var childPID: Int32 = -1
+        var cleanedUp: Bool = false
+
+        init(process: Process, usedGuard: Bool, pidFileURL: URL?) {
+            self.process = process
+            self.usedGuard = usedGuard
+            self.pidFileURL = pidFileURL
+        }
+    }
+
     private let lock = NSLock()
     private let paths: HostPaths
     private let adminCredentials: EngineAdminCredentials
@@ -72,11 +89,7 @@ public final class EngineSupervisor: @unchecked Sendable {
     private let stableRunResetSeconds: TimeInterval
     private let queue = DispatchQueue(label: "dev.depth3d.host.engine.supervisor", qos: .userInitiated)
 
-    private var process: Process?
-    private var usedGuardForCurrentProcess = false
-    private var trackedGuardPID: Int32 = -1
-    private var trackedChildPID: Int32 = -1
-    private var currentChildPIDFile: URL?
+    private var activeLaunch: LaunchRecord?
     private var logState = EngineLogState()
     private var currentConfig: EngineConfigGenerator.Input?
     private var shouldBeRunning = false
@@ -304,6 +317,12 @@ public final class EngineSupervisor: @unchecked Sendable {
         proc.standardOutput = outputPipe
         proc.standardError = outputPipe
 
+        let launchRecord = LaunchRecord(
+            process: proc,
+            usedGuard: usedGuard,
+            pidFileURL: usedGuard ? childPIDFileURL : nil
+        )
+
         let lineBufferLock = NSLock()
         var pendingLineData = Data()
 
@@ -326,14 +345,14 @@ public final class EngineSupervisor: @unchecked Sendable {
             lineBufferLock.unlock()
 
             for line in lines {
-                self?.handleEngineLogLine(line)
+                self?.handleEngineLogLine(line, from: launchRecord)
             }
         }
 
         proc.terminationHandler = { [weak self] finished in
             outputPipe.fileHandleForReading.readabilityHandler = nil
             self?.queue.async {
-                self?.handleProcessTerminated(finished)
+                self?.handleProcessTerminated(finished, record: launchRecord)
             }
         }
 
@@ -348,11 +367,9 @@ public final class EngineSupervisor: @unchecked Sendable {
             }
 
             lock.lock()
-            self.process = proc
-            self.usedGuardForCurrentProcess = usedGuard
-            self.trackedGuardPID = usedGuard ? topPID : -1
-            self.trackedChildPID = realChildPID
-            self.currentChildPIDFile = usedGuard ? childPIDFileURL : nil
+            launchRecord.guardPID = usedGuard ? topPID : -1
+            launchRecord.childPID = realChildPID
+            self.activeLaunch = launchRecord
             lock.unlock()
 
             if usedGuard {
@@ -365,7 +382,7 @@ public final class EngineSupervisor: @unchecked Sendable {
                 if realChildPID > 1 {
                     ledger.register(
                         pid: realChildPID,
-                        pgid: topPID,
+                        pgid: realChildPID,
                         kind: .engine,
                         executableHint: executableURL.lastPathComponent
                     )
@@ -389,10 +406,14 @@ public final class EngineSupervisor: @unchecked Sendable {
         }
     }
 
-    private func handleEngineLogLine(_ line: String) {
+    private func handleEngineLogLine(_ line: String, from record: LaunchRecord) {
         guard let event = EngineLogParser.parse(line: line) else { return }
 
         lock.lock()
+        guard activeLaunch === record else {
+            lock.unlock()
+            return
+        }
         logState.apply(event)
         let ls = logState
         let sessionCount = ls.activeSessions
@@ -429,33 +450,37 @@ public final class EngineSupervisor: @unchecked Sendable {
         return .starting
     }
 
-    private func handleProcessTerminated(_ terminated: Process) {
+    private func handleProcessTerminated(_ terminated: Process, record: LaunchRecord) {
         lock.lock()
-        let isCurrent = (process === terminated)
-        let guardPIDToClear = trackedGuardPID
-        let childPIDToClear = trackedChildPID
-        let pidFileToRemove = currentChildPIDFile
+        let isCurrent = (activeLaunch === record)
+        let alreadyCleaned = record.cleanedUp
+        record.cleanedUp = true
+        let guardPIDToClear = record.guardPID
+        let childPIDToClear = record.childPID
+        let pidFileToRemove = record.pidFileURL
+        var hadSessions = false
+        var sessionCB: (@Sendable (Int) -> Void)?
         if isCurrent {
-            process = nil
-            usedGuardForCurrentProcess = false
-            trackedGuardPID = -1
-            trackedChildPID = -1
-            currentChildPIDFile = nil
+            activeLaunch = nil
+            hadSessions = lastReportedSessionCount > 0
+            lastReportedSessionCount = 0
+            sessionCB = onActiveSessionCountChanged
         }
         let wantRun = shouldBeRunning
         let launchedAt = lastLaunchDate
-        let hadSessions = lastReportedSessionCount > 0
-        lastReportedSessionCount = 0
-        let sessionCB = onActiveSessionCountChanged
         lock.unlock()
 
-        if guardPIDToClear > 1 { ledger.unregister(pid: guardPIDToClear) }
-        if childPIDToClear > 1 { ledger.unregister(pid: childPIDToClear) }
-        if let pidFileToRemove { try? FileManager.default.removeItem(at: pidFileToRemove) }
+        if !alreadyCleaned {
+            if guardPIDToClear > 1 { ledger.unregister(pid: guardPIDToClear) }
+            if childPIDToClear > 1 { ledger.unregister(pid: childPIDToClear) }
+            if let pidFileToRemove { try? FileManager.default.removeItem(at: pidFileToRemove) }
+        }
         if hadSessions {
             sessionCB?(0)
         }
 
+        // Critical (S-1): If a restart already replaced `activeLaunch`, return immediately
+        // without mutating any state or ledger entries belonging to the new process!
         guard isCurrent else { return }
 
         let code = terminated.terminationStatus
@@ -493,16 +518,21 @@ public final class EngineSupervisor: @unchecked Sendable {
 
     private func terminateCurrentProcessSync() {
         lock.lock()
-        let proc = process
-        let usedGuard = usedGuardForCurrentProcess
-        let guardPIDToClear = trackedGuardPID
-        var childPIDToClear = trackedChildPID
-        let pidFileToRemove = currentChildPIDFile
-        process = nil
-        usedGuardForCurrentProcess = false
-        trackedGuardPID = -1
-        trackedChildPID = -1
-        currentChildPIDFile = nil
+        let record = activeLaunch
+        activeLaunch = nil
+        var guardPIDToClear: Int32 = -1
+        var childPIDToClear: Int32 = -1
+        var pidFileToRemove: URL?
+        var proc: Process?
+        var usedGuard = false
+        if let record {
+            record.cleanedUp = true
+            proc = record.process
+            usedGuard = record.usedGuard
+            guardPIDToClear = record.guardPID
+            childPIDToClear = record.childPID
+            pidFileToRemove = record.pidFileURL
+        }
         let hadSessions = lastReportedSessionCount > 0
         lastReportedSessionCount = 0
         let sessionCB = onActiveSessionCountChanged

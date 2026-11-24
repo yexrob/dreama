@@ -68,6 +68,21 @@ public final class HostRuntime: ObservableObject {
     private var workspaceObservers: [NSObjectProtocol] = []
     private var hasStarted = false
 
+    private struct PendingPairingTicket {
+        let ticket: String
+        let clientIP: String
+        let deviceName: String
+        let deviceId: String
+        let rememberAutoAllow: Bool
+        let approvedViaAutoAllow: Bool
+        let expiresAt: Date
+        var feederTask: Task<Void, Never>?
+    }
+
+    private var pendingPairingTickets: [String: PendingPairingTicket] = [:]
+    internal var ticketTTLSeconds: TimeInterval = 120.0
+    internal var pinFeederWindowSeconds: TimeInterval = 60.0
+
     internal var currentWebDAVCredentials: WebDAVCredentials? { webDAVCredentials }
     internal var currentMediaCredentialRevision: Int { mediaCredentialRevision }
 
@@ -212,18 +227,17 @@ public final class HostRuntime: ObservableObject {
             let tlsId = try tlsManager.loadOrCreateIdentity(commonName: loadedSettings.computerName)
             self.tlsFingerprint = tlsId.fingerprintSHA256
 
-            // 2. Certificate-bound pairing coordinator & control protocol HTTPS server.
-            let autoCertMap = Dictionary(
-                pairedDevices.compactMap { dev -> (String, String)? in
+            // 2. Certificate-fingerprint-bound pairing coordinator & control protocol HTTPS server.
+            let autoFingerprints = Set(
+                pairedDevices.compactMap { dev -> String? in
                     guard dev.autoAllow, let fp = dev.certFingerprint, !fp.isEmpty else { return nil }
-                    return (dev.deviceId, fp)
-                },
-                uniquingKeysWith: { first, _ in first }
+                    return fp.uppercased()
+                }
             )
             let coordinator = PairingCoordinator(
                 timeout: 60.0,
                 cooldownDuration: 30.0,
-                autoAllowedCertByDeviceId: autoCertMap
+                autoAllowedFingerprints: autoFingerprints
             )
             self.pairingCoordinator = coordinator
             Task { [weak self] in
@@ -380,6 +394,10 @@ public final class HostRuntime: ObservableObject {
         webDAVServer?.stop()
         rcloneManager?.stopAll()
         engineSupervisor?.stop()
+        for entry in pendingPairingTickets.values {
+            entry.feederTask?.cancel()
+        }
+        pendingPairingTickets.removeAll()
         if let coordinator = pairingCoordinator {
             Task { await coordinator.cancelAll() }
         }
@@ -472,40 +490,53 @@ public final class HostRuntime: ObservableObject {
         }
     }
 
-    public func setAutoAllow(_ enabled: Bool, for deviceId: String) {
+    public func setAutoAllow(_ enabled: Bool, forRecordId recordId: String) {
         guard let store else { return }
-        var boundCertFP: String?
-        if var existing = pairedDevices.first(where: { $0.deviceId == deviceId }) {
+        var targetFP: String?
+        var effective = false
+        if var existing = pairedDevices.first(where: { $0.id == recordId }) {
             // Only cert-bound devices can enable auto-allow.
-            let effective = enabled && (existing.certFingerprint?.isEmpty == false)
+            effective = enabled && (existing.certFingerprint?.isEmpty == false)
             existing.autoAllow = effective
-            boundCertFP = effective ? existing.certFingerprint : nil
+            targetFP = existing.certFingerprint
             if let updated = try? store.upsertPairedDevice(existing) {
                 pairedDevices = updated
             }
         }
-        if let coordinator = pairingCoordinator {
-            Task { await coordinator.setAutoAllowed(deviceId: deviceId, certFingerprintSHA256: boundCertFP) }
+        if let coordinator = pairingCoordinator, let fp = targetFP {
+            Task { await coordinator.setAutoAllowed(certFingerprintSHA256: fp, enabled: effective) }
         }
     }
 
     public func removePairedDevice(_ device: PairedDeviceRecord) {
+        Task { @MainActor in
+            await self.removePairedDeviceAndWait(device)
+        }
+    }
+
+    /// Removes a paired device record by primary key (`device.id`), clears auto-allow, rotates
+    /// WebDAV credentials & bumps `mrev`, and unpairs EVERY entry in the engine matching
+    /// `device.certFingerprint` (even when `device.engineUUID` is nil or duplicates exist).
+    /// Legacy records without a fingerprint are simply deleted locally.
+    internal func removePairedDeviceAndWait(_ device: PairedDeviceRecord) async {
         guard let store else { return }
-        if let updated = try? store.removePairedDevice(deviceId: device.deviceId) {
+        if let updated = try? store.removePairedDevice(id: device.id) {
             pairedDevices = updated
         }
-        if let coordinator = pairingCoordinator {
-            Task { await coordinator.setAutoAllowed(deviceId: device.deviceId, certFingerprintSHA256: nil) }
+        if let coordinator = pairingCoordinator, let fp = device.certFingerprint, !fp.isEmpty {
+            await coordinator.setAutoAllowed(certFingerprintSHA256: fp, enabled: false)
         }
         // Immediately rotate WebDAV credentials and bump Bonjour TXT revision so the removed
         // device loses media access right away while remaining paired headsets re-fetch `/media`.
         rotateWebDAVCredentialsAndNotify()
 
-        if let uuid = device.engineUUID, let api = engineAPIClient {
-            Task {
-                _ = try? await api.unpairClient(uuid: uuid)
-                self.refreshPairedClientsFromEngine()
-            }
+        if let fp = device.certFingerprint, !fp.isEmpty, let api = engineAPIClient {
+            await api.unpairAllEntries(
+                forFingerprint: fp,
+                fallbackUUID: device.engineUUID,
+                stateFileURL: store.paths.engineStateFile
+            )
+            refreshPairedClientsFromEngine()
         }
     }
 
@@ -726,29 +757,34 @@ public final class HostRuntime: ObservableObject {
         )
     }
 
-    /// Strict certificate-bound media authorization:
-    /// - Requires `deviceId` to exist in `pairedDevices` with a bound `certFingerprint`
-    /// - Requires `peerCertFingerprintSHA256` to match that bound fingerprint exactly
-    /// - Requires that certificate to still be present in the streaming engine's `state.json`
-    /// Never matches by display name and never binds an arbitrary cert on first `/media` use.
-    internal func authorizeMediaClient(deviceId: String, peerCertFingerprintSHA256: String) -> Bool {
+    /// Returns `true` iff `fingerprintSHA256` corresponds to a persisted paired device record
+    /// (used by `ControlHTTPSServer` so arbitrary self-signed certs cannot bypass rate limits).
+    internal func isKnownPairedCertificate(fingerprintSHA256: String) -> Bool {
+        pairedDevices.contains {
+            $0.certFingerprint?.caseInsensitiveCompare(fingerprintSHA256) == .orderedSame
+        }
+    }
+
+    /// Strict certificate-fingerprint media authorization (`docs/specs/host-protocol.md` v1):
+    /// - Does NOT depend on `X-Depth3d-Device` header
+    /// - Requires `peerCertFingerprintSHA256` to match a persisted `PairedDeviceRecord`
+    /// - Requires that certificate to be currently **enabled and unique** in the engine's `state.json`
+    internal func authorizeMediaClient(peerCertFingerprintSHA256: String) -> Bool {
         guard let store else { return false }
-        guard let idx = pairedDevices.firstIndex(where: { $0.deviceId == deviceId }) else {
+        guard let idx = pairedDevices.firstIndex(where: {
+            $0.certFingerprint?.caseInsensitiveCompare(peerCertFingerprintSHA256) == .orderedSame
+        }) else {
             return false
         }
         var record = pairedDevices[idx]
         guard let boundFP = record.certFingerprint, !boundFP.isEmpty else {
             return false
         }
-        guard boundFP.caseInsensitiveCompare(peerCertFingerprintSHA256) == .orderedSame else {
-            return false
-        }
 
-        // Verify the certificate has not been unpaired from the streaming engine.
-        let engineCerts = EngineConfigGenerator.loadPairedCerts(at: store.paths.engineStateFile)
-        guard engineCerts.contains(where: {
-            $0.fingerprintSHA256?.caseInsensitiveCompare(boundFP) == .orderedSame
-        }) else {
+        guard EngineConfigGenerator.isCertificateUniquelyEnabled(
+            fingerprintSHA256: boundFP,
+            at: store.paths.engineStateFile
+        ) else {
             return false
         }
 
@@ -759,118 +795,210 @@ public final class HostRuntime: ObservableObject {
         return true
     }
 
-    internal func knownBoundCertFingerprint(forDeviceId deviceId: String) -> String? {
-        guard let fp = pairedDevices.first(where: { $0.deviceId == deviceId })?.certFingerprint,
-              !fp.isEmpty
-        else {
-            return nil
-        }
-        return fp
+    internal func knownBoundCertFingerprints(forDeviceId deviceId: String) -> Set<String> {
+        Set(
+            pairedDevices
+                .filter { $0.deviceId == deviceId }
+                .compactMap { $0.certFingerprint?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
+                .filter { !$0.isEmpty }
+        )
     }
 
-    /// Completes an approved `/depth3d/v1/pair` request deterministically:
-    /// - Fails immediately (`false` -> HTTP `503`) if the streaming engine is not ready or unreachable
-    /// - Submits the PIN ONLY to the single GameStream pending pairing matching `clientAddress`
-    /// - Waits for GameStream pairing to finish AND for the client certificate to be written to
-    ///   `state.json` and bound to `PairedDeviceRecord` BEFORE returning `true` (`200 OK`)
-    /// - Never returns a speculative `200` before completion and never saves a device on failure
-    internal func handleApprovedPairing(
+    /// Step 1 of two-step pairing (`POST /depth3d/v1/pair`):
+    /// - Returns IMMEDIATELY with `next: "done"` (cert already uniquely enabled in engine) or
+    ///   `next: "gamestream"` (spawns 60s background PIN feeder for `clientAddress`) plus an opaque
+    ///   120s `ticket`. NEVER waits for GameStream pairing to finish here.
+    internal func issueApprovedPairingTicket(
         deviceName: String,
         deviceId: String,
         pin: String,
         clientAddress: String,
+        peerCertFingerprintSHA256: String?,
         autoAllowFuture: Bool,
-        pairingWaitSeconds: TimeInterval = 25.0
-    ) async -> Bool {
+        approvedViaAutoAllow: Bool
+    ) async -> PairTicketIssueResult {
+        pruneExpiredPairingTickets()
+        let fallbackReason = streamReadyInfo.reason ?? HostStrings.string("protocol.stream.unavailable")
         guard let store, let api = engineAPIClient, engineState.isReadyForClients else {
-            return false
-        }
-
-        // Verify the engine management API is reachable right now.
-        guard let pending = try? await api.fetchPendingPairings() else {
-            HostLogger.warning("Engine API unreachable while handling approved pairing", category: "pair")
-            return false
+            return .streamNotReady(reason: fallbackReason)
         }
 
         let targetIP = IPAddressNormalizer.normalize(clientAddress)
-        let matching = pending.filter { $0.normalizedAddress == targetIP }
-        if matching.count > 1 {
-            HostLogger.warning("Refusing ambiguous pairing: \(matching.count) pending sessions from \(targetIP)", category: "pair")
-            return false
+        let alreadyUniquelyPaired: Bool
+        if let peerFP = peerCertFingerprintSHA256?.trimmingCharacters(in: .whitespacesAndNewlines), !peerFP.isEmpty {
+            alreadyUniquelyPaired = EngineConfigGenerator.isCertificateUniquelyEnabled(
+                fingerprintSHA256: peerFP,
+                at: store.paths.engineStateFile
+            )
+        } else {
+            alreadyUniquelyPaired = false
         }
 
-        let existing = pairedDevices.first(where: { $0.deviceId == deviceId })
-        let existingFP = existing?.certFingerprint
-        let stateFileURL = store.paths.engineStateFile
+        let nextStep = alreadyUniquelyPaired ? "done" : "gamestream"
+        let ticket = SecureRandom.hexString(byteCount: 24)
 
-        // Wait synchronously (inside cooperative Swift Task, never blocking GCD worker threads)
-        // for the matching GameStream pairing session from `targetIP` to complete and produce its cert.
-        guard let verified = await api.completeMatchedPairing(
-            pin: pin,
-            deviceName: deviceName,
-            clientAddress: targetIP,
-            stateFileURL: stateFileURL,
-            existingBoundFingerprint: existingFP,
-            maxWait: pairingWaitSeconds
-        ) else {
-            HostLogger.warning("GameStream pairing failed or timed out for \(deviceName) (\(targetIP)); not saving device", category: "pair")
-            return false
+        // Cancel any earlier superseded feeder from the same source IP so two feeders never collide.
+        for (oldKey, oldEntry) in pendingPairingTickets where oldEntry.clientIP == targetIP {
+            oldEntry.feederTask?.cancel()
+            pendingPairingTickets.removeValue(forKey: oldKey)
         }
 
-        persistVerifiedPairing(
+        var feederTask: Task<Void, Never>?
+        if nextStep == "gamestream" {
+            let maxWait = pinFeederWindowSeconds
+            feederTask = Task.detached { [api] in
+                _ = await api.feedPINForApprovedSession(
+                    pin: pin,
+                    deviceName: deviceName,
+                    clientAddress: targetIP,
+                    maxWait: maxWait
+                )
+            }
+        }
+
+        pendingPairingTickets[ticket] = PendingPairingTicket(
+            ticket: ticket,
+            clientIP: targetIP,
             deviceName: deviceName,
             deviceId: deviceId,
-            verified: verified,
-            autoAllowFuture: autoAllowFuture
+            rememberAutoAllow: autoAllowFuture,
+            approvedViaAutoAllow: approvedViaAutoAllow,
+            expiresAt: Date().addingTimeInterval(ticketTTLSeconds),
+            feederTask: feederTask
+        )
+
+        HostLogger.info(
+            "Issued pairing ticket for \(deviceName) (\(targetIP), next=\(nextStep))",
+            category: "pair"
+        )
+        return .issued(next: nextStep, ticket: ticket)
+    }
+
+    /// Step 2 of two-step pairing (`POST /depth3d/v1/pair/complete`):
+    /// - Validates `ticket` existence/expiry (120s) and matching source IP
+    /// - Verifies the TLS handshake client certificate fingerprint is enabled in engine `state.json`
+    /// - Deduplicates duplicate entries for that certificate (keeps newest enabled, unpairs extras)
+    /// - Persists `PairedDeviceRecord` keyed strictly by certificate fingerprint (never overwriting
+    ///   a different certificate that shares `deviceId`)
+    internal func completePairing(
+        ticket: String,
+        deviceName: String?,
+        deviceId: String?,
+        clientAddress: String,
+        peerCertFingerprintSHA256: String
+    ) async -> PairCompleteOutcome {
+        pruneExpiredPairingTickets()
+        let normalizedIP = IPAddressNormalizer.normalize(clientAddress)
+        let normalizedFP = peerCertFingerprintSHA256.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+
+        guard let entry = pendingPairingTickets[ticket] else {
+            return .ticketExpired
+        }
+        guard entry.clientIP == normalizedIP else {
+            HostLogger.warning("Pairing complete source mismatch: expected \(entry.clientIP), got \(normalizedIP)", category: "pair")
+            return .sourceMismatch
+        }
+        guard let store, let api = engineAPIClient, engineState.isReadyForClients else {
+            let reason = streamReadyInfo.reason ?? HostStrings.string("protocol.stream.unavailable")
+            return .streamNotReady(reason: reason)
+        }
+
+        guard let verifiedCert = await api.ensureUniqueEnabledCert(
+            fingerprintSHA256: normalizedFP,
+            stateFileURL: store.paths.engineStateFile
+        ) else {
+            // Do NOT consume `ticket` or stop the feeder: headset may retry within 5s while engine flushes.
+            return .notPaired
+        }
+
+        // Ticket verified & certificate uniquely enabled in engine: consume ticket & persist record.
+        pendingPairingTickets.removeValue(forKey: ticket)
+        entry.feederTask?.cancel()
+
+        let finalName = (deviceName?.isEmpty == false ? deviceName! : entry.deviceName)
+        let finalDeviceId = (deviceId?.isEmpty == false ? deviceId! : entry.deviceId)
+
+        await persistVerifiedPairing(
+            deviceName: finalName,
+            deviceId: finalDeviceId,
+            engineUUID: verifiedCert.uuid,
+            certFingerprintSHA256: normalizedFP,
+            rememberAutoAllow: entry.rememberAutoAllow,
+            approvedViaAutoAllow: entry.approvedViaAutoAllow
         )
         refreshPairedClientsFromEngine()
-        return true
+        return .completed(mediaPort: webDAVPort)
+    }
+
+    internal func cancelPendingEnginePairings(forClientAddress clientAddress: String) async {
+        await engineAPIClient?.cancelPendingPairings(forIP: clientAddress)
+    }
+
+    private func pruneExpiredPairingTickets() {
+        let now = Date()
+        var expiredIPs: [String] = []
+        for (key, entry) in pendingPairingTickets where entry.expiresAt <= now {
+            entry.feederTask?.cancel()
+            pendingPairingTickets.removeValue(forKey: key)
+            expiredIPs.append(entry.clientIP)
+        }
+        if !expiredIPs.isEmpty, let api = engineAPIClient {
+            for ip in Set(expiredIPs) {
+                Task { await api.cancelPendingPairings(forIP: ip) }
+            }
+        }
     }
 
     private func persistVerifiedPairing(
         deviceName: String,
         deviceId: String,
-        verified: VerifiedEnginePairing,
-        autoAllowFuture: Bool
-    ) {
+        engineUUID: String,
+        certFingerprintSHA256: String,
+        rememberAutoAllow: Bool,
+        approvedViaAutoAllow: Bool
+    ) async {
         guard let store else { return }
-        let existing = pairedDevices.first(where: { $0.deviceId == deviceId })
-        let isSameBoundIdentity: Bool = {
-            guard let oldFP = existing?.certFingerprint, !oldFP.isEmpty else { return false }
-            return oldFP.caseInsensitiveCompare(verified.certFingerprintSHA256) == .orderedSame
-        }()
-        let isIdentityChange: Bool = {
-            guard let oldFP = existing?.certFingerprint, !oldFP.isEmpty else { return false }
-            return !isSameBoundIdentity
-        }()
+        let normalizedFP = certFingerprintSHA256.uppercased()
 
-        // Security rule (S3 & S7):
-        // - Exact same bound certificate -> preserve pairedAt and allow inheriting existing autoAllow.
-        // - Changed certificate fingerprint -> treat as a BRAND NEW device; NEVER inherit autoAllow!
-        // - Legacy unbound record (certFingerprint == nil) -> upgrade in-place with new cert; do NOT
-        //   silently inherit unverified autoAllow (respect explicit `autoAllowFuture` from this prompt).
-        let shouldAutoAllow = isSameBoundIdentity
-            ? (autoAllowFuture || (existing?.autoAllow ?? false))
-            : autoAllowFuture
-        let pairedAt: Date = isIdentityChange ? Date() : (existing?.pairedAt ?? Date())
+        // Primary key lookup is STRICTLY by certificate fingerprint (P4):
+        // an identity-changed re-pair with a different fingerprint creates a NEW record and NEVER
+        // overwrites or modifies the original certificate's record!
+        let existingByFP = pairedDevices.first(where: {
+            $0.certFingerprint?.caseInsensitiveCompare(normalizedFP) == .orderedSame
+        })
+
+        // Upgrade legacy unbound stubs (`certFingerprint == nil`) sharing `deviceId`, if any,
+        // without ever touching any record that already has a bound certificate fingerprint.
+        if existingByFP == nil,
+           let legacyStub = pairedDevices.first(where: { $0.certFingerprint == nil && $0.deviceId == deviceId })
+        {
+            if let cleaned = try? store.removePairedDevice(id: legacyStub.id) {
+                self.pairedDevices = cleaned
+            }
+        }
+
+        let shouldAutoAllow: Bool
+        if let existing = existingByFP {
+            shouldAutoAllow = approvedViaAutoAllow ? true : (rememberAutoAllow || existing.autoAllow)
+        } else {
+            // Brand-new certificate (including identity-changed deviceId): NEVER inherit any old record's autoAllow!
+            shouldAutoAllow = rememberAutoAllow
+        }
 
         let record = PairedDeviceRecord(
             deviceId: deviceId,
             name: deviceName,
-            engineUUID: verified.engineUUID,
-            certFingerprint: verified.certFingerprintSHA256,
+            engineUUID: engineUUID,
+            certFingerprint: normalizedFP,
             autoAllow: shouldAutoAllow,
-            pairedAt: pairedAt,
+            pairedAt: existingByFP?.pairedAt ?? Date(),
             lastSeenAt: Date()
         )
         if let saved = try? store.upsertPairedDevice(record) {
             self.pairedDevices = saved
         }
         if let coordinator = pairingCoordinator {
-            let fpForAutoAllow: String? = shouldAutoAllow ? verified.certFingerprintSHA256 : nil
-            Task {
-                await coordinator.setAutoAllowed(deviceId: deviceId, certFingerprintSHA256: fpForAutoAllow)
-            }
+            await coordinator.setAutoAllowed(certFingerprintSHA256: normalizedFP, enabled: shouldAutoAllow)
         }
     }
 
@@ -1069,32 +1197,68 @@ private final class RuntimeControlProtocolAdapter: ControlProtocolDelegate, @unc
         }
     }
 
-    func authorizeMediaClient(deviceId: String, peerCertFingerprintSHA256: String) async -> Bool {
+    func isKnownPairedCertificate(fingerprintSHA256: String) async -> Bool {
         await MainActor.run {
-            runtime?.authorizeMediaClient(deviceId: deviceId, peerCertFingerprintSHA256: peerCertFingerprintSHA256) ?? false
+            runtime?.isKnownPairedCertificate(fingerprintSHA256: fingerprintSHA256) ?? false
         }
     }
 
-    func knownBoundCertFingerprint(forDeviceId deviceId: String) async -> String? {
+    func authorizeMediaClient(peerCertFingerprintSHA256: String) async -> Bool {
         await MainActor.run {
-            runtime?.knownBoundCertFingerprint(forDeviceId: deviceId)
+            runtime?.authorizeMediaClient(peerCertFingerprintSHA256: peerCertFingerprintSHA256) ?? false
         }
     }
 
-    func handleApprovedPairing(
+    func knownBoundCertFingerprints(forDeviceId deviceId: String) async -> Set<String> {
+        await MainActor.run {
+            runtime?.knownBoundCertFingerprints(forDeviceId: deviceId) ?? []
+        }
+    }
+
+    func issueApprovedPairingTicket(
         deviceName: String,
         deviceId: String,
         pin: String,
         clientAddress: String,
-        autoAllowFuture: Bool
-    ) async -> Bool {
-        guard let runtime else { return false }
-        return await runtime.handleApprovedPairing(
+        peerCertFingerprintSHA256: String?,
+        autoAllowFuture: Bool,
+        approvedViaAutoAllow: Bool
+    ) async -> PairTicketIssueResult {
+        guard let runtime else {
+            return .streamNotReady(reason: HostStrings.string("protocol.stream.not_initialized"))
+        }
+        return await runtime.issueApprovedPairingTicket(
             deviceName: deviceName,
             deviceId: deviceId,
             pin: pin,
             clientAddress: clientAddress,
-            autoAllowFuture: autoAllowFuture
+            peerCertFingerprintSHA256: peerCertFingerprintSHA256,
+            autoAllowFuture: autoAllowFuture,
+            approvedViaAutoAllow: approvedViaAutoAllow
         )
+    }
+
+    func completePairing(
+        ticket: String,
+        deviceName: String?,
+        deviceId: String?,
+        clientAddress: String,
+        peerCertFingerprintSHA256: String
+    ) async -> PairCompleteOutcome {
+        guard let runtime else {
+            return .streamNotReady(reason: HostStrings.string("protocol.stream.not_initialized"))
+        }
+        return await runtime.completePairing(
+            ticket: ticket,
+            deviceName: deviceName,
+            deviceId: deviceId,
+            clientAddress: clientAddress,
+            peerCertFingerprintSHA256: peerCertFingerprintSHA256
+        )
+    }
+
+    func cancelPendingEnginePairings(forClientAddress clientAddress: String) async {
+        guard let runtime else { return }
+        await runtime.cancelPendingEnginePairings(forClientAddress: clientAddress)
     }
 }

@@ -557,7 +557,7 @@ public final class RcloneBridgeManager: @unchecked Sendable {
                 if realChildPID > 1 {
                     ledger?.register(
                         pid: realChildPID,
-                        pgid: topPID,
+                        pgid: realChildPID,
                         kind: .rclone,
                         executableHint: (executablePath as NSString).lastPathComponent
                     )

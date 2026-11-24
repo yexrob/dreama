@@ -71,9 +71,14 @@ public struct CloudRemoteEntry: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
-/// A paired headset record persisted by depth3d Host ONLY after GameStream pairing succeeds.
+/// A paired headset record persisted by depth3d Host ONLY after `/depth3d/v1/pair/complete`
+/// verifies the TLS client certificate is enabled in the streaming engine.
+///
+/// Primary key is `certFingerprint` (uppercase SHA-256 hex digest of the headset's X.509 client
+/// certificate); `deviceId` is only a display/lookup label and never a credential. Legacy records
+/// migrated from older builds without `certFingerprint` fall back to `"legacy:\(deviceId)"`.
 public struct PairedDeviceRecord: Codable, Equatable, Identifiable, Sendable {
-    public let deviceId: String
+    public var deviceId: String
     public var name: String
     public var engineUUID: String?
     /// Uppercase SHA-256 hex digest of the exact X.509 client certificate bound during pairing.
@@ -82,7 +87,12 @@ public struct PairedDeviceRecord: Codable, Equatable, Identifiable, Sendable {
     public let pairedAt: Date
     public var lastSeenAt: Date
 
-    public var id: String { deviceId }
+    public var id: String {
+        if let fp = certFingerprint?.trimmingCharacters(in: .whitespacesAndNewlines), !fp.isEmpty {
+            return fp.uppercased()
+        }
+        return "legacy:\(deviceId)"
+    }
 
     public init(
         deviceId: String,
@@ -96,7 +106,11 @@ public struct PairedDeviceRecord: Codable, Equatable, Identifiable, Sendable {
         self.deviceId = deviceId
         self.name = name
         self.engineUUID = engineUUID
-        self.certFingerprint = certFingerprint
+        if let fp = certFingerprint?.trimmingCharacters(in: .whitespacesAndNewlines), !fp.isEmpty {
+            self.certFingerprint = fp.uppercased()
+        } else {
+            self.certFingerprint = nil
+        }
         self.autoAllow = autoAllow
         self.pairedAt = pairedAt
         self.lastSeenAt = lastSeenAt

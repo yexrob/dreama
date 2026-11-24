@@ -194,12 +194,20 @@ public final class ChildProcessLedger: @unchecked Sendable {
             }
         }
 
-        // Belt-and-suspenders: if the real child was tracked and somehow changed process group / survived, kill it too.
-        if let childPID = realChildPID, childPID > 1, kill(childPID, 0) == 0 {
-            if let childPGID = processGroupID(pid: childPID), childPGID > 1, childPGID != myPGID {
-                _ = kill(-childPGID, SIGKILL)
+        // Belt-and-suspenders: if the real child OR any grandchild in its dedicated process group
+        // (`pgid == childPID`) somehow survived guard exit, kill the entire child process group.
+        if let childPID = realChildPID, childPID > 1 {
+            if usedGuard && childPID != myPGID {
+                if kill(-childPID, 0) == 0 || errno == EPERM {
+                    _ = kill(-childPID, SIGKILL)
+                }
             }
-            _ = kill(childPID, SIGKILL)
+            if kill(childPID, 0) == 0 {
+                if let childPGID = processGroupID(pid: childPID), childPGID > 1, childPGID != myPGID {
+                    _ = kill(-childPGID, SIGKILL)
+                }
+                _ = kill(childPID, SIGKILL)
+            }
         }
     }
 

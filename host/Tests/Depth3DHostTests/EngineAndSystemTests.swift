@@ -322,6 +322,139 @@ final class EngineAndSystemTests: XCTestCase {
         XCTAssertTrue(grandchildDead, "depth3d-child-guard must SIGKILL SIGTERM-ignoring grandchild when parent is SIGKILLed")
     }
 
+    /// S-1: Verifies `EngineSupervisor.restart()` does NOT allow the old exited process's delayed
+    /// `terminationHandler` to erase the newly spawned guard/engine PIDs from `running-children.json`
+    /// or delete the new child PID file.
+    func testEngineSupervisorRestartPreservesNewProcessInLedgerAndPIDFile() throws {
+        guard let guardBin = locateBuiltChildGuard() else {
+            throw XCTSkip("depth3d-child-guard executable not built in expected SwiftPM path")
+        }
+
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("depth3d-restart-ledger-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let pidLog = tmp.appendingPathComponent("launches.log")
+        let script = tmp.appendingPathComponent("sleeper.sh")
+        try """
+        #!/bin/sh
+        echo $$ >> "\(pidLog.path)"
+        exec /bin/sleep 60
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let paths = HostPaths(rootDirectory: tmp.appendingPathComponent("data", isDirectory: true))
+        let ledger = ChildProcessLedger(ledgerURL: paths.childLedgerFile)
+        let supervisor = EngineSupervisor(
+            paths: paths,
+            adminCredentials: EngineAdminCredentials(username: "u", password: "pw"),
+            engineExecutableOverride: script,
+            childGuardOverride: guardBin,
+            ledger: ledger
+        )
+        defer { supervisor.stop() }
+
+        var testPort: UInt16 = 59319
+        while !PortProbe.occupiedTCPPorts(in: HostPortDefaults.engineTCPPorts(basePort: testPort)).isEmpty {
+            testPort += 30
+        }
+        let cfg = EngineConfigGenerator.Input(
+            hostName: "RestartLedger", basePort: testPort, quality: .balanced, displayID: nil, paths: paths
+        )
+
+        supervisor.start(config: cfg)
+        let firstDeadline = Date().addingTimeInterval(3.0)
+        var firstEntries: [TrackedChildProcess] = []
+        while Date() < firstDeadline {
+            firstEntries = ledger.allEntries()
+            if firstEntries.contains(where: { $0.kind == .childGuard }) && firstEntries.contains(where: { $0.kind == .engine }) {
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        let oldGuardPID = try XCTUnwrap(firstEntries.first(where: { $0.kind == .childGuard })?.pid)
+        let oldEnginePID = try XCTUnwrap(firstEntries.first(where: { $0.kind == .engine })?.pid)
+
+        // Trigger restart — old process terminates while new process starts in the same queue turn.
+        supervisor.restart(with: cfg)
+        // Wait generously so the old process's delayed `terminationHandler` definitely finishes running!
+        Thread.sleep(forTimeInterval: 0.9)
+
+        let afterEntries = ledger.allEntries()
+        let newGuard = afterEntries.first(where: { $0.kind == .childGuard })
+        let newEngine = afterEntries.first(where: { $0.kind == .engine })
+        XCTAssertNotNil(newGuard, "S-1: Restarted guard PID must remain registered in ledger after old terminationHandler runs")
+        XCTAssertNotNil(newEngine, "S-1: Restarted engine PID must remain registered in ledger after old terminationHandler runs")
+        XCTAssertNotEqual(newGuard?.pid, oldGuardPID)
+        XCTAssertNotEqual(newEngine?.pid, oldEnginePID)
+        if let g = newGuard, let e = newEngine {
+            XCTAssertEqual(kill(g.pid, 0), 0)
+            XCTAssertEqual(kill(e.pid, 0), 0)
+            XCTAssertEqual(e.pgid, e.pid, "Guarded engine must run in its own dedicated process group")
+        }
+    }
+
+    /// m-4: Verifies normal `EngineSupervisor.stop()` terminates grandchildren spawned inside the
+    /// child's process group even when the immediate child exits cleanly on `SIGTERM` while its
+    /// grandchild ignores `SIGTERM`!
+    func testNormalStopKillsGrandchildrenInChildProcessGroup() throws {
+        guard let guardBin = locateBuiltChildGuard() else {
+            throw XCTSkip("depth3d-child-guard executable not built in expected SwiftPM path")
+        }
+
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("depth3d-grandchild-stop-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let grandchildPidFile = tmp.appendingPathComponent("grandchild.pid")
+        let parentEngine = tmp.appendingPathComponent("spawns-grandchild.sh")
+        // Immediate child spawns a grandchild that IGNORES SIGTERM, while immediate child exits immediately on SIGTERM!
+        try """
+        #!/bin/sh
+        /bin/sh -c 'trap "" TERM; echo $$ > "\(grandchildPidFile.path)"; exec /bin/sleep 60' &
+        trap 'exit 0' TERM
+        while true; do /bin/sleep 1; done
+        """.write(to: parentEngine, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parentEngine.path)
+
+        let paths = HostPaths(rootDirectory: tmp.appendingPathComponent("data", isDirectory: true))
+        let supervisor = EngineSupervisor(
+            paths: paths,
+            adminCredentials: EngineAdminCredentials(username: "u", password: "pw"),
+            engineExecutableOverride: parentEngine,
+            childGuardOverride: guardBin
+        )
+
+        var testPort: UInt16 = 59419
+        while !PortProbe.occupiedTCPPorts(in: HostPortDefaults.engineTCPPorts(basePort: testPort)).isEmpty {
+            testPort += 30
+        }
+        supervisor.start(config: EngineConfigGenerator.Input(
+            hostName: "GrandchildTest", basePort: testPort, quality: .balanced, displayID: nil, paths: paths
+        ))
+
+        let grandchildPID = waitForPID(at: grandchildPidFile, timeout: 3.0)
+        XCTAssertGreaterThan(grandchildPID, 1, "Grandchild should have started")
+        XCTAssertEqual(kill(grandchildPID, 0), 0)
+        defer { if grandchildPID > 1 && kill(grandchildPID, 0) == 0 { _ = kill(grandchildPID, SIGKILL) } }
+
+        // Normal stop() MUST kill the stubborn grandchild inside the child's process group too!
+        supervisor.stop()
+
+        let deadDeadline = Date().addingTimeInterval(3.0)
+        var grandchildDead = false
+        while Date() < deadDeadline {
+            if kill(grandchildPID, 0) != 0 && errno == ESRCH {
+                grandchildDead = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        XCTAssertTrue(grandchildDead, "m-4: Normal stop must terminate grandchildren in the child's process group")
+    }
+
     /// m1: Verifies `EngineSupervisor` always overwrites stale `credentials.json` on launch.
     func testEngineSupervisorAlwaysSynchronizesStaleCredentialsFile() throws {
         let tmp = FileManager.default.temporaryDirectory
@@ -509,9 +642,10 @@ final class EngineAndSystemTests: XCTestCase {
         XCTAssertEqual(try store.loadOrCreateWebDAVCredentials(), rotated)
     }
 
-    /// m6: Verifies `fetch-engine.sh --verify-only` validates per-file SHA-256 hashes recorded in
-    /// `ENGINE-MANIFEST.json` and fails closed when even 1 byte of a staged engine file is modified.
-    func testFetchEngineVerifyOnlyDetectsTamperedStagedEngine() throws {
+    /// m-1 (upgraded m6): Verifies `fetch-engine.sh --verify-only` validates against the
+    /// version-controlled manifest in `host/scripts/engine-manifest-arm64.json` (NEVER trusting
+    /// the writable `ENGINE-MANIFEST.json` inside `build/`), AND verifies symlink targets!
+    func testFetchEngineVerifyOnlyUsesVersionControlledManifestAndChecksSymlinks() throws {
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         let scriptCandidates = [
             cwd.appendingPathComponent("scripts/fetch-engine.sh"),
@@ -522,13 +656,13 @@ final class EngineAndSystemTests: XCTestCase {
             cwd.appendingPathComponent("host/build/engine-arm64/stream-engine")
         ]
         guard let scriptURL = scriptCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0.path) }),
-              let stageURL = stageCandidates.first(where: { FileManager.default.fileExists(atPath: $0.appendingPathComponent("ENGINE-MANIFEST.json").path) })
+              let stageURL = stageCandidates.first(where: { FileManager.default.fileExists(atPath: $0.appendingPathComponent("MacOS/depth3d-stream-engine").path) })
         else {
             throw XCTSkip("Staged engine directory or fetch-engine.sh not present")
         }
 
         let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("depth3d-m6-verify-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("depth3d-m1-verify-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
 
@@ -546,23 +680,48 @@ final class EngineAndSystemTests: XCTestCase {
             return p.terminationStatus
         }
 
-        // 1. Intact staged copy passes full per-file SHA-256 verification
+        // 1. Intact staged copy passes full file + symlink verification against repo-pinned manifest
         XCTAssertEqual(try runVerifyOnly(), 0, "Untampered staged engine copy must pass --verify-only")
 
-        // 2. Unexpected injected file -> --verify-only MUST fail non-zero!
+        // 2. Unexpected injected file -> MUST fail
         let strayURL = copiedStage.appendingPathComponent("injected.dylib")
         try Data("evil".utf8).write(to: strayURL)
-        XCTAssertNotEqual(try runVerifyOnly(), 0, "Unexpected extra file in staged engine dir MUST fail --verify-only")
+        XCTAssertNotEqual(try runVerifyOnly(), 0)
         try FileManager.default.removeItem(at: strayURL)
+
+        // 3. Symlink tampering (replace a Qt framework symlink with a different target) -> MUST fail!
+        let symlinkURL = copiedStage.appendingPathComponent("Frameworks/QtCore.framework/QtCore")
+        let originalTarget = try FileManager.default.destinationOfSymbolicLink(atPath: symlinkURL.path)
+        try FileManager.default.removeItem(at: symlinkURL)
+        try FileManager.default.createSymbolicLink(atPath: symlinkURL.path, withDestinationPath: "/tmp/evil-target")
+        XCTAssertNotEqual(try runVerifyOnly(), 0, "m-1: Tampered symlink target MUST fail --verify-only")
+        try FileManager.default.removeItem(at: symlinkURL)
+        try FileManager.default.createSymbolicLink(atPath: symlinkURL.path, withDestinationPath: originalTarget)
         XCTAssertEqual(try runVerifyOnly(), 0)
 
-        // 3. Flip 1 byte in the staged engine binary -> --verify-only MUST fail non-zero!
+        // 4. Tamper 1 byte in binary AND rewrite the writable `ENGINE-MANIFEST.json` inside stage dir
+        //    to match the tampered hash -> MUST STILL FAIL because `--verify-only` checks repo manifest!
         let binURL = copiedStage.appendingPathComponent("MacOS/depth3d-stream-engine")
         var bytes = try Data(contentsOf: binURL)
-        XCTAssertGreaterThan(bytes.count, 16)
         bytes[bytes.count - 1] ^= 0xFF
         try bytes.write(to: binURL, options: .atomic)
-        XCTAssertNotEqual(try runVerifyOnly(), 0, "Tampered staged engine binary MUST fail --verify-only")
+        let tamperedHash = TLSIdentityManager.sha256Hex(bytes).lowercased()
+        let stageManifestURL = copiedStage.appendingPathComponent("ENGINE-MANIFEST.json")
+        if let raw = try? Data(contentsOf: stageManifestURL),
+           var obj = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any],
+           var files = obj["files"] as? [String: String]
+        {
+            files["MacOS/depth3d-stream-engine"] = tamperedHash
+            obj["files"] = files
+            if let forged = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) {
+                try forged.write(to: stageManifestURL, options: .atomic)
+            }
+        }
+        XCTAssertNotEqual(
+            try runVerifyOnly(),
+            0,
+            "m-1: Tampering BOTH binary and writable stage ENGINE-MANIFEST.json MUST STILL FAIL against repo-pinned manifest"
+        )
     }
 
     private func locateBuiltChildGuard() -> URL? {

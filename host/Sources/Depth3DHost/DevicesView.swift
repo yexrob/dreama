@@ -156,7 +156,7 @@ struct DevicesView: View {
                                         L10n.string("devices.auto_allow"),
                                         isOn: Binding(
                                             get: { device.autoAllow },
-                                            set: { runtime.setAutoAllow($0, for: device.deviceId) }
+                                            set: { runtime.setAutoAllow($0, forRecordId: device.id) }
                                         )
                                     )
                                     .toggleStyle(.switch)

@@ -7,10 +7,14 @@
 #   (https://github.com/LizardByte/Sunshine returns HTTP 301 -> SunshineStream/Sunshine).
 #
 # Strict integrity guarantees:
-#   - Every supported architecture MUST have a hardcoded, pinned SHA-256 digest below.
+#   - Every supported architecture MUST have a hardcoded, pinned DMG SHA-256 digest below
+#     AND a version-controlled file + symlink manifest at host/scripts/engine-manifest-<arch>.json.
 #   - Environment overrides to bypass or weaken SHA-256 verification are NOT supported.
-#   - Extracted files are recorded with per-file SHA-256 digests inside ENGINE-MANIFEST.json
-#     and re-verified both on cached reuse AND via `--verify-only` (used by build.sh --skip-engine-fetch).
+#   - Verification (`--verify-only` and cached reuse) ALWAYS checks the extracted stage directory
+#     against the version-controlled manifest in host/scripts/, NEVER trusting any manifest file
+#     stored inside the writable build/ stage directory.
+#   - Both regular files (SHA-256) and symlinks (exact readlink targets, file & directory links)
+#     are verified strictly.
 #
 # Usage:
 #   host/scripts/fetch-engine.sh [--arch arm64|x86_64] [--out <dir>] [--verify-only]
@@ -86,7 +90,8 @@ CACHE_DIR="${HOST_DIR}/.cache"
 OUT_DIR="${OUT_DIR:-${HOST_DIR}/build/engine-${ARCH}/stream-engine}"
 DMG_PATH="${CACHE_DIR}/${DMG_NAME}"
 DOWNLOAD_URL="${BASE_URL}/${DMG_NAME}"
-MANIFEST_PATH="${OUT_DIR}/ENGINE-MANIFEST.json"
+PINNED_MANIFEST="${SCRIPT_DIR}/engine-manifest-${ARCH}.json"
+STAGE_MANIFEST="${OUT_DIR}/ENGINE-MANIFEST.json"
 
 verify_sha256() {
   local file="$1"
@@ -106,36 +111,46 @@ verify_sha256() {
   echo "$actual"
 }
 
-verify_extracted_manifest() {
+verify_extracted_against_pinned_manifest() {
   local dir="$1"
-  local expected_arch="$2"
-  local expected_dmg_sha="$3"
-  python3 - "$dir" "$expected_arch" "$expected_dmg_sha" <<'PY'
-import hashlib, json, os, sys
+  local pinned_manifest="$2"
+  local expected_arch="$3"
+  local expected_dmg_sha="$4"
 
-out_dir, expected_arch, expected_dmg_sha = sys.argv[1], sys.argv[2], sys.argv[3]
-manifest_path = os.path.join(out_dir, "ENGINE-MANIFEST.json")
-if not os.path.isfile(manifest_path):
-    sys.stderr.write(f"depth3d: missing manifest at {manifest_path}\n")
+  if [[ ! -f "$pinned_manifest" ]]; then
+    echo "depth3d: missing version-controlled manifest at ${pinned_manifest}" >&2
+    return 1
+  fi
+
+  python3 - "$dir" "$pinned_manifest" "$expected_arch" "$expected_dmg_sha" <<'PY'
+import hashlib, json, os, stat, sys
+
+out_dir, pinned_path, expected_arch, expected_dmg_sha = sys.argv[1:5]
+if not os.path.isdir(out_dir):
+    sys.stderr.write(f"depth3d: staged engine directory does not exist: {out_dir}\n")
     sys.exit(1)
 
 try:
-    manifest = json.loads(open(manifest_path, "r", encoding="utf-8").read())
+    manifest = json.loads(open(pinned_path, "r", encoding="utf-8").read())
 except Exception as e:
-    sys.stderr.write(f"depth3d: invalid ENGINE-MANIFEST.json: {e}\n")
+    sys.stderr.write(f"depth3d: invalid pinned manifest {pinned_path}: {e}\n")
     sys.exit(1)
 
 if manifest.get("arch") != expected_arch:
-    sys.stderr.write(f"depth3d: manifest arch mismatch (expected {expected_arch}, got {manifest.get('arch')})\n")
+    sys.stderr.write(f"depth3d: pinned manifest arch mismatch (expected {expected_arch}, got {manifest.get('arch')})\n")
     sys.exit(1)
 
 if manifest.get("sha256") != expected_dmg_sha:
-    sys.stderr.write(f"depth3d: manifest DMG sha256 mismatch (expected {expected_dmg_sha}, got {manifest.get('sha256')})\n")
+    sys.stderr.write(f"depth3d: pinned manifest DMG sha256 mismatch (expected {expected_dmg_sha}, got {manifest.get('sha256')})\n")
     sys.exit(1)
 
-files = manifest.get("files")
-if not isinstance(files, dict) or "MacOS/depth3d-stream-engine" not in files:
-    sys.stderr.write("depth3d: manifest missing per-file SHA-256 inventory\n")
+expected_files = manifest.get("files")
+expected_symlinks = manifest.get("symlinks")
+if not isinstance(expected_files, dict) or "MacOS/depth3d-stream-engine" not in expected_files:
+    sys.stderr.write("depth3d: pinned manifest missing per-file SHA-256 inventory\n")
+    sys.exit(1)
+if not isinstance(expected_symlinks, dict):
+    sys.stderr.write("depth3d: pinned manifest missing symlink inventory\n")
     sys.exit(1)
 
 def sha256_file(path):
@@ -148,47 +163,87 @@ def sha256_file(path):
             h.update(chunk)
     return h.hexdigest()
 
-seen = set()
-for root, _, filenames in os.walk(out_dir):
-    for name in filenames:
-        full = os.path.join(root, name)
+seen_files = {}
+seen_symlinks = {}
+
+for root, dirnames, filenames in os.walk(out_dir, followlinks=False):
+    # Inspect directory entries for directory symlinks (e.g. Qt framework Versions/Current -> A)
+    # and prevent descending into symlinked directories.
+    keep_dirs = []
+    for d in sorted(dirnames):
+        full = os.path.join(root, d)
+        rel = os.path.relpath(full, out_dir).replace(os.sep, "/")
         if os.path.islink(full):
-            continue
+            seen_symlinks[rel] = os.readlink(full)
+        else:
+            keep_dirs.append(d)
+    dirnames[:] = keep_dirs
+
+    for name in sorted(filenames):
+        full = os.path.join(root, name)
         rel = os.path.relpath(full, out_dir).replace(os.sep, "/")
         if rel == "ENGINE-MANIFEST.json":
+            if os.path.islink(full):
+                sys.stderr.write("depth3d: ENGINE-MANIFEST.json must not be a symlink\n")
+                sys.exit(1)
             continue
-        seen.add(rel)
+        if os.path.islink(full):
+            seen_symlinks[rel] = os.readlink(full)
+        else:
+            st = os.lstat(full)
+            if not stat.S_ISREG(st.st_mode):
+                sys.stderr.write(f"depth3d: unexpected non-regular entry in staged engine: {rel}\n")
+                sys.exit(1)
+            seen_files[rel] = full
 
-expected_set = set(files.keys())
-missing = sorted(expected_set - seen)
-extra = sorted(seen - expected_set)
-if missing:
-    sys.stderr.write(f"depth3d: extracted engine missing files: {missing[:5]}\n")
+expected_file_set = set(expected_files.keys())
+actual_file_set = set(seen_files.keys())
+missing_files = sorted(expected_file_set - actual_file_set)
+extra_files = sorted(actual_file_set - expected_file_set)
+if missing_files:
+    sys.stderr.write(f"depth3d: staged engine missing files: {missing_files[:5]}\n")
     sys.exit(1)
-if extra:
-    sys.stderr.write(f"depth3d: extracted engine contains unexpected files: {extra[:5]}\n")
+if extra_files:
+    sys.stderr.write(f"depth3d: staged engine contains unexpected files: {extra_files[:5]}\n")
     sys.exit(1)
+
+expected_link_set = set(expected_symlinks.keys())
+actual_link_set = set(seen_symlinks.keys())
+missing_links = sorted(expected_link_set - actual_link_set)
+extra_links = sorted(actual_link_set - expected_link_set)
+if missing_links:
+    sys.stderr.write(f"depth3d: staged engine missing symlinks: {missing_links[:5]}\n")
+    sys.exit(1)
+if extra_links:
+    sys.stderr.write(f"depth3d: staged engine contains unexpected symlinks: {extra_links[:5]}\n")
+    sys.exit(1)
+
+for rel in sorted(expected_link_set):
+    if seen_symlinks[rel] != expected_symlinks[rel]:
+        sys.stderr.write(f"depth3d: symlink target mismatch for {rel}\n")
+        sys.stderr.write(f"  expected: {expected_symlinks[rel]}\n")
+        sys.stderr.write(f"  actual:   {seen_symlinks[rel]}\n")
+        sys.exit(1)
 
 engine_bin = os.path.join(out_dir, "MacOS/depth3d-stream-engine")
 if not os.access(engine_bin, os.X_OK):
     sys.stderr.write(f"depth3d: engine binary not executable: {engine_bin}\n")
     sys.exit(1)
 
-for rel in sorted(expected_set):
-    full = os.path.join(out_dir, rel)
-    actual = sha256_file(full)
-    if actual != files[rel]:
-        sys.stderr.write(f"depth3d: extracted file hash mismatch for {rel}\n")
-        sys.stderr.write(f"  expected: {files[rel]}\n")
+for rel in sorted(expected_file_set):
+    actual = sha256_file(seen_files[rel])
+    if actual != expected_files[rel]:
+        sys.stderr.write(f"depth3d: staged file SHA-256 mismatch for {rel}\n")
+        sys.stderr.write(f"  expected: {expected_files[rel]}\n")
         sys.stderr.write(f"  actual:   {actual}\n")
         sys.exit(1)
 
-print(f"depth3d: verified {len(expected_set)} extracted engine files against ENGINE-MANIFEST.json")
+print(f"depth3d: verified {len(expected_file_set)} files and {len(expected_link_set)} symlinks against {os.path.basename(pinned_path)}")
 PY
 }
 
 if [[ "$VERIFY_ONLY" == "1" ]]; then
-  verify_extracted_manifest "$OUT_DIR" "$ARCH" "$EXPECTED_SHA"
+  verify_extracted_against_pinned_manifest "$OUT_DIR" "$PINNED_MANIFEST" "$ARCH" "$EXPECTED_SHA"
   exit 0
 fi
 
@@ -212,12 +267,13 @@ fi
 ACTUAL_SHA="$(verify_sha256 "$DMG_PATH" "$EXPECTED_SHA")"
 echo "depth3d: verified ${DMG_NAME} sha256=${ACTUAL_SHA}"
 
-if [[ -f "$MANIFEST_PATH" ]]; then
-  if verify_extracted_manifest "$OUT_DIR" "$ARCH" "$ACTUAL_SHA"; then
+if [[ -d "$OUT_DIR" && -f "$PINNED_MANIFEST" ]]; then
+  if verify_extracted_against_pinned_manifest "$OUT_DIR" "$PINNED_MANIFEST" "$ARCH" "$ACTUAL_SHA"; then
+    cp "$PINNED_MANIFEST" "$STAGE_MANIFEST"
     echo "depth3d: extracted engine verified and up to date at ${OUT_DIR}"
     exit 0
   fi
-  echo "depth3d: extracted engine failed integrity check; re-extracting cleanly from verified DMG..." >&2
+  echo "depth3d: extracted engine failed pinned manifest check; re-extracting cleanly from verified DMG..." >&2
 fi
 
 MNT_DIR="${CACHE_DIR}/mnt-sunshine-${ARCH}-$$"
@@ -241,7 +297,7 @@ fi
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
-# Copy runtime payload; intentionally omit Info.plist and upstream icon so this
+# Copy runtime payload preserving symlinks; intentionally omit Info.plist and upstream icon so this
 # helper runs under depth3d Host.app's TCC identity without upstream branding.
 cp -R "${SRC_APP}/MacOS" "${OUT_DIR}/MacOS"
 cp -R "${SRC_APP}/Frameworks" "${OUT_DIR}/Frameworks"
@@ -252,8 +308,9 @@ mv "${OUT_DIR}/MacOS/Sunshine" "${OUT_DIR}/MacOS/depth3d-stream-engine"
 chmod 755 "${OUT_DIR}/MacOS/depth3d-stream-engine"
 rm -f "${OUT_DIR}/Resources/sunshine.icns"
 
-# Ad-hoc sign renamed executable so staged engine can also run directly in tests.
-codesign --force --sign - "${OUT_DIR}/MacOS/depth3d-stream-engine" >/dev/null
+# Deterministic ad-hoc sign with fixed identifier so staged binary executes in tests AND hashes
+# reproducibly against the version-controlled manifest in host/scripts/.
+codesign --force --sign - --identifier dev.depth3d.stream-engine "${OUT_DIR}/MacOS/depth3d-stream-engine" >/dev/null
 
 # Verify zero non-system absolute dylib references remain
 BAD_LINKS="$(otool -L "${OUT_DIR}/MacOS/depth3d-stream-engine" | tail -n +2 | awk '{print $1}' | grep -vE '^(/System/|/usr/lib/|@executable_path/|@loader_path/|@rpath/)' || true)"
@@ -263,44 +320,7 @@ if [[ -n "$BAD_LINKS" ]]; then
   exit 1
 fi
 
-# Record complete per-file SHA-256 inventory in ENGINE-MANIFEST.json for tamper detection.
-python3 - "$OUT_DIR" "$ENGINE_VERSION" "$ENGINE_COMMIT" "$ARCH" "$ENGINE_LICENSE" "$DOWNLOAD_URL" "$ACTUAL_SHA" <<'PY'
-import hashlib, json, os, sys
-
-out_dir, version, commit, arch, lic, url, dmg_sha = sys.argv[1:8]
-files = {}
-for root, _, filenames in os.walk(out_dir):
-    for name in filenames:
-        full = os.path.join(root, name)
-        if os.path.islink(full):
-            continue
-        rel = os.path.relpath(full, out_dir).replace(os.sep, "/")
-        if rel == "ENGINE-MANIFEST.json":
-            continue
-        h = hashlib.sha256()
-        with open(full, "rb") as f:
-            while True:
-                chunk = f.read(1024 * 1024)
-                if not chunk:
-                    break
-                h.update(chunk)
-        files[rel] = h.hexdigest()
-
-manifest = {
-    "component": "Sunshine",
-    "organization": "SunshineStream (formerly LizardByte)",
-    "version": version,
-    "commit": commit,
-    "arch": arch,
-    "license": lic,
-    "sourceUrl": url,
-    "sha256": dmg_sha,
-    "files": dict(sorted(files.items())),
-}
-with open(os.path.join(out_dir, "ENGINE-MANIFEST.json"), "w", encoding="utf-8") as f:
-    json.dump(manifest, f, indent=2)
-    f.write("\n")
-PY
-
-verify_extracted_manifest "$OUT_DIR" "$ARCH" "$ACTUAL_SHA"
-echo "depth3d: extracted streaming engine to ${OUT_DIR}"
+# Verify extracted payload strictly against the version-controlled manifest in host/scripts/.
+verify_extracted_against_pinned_manifest "$OUT_DIR" "$PINNED_MANIFEST" "$ARCH" "$ACTUAL_SHA"
+cp "$PINNED_MANIFEST" "$STAGE_MANIFEST"
+echo "depth3d: extracted and verified streaming engine at ${OUT_DIR}"

@@ -108,6 +108,7 @@ public final class ControlHTTPSServer: @unchecked Sendable {
         identity: SecIdentity,
         router: ControlProtocolRouter,
         maxConnections: Int = 32,
+        maxConnectionsPerIP: Int = 8,
         unauthRateLimitPerWindow: Int = 30,
         unauthRateWindowSeconds: TimeInterval = 10.0,
         handshakeTimeoutSec: TimeInterval = 5.0,
@@ -115,7 +116,10 @@ public final class ControlHTTPSServer: @unchecked Sendable {
     ) {
         self.identity = identity
         self.router = router
-        self.connectionGuard = ConnectionGuard(maxConnections: maxConnections)
+        self.connectionGuard = ConnectionGuard(
+            maxConnections: maxConnections,
+            maxConnectionsPerIP: maxConnectionsPerIP
+        )
         self.unauthRateLimiter = IPRateLimiter(
             maxEvents: unauthRateLimitPerWindow,
             windowSeconds: unauthRateWindowSeconds
@@ -180,45 +184,11 @@ public final class ControlHTTPSServer: @unchecked Sendable {
         }
     }
 
+    /// Binds strictly on IPv4 (`AF_INET`, `INADDR_ANY`) per `docs/specs/host-protocol.md` (S-3)
+    /// so control connections and GameStream pairing connections always share the exact same IPv4
+    /// source address instead of mismatching IPv6 vs IPv4 on dual-stack LANs.
     private func openListeningSocket(port: UInt16) throws -> (Int32, UInt16) {
-        var fd = Darwin.socket(AF_INET6, SOCK_STREAM, 0)
-        if fd >= 0 {
-            var one: Int32 = 1
-            var zero: Int32 = 0
-            if port != 0 {
-                setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
-            }
-            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, socklen_t(MemoryLayout<Int32>.size))
-
-            var addr = sockaddr_in6()
-            addr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
-            addr.sin6_family = sa_family_t(AF_INET6)
-            addr.sin6_addr = in6addr_any
-            addr.sin6_port = port.bigEndian
-
-            let bindResult = withUnsafePointer(to: &addr) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
-                }
-            }
-            if bindResult == 0, Darwin.listen(fd, 32) == 0 {
-                var boundAddr = sockaddr_in6()
-                var len = socklen_t(MemoryLayout<sockaddr_in6>.size)
-                _ = withUnsafeMutablePointer(to: &boundAddr) {
-                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                        Darwin.getsockname(fd, $0, &len)
-                    }
-                }
-                return (fd, UInt16(bigEndian: boundAddr.sin6_port))
-            }
-            let err = errno
-            Darwin.close(fd)
-            if err == EADDRINUSE {
-                throw ControlHTTPSServerError.bindFailed(port, err)
-            }
-        }
-
-        fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else {
             throw ControlHTTPSServerError.socketCreationFailed(errno)
         }
@@ -273,13 +243,14 @@ public final class ControlHTTPSServer: @unchecked Sendable {
                 break
             }
 
-            // Enforce strict connection ceiling before allocating TLS state or threads.
-            guard connectionGuard.tryAcquire() else {
+            let peerIP = IPAddressNormalizer.peerAddress(from: &storage)
+
+            // Enforce BOTH global and per-IP concurrent connection ceilings BEFORE TLS handshake (S-5).
+            guard connectionGuard.tryAcquire(forIP: peerIP) else {
                 Darwin.close(clientFD)
                 continue
             }
 
-            let peerIP = IPAddressNormalizer.peerAddress(from: &storage)
             var one: Int32 = 1
             setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
             // Use non-blocking socket paired with poll() against per-connection absolute deadline.
@@ -306,7 +277,7 @@ public final class ControlHTTPSServer: @unchecked Sendable {
     private func performTLSRead(fd: Int32, peerIP: String) {
         guard let ctx = SSLCreateContext(kCFAllocatorDefault, .serverSide, .streamType) else {
             Darwin.close(fd)
-            connectionGuard.release()
+            connectionGuard.release(forIP: peerIP)
             return
         }
 
@@ -414,7 +385,7 @@ public final class ControlHTTPSServer: @unchecked Sendable {
         }
         guard handshakeStatus == noErr && !ioCtx.timedOut else {
             conn.close()
-            connectionGuard.release()
+            connectionGuard.release(forIP: peerIP)
             return
         }
 
@@ -434,20 +405,6 @@ public final class ControlHTTPSServer: @unchecked Sendable {
             peerDER = SecCertificateCopyData(leaf) as Data
         }
 
-        // Rate-limit unauthenticated connections (clients not presenting a verified client certificate).
-        if peerDER == nil && !unauthRateLimiter.allow(key: peerIP) {
-            ioCtx.deadlineUptime = ProcessInfo.processInfo.systemUptime + 5.0
-            let limited = HTTPResponse.json(
-                429,
-                object: ["error": "rate_limited"],
-                extraHeaders: [("Retry-After", "10")]
-            )
-            writeAll(ctx: ctx, data: limited.serialize())
-            conn.close()
-            connectionGuard.release()
-            return
-        }
-
         guard let request = readHTTPRequest(
             ctx: ctx,
             ioCtx: ioCtx,
@@ -460,23 +417,43 @@ public final class ControlHTTPSServer: @unchecked Sendable {
                 writeAll(ctx: ctx, data: bad.serialize())
             }
             conn.close()
-            connectionGuard.release()
+            connectionGuard.release(forIP: peerIP)
             return
         }
 
-        // Hand off routing to an async Swift Task so long-running `/depth3d/v1/pair`
-        // waits (up to 60s) suspend cooperatively without occupying ANY GCD thread-pool thread!
+        // Hand off rate-limit verification & routing to an async Swift Task so long-running
+        // `/depth3d/v1/pair` waits (up to 60s) suspend cooperatively without occupying ANY GCD thread.
+        // Only genuinely paired client certificates bypass `unauthRateLimiter`; presenting an
+        // arbitrary self-signed client certificate MUST still be rate-limited (S-5).
         let router = self.router
         let ioQueue = self.ioQueue
         let guardRef = self.connectionGuard
+        let rateLimiter = self.unauthRateLimiter
         Task {
-            let response = await router.handle(request)
+            let isKnownPaired: Bool
+            if let fp = request.peerCertificateFingerprintSHA256 {
+                isKnownPaired = await router.isKnownPairedCertificate(fingerprintSHA256: fp)
+            } else {
+                isKnownPaired = false
+            }
+
+            let response: HTTPResponse
+            if !isKnownPaired && !rateLimiter.allow(key: peerIP) {
+                response = HTTPResponse.json(
+                    429,
+                    object: ["error": "rate_limited"],
+                    extraHeaders: [("Retry-After", "10")]
+                )
+            } else {
+                response = await router.handle(request)
+            }
+
             ioQueue.async {
                 conn.ioCtx.timedOut = false
                 conn.ioCtx.deadlineUptime = ProcessInfo.processInfo.systemUptime + 10.0
                 Self.writeAllStatic(ctx: conn.ctx, data: response.serialize(includeBody: request.method != "HEAD"))
                 conn.close()
-                guardRef.release()
+                guardRef.release(forIP: peerIP)
             }
         }
     }
