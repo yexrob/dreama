@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://depth3d.dev/schemas/plugin/v1/manifest.schema.json",
+  "title": "depth3d Plugin Manifest (v1)",
+  "type": "object",
+  "required": ["api", "id", "name", "version", "author"],
+  "additionalProperties": true,
+  "properties": {
+    "api": {
+      "type": "integer",
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9-]*(\\.[a-z0-9][a-z0-9-]*)+$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "author": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 1000
+    },
+    "homepage": {
+      "type": "string",
+      "pattern": "^https?://.+"
+    },
+    "license": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "minApp": {
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "multiInstance": {
+      "type": "boolean"
+    },
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "search",
+          "progress",
+          "favorites",
+          "played",
+          "filters",
+          "subtitles",
+          "danmaku",
+          "live",
+          "categories"
+        ]
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "hosts": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253,
+            "pattern": "^(\\*\\.)?[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$"
+          }
+        },
+        "userHosts": {
+          "type": "boolean"
+        },
+        "lan": {
+          "type": "boolean"
+        }
+      }
+    },
+    "config": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ConfigField"
+      }
+    },
+    "auth": {
+      "type": "string",
+      "enum": ["none", "form", "qr", "device"]
+    }
+  },
+  "$defs": {
+    "ConfigOption": {
+      "type": "object",
+      "required": ["value", "label"],
+      "additionalProperties": true,
+      "properties": {
+        "value": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 }
+      }
+    },
+    "ConfigField": {
+      "type": "object",
+      "required": ["key", "type", "label"],
+      "additionalProperties": true,
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["text", "password", "url", "number", "select", "toggle"]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "required": { "type": "boolean" },
+        "discover": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^_[a-zA-Z0-9-]+\\._(tcp|udp)\\.?$"
+        },
+        "placeholder": { "type": "string" },
+        "default": {
+          "type": ["string", "number", "boolean"]
+        },
+        "options": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/ConfigOption" }
+        }
+      },
+      "if": {
+        "properties": { "type": { "const": "select" } },
+        "required": ["type"]
+      },
+      "then": {
+        "required": ["options"]
+      }
+    }
+  }
+}

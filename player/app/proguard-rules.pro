@@ -33,3 +33,6 @@
 # jMDNS
 -dontwarn javax.jmdns.impl.DNSCache
 -dontwarn org.slf4j.**
+
+# QuickJS-KT JNI callbacks
+-keep class com.dokar.quickjs.** { *; }

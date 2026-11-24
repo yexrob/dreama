@@ -1,0 +1,308 @@
+{
+  "authSuccess": {
+    "AccessToken": "jf-tok-9f8e7d6c5b4a",
+    "ServerId": "srv-home-01",
+    "User": {
+      "Id": "user-alice-001",
+      "Name": "Alice",
+      "PrimaryImageTag": "avatar-tag-1"
+    }
+  },
+  "views": {
+    "Items": [
+      {
+        "Id": "lib-movies",
+        "Name": "电影",
+        "Type": "CollectionFolder",
+        "CollectionType": "movies",
+        "ChildCount": 2,
+        "ImageTags": { "Primary": "lib-m-tag" }
+      },
+      {
+        "Id": "lib-shows",
+        "Name": "剧集",
+        "Type": "CollectionFolder",
+        "CollectionType": "tvshows",
+        "ChildCount": 1,
+        "ImageTags": { "Primary": "lib-s-tag" }
+      },
+      {
+        "Id": "lib-music",
+        "Name": "音乐",
+        "Type": "CollectionFolder",
+        "CollectionType": "music"
+      }
+    ]
+  },
+  "resume": {
+    "Items": [
+      {
+        "Id": "mov-dune",
+        "Name": "沙丘",
+        "Type": "Movie",
+        "ProductionYear": 2021,
+        "Overview": "保罗·厄崔迪前往危险的沙丘星球。",
+        "Genres": ["科幻", "冒险"],
+        "CommunityRating": 8.2,
+        "RunTimeTicks": 93000000000,
+        "Video3DFormat": "HalfSideBySide",
+        "ImageTags": { "Primary": "dune-p1", "Thumb": "dune-t1" },
+        "BackdropImageTags": ["dune-b1"],
+        "ImageBlurHashes": {
+          "Primary": { "dune-p1": "LEHV6nWB2yk8pyo0adR*.7kCMdnj" },
+          "Backdrop": { "dune-b1": "L6PZfSi_.AyE_3t7t7R**0o#DgR4" }
+        },
+        "UserData": {
+          "PlaybackPositionTicks": 18000000000,
+          "Played": false,
+          "IsFavorite": true
+        },
+        "MediaSources": [
+          {
+            "Id": "ms-dune-1",
+            "Container": "mkv",
+            "Bitrate": 24500000,
+            "MediaStreams": [
+              { "Type": "Video", "Width": 3840, "Height": 2160, "Codec": "hevc", "VideoRange": "HDR" }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "nextUp": {
+    "Items": [
+      {
+        "Id": "ep-s1e2",
+        "Name": "红岸基地",
+        "Type": "Episode",
+        "SeriesId": "ser-threebody",
+        "SeriesName": "三体",
+        "SeasonId": "sea-threebody-1",
+        "ParentIndexNumber": 1,
+        "IndexNumber": 2,
+        "Overview": "叶文洁在红岸基地探索宇宙信号。",
+        "RunTimeTicks": 27000000000,
+        "ImageTags": { "Primary": "ep2-img" },
+        "UserData": { "PlaybackPositionTicks": 0, "Played": false, "IsFavorite": false }
+      }
+    ]
+  },
+  "latestMovies": [
+    {
+      "Id": "mov-dune",
+      "Name": "沙丘",
+      "Type": "Movie",
+      "ProductionYear": 2021,
+      "Genres": ["科幻", "冒险"],
+      "CommunityRating": 8.2,
+      "RunTimeTicks": 93000000000,
+      "ImageTags": { "Primary": "dune-p1" },
+      "UserData": { "PlaybackPositionTicks": 18000000000, "Played": false, "IsFavorite": true }
+    },
+    {
+      "Id": "mov-arrival",
+      "Name": "降临",
+      "Type": "Movie",
+      "ProductionYear": 2016,
+      "Genres": ["科幻", "悬疑"],
+      "CommunityRating": 8.0,
+      "RunTimeTicks": 69600000000,
+      "ImageTags": { "Primary": "arr-p1" },
+      "UserData": { "PlaybackPositionTicks": 0, "Played": true, "IsFavorite": false }
+    }
+  ],
+  "latestShows": [
+    {
+      "Id": "ser-threebody",
+      "Name": "三体",
+      "Type": "Series",
+      "ProductionYear": 2023,
+      "Genres": ["科幻", "剧情"],
+      "CommunityRating": 8.7,
+      "ChildCount": 1,
+      "ImageTags": { "Primary": "tb-p1" },
+      "BackdropImageTags": ["tb-b1"],
+      "UserData": { "Played": false, "IsFavorite": true }
+    }
+  ],
+  "browseMoviesPage1": {
+    "TotalRecordCount": 2,
+    "Items": [
+      {
+        "Id": "mov-dune",
+        "Name": "沙丘",
+        "Type": "Movie",
+        "ProductionYear": 2021,
+        "Genres": ["科幻"],
+        "CommunityRating": 8.2,
+        "RunTimeTicks": 93000000000,
+        "ImageTags": { "Primary": "dune-p1" }
+      }
+    ]
+  },
+  "browseMoviesPage2": {
+    "TotalRecordCount": 2,
+    "Items": [
+      {
+        "Id": "mov-arrival",
+        "Name": "降临",
+        "Type": "Movie",
+        "ProductionYear": 2016,
+        "Genres": ["科幻"],
+        "CommunityRating": 8.0,
+        "RunTimeTicks": 69600000000,
+        "ImageTags": { "Primary": "arr-p1" }
+      }
+    ]
+  },
+  "movieDetail": {
+    "Id": "mov-dune",
+    "Name": "沙丘",
+    "Type": "Movie",
+    "ProductionYear": 2021,
+    "Overview": "保罗·厄崔迪前往危险的沙丘星球。",
+    "Genres": ["科幻", "冒险"],
+    "CommunityRating": 8.2,
+    "RunTimeTicks": 93000000000,
+    "Video3DFormat": "HalfSideBySide",
+    "ImageTags": { "Primary": "dune-p1", "Thumb": "dune-t1" },
+    "BackdropImageTags": ["dune-b1"],
+    "ImageBlurHashes": {
+      "Primary": { "dune-p1": "LEHV6nWB2yk8pyo0adR*.7kCMdnj" }
+    },
+    "People": [
+      { "Id": "p-denis", "Name": "丹尼斯·维伦纽瓦", "Type": "Director", "PrimaryImageTag": "denis-img" },
+      { "Id": "p-timothee", "Name": "提莫西·查拉梅", "Role": "Paul Atreides", "Type": "Actor" }
+    ],
+    "Studios": [{ "Name": "Legendary Pictures" }],
+    "UserData": {
+      "PlaybackPositionTicks": 18000000000,
+      "Played": false,
+      "IsFavorite": true
+    },
+    "MediaSources": [
+      {
+        "Id": "ms-dune-1",
+        "Container": "mkv",
+        "Bitrate": 24500000,
+        "MediaStreams": [
+          { "Type": "Video", "Index": 0, "Width": 3840, "Height": 2160, "Codec": "hevc", "VideoRange": "HDR" },
+          { "Type": "Audio", "Index": 1, "Language": "eng", "DisplayTitle": "English TrueHD 7.1" },
+          { "Type": "Subtitle", "Index": 2, "Language": "chi", "Codec": "srt", "DisplayTitle": "简体中文", "IsDefault": true }
+        ]
+      }
+    ]
+  },
+  "similarMovies": {
+    "Items": [
+      {
+        "Id": "mov-arrival",
+        "Name": "降临",
+        "Type": "Movie",
+        "ProductionYear": 2016,
+        "ImageTags": { "Primary": "arr-p1" }
+      }
+    ]
+  },
+  "seriesDetail": {
+    "Id": "ser-threebody",
+    "Name": "三体",
+    "Type": "Series",
+    "ProductionYear": 2023,
+    "Overview": "纳米材料学家汪淼卷入地球往事。",
+    "Genres": ["科幻", "剧情"],
+    "CommunityRating": 8.7,
+    "ChildCount": 1,
+    "ImageTags": { "Primary": "tb-p1" },
+    "BackdropImageTags": ["tb-b1"]
+  },
+  "seriesSeasons": {
+    "Items": [
+      {
+        "Id": "sea-threebody-1",
+        "Name": "第一季",
+        "Type": "Season",
+        "SeriesId": "ser-threebody",
+        "IndexNumber": 1,
+        "ChildCount": 2,
+        "ImageTags": { "Primary": "sea1-p1" }
+      }
+    ]
+  },
+  "seasonDetail": {
+    "Id": "sea-threebody-1",
+    "Name": "第一季",
+    "Type": "Season",
+    "SeriesId": "ser-threebody",
+    "IndexNumber": 1,
+    "ChildCount": 2
+  },
+  "seasonEpisodes": {
+    "Items": [
+      {
+        "Id": "ep-s1e1",
+        "Name": "科学边界",
+        "Type": "Episode",
+        "SeriesId": "ser-threebody",
+        "SeriesName": "三体",
+        "SeasonId": "sea-threebody-1",
+        "ParentIndexNumber": 1,
+        "IndexNumber": 1,
+        "RunTimeTicks": 26400000000,
+        "UserData": { "Played": true, "PlaybackPositionTicks": 0 }
+      },
+      {
+        "Id": "ep-s1e2",
+        "Name": "红岸基地",
+        "Type": "Episode",
+        "SeriesId": "ser-threebody",
+        "SeriesName": "三体",
+        "SeasonId": "sea-threebody-1",
+        "ParentIndexNumber": 1,
+        "IndexNumber": 2,
+        "RunTimeTicks": 27000000000,
+        "UserData": { "Played": false, "PlaybackPositionTicks": 6000000000 }
+      }
+    ]
+  },
+  "playbackInfo": {
+    "PlaySessionId": "jf-play-sess-888",
+    "MediaSources": [
+      {
+        "Id": "ms-dune-1",
+        "Container": "mkv",
+        "SupportsDirectPlay": true,
+        "SupportsTranscoding": true,
+        "Video3DFormat": "HalfSideBySide",
+        "MediaStreams": [
+          { "Type": "Video", "Index": 0, "Width": 3840, "Height": 2160, "Codec": "hevc", "VideoRange": "HDR" },
+          { "Type": "Audio", "Index": 1, "Language": "eng", "DisplayTitle": "English TrueHD 7.1" },
+          { "Type": "Audio", "Index": 2, "Language": "chi", "DisplayTitle": "国语配音 AAC" },
+          { "Type": "Subtitle", "Index": 3, "Language": "chi", "Codec": "srt", "DisplayTitle": "简体中文 SRT", "IsDefault": true },
+          { "Type": "Subtitle", "Index": 4, "Language": "eng", "Codec": "vtt", "DisplayTitle": "English VTT", "DeliveryUrl": "/Videos/mov-dune/ms-dune-1/Subtitles/4/0/Stream.vtt" },
+          { "Type": "Subtitle", "Index": 5, "Language": "chi", "Codec": "ass", "DisplayTitle": "双语特效 ASS" },
+          { "Type": "Subtitle", "Index": 6, "Language": "jpn", "Codec": "pgssub", "DisplayTitle": "PGS Bitmap (ignored)" }
+        ]
+      }
+    ]
+  },
+  "searchResults": {
+    "TotalRecordCount": 1,
+    "Items": [
+      {
+        "Id": "mov-dune",
+        "Name": "沙丘",
+        "Type": "Movie",
+        "ProductionYear": 2021,
+        "ImageTags": { "Primary": "dune-p1" }
+      }
+    ]
+  },
+  "searchHints": {
+    "SearchHints": [
+      { "ItemId": "mov-dune", "Name": "沙丘" },
+      { "ItemId": "ser-threebody", "Name": "三体" }
+    ]
+  }
+}

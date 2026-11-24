@@ -1,0 +1,72 @@
+{
+  "api": 1,
+  "id": "dev.depth3d.reference",
+  "name": "$t:plugin_name",
+  "version": "1.0.0",
+  "author": "depth3d",
+  "description": "$t:plugin_desc",
+  "homepage": "https://depth3d.dev/plugins/reference",
+  "license": "GPL-3.0-or-later",
+  "minApp": "1.0.0",
+  "multiInstance": true,
+  "capabilities": [
+    "search",
+    "progress",
+    "favorites",
+    "played",
+    "filters",
+    "subtitles",
+    "danmaku",
+    "live",
+    "categories"
+  ],
+  "permissions": {
+    "hosts": ["api.reference.invalid", "*.cdn.reference.invalid"],
+    "userHosts": false,
+    "lan": false
+  },
+  "config": [
+    {
+      "key": "endpoint",
+      "type": "url",
+      "label": "$t:cfg_endpoint",
+      "discover": "_depth3d-ref._tcp",
+      "default": "https://api.reference.invalid"
+    },
+    {
+      "key": "username",
+      "type": "text",
+      "label": "$t:cfg_username",
+      "default": "tester"
+    },
+    {
+      "key": "password",
+      "type": "password",
+      "label": "$t:cfg_password"
+    },
+    {
+      "key": "pageSize",
+      "type": "number",
+      "label": "$t:cfg_page_size",
+      "default": 2
+    },
+    {
+      "key": "authFlow",
+      "type": "select",
+      "label": "$t:cfg_auth_flow",
+      "options": [
+        { "value": "qr", "label": "$t:auth_qr" },
+        { "value": "device", "label": "$t:auth_device" },
+        { "value": "form", "label": "$t:auth_form" }
+      ],
+      "default": "qr"
+    },
+    {
+      "key": "preferHevc",
+      "type": "toggle",
+      "label": "$t:cfg_prefer_hevc",
+      "default": true
+    }
+  ],
+  "auth": "qr"
+}

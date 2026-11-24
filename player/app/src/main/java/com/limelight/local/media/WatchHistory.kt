@@ -9,6 +9,13 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.Upsert
 import com.limelight.LimeLog
+import com.limelight.local.plugin.InstalledPluginEntity
+import com.limelight.local.plugin.PluginInstanceDao
+import com.limelight.local.plugin.PluginInstanceEntity
+import com.limelight.local.plugin.PluginPackageDao
+import com.limelight.local.plugin.PluginRepoDao
+import com.limelight.local.plugin.PluginRepoEntity
+import com.limelight.local.plugin.WALL_DATABASE_MIGRATION_1_2
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -57,16 +64,31 @@ interface WatchProgressDao {
     suspend fun upsert(progress: WatchProgress)
 }
 
-@Database(entities = [WatchProgress::class], version = 1, exportSchema = true)
+@Database(
+    entities = [
+        WatchProgress::class,
+        InstalledPluginEntity::class,
+        PluginInstanceEntity::class,
+        PluginRepoEntity::class,
+    ],
+    version = 2,
+    exportSchema = true,
+)
 abstract class WallDatabase : RoomDatabase() {
     abstract fun progress(): WatchProgressDao
+    abstract fun pluginPackages(): PluginPackageDao
+    abstract fun pluginInstances(): PluginInstanceDao
+    abstract fun pluginRepos(): PluginRepoDao
 
     companion object {
+        val MIGRATION_1_2 = WALL_DATABASE_MIGRATION_1_2
+
         @Volatile
         private var instance: WallDatabase? = null
 
         fun get(context: Context): WallDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(context.applicationContext, WallDatabase::class.java, "wall.db")
+                .addMigrations(MIGRATION_1_2)
                 .build().also { instance = it }
         }
     }

@@ -1,0 +1,15 @@
+{
+  "plugin_name": "协议参考插件",
+  "plugin_desc": "覆盖全部字段、能力、错误码和登录方式的一致性测试插件",
+  "cfg_endpoint": "模拟接口地址",
+  "cfg_username": "测试用户名",
+  "cfg_password": "测试密码",
+  "cfg_page_size": "每页数量",
+  "cfg_auth_flow": "登录方式",
+  "cfg_prefer_hevc": "优先 HEVC 编码",
+  "auth_qr": "二维码登录",
+  "auth_device": "设备码登录",
+  "auth_form": "表单登录",
+  "welcome": "欢迎回来，{{name}}",
+  "qr_hint": "请使用手机应用扫描二维码确认登录"
+}

@@ -1,0 +1,22 @@
+{
+  "name": "@depth3d/plugin-kit",
+  "version": "1.0.0",
+  "description": "CLI toolkit and QuickJS runtime for developing, checking, packing, and serving depth3d v1 plugins",
+  "type": "module",
+  "license": "GPL-3.0-or-later",
+  "bin": {
+    "d3plugin": "./bin/d3plugin.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "ajv": "^8.20.0",
+    "jszip": "^3.10.2",
+    "linkedom": "^0.18.15",
+    "quickjs-emscripten": "^0.32.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

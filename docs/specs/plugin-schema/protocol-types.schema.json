@@ -1,0 +1,394 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://depth3d.dev/schemas/plugin/v1/protocol-types.schema.json",
+  "title": "depth3d Plugin Protocol Data Types (v1)",
+  "$defs": {
+    "Headers": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "Kind": {
+      "type": "string",
+      "enum": [
+        "movie",
+        "series",
+        "season",
+        "episode",
+        "video",
+        "folder",
+        "live",
+        "collection",
+        "person"
+      ]
+    },
+    "Stereo": {
+      "type": "string",
+      "enum": ["2d", "sbs", "ou", "mvhevc", "180", "360"]
+    },
+    "Image": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        {
+          "type": "object",
+          "required": ["url"],
+          "additionalProperties": true,
+          "properties": {
+            "url": { "type": "string", "minLength": 1 },
+            "headers": { "$ref": "#/$defs/Headers" },
+            "blurhash": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "Person": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "role": { "type": "string" },
+        "image": { "$ref": "#/$defs/Image" },
+        "id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "ExtraField": {
+      "type": "object",
+      "required": ["label", "value"],
+      "additionalProperties": true,
+      "properties": {
+        "label": { "type": "string", "minLength": 1 },
+        "value": { "type": "string" }
+      }
+    },
+    "Item": {
+      "type": "object",
+      "required": ["id", "kind", "title"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": { "$ref": "#/$defs/Kind" },
+        "title": { "type": "string", "minLength": 1 },
+        "subtitle": { "type": "string" },
+        "poster": { "$ref": "#/$defs/Image" },
+        "thumb": { "$ref": "#/$defs/Image" },
+        "backdrop": { "$ref": "#/$defs/Image" },
+        "year": { "type": "integer", "minimum": 1800, "maximum": 3000 },
+        "overview": { "type": "string" },
+        "rating": { "type": "number", "minimum": 0, "maximum": 10 },
+        "durationMs": { "type": "number", "minimum": 0 },
+        "progressMs": { "type": "number", "minimum": 0 },
+        "played": { "type": "boolean" },
+        "favorite": { "type": "boolean" },
+        "badges": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "stereo": { "$ref": "#/$defs/Stereo" },
+        "parentId": { "type": "string", "minLength": 1 },
+        "index": { "type": "integer", "minimum": 0 },
+        "childCount": { "type": "integer", "minimum": 0 },
+        "seasons": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Item" }
+        },
+        "episodes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Item" }
+        },
+        "related": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Item" }
+        },
+        "people": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Person" }
+        },
+        "genres": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "extra": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ExtraField" }
+        }
+      }
+    },
+    "Shelf": {
+      "type": "object",
+      "required": ["id", "title", "items"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "style": {
+          "type": "string",
+          "enum": ["poster", "thumb", "continue", "hero", "category"]
+        },
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Item" }
+        },
+        "more": { "type": "string", "minLength": 1 }
+      }
+    },
+    "HomeResult": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Shelf" }
+    },
+    "ItemPage": {
+      "type": "object",
+      "required": ["items"],
+      "additionalProperties": true,
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Item" }
+        },
+        "next": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "Track": {
+      "type": "object",
+      "required": ["id", "url", "mime", "codecs", "bandwidth"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "url": { "type": "string", "minLength": 1 },
+        "backupUrls": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "mime": { "type": "string", "minLength": 1 },
+        "codecs": { "type": "string", "minLength": 1 },
+        "bandwidth": { "type": "number", "minimum": 0 },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "frameRate": { "type": "number", "exclusiveMinimum": 0 },
+        "quality": { "type": "string", "minLength": 1 },
+        "initRange": { "type": "string", "pattern": "^\\d+-\\d+$" },
+        "indexRange": { "type": "string", "pattern": "^\\d+-\\d+$" }
+      }
+    },
+    "DashSource": {
+      "type": "object",
+      "required": ["video", "audio"],
+      "additionalProperties": true,
+      "properties": {
+        "video": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/Track" }
+        },
+        "audio": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Track" }
+        }
+      }
+    },
+    "QualityOption": {
+      "type": "object",
+      "required": ["id", "label"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "selected": { "type": "boolean" },
+        "locked": { "type": "string", "minLength": 1 }
+      }
+    },
+    "Subtitle": {
+      "type": "object",
+      "required": ["id", "label", "url", "format"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "lang": { "type": "string", "minLength": 1 },
+        "url": { "type": "string", "minLength": 1 },
+        "format": {
+          "type": "string",
+          "enum": ["srt", "vtt", "ass", "json"]
+        },
+        "headers": { "$ref": "#/$defs/Headers" },
+        "default": { "type": "boolean" }
+      }
+    },
+    "AudioOption": {
+      "type": "object",
+      "required": ["id", "label"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "lang": { "type": "string", "minLength": 1 }
+      }
+    },
+    "PlaybackInfo": {
+      "type": "object",
+      "additionalProperties": true,
+      "oneOf": [
+        {
+          "required": ["url"],
+          "not": { "anyOf": [{ "required": ["dash"] }, { "required": ["mpd"] }] }
+        },
+        {
+          "required": ["dash"],
+          "not": { "anyOf": [{ "required": ["url"] }, { "required": ["mpd"] }] }
+        },
+        {
+          "required": ["mpd"],
+          "not": { "anyOf": [{ "required": ["url"] }, { "required": ["dash"] }] }
+        }
+      ],
+      "properties": {
+        "url": { "type": "string", "minLength": 1 },
+        "dash": { "$ref": "#/$defs/DashSource" },
+        "mpd": { "type": "string", "minLength": 1 },
+        "mime": { "type": "string", "minLength": 1 },
+        "headers": { "$ref": "#/$defs/Headers" },
+        "qualities": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/QualityOption" }
+        },
+        "subtitles": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Subtitle" }
+        },
+        "audios": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/AudioOption" }
+        },
+        "startMs": { "type": "number", "minimum": 0 },
+        "live": { "type": "boolean" },
+        "expiresAt": { "type": "number", "minimum": 0 },
+        "stereo": { "$ref": "#/$defs/Stereo" },
+        "next": { "type": "string", "minLength": 1 },
+        "session": { "type": "string", "minLength": 1 }
+      }
+    },
+    "Option": {
+      "type": "object",
+      "required": ["value", "label"],
+      "additionalProperties": true,
+      "properties": {
+        "value": { "type": "string" },
+        "label": { "type": "string", "minLength": 1 }
+      }
+    },
+    "FilterGroup": {
+      "type": "object",
+      "required": ["key", "label", "options"],
+      "additionalProperties": true,
+      "properties": {
+        "key": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "options": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Option" }
+        }
+      }
+    },
+    "FiltersResult": {
+      "type": "object",
+      "required": ["sorts", "filters"],
+      "additionalProperties": true,
+      "properties": {
+        "sorts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Option" }
+        },
+        "filters": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/FilterGroup" }
+        }
+      }
+    },
+    "DanmakuItem": {
+      "type": "object",
+      "required": ["timeMs", "text"],
+      "additionalProperties": true,
+      "properties": {
+        "timeMs": { "type": "number", "minimum": 0 },
+        "text": { "type": "string" },
+        "color": { "type": "string", "pattern": "^#?[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$" },
+        "mode": { "type": "string", "enum": ["scroll", "top", "bottom"] }
+      }
+    },
+    "DanmakuResult": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/DanmakuItem" }
+    },
+    "CategoryEntry": {
+      "type": "object",
+      "required": ["id", "title"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "icon": { "type": "string", "minLength": 1 }
+      }
+    },
+    "CategoriesResult": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/CategoryEntry" }
+    },
+    "SuggestResult": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "UserProfile": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "avatar": { "$ref": "#/$defs/Image" }
+      }
+    },
+    "FormLoginResult": {
+      "type": "object",
+      "required": ["ok"],
+      "additionalProperties": true,
+      "properties": {
+        "ok": { "type": "boolean", "const": true },
+        "user": { "$ref": "#/$defs/UserProfile" }
+      }
+    },
+    "QrLoginStartResult": {
+      "type": "object",
+      "required": ["qr", "expiresInSec", "state"],
+      "additionalProperties": true,
+      "properties": {
+        "qr": { "type": "string", "minLength": 1 },
+        "hint": { "type": "string" },
+        "expiresInSec": { "type": "number", "exclusiveMinimum": 0 },
+        "state": { "type": "string", "minLength": 1 }
+      }
+    },
+    "DeviceLoginStartResult": {
+      "type": "object",
+      "required": ["url", "code", "expiresInSec", "state"],
+      "additionalProperties": true,
+      "properties": {
+        "url": { "type": "string", "minLength": 1 },
+        "code": { "type": "string", "minLength": 1 },
+        "expiresInSec": { "type": "number", "exclusiveMinimum": 0 },
+        "state": { "type": "string", "minLength": 1 }
+      }
+    },
+    "LoginPollResult": {
+      "type": "object",
+      "required": ["status"],
+      "additionalProperties": true,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["pending", "scanned", "done", "expired"]
+        },
+        "user": { "$ref": "#/$defs/UserProfile" }
+      }
+    }
+  }
+}

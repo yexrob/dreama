@@ -6,8 +6,11 @@ proto/samples/
 
 player/local.properties
 player/.gradle/
+player/.kotlin/
 player/build/
 player/app/build/
 player/.cxx/
 player/app/.cxx/
 proto/samples/
+node_modules/
+*.d3plugin

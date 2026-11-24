@@ -1,0 +1,20 @@
+{
+  "plugin_name": "Jellyfin",
+  "plugin_desc": "连接你的 Jellyfin 媒体服务器，支持海报墙、剧集选集、外挂字幕、进度同步与转码清晰度切换",
+  "cfg_server": "服务器地址",
+  "cfg_username": "用户名",
+  "cfg_password": "密码",
+  "cfg_quality": "默认清晰度",
+  "q_direct": "原画直连",
+  "q_1080p": "1080P（8 Mbps）",
+  "q_720p": "720P（4 Mbps）",
+  "q_480p": "480P（1.5 Mbps）",
+  "shelf_resume": "继续观看",
+  "shelf_next_up": "接下来观看",
+  "shelf_latest": "最近添加 · {{name}}",
+  "err_no_server": "请先填写 Jellyfin 服务器地址。",
+  "err_no_user": "请填写 Jellyfin 用户名。",
+  "err_needs_auth": "登录状态已失效，请重新登录 Jellyfin。",
+  "err_auth_failed": "用户名或密码不正确，请检查后重试。",
+  "err_connect": "无法连接到 Jellyfin 服务器，请检查地址和网络。"
+}
