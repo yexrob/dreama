@@ -43,6 +43,11 @@ object Artworks {
     fun cached(art: Artwork, size: Size): Bitmap? = memory.get(key(art, size))
 
     suspend fun load(context: Context, art: Artwork, size: Size): Bitmap? {
+        if (art.sourceKind == SourceKind.PLUGIN) {
+            throw UnsupportedOperationException(
+                "插件来源图片禁止走 Artworks.load（会绕过 NetworkPolicy），请改用 PluginImages.loadBitmap",
+            )
+        }
         val key = key(art, size)
         memory.get(key)?.let { return it }
         if (key in failed) {
@@ -66,6 +71,11 @@ object Artworks {
     // A tenth of the way in, capped at five minutes, skips the black or the
     // studio logo a frame at zero usually is
     private fun frame(context: Context, art: Artwork, size: Size): Bitmap? {
+        if (art.sourceKind == SourceKind.PLUGIN) {
+            throw UnsupportedOperationException(
+                "插件来源禁止走 MediaMetadataRetriever 取帧，请使用 PluginImages.loadBitmap 或占位图",
+            )
+        }
         val mmr = MediaMetadataRetriever()
         return try {
             if (art.url.startsWith("http")) {

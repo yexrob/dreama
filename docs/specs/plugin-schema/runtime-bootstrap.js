@@ -340,13 +340,33 @@
         if (utf8ByteLength(urlStr) > MAX_FETCH_URL_BYTES) {
           throw new RangeError('请求 URL 超过大小限制（上限 8 KB）');
         }
+        const rawMethod = o.method !== undefined && o.method !== null ? String(o.method) : 'GET';
+        if (rawMethod.length > 16) {
+          throw new RangeError('请求 method 过长');
+        }
+        const method = rawMethod.toUpperCase();
+        if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].includes(method)) {
+          throw new RangeError('不支持的 HTTP method：' + method);
+        }
+        const rawRedirect = o.redirect !== undefined && o.redirect !== null ? String(o.redirect) : 'follow';
+        if (rawRedirect.length > 16) {
+          throw new RangeError('请求 redirect 参数过长');
+        }
+        const redirect = rawRedirect.toLowerCase();
+        if (!['follow', 'manual', 'error'].includes(redirect)) {
+          throw new RangeError('不支持的 redirect 模式：' + redirect);
+        }
         const req = {
           url: urlStr,
-          method: o.method ? String(o.method) : 'GET',
+          method,
           headers: {},
-          redirect: o.redirect ? String(o.redirect) : 'follow',
+          redirect,
         };
-        if (o.timeoutMs !== undefined && o.timeoutMs !== null) req.timeoutMs = Number(o.timeoutMs);
+        if (o.timeoutMs !== undefined && o.timeoutMs !== null) {
+          const t = Number(o.timeoutMs);
+          if (!Number.isFinite(t) || t < 0) throw new RangeError('无效的 timeoutMs 参数');
+          req.timeoutMs = t;
+        }
         let headersBytes = 0;
         if (o.headers && typeof o.headers === 'object') {
           for (const [k, v] of Object.entries(o.headers)) {

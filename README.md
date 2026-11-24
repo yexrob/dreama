@@ -175,7 +175,8 @@ sh player/app/src/main/jni/airplay/mac/build.sh     # 需要 Xcode 命令行工�
 | kotlinx-serialization-json（JSON AST / Schema 校验） | 1.13.0，[Kotlin/kotlinx.serialization](https://github.com/Kotlin/kotlinx.serialization) | Apache-2.0 | `player/app/build.gradle` |
 | quickjs-emscripten（开发工具 QuickJS WASM） | 0.32.0，[justjake/quickjs-emscripten](https://github.com/justjake/quickjs-emscripten) | MIT | `tools/plugin-kit/package.json` |
 | ajv（共用 JSON Schema 校验） | 8.20.0，[ajv-validator/ajv](https://github.com/ajv-validator/ajv) | MIT | `tools/plugin-kit/package.json` |
-| linkedom（开发工具 `ctx.parse`） | 0.18.15，[WebReflection/linkedom](https://github.com/WebReflection/linkedom) | ISC | `tools/plugin-kit/package.json` |
+| linkedom（开发工具 `ctx.parse.xml`） | 0.18.15，[WebReflection/linkedom](https://github.com/WebReflection/linkedom) | ISC | `tools/plugin-kit/package.json` |
+| parse5（开发工具 `ctx.parse.html` HTML5 树构建） | 8.1.1，[inikulin/parse5](https://github.com/inikulin/parse5) | MIT | `tools/plugin-kit/package.json` |
 | jszip（`.d3plugin` 打包解包） | 3.10.2，[Stuk/jszip](https://github.com/Stuk/jszip) | MIT / GPL-3.0-or-later | `tools/plugin-kit/package.json` |
 | 测试依赖：`mockwebserver` 5.5.0、`kotlinx-coroutines-test` 1.11.0、`sqlite-jdbc` 3.54.1.0、`room-testing` 2.8.5、`robolectric` 4.18.1 | Maven Central | Apache-2.0 / MIT（Robolectric） | `player/app/build.gradle`（`testImplementation`） |
 

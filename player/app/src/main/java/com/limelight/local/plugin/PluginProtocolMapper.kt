@@ -15,6 +15,7 @@ import com.limelight.local.media.PlaybackInfo
 import com.limelight.local.media.QualityOption
 import com.limelight.local.media.Shelf
 import com.limelight.local.media.ShelfStyle
+import com.limelight.local.media.SourceKind
 import com.limelight.local.media.StereoHint
 import com.limelight.local.media.SubtitleFormat
 import com.limelight.local.media.SubtitleTrack
@@ -251,6 +252,7 @@ class PluginProtocolMapper(
             expiresAtMs = expiresAt,
             nextItemId = obj.optString("next"),
             sessionId = obj.optString("session"),
+            sourceKind = SourceKind.PLUGIN,
         )
     }
 
@@ -467,7 +469,7 @@ class PluginProtocolMapper(
         }
         return try {
             networkPolicy.validateResourceUrlPrecheck(url)
-            Artwork(url = url, headers = headers, blurhash = blurhash)
+            Artwork(url = url, headers = headers, blurhash = blurhash, sourceKind = SourceKind.PLUGIN)
         } catch (e: NetworkPolicyException) {
             logger?.warn("Rejected disallowed image URL: ${e.message}")
             null

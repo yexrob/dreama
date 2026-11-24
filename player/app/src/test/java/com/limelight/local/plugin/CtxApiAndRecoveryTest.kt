@@ -1253,6 +1253,226 @@ class CtxApiAndRecoveryTest {
             tmpDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun enforcesLinearMemoizedSelectorsMatrix85ParityExactRecountAndQueuedFetchBodyCap(): Unit = runBlocking {
+        // 1. Round 5 Item #3: Run ALL 85 cases2.json matrixCases from shared dom-vectors.json
+        val repoRoot = ManifestAndPermissionTest.locateRepoRoot()
+        val vecRoot = kotlinx.serialization.json.Json.parseToJsonElement(
+            File(repoRoot, "docs/specs/plugin-schema/dom-vectors.json").readText(),
+        ).jsonObject
+        val matrixCases = vecRoot["matrixCases"]!!.jsonArray
+        assertTrue("Expected all 85 matrixCases in dom-vectors.json", matrixCases.size >= 85)
+        for (mcEl in matrixCases) {
+            val mc = mcEl.jsonObject
+            val id = mc["id"]!!.jsonPrimitive.int
+            val mode = mc["mode"]!!.jsonPrimitive.content
+            val input = mc["input"]!!.jsonPrimitive.content
+            val target = mc["target"]!!.jsonPrimitive.content
+            val op = mc["op"]!!.jsonPrimitive.content
+            val expectThrows = mc["throws"]!!.jsonPrimitive.boolean
+            val expectedEl = mc["expected"]!!
+
+            val parser = PluginDomParser()
+            var threw = false
+            var actual: String? = null
+            try {
+                val root = if (mode == "xml") parser.parseXml(input) else parser.parseHtml(input)
+                val nodeId = if (target == "#root") root else parser.selectFirstId(root, target)
+                actual = when {
+                    nodeId <= 0 -> null
+                    op == "tag" -> parser.tag(nodeId)
+                    op == "text" -> parser.text(nodeId)
+                    op == "html" -> parser.html(nodeId)
+                    op == "outer" -> parser.outerHtml(nodeId)
+                    op == "attrs" -> parser.attrsJson(nodeId)
+                    op == "children" -> parser.childrenIds(nodeId).joinToString(",") { parser.tag(it.jsonPrimitive.int) }
+                    op.startsWith("attr:") -> parser.attr(nodeId, op.removePrefix("attr:"))
+                    op.startsWith("all:") -> parser.selectAllIds(nodeId, op.removePrefix("all:"))
+                        .joinToString("|") { el ->
+                            val cid = el.jsonPrimitive.int
+                            "${parser.tag(cid)}=${parser.text(cid)}"
+                        }
+                    else -> fail("Unknown op: $op").toString()
+                }
+            } catch (_: Exception) {
+                threw = true
+            }
+            if (expectThrows) {
+                assertTrue("matrixCase #$id ($mode / $target / $op) must throw", threw)
+            } else {
+                assertFalse("matrixCase #$id ($mode / $target / $op) must not throw", threw)
+                val expectedStr = if (expectedEl is kotlinx.serialization.json.JsonNull) null else expectedEl.jsonPrimitive.content
+                assertEquals("matrixCase #$id ($mode / $target / $op) mismatch", expectedStr, actual)
+            }
+        }
+
+        // 2. Round 5 Item #1 [Blocking]: Pathological selectors MUST complete in < 1s via O(N*S) memoized DP
+        run {
+            val p1 = PluginDomParser()
+            val r1 = p1.parseHtml("<div>".repeat(500))
+            val t1 = System.nanoTime()
+            val m1 = p1.selectAllIds(r1, "span div div div div")
+            val ms1 = (System.nanoTime() - t1) / 1_000_000L
+            assertEquals(0, m1.size)
+            assertTrue("500 nested divs + 'span div div div div' must finish in < 1000ms, took ${ms1}ms", ms1 < 1000L)
+        }
+        run {
+            val p2 = PluginDomParser()
+            val r2 = p2.parseHtml("<ul>" + "<li>x</li>".repeat(2000) + "</ul>")
+            val t2a = System.nanoTime()
+            val m2a = p2.selectAllIds(r2, "b ~ li ~ li")
+            val ms2a = (System.nanoTime() - t2a) / 1_000_000L
+            assertEquals(0, m2a.size)
+            assertTrue("2000 li + 'b ~ li ~ li' must finish in < 1000ms, took ${ms2a}ms", ms2a < 1000L)
+
+            val t2b = System.nanoTime()
+            val m2b = p2.selectAllIds(r2, "b ~ li ~ li ~ li")
+            val ms2b = (System.nanoTime() - t2b) / 1_000_000L
+            assertEquals(0, m2b.size)
+            assertTrue("2000 li + 'b ~ li ~ li ~ li' must finish in < 1000ms, took ${ms2b}ms", ms2b < 1000L)
+        }
+        // 100,000 sibling <li> + :nth-child / :last-child / :nth-last-of-type MUST each finish in < 1000ms!
+        run {
+            val p3 = PluginDomParser()
+            val r3 = p3.parseHtml("<ul>" + "<li>x</li>".repeat(100_000) + "</ul>")
+            val checks = listOf(
+                "li:nth-child(2n+1)" to 50_000,
+                "li:last-child" to 1,
+                "li:nth-last-of-type(3n+1)" to 33_334,
+            )
+            for ((sel, expectedCount) in checks) {
+                val t = System.nanoTime()
+                val res = p3.selectAllIds(r3, sel)
+                val ms = (System.nanoTime() - t) / 1_000_000L
+                assertEquals("Selector $sel match count", expectedCount, res.size)
+                assertTrue("100k siblings '$sel' must finish in < 1000ms, took ${ms}ms", ms < 1000L)
+            }
+        }
+        // Step budget enforcement & deadline timeout enforcement
+        run {
+            val tight = PluginDomParser(maxSelectorSteps = 500)
+            val r = tight.parseHtml("<ul>" + "<li>x</li>".repeat(2000) + "</ul>")
+            try {
+                tight.selectAllIds(r, "li")
+                fail("Exceeding maxSelectorSteps must throw DomLimitExceededException")
+            } catch (_: DomLimitExceededException) {
+            }
+            val expired = PluginDomParser()
+            val rExp = expired.parseHtml("<ul>" + "<li>x</li>".repeat(3000) + "</ul>")
+            expired.setCallDeadlineNanos(System.nanoTime() - 1L)
+            try {
+                expired.selectAllIds(rExp, "li")
+                fail("Expired call deadline must throw DomTimeoutException")
+            } catch (_: DomTimeoutException) {
+            }
+        }
+
+        // 3. Round 5 Item #4: Exact post-parse element recount catches adoption-agency undercount + unified count excluding #document
+        run {
+            val p = PluginDomParser()
+            try {
+                p.parseHtml("<b><p>x</b>y</p>".repeat(95_000))
+                fail("95,000x <b><p>x</b>y</p> (285k actual elements) must be rejected by exact post-parse recount")
+            } catch (_: DomLimitExceededException) {
+            }
+            assertEquals(0, p.currentTotalNodes())
+
+            val pCount = PluginDomParser()
+            pCount.parseHtml("<p>x</p>")
+            assertEquals("HTML <p>x</p> has 4 elements (html,head,body,p) excluding #document", 4, pCount.currentTotalNodes())
+            pCount.parseXml("<r><a/></r>")
+            assertEquals("XML <r><a/></r> adds 2 elements (r,a) excluding #document", 6, pCount.currentTotalNodes())
+        }
+
+        // 4. Round 5 Item #5: fetch method/redirect length pre-checks + 8 MB queued+active request body cap
+        val tmpDir = Files.createTempDirectory("d3-r5-fetch").toFile()
+        val secretBox = SoftwareAesSecretBox()
+        val logger = PluginLogger("dev.depth3d.r5", "inst-r5", sink = { _, _ -> })
+        val storage = InstanceStorage(File(tmpDir, "storage.enc"), secretBox)
+        val cookieJar = PluginCookieJar(File(tmpDir, "cookies.enc"), secretBox)
+        val server = MockWebServer()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                if (request.path.orEmpty().startsWith("/slow-post")) {
+                    Thread.sleep(250)
+                }
+                return MockResponse().setResponseCode(200).setBody("ok")
+            }
+        }
+        server.start()
+        val okHttp = OkHttpClient.Builder()
+            .proxy(Proxy.NO_PROXY)
+            .socketFactory(LocalRedirectSocketFactory("192.168.1.50", server.port))
+            .build()
+        val manifest = PluginManifest(
+            api = 1,
+            id = "dev.depth3d.r5",
+            name = "R5",
+            version = "1.0.0",
+            permissions = PluginPermissions(hosts = emptyList(), userHosts = true, lan = true),
+        )
+        val policy = NetworkPolicy(
+            permissions = manifest.permissions,
+            userConfiguredHosts = setOf("192.168.1.50"),
+            dnsResolver = { listOf(InetAddress.getByName("192.168.1.50")) },
+        )
+        val fetchGw = PluginFetchGateway(policy, cookieJar, baseClient = okHttp)
+        val baseUrl = "http://192.168.1.50:${server.port}"
+        val runtime = PluginRuntime(
+            manifest = manifest,
+            instanceId = "inst-r5",
+            mainJsSource = """
+                export default {
+                  home() { return []; },
+                  async browse(ctx, arg) {
+                    if (arg.categoryId === 'bad-method') {
+                      await ctx.fetch(arg.url, { method: 'G'.repeat(500) });
+                    }
+                    if (arg.categoryId === 'bad-redirect') {
+                      await ctx.fetch(arg.url, { redirect: 'follow'.repeat(500) });
+                    }
+                    if (arg.categoryId === 'body-budget-flood') {
+                      const body = 'B'.repeat(1800 * 1024); // 1.8 MB each -> 6 * 1.8 MB = 10.8 MB > 8 MB cap
+                      const ps = [];
+                      for (let i = 0; i < 6; i++) {
+                        ps.push(ctx.fetch(arg.url + '/slow-post?i=' + i, { method: 'POST', body }).then(() => 'ok', (e) => 'err:' + (e.message || e)));
+                      }
+                      return { results: await Promise.all(ps) };
+                    }
+                    return { items: [] };
+                  },
+                  detail() { return { id: '1', kind: 'video', title: '1' }; },
+                  playback() { return { url: 'https://cdn.example.com/a.mp4' }; },
+                };
+            """.trimIndent(),
+            config = emptyMap(),
+            fetchGateway = fetchGw,
+            storage = storage,
+            cookieJar = cookieJar,
+            logger = logger,
+        )
+        try {
+            for (bad in listOf("bad-method", "bad-redirect")) {
+                try {
+                    runtime.invoke("browse", JsonObject(mapOf("categoryId" to JsonPrimitive(bad), "url" to JsonPrimitive(baseUrl))))
+                    fail("Oversized $bad must be rejected")
+                } catch (_: PluginInternalException) {
+                }
+            }
+            val floodRes = runtime.invoke(
+                "browse",
+                JsonObject(mapOf("categoryId" to JsonPrimitive("body-budget-flood"), "url" to JsonPrimitive(baseUrl))),
+            ).jsonObject["results"]!!.jsonArray.map { it.jsonPrimitive.content }
+            val errs = floodRes.filter { it.startsWith("err:") }
+            assertTrue("6 x 1.8 MB concurrent POSTs must trip 8 MB queued+active request body cap: $floodRes", errs.isNotEmpty())
+            assertEquals("Request body budget must return to 0 after call finishes", 0L, fetchGw.requestBodyBudget.currentUsed())
+        } finally {
+            runtime.close()
+            server.shutdown()
+            tmpDir.deleteRecursively()
+        }
+    }
 }
 
 /**

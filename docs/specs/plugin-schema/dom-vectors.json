@@ -6,17 +6,75 @@
       "mode": "xml",
       "input": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><MPD xmlns:dvb=\"urn:dvb:dash:dash-extensions:2014-1\" mediaPresentationDuration=\"PT120S\"><Period><AdaptationSet mimeType=\"video/mp4\"><Representation id=\"v1\" bandwidth=\"4000000\"><BaseURL dvb:priority=\"1\">https://cdn1.example.com/v.mp4</BaseURL><BaseURL dvb:priority=\"2\">https://cdn2.example.com/v.mp4</BaseURL><SegmentBase indexRange=\"700-750\"><Initialization range=\"0-699\"/><RepresentationIndex range=\"700-750\"/></SegmentBase></Representation></AdaptationSet></Period></MPD>",
       "assertions": [
-        { "op": "rootTag", "expected": "#document" },
-        { "op": "rootChildrenTags", "expected": ["MPD"] },
-        { "op": "firstTag", "selector": "Representation", "expected": "Representation" },
-        { "op": "firstTag", "selector": "representation", "expected": null },
-        { "op": "firstAttr", "selector": "Representation", "attr": "id", "expected": "v1" },
-        { "op": "firstAttr", "selector": "Representation", "attr": "ID", "expected": null },
-        { "op": "firstAttr", "selector": "Representation", "attr": "missing", "expected": null },
-        { "op": "allTexts", "selector": "BaseURL", "expected": ["https://cdn1.example.com/v.mp4", "https://cdn2.example.com/v.mp4"] },
-        { "op": "allAttrs", "selector": "BaseURL", "attr": "dvb:priority", "expected": ["1", "2"] },
-        { "op": "childrenTags", "selector": "SegmentBase", "expected": ["Initialization", "RepresentationIndex"] },
-        { "op": "firstAttr", "selector": "Initialization", "attr": "range", "expected": "0-699" }
+        {
+          "op": "rootTag",
+          "expected": "#document"
+        },
+        {
+          "op": "rootChildrenTags",
+          "expected": [
+            "MPD"
+          ]
+        },
+        {
+          "op": "firstTag",
+          "selector": "Representation",
+          "expected": "Representation"
+        },
+        {
+          "op": "firstTag",
+          "selector": "representation",
+          "expected": null
+        },
+        {
+          "op": "firstAttr",
+          "selector": "Representation",
+          "attr": "id",
+          "expected": "v1"
+        },
+        {
+          "op": "firstAttr",
+          "selector": "Representation",
+          "attr": "ID",
+          "expected": null
+        },
+        {
+          "op": "firstAttr",
+          "selector": "Representation",
+          "attr": "missing",
+          "expected": null
+        },
+        {
+          "op": "allTexts",
+          "selector": "BaseURL",
+          "expected": [
+            "https://cdn1.example.com/v.mp4",
+            "https://cdn2.example.com/v.mp4"
+          ]
+        },
+        {
+          "op": "allAttrs",
+          "selector": "BaseURL",
+          "attr": "dvb:priority",
+          "expected": [
+            "1",
+            "2"
+          ]
+        },
+        {
+          "op": "childrenTags",
+          "selector": "SegmentBase",
+          "expected": [
+            "Initialization",
+            "RepresentationIndex"
+          ]
+        },
+        {
+          "op": "firstAttr",
+          "selector": "Initialization",
+          "attr": "range",
+          "expected": "0-699"
+        }
       ]
     },
     {
@@ -24,12 +82,35 @@
       "mode": "xml",
       "input": "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><item><title><![CDATA[  Hello & <World>   2026  ]]></title><link>https://feeds.example.com/ep/1</link><description>Plain   text</description></item></channel></rss>",
       "assertions": [
-        { "op": "rootTag", "expected": "#document" },
-        { "op": "firstTag", "selector": "rss", "expected": "rss" },
-        { "op": "firstText", "selector": "item title", "expected": "Hello & <World> 2026" },
-        { "op": "firstText", "selector": "item link", "expected": "https://feeds.example.com/ep/1" },
-        { "op": "firstText", "selector": "item description", "expected": "Plain text" },
-        { "op": "firstText", "selector": "item", "expected": "Hello & <World> 2026 https://feeds.example.com/ep/1Plain text" }
+        {
+          "op": "rootTag",
+          "expected": "#document"
+        },
+        {
+          "op": "firstTag",
+          "selector": "rss",
+          "expected": "rss"
+        },
+        {
+          "op": "firstText",
+          "selector": "item title",
+          "expected": "Hello & <World> 2026"
+        },
+        {
+          "op": "firstText",
+          "selector": "item link",
+          "expected": "https://feeds.example.com/ep/1"
+        },
+        {
+          "op": "firstText",
+          "selector": "item description",
+          "expected": "Plain text"
+        },
+        {
+          "op": "firstText",
+          "selector": "item",
+          "expected": "Hello & <World> 2026 https://feeds.example.com/ep/1Plain text"
+        }
       ]
     },
     {
@@ -37,13 +118,43 @@
       "mode": "xml",
       "input": "<?xml version=\"1.0\"?><!DOCTYPE r [<!ENTITY e \"EXP\">]><r xmlns:dvb=\"u\"><dvb:x Attr=\"1\">caf&eacute; &amp; &#233; &e;</dvb:x><item><title>A</title><description>B</description></item><a><b/><c>after</c></a></r>",
       "assertions": [
-        { "op": "firstText", "selector": "dvb|x", "expected": "caf&eacute; & \u00e9 &e;" },
-        { "op": "firstAttr", "selector": "dvb|x", "attr": "Attr", "expected": "1" },
-        { "op": "firstAttr", "selector": "dvb|x", "attr": "attr", "expected": null },
-        { "op": "firstTag", "selector": "dvb|x[Attr=\"1\"]", "expected": "dvb:x" },
-        { "op": "firstTag", "selector": "dvb|x[attr=\"1\"]", "expected": null },
-        { "op": "firstText", "selector": "item", "expected": "AB" },
-        { "op": "firstText", "selector": "a > c", "expected": "after" }
+        {
+          "op": "firstText",
+          "selector": "dvb|x",
+          "expected": "caf&eacute; & é &e;"
+        },
+        {
+          "op": "firstAttr",
+          "selector": "dvb|x",
+          "attr": "Attr",
+          "expected": "1"
+        },
+        {
+          "op": "firstAttr",
+          "selector": "dvb|x",
+          "attr": "attr",
+          "expected": null
+        },
+        {
+          "op": "firstTag",
+          "selector": "dvb|x[Attr=\"1\"]",
+          "expected": "dvb:x"
+        },
+        {
+          "op": "firstTag",
+          "selector": "dvb|x[attr=\"1\"]",
+          "expected": null
+        },
+        {
+          "op": "firstText",
+          "selector": "item",
+          "expected": "AB"
+        },
+        {
+          "op": "firstText",
+          "selector": "a > c",
+          "expected": "after"
+        }
       ]
     },
     {
@@ -51,37 +162,142 @@
       "mode": "html",
       "input": "<!DOCTYPE html><html><head><title>Sample</title></head><body><DIV class=\"Hero\" DATA-X=\"1\" data-id=\"42\" disabled><H1>  Title   One </H1><P>Line  1</P><P>Line\n\t2</P></DIV><div class=\"a\"><div class=\"b\">inner</div></div></body></html>",
       "assertions": [
-        { "op": "rootTag", "expected": "#document" },
-        { "op": "firstTag", "selector": ".Hero", "expected": "div" },
-        { "op": "firstTag", "selector": "H1", "expected": "h1" },
-        { "op": "firstText", "selector": "h1", "expected": "Title One" },
-        { "op": "firstText", "selector": ".Hero", "expected": "Title One Line 1 Line 2" },
-        { "op": "firstAttr", "selector": ".Hero", "attr": "data-id", "expected": "42" },
-        { "op": "firstAttr", "selector": ".Hero", "attr": "data-x", "expected": "1" },
-        { "op": "firstAttr", "selector": ".Hero", "attr": "DATA-X", "expected": "1" },
-        { "op": "firstAttr", "selector": ".Hero", "attr": "disabled", "expected": "" },
-        { "op": "firstAttr", "selector": ".Hero", "attr": "nonexistent", "expected": null },
-        { "op": "allTexts", "selector": "p", "expected": ["Line 1", "Line 2"] },
-        { "op": "subFirstAttr", "parent": "div.a", "selector": "div", "attr": "class", "expected": "b" }
+        {
+          "op": "rootTag",
+          "expected": "#document"
+        },
+        {
+          "op": "firstTag",
+          "selector": ".Hero",
+          "expected": "div"
+        },
+        {
+          "op": "firstTag",
+          "selector": "H1",
+          "expected": "h1"
+        },
+        {
+          "op": "firstText",
+          "selector": "h1",
+          "expected": "Title One"
+        },
+        {
+          "op": "firstText",
+          "selector": ".Hero",
+          "expected": "Title One Line 1 Line 2"
+        },
+        {
+          "op": "firstAttr",
+          "selector": ".Hero",
+          "attr": "data-id",
+          "expected": "42"
+        },
+        {
+          "op": "firstAttr",
+          "selector": ".Hero",
+          "attr": "data-x",
+          "expected": "1"
+        },
+        {
+          "op": "firstAttr",
+          "selector": ".Hero",
+          "attr": "DATA-X",
+          "expected": "1"
+        },
+        {
+          "op": "firstAttr",
+          "selector": ".Hero",
+          "attr": "disabled",
+          "expected": ""
+        },
+        {
+          "op": "firstAttr",
+          "selector": ".Hero",
+          "attr": "nonexistent",
+          "expected": null
+        },
+        {
+          "op": "allTexts",
+          "selector": "p",
+          "expected": [
+            "Line 1",
+            "Line 2"
+          ]
+        },
+        {
+          "op": "subFirstAttr",
+          "parent": "div.a",
+          "selector": "div",
+          "attr": "class",
+          "expected": "b"
+        }
       ]
     },
     {
       "name": "html_script_style_blocks_unicode_space_and_unsupported_pseudos",
       "mode": "html",
-      "input": "<!DOCTYPE html><html><head><title>T</title><style>.x{color:red}</style></head><body><div id=\"s\"><script>var x=1;</script><style>body{display:none}</style>Hi</div><div id=\"n\">a&nbsp;&nbsp;b</div><div id=\"br\">a<br>b</div><div id=\"v\"><span>a</span><video>v</video>b</div><div id=\"d\"><details><summary>S</summary>D</details>x</div><select id=\"sel\"><option>o1</option><option>o2</option></select><div id=\"u\">a\u2003\u2003b</div><table id=\"tb\"><tr><td>a</td><td>b</td></tr></table><div id=\"ta\"><textarea>  t  </textarea></div><ul><li>1</li><li>2</li></ul></body></html>",
+      "input": "<!DOCTYPE html><html><head><title>T</title><style>.x{color:red}</style></head><body><div id=\"s\"><script>var x=1;</script><style>body{display:none}</style>Hi</div><div id=\"n\">a&nbsp;&nbsp;b</div><div id=\"br\">a<br>b</div><div id=\"v\"><span>a</span><video>v</video>b</div><div id=\"d\"><details><summary>S</summary>D</details>x</div><select id=\"sel\"><option>o1</option><option>o2</option></select><div id=\"u\">a  b</div><table id=\"tb\"><tr><td>a</td><td>b</td></tr></table><div id=\"ta\"><textarea>  t  </textarea></div><ul><li>1</li><li>2</li></ul></body></html>",
       "assertions": [
-        { "op": "firstText", "selector": "#s", "expected": "Hi" },
-        { "op": "firstText", "selector": "#n", "expected": "a b" },
-        { "op": "firstText", "selector": "#br", "expected": "a b" },
-        { "op": "firstText", "selector": "#v", "expected": "a v b" },
-        { "op": "firstText", "selector": "#d", "expected": "SD x" },
-        { "op": "firstText", "selector": "#sel", "expected": "o1 o2" },
-        { "op": "firstText", "selector": "#u", "expected": "a\u2003\u2003b" },
-        { "op": "firstText", "selector": "#tb", "expected": "a b" },
-        { "op": "firstText", "selector": "#ta", "expected": "t" },
-        { "op": "firstText", "selector": "li:nth-child(2)", "expected": "2" },
-        { "op": "selectorThrows", "selector": "li:eq(1)", "expected": true },
-        { "op": "selectorThrows", "selector": "div:contains(Hi)", "expected": true }
+        {
+          "op": "firstText",
+          "selector": "#s",
+          "expected": "Hi"
+        },
+        {
+          "op": "firstText",
+          "selector": "#n",
+          "expected": "a b"
+        },
+        {
+          "op": "firstText",
+          "selector": "#br",
+          "expected": "a b"
+        },
+        {
+          "op": "firstText",
+          "selector": "#v",
+          "expected": "a v b"
+        },
+        {
+          "op": "firstText",
+          "selector": "#d",
+          "expected": "SD x"
+        },
+        {
+          "op": "firstText",
+          "selector": "#sel",
+          "expected": "o1 o2"
+        },
+        {
+          "op": "firstText",
+          "selector": "#u",
+          "expected": "a  b"
+        },
+        {
+          "op": "firstText",
+          "selector": "#tb",
+          "expected": "a b"
+        },
+        {
+          "op": "firstText",
+          "selector": "#ta",
+          "expected": "t"
+        },
+        {
+          "op": "firstText",
+          "selector": "li:nth-child(2)",
+          "expected": "2"
+        },
+        {
+          "op": "selectorThrows",
+          "selector": "li:eq(1)",
+          "expected": true
+        },
+        {
+          "op": "selectorThrows",
+          "selector": "div:contains(Hi)",
+          "expected": true
+        }
       ]
     },
     {
@@ -89,11 +305,798 @@
       "mode": "html",
       "input": "<title>T</title><p>body</p><ul class=\"list\"><li>First</li><li>Second</li></ul>",
       "assertions": [
-        { "op": "rootTag", "expected": "#document" },
-        { "op": "rootText", "expected": "T body First Second" },
-        { "op": "allTexts", "selector": "ul.list > li", "expected": ["First", "Second"] },
-        { "op": "allTags", "selector": "ul.list > li", "expected": ["li", "li"] }
+        {
+          "op": "rootTag",
+          "expected": "#document"
+        },
+        {
+          "op": "rootText",
+          "expected": "T body First Second"
+        },
+        {
+          "op": "allTexts",
+          "selector": "ul.list > li",
+          "expected": [
+            "First",
+            "Second"
+          ]
+        },
+        {
+          "op": "allTags",
+          "selector": "ul.list > li",
+          "expected": [
+            "li",
+            "li"
+          ]
+        }
       ]
+    }
+  ],
+  "matrixCases": [
+    {
+      "id": 1,
+      "mode": "html",
+      "input": "<table><tr><td>a</td></tr></table>",
+      "target": "table > tbody > tr",
+      "op": "text",
+      "throws": false,
+      "expected": "a"
+    },
+    {
+      "id": 2,
+      "mode": "html",
+      "input": "<table><tr><td>a</td></tr></table>",
+      "target": "table > tr",
+      "op": "text",
+      "throws": false,
+      "expected": null
+    },
+    {
+      "id": 3,
+      "mode": "html",
+      "input": "<p>a<p>b",
+      "target": "p",
+      "op": "all:p",
+      "throws": false,
+      "expected": ""
+    },
+    {
+      "id": 4,
+      "mode": "html",
+      "input": "<div><p>a<p>b</div>",
+      "target": "#root",
+      "op": "all:p",
+      "throws": false,
+      "expected": "p=a|p=b"
+    },
+    {
+      "id": 5,
+      "mode": "html",
+      "input": "<p>x<div>y</div></p>",
+      "target": "p",
+      "op": "text",
+      "throws": false,
+      "expected": "x"
+    },
+    {
+      "id": 6,
+      "mode": "html",
+      "input": "<p>x<div>y</div></p>",
+      "target": "p > div",
+      "op": "text",
+      "throws": false,
+      "expected": null
+    },
+    {
+      "id": 7,
+      "mode": "html",
+      "input": "<ul><li>a<li>b</ul>",
+      "target": "li",
+      "op": "text",
+      "throws": false,
+      "expected": "a"
+    },
+    {
+      "id": 8,
+      "mode": "html",
+      "input": "<b><p>x</b>y</p>",
+      "target": "p > b",
+      "op": "text",
+      "throws": false,
+      "expected": "x"
+    },
+    {
+      "id": 9,
+      "mode": "html",
+      "input": "<a href=1><a href=2>x</a>",
+      "target": "a",
+      "op": "all:a a",
+      "throws": false,
+      "expected": ""
+    },
+    {
+      "id": 10,
+      "mode": "html",
+      "input": "<table><b>x</b><tr><td>y</td></tr></table>",
+      "target": "body > b",
+      "op": "text",
+      "throws": false,
+      "expected": "x"
+    },
+    {
+      "id": 11,
+      "mode": "html",
+      "input": "<div class=a><div class=a>x</div></div>",
+      "target": "div",
+      "op": "all:div",
+      "throws": false,
+      "expected": "div=x"
+    },
+    {
+      "id": 12,
+      "mode": "html",
+      "input": "<div><p>a</p><p>b</p></div>",
+      "target": "div",
+      "op": "html",
+      "throws": false,
+      "expected": "<p>a</p><p>b</p>"
+    },
+    {
+      "id": 13,
+      "mode": "html",
+      "input": "<div><p>a</p><p>b</p></div>",
+      "target": "div",
+      "op": "outer",
+      "throws": false,
+      "expected": "<div><p>a</p><p>b</p></div>"
+    },
+    {
+      "id": 14,
+      "mode": "html",
+      "input": "<p title=\"a&amp;b\">&nbsp;x&lt;</p>",
+      "target": "p",
+      "op": "outer",
+      "throws": false,
+      "expected": "<p title=\"a&amp;b\">&nbsp;x&lt;</p>"
+    },
+    {
+      "id": 15,
+      "mode": "html",
+      "input": "<div><br><input disabled></div>",
+      "target": "div",
+      "op": "html",
+      "throws": false,
+      "expected": "<br><input disabled>"
+    },
+    {
+      "id": 16,
+      "mode": "html",
+      "input": "<div><input disabled></div>",
+      "target": "input",
+      "op": "attrs",
+      "throws": false,
+      "expected": "{\"disabled\":\"\"}"
+    },
+    {
+      "id": 17,
+      "mode": "html",
+      "input": "<div DATA-X=1 data-x=2></div>",
+      "target": "div",
+      "op": "attrs",
+      "throws": false,
+      "expected": "{\"data-x\":\"1\"}"
+    },
+    {
+      "id": 18,
+      "mode": "html",
+      "input": "<DIV>x</DIV>",
+      "target": "DIV",
+      "op": "tag",
+      "throws": false,
+      "expected": "div"
+    },
+    {
+      "id": 19,
+      "mode": "html",
+      "input": "<div data-x=1>x</div>",
+      "target": "[DATA-X]",
+      "op": "text",
+      "throws": false,
+      "expected": "x"
+    },
+    {
+      "id": 20,
+      "mode": "html",
+      "input": "<input type=TEXT>",
+      "target": "[type=text]",
+      "op": "tag",
+      "throws": false,
+      "expected": null
+    },
+    {
+      "id": 21,
+      "mode": "html",
+      "input": "<input type=TEXT>",
+      "target": "[type=text i]",
+      "op": "tag",
+      "throws": false,
+      "expected": "input"
+    },
+    {
+      "id": 22,
+      "mode": "html",
+      "input": "<svg><foreignObject>x</foreignObject></svg>",
+      "target": "foreignObject",
+      "op": "tag",
+      "throws": false,
+      "expected": "foreignobject"
+    },
+    {
+      "id": 23,
+      "mode": "html",
+      "input": "<svg viewBox=\"0 0 1 1\"></svg>",
+      "target": "svg",
+      "op": "attrs",
+      "throws": false,
+      "expected": "{\"viewbox\":\"0 0 1 1\"}"
+    },
+    {
+      "id": 24,
+      "mode": "html",
+      "input": "<ul><li>1</li><li>2</li><li>3</li><li>4</li></ul>",
+      "target": "li:nth-child(2n+1)",
+      "op": "all:*",
+      "throws": false,
+      "expected": ""
+    },
+    {
+      "id": 25,
+      "mode": "html",
+      "input": "<ul><li>1</li><li>2</li><li>3</li></ul>",
+      "target": "ul",
+      "op": "all:li:nth-child(odd)",
+      "throws": false,
+      "expected": "li=1|li=3"
+    },
+    {
+      "id": 26,
+      "mode": "html",
+      "input": "<ul><li>1</li><li>2</li><li>3</li></ul>",
+      "target": "ul",
+      "op": "all:li:nth-child(-n+2)",
+      "throws": false,
+      "expected": "li=1|li=2"
+    },
+    {
+      "id": 27,
+      "mode": "html",
+      "input": "<ul><li>1</li><li>2</li><li>3</li></ul>",
+      "target": "ul",
+      "op": "all:li:not(:first-child)",
+      "throws": false,
+      "expected": "li=2|li=3"
+    },
+    {
+      "id": 28,
+      "mode": "html",
+      "input": "<div><p></p><p> </p></div>",
+      "target": "div",
+      "op": "all:p:empty",
+      "throws": false,
+      "expected": "p="
+    },
+    {
+      "id": 29,
+      "mode": "html",
+      "input": "<div><a></a><b></b><a></a></div>",
+      "target": "div",
+      "op": "all:b ~ a",
+      "throws": false,
+      "expected": "a="
+    },
+    {
+      "id": 30,
+      "mode": "html",
+      "input": "<div><a></a><b></b><a></a></div>",
+      "target": "div",
+      "op": "all:b + a",
+      "throws": false,
+      "expected": "a="
+    },
+    {
+      "id": 31,
+      "mode": "html",
+      "input": "<div><span>x</span></div>",
+      "target": "div:has(span)",
+      "op": "tag",
+      "throws": true,
+      "expected": null
+    },
+    {
+      "id": 32,
+      "mode": "html",
+      "input": "<p id=\"a:b\">x</p>",
+      "target": "#a\\:b",
+      "op": "text",
+      "throws": false,
+      "expected": "x"
+    },
+    {
+      "id": 33,
+      "mode": "html",
+      "input": "<p>x</p>",
+      "target": "p >",
+      "op": "tag",
+      "throws": true,
+      "expected": null
+    },
+    {
+      "id": 34,
+      "mode": "html",
+      "input": "<p>x</p>",
+      "target": "",
+      "op": "tag",
+      "throws": true,
+      "expected": null
+    },
+    {
+      "id": 35,
+      "mode": "html",
+      "input": "<p>x</p>",
+      "target": "[a=",
+      "op": "tag",
+      "throws": true,
+      "expected": null
+    },
+    {
+      "id": 36,
+      "mode": "html",
+      "input": "<div><pre>  a\n  b </pre></div>",
+      "target": "div",
+      "op": "text",
+      "throws": false,
+      "expected": "a b"
+    },
+    {
+      "id": 37,
+      "mode": "html",
+      "input": "<div><noscript>n</noscript>x</div>",
+      "target": "div",
+      "op": "text",
+      "throws": false,
+      "expected": "n x"
+    },
+    {
+      "id": 38,
+      "mode": "html",
+      "input": "<div><template><p>t</p></template>x</div>",
+      "target": "div",
+      "op": "text",
+      "throws": false,
+      "expected": "t x"
+    },
+    {
+      "id": 39,
+      "mode": "html",
+      "input": "<div><template><p>t</p></template>x</div>",
+      "target": "div p",
+      "op": "text",
+      "throws": false,
+      "expected": "t"
+    },
+    {
+      "id": 40,
+      "mode": "html",
+      "input": "<p>a　b​c d</p>",
+      "target": "p",
+      "op": "text",
+      "throws": false,
+      "expected": "a　b​c d"
+    },
+    {
+      "id": 41,
+      "mode": "html",
+      "input": "<head><title>T</title><style>s{}</style></head><body>b</body>",
+      "target": "#root",
+      "op": "text",
+      "throws": false,
+      "expected": "T b"
+    },
+    {
+      "id": 42,
+      "mode": "html",
+      "input": "<div>a<span>b</span>c<p>d</p>e</div>",
+      "target": "div",
+      "op": "text",
+      "throws": false,
+      "expected": "abc d e"
+    },
+    {
+      "id": 43,
+      "mode": "html",
+      "input": "<div>x<!-- c -->y</div>",
+      "target": "div",
+      "op": "text",
+      "throws": false,
+      "expected": "xy"
+    },
+    {
+      "id": 44,
+      "mode": "html",
+      "input": "<div><textarea>a<b>b</b></textarea></div>",
+      "target": "div",
+      "op": "text",
+      "throws": false,
+      "expected": "a<b>b</b>"
+    },
+    {
+      "id": 45,
+      "mode": "html",
+      "input": "<div><textarea>a<b>b</b></textarea></div>",
+      "target": "div b",
+      "op": "tag",
+      "throws": false,
+      "expected": null
+    },
+    {
+      "id": 46,
+      "mode": "html",
+      "input": "<div><title>a<b>b</b></title></div>",
+      "target": "div b",
+      "op": "tag",
+      "throws": false,
+      "expected": null
+    },
+    {
+      "id": 47,
+      "mode": "html",
+      "input": "<html><body><p>x</p></body></html><p>y</p>",
+      "target": "#root",
+      "op": "all:p",
+      "throws": false,
+      "expected": "p=x|p=y"
+    },
+    {
+      "id": 48,
+      "mode": "html",
+      "input": "<frameset><frame></frameset>",
+      "target": "#root",
+      "op": "all:*",
+      "throws": false,
+      "expected": "html=|head=|frameset=|frame="
+    },
+    {
+      "id": 49,
+      "mode": "html",
+      "input": "<div id=x></div><div id=x></div>",
+      "target": "#root",
+      "op": "all:#x",
+      "throws": false,
+      "expected": "div=|div="
+    },
+    {
+      "id": 50,
+      "mode": "html",
+      "input": "<div class=\"A b\"></div>",
+      "target": "#root",
+      "op": "all:.a",
+      "throws": false,
+      "expected": ""
+    },
+    {
+      "id": 51,
+      "mode": "html",
+      "input": "<div class=\"A b\"></div>",
+      "target": "#root",
+      "op": "all:.A",
+      "throws": false,
+      "expected": "div="
+    },
+    {
+      "id": 52,
+      "mode": "html",
+      "input": "<p>&notit; &amp &copy &#128512; &#x0;</p>",
+      "target": "p",
+      "op": "text",
+      "throws": false,
+      "expected": "¬it; & © 😀 �"
+    },
+    {
+      "id": 53,
+      "mode": "html",
+      "input": "<p>x</p>",
+      "target": "#root",
+      "op": "children",
+      "throws": false,
+      "expected": "html"
+    },
+    {
+      "id": 54,
+      "mode": "html",
+      "input": "",
+      "target": "#root",
+      "op": "children",
+      "throws": false,
+      "expected": "html"
+    },
+    {
+      "id": 55,
+      "mode": "html",
+      "input": "<p>x</p>",
+      "target": "p",
+      "op": "attr:missing",
+      "throws": false,
+      "expected": null
+    },
+    {
+      "id": 56,
+      "mode": "xml",
+      "input": "<r><a>1</a><a>2</a></r>",
+      "target": "r",
+      "op": "all:a",
+      "throws": false,
+      "expected": "a=1|a=2"
+    },
+    {
+      "id": 57,
+      "mode": "xml",
+      "input": "<r xmlns=\"urn:x\"><a>1</a></r>",
+      "target": "a",
+      "op": "text",
+      "throws": false,
+      "expected": "1"
+    },
+    {
+      "id": 58,
+      "mode": "xml",
+      "input": "<r xmlns:d=\"u\"><d:a>1</d:a><a>2</a></r>",
+      "target": "r",
+      "op": "all:*|a",
+      "throws": false,
+      "expected": "d:a=1|a=2"
+    },
+    {
+      "id": 59,
+      "mode": "xml",
+      "input": "<r xmlns:d=\"u\"><d:a>1</d:a><a>2</a></r>",
+      "target": "r",
+      "op": "all:|a",
+      "throws": false,
+      "expected": "a=2"
+    },
+    {
+      "id": 60,
+      "mode": "xml",
+      "input": "<r xmlns:d=\"u\"><d:a>1</d:a><a>2</a></r>",
+      "target": "r",
+      "op": "all:d|*",
+      "throws": false,
+      "expected": "d:a=1"
+    },
+    {
+      "id": 61,
+      "mode": "xml",
+      "input": "<r xmlns:d=\"u\"><d:a>1</d:a><a>2</a></r>",
+      "target": "r",
+      "op": "all:a",
+      "throws": false,
+      "expected": "a=2"
+    },
+    {
+      "id": 62,
+      "mode": "xml",
+      "input": "<r xmlns:d=\"u\"><d:a>1</d:a></r>",
+      "target": "d|a",
+      "op": "tag",
+      "throws": false,
+      "expected": "d:a"
+    },
+    {
+      "id": 63,
+      "mode": "xml",
+      "input": "<r><a Id=\"1\"/></r>",
+      "target": "[id]",
+      "op": "tag",
+      "throws": false,
+      "expected": null
+    },
+    {
+      "id": 64,
+      "mode": "xml",
+      "input": "<r><a Id=\"1\"/></r>",
+      "target": "[Id]",
+      "op": "tag",
+      "throws": false,
+      "expected": "a"
+    },
+    {
+      "id": 65,
+      "mode": "xml",
+      "input": "<r><a id=\"x\"/></r>",
+      "target": "#x",
+      "op": "tag",
+      "throws": false,
+      "expected": "a"
+    },
+    {
+      "id": 66,
+      "mode": "xml",
+      "input": "<r><a class=\"c\"/></r>",
+      "target": ".c",
+      "op": "tag",
+      "throws": false,
+      "expected": "a"
+    },
+    {
+      "id": 67,
+      "mode": "xml",
+      "input": "<r><![CDATA[a<b>]]>c</r>",
+      "target": "#root",
+      "op": "text",
+      "throws": false,
+      "expected": "a<b>c"
+    },
+    {
+      "id": 68,
+      "mode": "xml",
+      "input": "<r>a<?pi x?>b<!-- c -->d</r>",
+      "target": "#root",
+      "op": "text",
+      "throws": false,
+      "expected": "abd"
+    },
+    {
+      "id": 69,
+      "mode": "xml",
+      "input": "<r><a>1</a></r>",
+      "target": "r",
+      "op": "html",
+      "throws": false,
+      "expected": "<a>1</a>"
+    },
+    {
+      "id": 70,
+      "mode": "xml",
+      "input": "<r><a/><b x=\"1&amp;2\">t&lt;</b></r>",
+      "target": "r",
+      "op": "html",
+      "throws": false,
+      "expected": "<a/><b x=\"1&amp;2\">t&lt;</b>"
+    },
+    {
+      "id": 71,
+      "mode": "xml",
+      "input": "<r><a/></r>",
+      "target": "r",
+      "op": "outer",
+      "throws": false,
+      "expected": "<r><a/></r>"
+    },
+    {
+      "id": 72,
+      "mode": "xml",
+      "input": "<r>&#x1F600;&#233;&lt;&quot;&apos;</r>",
+      "target": "#root",
+      "op": "text",
+      "throws": false,
+      "expected": "😀é<\"'"
+    },
+    {
+      "id": 73,
+      "mode": "xml",
+      "input": "<r>&amp;eacute;</r>",
+      "target": "#root",
+      "op": "text",
+      "throws": false,
+      "expected": "&eacute;"
+    },
+    {
+      "id": 74,
+      "mode": "xml",
+      "input": "<r>&</r>",
+      "target": "#root",
+      "op": "text",
+      "throws": false,
+      "expected": "&"
+    },
+    {
+      "id": 75,
+      "mode": "xml",
+      "input": "<r><a></r>",
+      "target": "#root",
+      "op": "text",
+      "throws": false,
+      "expected": ""
+    },
+    {
+      "id": 76,
+      "mode": "xml",
+      "input": "<r>a</r><s>b</s>",
+      "target": "#root",
+      "op": "all:*",
+      "throws": false,
+      "expected": "r=a|s=b"
+    },
+    {
+      "id": 77,
+      "mode": "xml",
+      "input": "not xml",
+      "target": "#root",
+      "op": "text",
+      "throws": false,
+      "expected": "not xml"
+    },
+    {
+      "id": 78,
+      "mode": "xml",
+      "input": "<r>  a   b  </r>",
+      "target": "r",
+      "op": "text",
+      "throws": false,
+      "expected": "a b"
+    },
+    {
+      "id": 79,
+      "mode": "xml",
+      "input": "<r><p>a</p><p>b</p></r>",
+      "target": "r",
+      "op": "text",
+      "throws": false,
+      "expected": "ab"
+    },
+    {
+      "id": 80,
+      "mode": "xml",
+      "input": "<R><r>x</r></R>",
+      "target": "r",
+      "op": "tag",
+      "throws": false,
+      "expected": "r"
+    },
+    {
+      "id": 81,
+      "mode": "xml",
+      "input": "<r><a>1</a></r>",
+      "target": "A",
+      "op": "tag",
+      "throws": false,
+      "expected": null
+    },
+    {
+      "id": 82,
+      "mode": "xml",
+      "input": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><r a=\"1\"/>",
+      "target": "#root",
+      "op": "children",
+      "throws": false,
+      "expected": "r"
+    },
+    {
+      "id": 83,
+      "mode": "xml",
+      "input": "<r xml:lang=\"en\"/>",
+      "target": "r",
+      "op": "attrs",
+      "throws": false,
+      "expected": "{\"xml:lang\":\"en\"}"
+    },
+    {
+      "id": 84,
+      "mode": "xml",
+      "input": "<r>&eacute;<![CDATA[&eacute;]]></r>",
+      "target": "r",
+      "op": "text",
+      "throws": false,
+      "expected": "&eacute;&eacute;"
+    },
+    {
+      "id": 85,
+      "mode": "xml",
+      "input": "<r a=\"&eacute;\"/>",
+      "target": "r",
+      "op": "attr:a",
+      "throws": false,
+      "expected": "&eacute;"
     }
   ]
 }

@@ -25,9 +25,11 @@ import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
 import com.limelight.local.media.Artwork
 import com.limelight.local.media.DashStream
+import com.limelight.local.media.Item
 import com.limelight.local.media.MediaTrack
 import com.limelight.local.media.PlaybackInfo
 import com.limelight.local.media.SourceForbiddenException
+import com.limelight.local.media.SourceKind
 import com.limelight.local.media.SourceUnsupportedException
 import com.limelight.local.media.SubtitleFormat
 import com.limelight.local.media.SubtitleTrack
@@ -212,6 +214,69 @@ object PluginImages {
             ((bytes[22].toInt() and 0xFF) shl 8) or
             (bytes[23].toInt() and 0xFF)
         return w to h
+    }
+}
+
+/**
+ * Runtime boundary guards for host UI / player / DLNA entry points outside
+ * `com.limelight.local.plugin` (`docs/specs/plugin-host-integration.md`).
+ *
+ * Host screens (`Components.kt:298`, `WallActivity.kt:113-124`,
+ * `LocalPlayerXR.java:145,450-475`, `local/dlna/`, `local/wall/CastScreen.kt`)
+ * MUST invoke these guards at their entry points (or branch on `isPlugin*` to
+ * dispatch to [PluginImages.loadBitmap] / [PluginPlayback]) so a plugin item
+ * can NEVER silently fall into raw HTTP, `DefaultHttpDataSource`,
+ * `MediaMetadataRetriever`, or DLNA cast paths.
+ */
+object PluginHostGuards {
+    @JvmStatic
+    fun isPluginSource(sourceKind: SourceKind?): Boolean = sourceKind == SourceKind.PLUGIN
+
+    @JvmStatic
+    fun isPluginArtwork(artwork: Artwork): Boolean = artwork.sourceKind == SourceKind.PLUGIN
+
+    @JvmStatic
+    fun isPluginPlayback(info: PlaybackInfo): Boolean = info.sourceKind == SourceKind.PLUGIN
+
+    @JvmStatic
+    fun requireNonPluginArtwork(artwork: Artwork, sourceKind: SourceKind? = artwork.sourceKind) {
+        if (sourceKind == SourceKind.PLUGIN || artwork.sourceKind == SourceKind.PLUGIN) {
+            throw UnsupportedOperationException(
+                "插件来源图片禁止走 Artworks.load / 裸 HTTP 加载，请改用 PluginImages.loadBitmap(source, artwork, maxEdgePx)",
+            )
+        }
+    }
+
+    @JvmStatic
+    fun requireNonPluginPlayback(info: PlaybackInfo, sourceKind: SourceKind? = info.sourceKind) {
+        if (sourceKind == SourceKind.PLUGIN || info.sourceKind == SourceKind.PLUGIN) {
+            throw UnsupportedOperationException(
+                "插件来源播放禁止走 WallActivity.launchPlayer / DefaultHttpDataSource，请改用 PluginPlayback.createMediaSource 或 PluginPlayback.createSessionController",
+            )
+        }
+    }
+
+    @JvmStatic
+    fun requireNonPluginFrameProbe(sourceKind: SourceKind?, artwork: Artwork? = null, info: PlaybackInfo? = null) {
+        if (sourceKind == SourceKind.PLUGIN ||
+            artwork?.sourceKind == SourceKind.PLUGIN ||
+            info?.sourceKind == SourceKind.PLUGIN
+        ) {
+            throw UnsupportedOperationException(
+                "插件来源禁止走 MediaMetadataRetriever / MediaExtractor 远程探测或取帧，请改用 PluginImages.loadBitmap（或占位图）与 ExoPlayer Format 回调",
+            )
+        }
+    }
+
+    @JvmStatic
+    fun requireNonPluginCast(sourceKind: SourceKind?, info: PlaybackInfo? = null, item: Item? = null) {
+        val itemHasPluginArt = item != null && listOfNotNull(item.poster, item.thumb, item.backdrop)
+            .any { it.sourceKind == SourceKind.PLUGIN }
+        if (sourceKind == SourceKind.PLUGIN || info?.sourceKind == SourceKind.PLUGIN || itemHasPluginArt) {
+            throw UnsupportedOperationException(
+                "插件来源禁止交给 DLNA 投屏（local/dlna/、CastScreen.kt）或任何包外组件，仅允许通过 PluginPlayback 在应用内播放",
+            )
+        }
     }
 }
 

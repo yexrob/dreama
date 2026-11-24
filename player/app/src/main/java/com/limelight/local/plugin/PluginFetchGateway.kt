@@ -101,6 +101,7 @@ class PluginFetchGateway(
     private val maxResponseBytes: Int = MAX_RESPONSE_BYTES,
     private val maxConcurrentFetches: Int = MAX_CONCURRENT_FETCHES,
     val inFlightBudget: InFlightByteBudget = InFlightByteBudget(MAX_INFLIGHT_BYTES.toLong()),
+    val requestBodyBudget: InFlightByteBudget = InFlightByteBudget(MAX_QUEUED_REQUEST_BODY_BYTES.toLong()),
     private val maxRedirects: Int = MAX_REDIRECTS,
     private val maxQueuedFetches: Int = MAX_QUEUED_FETCHES,
     private val maxRequestBodyBytes: Int = MAX_REQUEST_BODY_BYTES,
@@ -181,10 +182,24 @@ class PluginFetchGateway(
     suspend fun fetch(req: FetchRequest, defaultTimeoutMs: Long = DEFAULT_TIMEOUT_MS): FetchResponse {
         validateRequestMetadata(req.url, req.headers)
         validateRequestBodyBytes(req.body)
-        return withSlot {
-            withContext(Dispatchers.IO) {
-                executeBlocking(req, defaultTimeoutMs)
+        val bodyBytes = req.body?.size?.toLong() ?: 0L
+        if (bodyBytes > 0L) {
+            try {
+                requestBodyBudget.reserve(bodyBytes)
+            } catch (e: FetchResponseTooLargeException) {
+                throw FetchRequestTooLargeException(
+                    "排队及在途请求体总量超过上限（${requestBodyBudget.maxBytes / (1024 * 1024)} MB）",
+                )
             }
+        }
+        return try {
+            withSlot {
+                withContext(Dispatchers.IO) {
+                    executeBlocking(req, defaultTimeoutMs)
+                }
+            }
+        } finally {
+            if (bodyBytes > 0L) requestBodyBudget.release(bodyBytes)
         }
     }
 
@@ -404,6 +419,8 @@ class PluginFetchGateway(
         const val MAX_RESPONSE_BYTES = 8 * 1024 * 1024
         /** Request body cap is 2 MB. */
         const val MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
+        /** Total queued + active request body byte budget per instance is 8 MB. */
+        const val MAX_QUEUED_REQUEST_BODY_BYTES = 8 * 1024 * 1024
         /** Request URL length cap is 8 KB. */
         const val MAX_REQUEST_URL_BYTES = 8 * 1024
         /** Request headers total byte cap is 32 KB. */

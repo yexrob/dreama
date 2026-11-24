@@ -792,6 +792,25 @@ class Media3DashAndRoomTest {
                         }
                     }
                 }
+
+                // Round 5 Item #2: Artworks.load MUST directly reject plugin-stamped Artwork at runtime
+                // even if UI code accidentally routes a plugin Artwork into Artworks.load.
+                val pluginStampedArt = Artwork(
+                    url = "$lanBase/Items/item1/Images/Primary",
+                    headers = mapOf("Authorization" to expectedAuth),
+                    sourceKind = com.limelight.local.media.SourceKind.PLUGIN,
+                )
+                runBlocking {
+                    try {
+                        com.limelight.local.media.Artworks.load(
+                            context,
+                            pluginStampedArt,
+                            com.limelight.local.media.Artworks.Size.CARD,
+                        )
+                        fail("Artworks.load must throw UnsupportedOperationException for SourceKind.PLUGIN Artwork")
+                    } catch (_: UnsupportedOperationException) {
+                    }
+                }
             } finally {
                 runBlocking { mgr.shutdownAll() }
             }

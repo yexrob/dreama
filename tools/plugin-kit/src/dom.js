@@ -1,12 +1,30 @@
-import { DOMParser, parseHTML } from 'linkedom';
+import { DOMParser } from 'linkedom';
+import * as parse5 from 'parse5';
 
-/** §11.1 (S4): max 8 parsed documents per call, 4 MB per doc, 200k total element nodes. */
+/** §11.1 (S4): max 8 parsed documents per call, 4 MB per doc, 200k total element nodes (excluding #document). */
 export const MAX_DOCS_PER_CALL = 8;
 export const MAX_DOC_BYTES = 4 * 1024 * 1024;
 export const MAX_TOTAL_NODES = 200_000;
+export const MAX_SELECTOR_STEPS = 2_000_000;
+const MAX_PSEUDO_NESTING = 8;
+
+const MEMO_UNCOMPUTED = 0;
+const MEMO_FALSE = 1;
+const MEMO_TRUE = 2;
+
+export class DomTimeoutError extends Error {
+  constructor(message = 'CSS 选择器执行超时') {
+    super(message);
+    this.name = 'DomTimeoutError';
+  }
+}
 
 const HTML_SKIP_TEXT_TAGS = new Set(['script', 'style']);
-
+const HTML_RAW_TEXT_TAGS = new Set(['script', 'style', 'xmp', 'iframe', 'noembed', 'noframes', 'plaintext']);
+const HTML_VOID_TAGS = new Set([
+  'area', 'base', 'basefont', 'bgsound', 'br', 'col', 'embed', 'frame',
+  'hr', 'img', 'input', 'keygen', 'link', 'meta', 'param', 'source', 'track', 'wbr',
+]);
 const HTML_BLOCK_TAGS = new Set([
   'address', 'article', 'aside', 'blockquote', 'body', 'br', 'caption', 'center',
   'col', 'colgroup', 'dd', 'details', 'dialog', 'dir', 'div', 'dl', 'dt',
@@ -17,19 +35,6 @@ const HTML_BLOCK_TAGS = new Set([
   'thead', 'title', 'tr', 'ul', 'video',
 ]);
 
-function normalizeHtmlInput(text) {
-  if (/<html[\s>]/i.test(text)) return text;
-  if (/<body[\s>]/i.test(text) || /<head[\s>]/i.test(text)) {
-    return `<html>${text}</html>`;
-  }
-  return `<html><head></head><body>${text}</body></html>`;
-}
-
-/**
- * Collapses ONLY ASCII whitespace (`[ \t\n\r\f]`) and NBSP (`\u00A0`),
- * preserving Unicode spaces such as U+2003 (EM SPACE) identically to Android
- * `PluginDomParser.kt`.
- */
 function collapseAsciiAndNbspWhitespace(raw) {
   const s = String(raw ?? '');
   let out = '';
@@ -51,54 +56,209 @@ function collapseAsciiAndNbspWhitespace(raw) {
   return out;
 }
 
+// Unified node accessors supporting BOTH parse5 HTML5 AST nodes and linkedom XML nodes
+function isDocumentNode(node) {
+  return Boolean(node) && (node.nodeName === '#document' || node.nodeType === 9);
+}
+
+function isElementNode(node) {
+  if (!node) return false;
+  if (node.nodeType !== undefined) return node.nodeType === 1;
+  return typeof node.tagName === 'string';
+}
+
+function isTextNode(node) {
+  if (!node) return false;
+  if (node.nodeType !== undefined) return node.nodeType === 3;
+  return node.nodeName === '#text';
+}
+
+function isCDataNode(node) {
+  return Boolean(node) && node.nodeType === 4;
+}
+
+function isCommentNode(node) {
+  if (!node) return false;
+  if (node.nodeType !== undefined) return node.nodeType === 8;
+  return node.nodeName === '#comment';
+}
+
+function getNodeTextValue(node) {
+  if (node.value !== undefined) return String(node.value);
+  return String(node.nodeValue ?? '');
+}
+
+function getNodeCommentData(node) {
+  if (node.data !== undefined) return String(node.data);
+  return String(node.nodeValue ?? '');
+}
+
+function getRawTagName(node) {
+  return String(node?.tagName ?? '');
+}
+
+function getChildNodes(node) {
+  if (!node) return [];
+  return node.childNodes || [];
+}
+
+function getElementChildren(node) {
+  const out = [];
+  for (const c of getChildNodes(node)) {
+    if (isElementNode(c)) out.push(c);
+  }
+  return out;
+}
+
+function getParentNode(node) {
+  return node?.parentNode ?? null;
+}
+
+function getParentElement(node) {
+  const p = getParentNode(node);
+  return isElementNode(p) ? p : null;
+}
+
+function getElementAttributes(el) {
+  if (!el || isDocumentNode(el)) return [];
+  if (Array.isArray(el.attrs)) return el.attrs;
+  if (el.attributes) return Array.from(el.attributes);
+  return [];
+}
+
 function getElementAttr(el, name, isXml) {
-  if (!el || el.nodeType === 9 || !el.attributes) return null;
+  if (!el || isDocumentNode(el)) return null;
+  const attrs = getElementAttributes(el);
   if (isXml) {
-    for (const a of Array.from(el.attributes)) {
+    for (const a of attrs) {
       if (a.name === name) return a.value ?? '';
     }
     return null;
   }
   const lower = String(name).toLowerCase();
-  for (const a of Array.from(el.attributes)) {
+  for (const a of attrs) {
     if (String(a.name).toLowerCase() === lower) return a.value ?? '';
   }
   return null;
 }
 
-function getElementChildren(el) {
-  if (!el) return [];
-  if (el.children && el.children.length > 0) return Array.from(el.children);
-  const out = [];
-  for (const c of el.childNodes || []) {
-    if (c.nodeType === 1) out.push(c);
+// Canonical HTML/XML serializer matching Android PluginDomParser.kt bit-for-bit
+function escapeHtmlText(s) {
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '&') out += '&amp;';
+    else if (c === '\u00A0') out += '&nbsp;';
+    else if (c === '<') out += '&lt;';
+    else if (c === '>') out += '&gt;';
+    else out += c;
   }
   return out;
 }
 
-function getParentElement(el) {
-  const p = el?.parentNode;
-  if (!p || p.nodeType !== 1) return null;
-  return p;
+function escapeHtmlAttr(s) {
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '&') out += '&amp;';
+    else if (c === '\u00A0') out += '&nbsp;';
+    else if (c === '"') out += '&quot;';
+    else out += c;
+  }
+  return out;
 }
 
-function getPrevElementSibling(el) {
-  let cur = el?.previousSibling;
-  while (cur) {
-    if (cur.nodeType === 1) return cur;
-    cur = cur.previousSibling;
+function escapeXmlText(s) {
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '&') out += '&amp;';
+    else if (c === '<') out += '&lt;';
+    else if (c === '>') out += '&gt;';
+    else out += c;
   }
-  return null;
+  return out;
+}
+
+function escapeXmlAttr(s) {
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '&') out += '&amp;';
+    else if (c === '<') out += '&lt;';
+    else if (c === '>') out += '&gt;';
+    else if (c === '"') out += '&quot;';
+    else out += c;
+  }
+  return out;
+}
+
+function serializeChildren(node, isXml, parts) {
+  const rawParent = !isXml && isElementNode(node) && HTML_RAW_TEXT_TAGS.has(getRawTagName(node).toLowerCase());
+  for (const child of getChildNodes(node)) {
+    if (rawParent && isTextNode(child)) {
+      parts.push(getNodeTextValue(child));
+    } else {
+      serializeNode(child, isXml, parts);
+    }
+  }
+}
+
+function serializeNode(node, isXml, parts) {
+  if (isCDataNode(node)) {
+    const data = getNodeTextValue(node);
+    parts.push(isXml ? `<![CDATA[${data}]]>` : escapeHtmlText(data));
+    return;
+  }
+  if (isTextNode(node)) {
+    const data = getNodeTextValue(node);
+    parts.push(isXml ? escapeXmlText(data) : escapeHtmlText(data));
+    return;
+  }
+  if (isCommentNode(node)) {
+    parts.push(`<!--${getNodeCommentData(node)}-->`);
+    return;
+  }
+  if (isElementNode(node)) {
+    const tag = isXml ? getRawTagName(node) : getRawTagName(node).toLowerCase();
+    parts.push(`<${tag}`);
+    for (const a of getElementAttributes(node)) {
+      const key = isXml ? a.name : String(a.name).toLowerCase();
+      const v = a.value ?? '';
+      if (!isXml && v === '') {
+        parts.push(` ${key}`);
+      } else {
+        parts.push(` ${key}="${isXml ? escapeXmlAttr(v) : escapeHtmlAttr(v)}"`);
+      }
+    }
+    if (isXml) {
+      const ch = getChildNodes(node);
+      if (ch.length === 0) {
+        parts.push('/>');
+      } else {
+        parts.push('>');
+        serializeChildren(node, true, parts);
+        parts.push(`</${tag}>`);
+      }
+    } else {
+      parts.push('>');
+      if (!HTML_VOID_TAGS.has(tag)) {
+        serializeChildren(node, false, parts);
+        parts.push(`</${tag}>`);
+      }
+    }
+  }
 }
 
 /**
- * Shared-subset CSS selector parser & evaluator mirroring Android's
- * `CssSelectorEngine` in `PluginDomParser.kt` identically.
+ * Shared-subset CSS selector parser & memoized O(N * S) DP evaluator
+ * mirroring Android's `CssSelectorEngine` in `PluginDomParser.kt` identically.
  */
 class SelectorParser {
-  constructor(src) {
+  constructor(src, nestingDepth = 0) {
     this.src = String(src ?? '');
     this.pos = 0;
+    this.nestingDepth = nestingDepth;
   }
 
   parseSelectorList(eofExpected) {
@@ -123,8 +283,8 @@ class SelectorParser {
 
   parseComplexSelector() {
     this.skipWs();
-    const head = this.parseCompoundSelector();
-    const steps = [];
+    const compounds = [this.parseCompoundSelector()];
+    const combinators = [];
     while (true) {
       const hadWs = this.skipWs();
       if (this.eof() || this.peek() === ',' || this.peek() === ')') break;
@@ -135,9 +295,10 @@ class SelectorParser {
       else if (c === '~') { this.pos += 1; this.skipWs(); comb = '~'; }
       else if (hadWs) { comb = ' '; }
       else break;
-      steps.push([comb, this.parseCompoundSelector()]);
+      combinators.push(comb);
+      compounds.push(this.parseCompoundSelector());
     }
-    return { head, steps };
+    return { compounds, combinators };
   }
 
   parseCompoundSelector() {
@@ -210,7 +371,7 @@ class SelectorParser {
   }
 
   parseAttrSelector() {
-    this.pos += 1; // '['
+    this.pos += 1;
     this.skipWs();
     const name = this.readIdent();
     this.skipWs();
@@ -247,7 +408,7 @@ class SelectorParser {
   }
 
   parsePseudoSelector() {
-    this.pos += 1; // ':'
+    this.pos += 1;
     if (this.peek() === ':') {
       this.pos += 1;
       const pe = this.readIdent();
@@ -262,9 +423,15 @@ class SelectorParser {
       }
       throw new Error(`不支持的 CSS 选择器伪类：:${rawName}`);
     }
-    this.pos += 1; // '('
+    this.pos += 1;
     if (name === 'not' || name === 'is') {
-      const inner = this.parseSelectorList(false);
+      if (this.nestingDepth >= MAX_PSEUDO_NESTING) {
+        throw new Error(`CSS 伪类嵌套层数超过上限（最多 ${MAX_PSEUDO_NESTING} 层）`);
+      }
+      const sub = new SelectorParser(this.src, this.nestingDepth + 1);
+      sub.pos = this.pos;
+      const inner = sub.parseSelectorList(false);
+      this.pos = sub.pos;
       this.skipWs();
       if (this.peek() !== ')') throw new Error(`:${name}() 缺少右括号：'${this.src}'`);
       this.pos += 1;
@@ -431,26 +598,6 @@ function matchesAttr(el, am, isXml) {
   }
 }
 
-function sameTypeSiblings(el, isXml) {
-  const parent = el.parentNode;
-  if (!parent) return null;
-  const myTag = isXml ? el.tagName : String(el.tagName || '').toLowerCase();
-  return getElementChildren(parent).filter((s) => {
-    const t = isXml ? s.tagName : String(s.tagName || '').toLowerCase();
-    return t === myTag;
-  });
-}
-
-function childIndex(el, fromEnd, ofType, isXml) {
-  const parent = el.parentNode;
-  if (!parent) return -1;
-  const list = ofType ? sameTypeSiblings(el, isXml) : getElementChildren(parent);
-  if (!list) return -1;
-  const pos = list.indexOf(el);
-  if (pos < 0) return -1;
-  return fromEnd ? list.length - pos : pos + 1;
-}
-
 function matchesAnPlusB(idx, a, b) {
   if (a === 0) return idx === b;
   const diff = idx - b;
@@ -458,122 +605,292 @@ function matchesAnPlusB(idx, a, b) {
   return (diff / a) >= 0;
 }
 
-function matchesPseudo(el, pm, isXml) {
-  switch (pm.kind) {
-    case 'first-child': return childIndex(el, false, false, isXml) === 1;
-    case 'last-child': return childIndex(el, true, false, isXml) === 1;
-    case 'only-child': {
-      const parent = el.parentNode;
-      return Boolean(parent) && getElementChildren(parent).length === 1;
+class QueryContext {
+  constructor(isXml, maxSteps, deadlineMs) {
+    this.isXml = isXml;
+    this.maxSteps = maxSteps;
+    this.deadlineMs = deadlineMs;
+    this.steps = 0;
+    this.memos = new Map();
+    this.siblingTables = new Map();
+  }
+
+  tick() {
+    this.steps += 1;
+    if (this.steps > this.maxSteps) {
+      throw new Error(`CSS 选择器匹配步数超过上限（最多 ${this.maxSteps} 步）`);
     }
-    case 'first-of-type': return childIndex(el, false, true, isXml) === 1;
-    case 'last-of-type': return childIndex(el, true, true, isXml) === 1;
-    case 'only-of-type': {
-      const list = sameTypeSiblings(el, isXml);
-      return Boolean(list) && list.length === 1;
+    if ((this.steps & 1023) === 0 && this.deadlineMs !== Infinity && Date.now() > this.deadlineMs) {
+      throw new DomTimeoutError('CSS 选择器执行超时');
     }
-    case 'empty':
-      for (const n of el.childNodes || []) {
-        if (n.nodeType === 1) return false;
-        if ((n.nodeType === 3 || n.nodeType === 4) && (n.nodeValue || '').length > 0) return false;
+  }
+
+  memoFor(sel) {
+    let m = this.memos.get(sel);
+    if (!m) {
+      m = {
+        stepCount: sel.compounds.length,
+        matchStep: new Map(),
+        anyAncestor: new Map(),
+        anyPrevSibling: new Map(),
+      };
+      this.memos.set(sel, m);
+    }
+    return m;
+  }
+
+  getRow(map, el, stepCount) {
+    let row = map.get(el);
+    if (!row) {
+      row = new Uint8Array(stepCount);
+      map.set(el, row);
+    }
+    return row;
+  }
+
+  siblingTableFor(parent) {
+    let table = this.siblingTables.get(parent);
+    if (table) return table;
+    const children = getElementChildren(parent);
+    const n = children.length;
+    const childIndex1Based = new Map();
+    const typeIndex1Based = new Map();
+    const typeTotal = new Map();
+    const prevSibling = new Map();
+    const typeCounts = new Map();
+    const tags = new Array(n);
+    let prev = null;
+    for (let i = 0; i < n; i++) {
+      const c = children[i];
+      this.tick();
+      childIndex1Based.set(c, i + 1);
+      prevSibling.set(c, prev);
+      prev = c;
+      const tag = this.isXml ? getRawTagName(c) : getRawTagName(c).toLowerCase();
+      const cnt = (typeCounts.get(tag) || 0) + 1;
+      typeCounts.set(tag, cnt);
+      typeIndex1Based.set(c, cnt);
+      tags[i] = tag;
+    }
+    for (let i = 0; i < n; i++) {
+      typeTotal.set(children[i], typeCounts.get(tags[i]));
+    }
+    table = { totalChildren: n, childIndex1Based, typeIndex1Based, typeTotal, prevSibling };
+    this.siblingTables.set(parent, table);
+    return table;
+  }
+
+  prevElementSiblingFast(el) {
+    const p = getParentNode(el);
+    if (!p) return null;
+    return this.siblingTableFor(p).prevSibling.get(el) ?? null;
+  }
+
+  matchesAny(el, selectors) {
+    for (const sel of selectors) {
+      if (this.evalMatchStep(el, sel, sel.compounds.length - 1)) return true;
+    }
+    return false;
+  }
+
+  evalMatchStep(el, sel, idx) {
+    const memo = this.memoFor(sel);
+    const row = this.getRow(memo.matchStep, el, memo.stepCount);
+    const cached = row[idx];
+    if (cached !== MEMO_UNCOMPUTED) return cached === MEMO_TRUE;
+
+    this.tick();
+    let result = false;
+    if (this.matchesCompound(el, sel.compounds[idx])) {
+      if (idx === 0) {
+        result = true;
+      } else {
+        const comb = sel.combinators[idx - 1];
+        if (comb === '>') {
+          const p = getParentElement(el);
+          result = p !== null && this.evalMatchStep(p, sel, idx - 1);
+        } else if (comb === ' ') {
+          result = this.evalAnyAncestorMatches(el, sel, idx - 1);
+        } else if (comb === '+') {
+          const prev = this.prevElementSiblingFast(el);
+          result = prev !== null && this.evalMatchStep(prev, sel, idx - 1);
+        } else if (comb === '~') {
+          result = this.evalAnyPrevSiblingMatches(el, sel, idx - 1);
+        }
       }
-      return true;
-    case 'root':
-      return el.parentNode && el.parentNode.nodeType === 9;
-    case 'nth': {
-      const idx = childIndex(el, pm.fromEnd, pm.ofType, isXml);
-      return idx > 0 && matchesAnPlusB(idx, pm.a, pm.b);
     }
-    case 'not':
-      return !matchesAny(el, pm.inner, isXml);
-    case 'is':
-      return matchesAny(el, pm.inner, isXml);
-    default:
-      return false;
+    row[idx] = result ? MEMO_TRUE : MEMO_FALSE;
+    return result;
   }
-}
 
-function matchesCompound(el, comp, isXml) {
-  if (!el || el.nodeType !== 1) return false;
-  if (comp.nsPrefix !== null || comp.tagName !== null) {
-    if (!matchesTag(el.tagName, comp.nsPrefix, comp.tagName, isXml)) return false;
+  evalAnyAncestorMatches(el, sel, idx) {
+    const memo = this.memoFor(sel);
+    const chain = [];
+    let cur = el;
+    let baseResult = false;
+    while (true) {
+      const ancRow = this.getRow(memo.anyAncestor, cur, memo.stepCount);
+      const cached = ancRow[idx];
+      if (cached !== MEMO_UNCOMPUTED) {
+        baseResult = cached === MEMO_TRUE;
+        break;
+      }
+      this.tick();
+      const p = getParentElement(cur);
+      if (!p) {
+        ancRow[idx] = MEMO_FALSE;
+        baseResult = false;
+        break;
+      }
+      if (this.evalMatchStep(p, sel, idx)) {
+        ancRow[idx] = MEMO_TRUE;
+        baseResult = true;
+        break;
+      }
+      chain.push(cur);
+      cur = p;
+    }
+    const fill = baseResult ? MEMO_TRUE : MEMO_FALSE;
+    for (let i = chain.length - 1; i >= 0; i--) {
+      this.getRow(memo.anyAncestor, chain[i], memo.stepCount)[idx] = fill;
+    }
+    return baseResult;
   }
-  for (const id of comp.ids) {
-    if (getElementAttr(el, 'id', isXml) !== id) return false;
+
+  evalAnyPrevSiblingMatches(el, sel, idx) {
+    const memo = this.memoFor(sel);
+    const chain = [];
+    let cur = el;
+    let baseResult = false;
+    while (true) {
+      const sibRow = this.getRow(memo.anyPrevSibling, cur, memo.stepCount);
+      const cached = sibRow[idx];
+      if (cached !== MEMO_UNCOMPUTED) {
+        baseResult = cached === MEMO_TRUE;
+        break;
+      }
+      this.tick();
+      const prev = this.prevElementSiblingFast(cur);
+      if (!prev) {
+        sibRow[idx] = MEMO_FALSE;
+        baseResult = false;
+        break;
+      }
+      if (this.evalMatchStep(prev, sel, idx)) {
+        sibRow[idx] = MEMO_TRUE;
+        baseResult = true;
+        break;
+      }
+      chain.push(cur);
+      cur = prev;
+    }
+    const fill = baseResult ? MEMO_TRUE : MEMO_FALSE;
+    for (let i = chain.length - 1; i >= 0; i--) {
+      this.getRow(memo.anyPrevSibling, chain[i], memo.stepCount)[idx] = fill;
+    }
+    return baseResult;
   }
-  if (comp.classes.length > 0) {
-    const cls = getElementAttr(el, 'class', isXml);
-    if (cls === null) return false;
-    const tokens = cls.trim().split(/[ \t\n\r\f]+/).filter(Boolean);
-    for (const c of comp.classes) {
-      if (!tokens.includes(c)) return false;
+
+  matchesCompound(el, comp) {
+    if (!isElementNode(el)) return false;
+    if (comp.nsPrefix !== null || comp.tagName !== null) {
+      if (!matchesTag(getRawTagName(el), comp.nsPrefix, comp.tagName, this.isXml)) return false;
+    }
+    for (const id of comp.ids) {
+      if (getElementAttr(el, 'id', this.isXml) !== id) return false;
+    }
+    if (comp.classes.length > 0) {
+      const cls = getElementAttr(el, 'class', this.isXml);
+      if (cls === null) return false;
+      const tokens = cls.trim().split(/[ \t\n\r\f]+/).filter(Boolean);
+      for (const c of comp.classes) {
+        if (!tokens.includes(c)) return false;
+      }
+    }
+    for (const am of comp.attrs) {
+      if (!matchesAttr(el, am, this.isXml)) return false;
+    }
+    for (const pm of comp.pseudos) {
+      if (!this.matchesPseudo(el, pm)) return false;
+    }
+    return true;
+  }
+
+  matchesPseudo(el, pm) {
+    switch (pm.kind) {
+      case 'first-child': {
+        const p = getParentNode(el);
+        return Boolean(p) && this.siblingTableFor(p).childIndex1Based.get(el) === 1;
+      }
+      case 'last-child': {
+        const p = getParentNode(el);
+        if (!p) return false;
+        const t = this.siblingTableFor(p);
+        return t.childIndex1Based.get(el) === t.totalChildren;
+      }
+      case 'only-child': {
+        const p = getParentNode(el);
+        return Boolean(p) && this.siblingTableFor(p).totalChildren === 1;
+      }
+      case 'first-of-type': {
+        const p = getParentNode(el);
+        return Boolean(p) && this.siblingTableFor(p).typeIndex1Based.get(el) === 1;
+      }
+      case 'last-of-type': {
+        const p = getParentNode(el);
+        if (!p) return false;
+        const t = this.siblingTableFor(p);
+        return t.typeIndex1Based.get(el) === t.typeTotal.get(el);
+      }
+      case 'only-of-type': {
+        const p = getParentNode(el);
+        return Boolean(p) && this.siblingTableFor(p).typeTotal.get(el) === 1;
+      }
+      case 'empty':
+        for (const n of getChildNodes(el)) {
+          if (isElementNode(n)) return false;
+          if ((isTextNode(n) || isCDataNode(n)) && getNodeTextValue(n).length > 0) return false;
+        }
+        return true;
+      case 'root':
+        return isDocumentNode(getParentNode(el));
+      case 'nth': {
+        const p = getParentNode(el);
+        if (!p) return false;
+        const t = this.siblingTableFor(p);
+        let idx;
+        if (pm.ofType) {
+          const pos = t.typeIndex1Based.get(el);
+          const tot = t.typeTotal.get(el);
+          if (!pos || !tot) return false;
+          idx = pm.fromEnd ? (tot - pos + 1) : pos;
+        } else {
+          const pos = t.childIndex1Based.get(el);
+          if (!pos) return false;
+          idx = pm.fromEnd ? (t.totalChildren - pos + 1) : pos;
+        }
+        return matchesAnPlusB(idx, pm.a, pm.b);
+      }
+      case 'not':
+        return !this.matchesAny(el, pm.inner);
+      case 'is':
+        return this.matchesAny(el, pm.inner);
+      default:
+        return false;
     }
   }
-  for (const am of comp.attrs) {
-    if (!matchesAttr(el, am, isXml)) return false;
-  }
-  for (const pm of comp.pseudos) {
-    if (!matchesPseudo(el, pm, isXml)) return false;
-  }
-  return true;
 }
 
-function matchesStep(el, compounds, combinators, idx, isXml) {
-  if (!matchesCompound(el, compounds[idx], isXml)) return false;
-  if (idx === 0) return true;
-  const comb = combinators[idx - 1];
-  if (comb === '>') {
-    const p = getParentElement(el);
-    return p !== null && matchesStep(p, compounds, combinators, idx - 1, isXml);
-  }
-  if (comb === ' ') {
-    let p = getParentElement(el);
-    while (p) {
-      if (matchesStep(p, compounds, combinators, idx - 1, isXml)) return true;
-      p = getParentElement(p);
-    }
-    return false;
-  }
-  if (comb === '+') {
-    const prev = getPrevElementSibling(el);
-    return prev !== null && matchesStep(prev, compounds, combinators, idx - 1, isXml);
-  }
-  if (comb === '~') {
-    let prev = getPrevElementSibling(el);
-    while (prev) {
-      if (matchesStep(prev, compounds, combinators, idx - 1, isXml)) return true;
-      prev = getPrevElementSibling(prev);
-    }
-    return false;
-  }
-  return false;
-}
-
-function matchesComplex(el, sel, isXml) {
-  const compounds = [sel.head];
-  const combinators = [];
-  for (const [comb, comp] of sel.steps) {
-    combinators.push(comb);
-    compounds.push(comp);
-  }
-  return matchesStep(el, compounds, combinators, compounds.length - 1, isXml);
-}
-
-function matchesAny(el, selectors, isXml) {
-  for (const s of selectors) {
-    if (matchesComplex(el, s, isXml)) return true;
-  }
-  return false;
-}
-
-function queryDescendants(scopeRoot, selectors, isXml, firstOnly) {
+function queryDescendants(scopeRoot, selectors, isXml, firstOnly, maxSteps, deadlineMs) {
+  const ctx = new QueryContext(isXml, maxSteps, deadlineMs);
   const out = [];
   const stack = [];
   const top = getElementChildren(scopeRoot);
   for (let i = top.length - 1; i >= 0; i--) stack.push(top[i]);
   while (stack.length > 0) {
+    ctx.tick();
     const el = stack.pop();
-    if (matchesAny(el, selectors, isXml)) {
+    if (ctx.matchesAny(el, selectors)) {
       if (firstOnly) return el;
       out.push(el);
     }
@@ -588,22 +905,30 @@ export class PluginDomParser {
     maxDocsPerCall = MAX_DOCS_PER_CALL,
     maxDocBytes = MAX_DOC_BYTES,
     maxTotalNodes = MAX_TOTAL_NODES,
+    maxSelectorSteps = MAX_SELECTOR_STEPS,
   ) {
     this.maxDocsPerCall = maxDocsPerCall;
     this.maxDocBytes = maxDocBytes;
     this.maxTotalNodes = maxTotalNodes;
+    this.maxSelectorSteps = maxSelectorSteps;
     this.nextId = 1;
     this.docCount = 0;
     this.totalNodes = 0;
     this.nodes = new Map();
+    this.deadlineMs = Infinity;
     this._xmlParser = new DOMParser();
+  }
+
+  setCallDeadlineMs(deadlineMs) {
+    this.deadlineMs = deadlineMs;
   }
 
   parseHtml(html) {
     const text = String(html ?? '');
     this._checkPreParseLimits(text);
-    const { document } = parseHTML(normalizeHtmlInput(text));
-    const count = this._countElementsWithinLimit(document);
+    // WHATWG HTML5 compliant tree construction matching Android Jsoup
+    const document = parse5.parse(text);
+    const count = this._normalizeAndCountElements(document, true);
     this.docCount += 1;
     this.totalNodes += count;
     return this._register(document, false, true);
@@ -613,7 +938,7 @@ export class PluginDomParser {
     const text = String(xml ?? '');
     this._checkPreParseLimits(text);
     const document = this._xmlParser.parseFromString(text, 'text/xml');
-    const count = this._countElementsWithinLimit(document);
+    const count = this._normalizeAndCountElements(document, false);
     this.docCount += 1;
     this.totalNodes += count;
     return this._register(document, true, true);
@@ -623,7 +948,7 @@ export class PluginDomParser {
     const entry = this.nodes.get(nodeId);
     if (!entry) return -1;
     const parsed = new SelectorParser(selector).parseSelectorList(true);
-    const found = queryDescendants(entry.el, parsed, entry.isXml, true);
+    const found = queryDescendants(entry.el, parsed, entry.isXml, true, this.maxSelectorSteps, this.deadlineMs);
     if (!found) return -1;
     return this._register(found, entry.isXml, false);
   }
@@ -632,7 +957,7 @@ export class PluginDomParser {
     const entry = this.nodes.get(nodeId);
     if (!entry) return [];
     const parsed = new SelectorParser(selector).parseSelectorList(true);
-    const list = queryDescendants(entry.el, parsed, entry.isXml, false);
+    const list = queryDescendants(entry.el, parsed, entry.isXml, false, this.maxSelectorSteps, this.deadlineMs);
     return list.map((el) => this._register(el, entry.isXml, false));
   }
 
@@ -647,7 +972,7 @@ export class PluginDomParser {
     const entry = this.nodes.get(nodeId);
     if (!entry) return '';
     if (entry.isDocument) return '#document';
-    const raw = String(entry.el.tagName || '');
+    const raw = getRawTagName(entry.el);
     return entry.isXml ? raw : raw.toLowerCase();
   }
 
@@ -666,19 +991,21 @@ export class PluginDomParser {
   html(nodeId) {
     const entry = this.nodes.get(nodeId);
     if (!entry) return '';
-    if (entry.isDocument) {
-      return getElementChildren(entry.el).map((c) => c.outerHTML || '').join('');
-    }
-    return String(entry.el.innerHTML || '');
+    const parts = [];
+    serializeChildren(entry.el, entry.isXml, parts);
+    return parts.join('');
   }
 
   outerHtml(nodeId) {
     const entry = this.nodes.get(nodeId);
     if (!entry) return '';
+    const parts = [];
     if (entry.isDocument) {
-      return entry.el.toString();
+      serializeChildren(entry.el, entry.isXml, parts);
+    } else {
+      serializeNode(entry.el, entry.isXml, parts);
     }
-    return String(entry.el.outerHTML || '');
+    return parts.join('');
   }
 
   attr(nodeId, name) {
@@ -690,10 +1017,10 @@ export class PluginDomParser {
   attrsJson(nodeId) {
     const entry = this.nodes.get(nodeId);
     const attrs = {};
-    if (entry && !entry.isDocument && entry.el?.attributes) {
-      for (const a of Array.from(entry.el.attributes)) {
+    if (entry && !entry.isDocument) {
+      for (const a of getElementAttributes(entry.el)) {
         const key = entry.isXml ? a.name : String(a.name).toLowerCase();
-        attrs[key] = a.value;
+        attrs[key] = a.value ?? '';
       }
     }
     return JSON.stringify(attrs);
@@ -703,38 +1030,39 @@ export class PluginDomParser {
     this.nodes.clear();
     this.docCount = 0;
     this.totalNodes = 0;
+    this.deadlineMs = Infinity;
   }
 
   _collectXmlText(node, parts) {
     if (!node) return;
-    if (node.nodeType === 3 || node.nodeType === 4) {
-      parts.push(node.nodeValue || '');
+    if (isTextNode(node) || isCDataNode(node)) {
+      parts.push(getNodeTextValue(node));
       return;
     }
-    if (node.nodeType !== 1 && node.nodeType !== 9) return;
-    for (const child of node.childNodes || []) {
+    if (!isElementNode(node) && !isDocumentNode(node)) return;
+    for (const child of getChildNodes(node)) {
       this._collectXmlText(child, parts);
     }
   }
 
   _collectHtmlText(node, parts) {
     if (!node) return;
-    if (node.nodeType === 3 || node.nodeType === 4) {
-      parts.push(node.nodeValue || '');
+    if (isTextNode(node) || isCDataNode(node)) {
+      parts.push(getNodeTextValue(node));
       return;
     }
-    if (node.nodeType === 9) {
-      for (const child of node.childNodes || []) {
+    if (isDocumentNode(node)) {
+      for (const child of getChildNodes(node)) {
         this._collectHtmlText(child, parts);
       }
       return;
     }
-    if (node.nodeType !== 1) return;
-    const tag = String(node.tagName || '').toLowerCase();
+    if (!isElementNode(node)) return;
+    const tag = getRawTagName(node).toLowerCase();
     if (HTML_SKIP_TEXT_TAGS.has(tag)) return;
     const isBlock = HTML_BLOCK_TAGS.has(tag);
     if (isBlock) parts.push(' ');
-    for (const child of node.childNodes || []) {
+    for (const child of getChildNodes(node)) {
       this._collectHtmlText(child, parts);
     }
     if (isBlock) parts.push(' ');
@@ -765,20 +1093,34 @@ export class PluginDomParser {
     }
   }
 
-  _countElementsWithinLimit(root) {
+  /**
+   * Counts strictly Element nodes (excluding `#document` itself, matching Android
+   * `PluginDomParser.kt`), and in parse5 HTML trees flattens `<template>`'s
+   * `.content.childNodes` directly onto the `<template>` node so `<template>`
+   * traversal matches Jsoup.
+   */
+  _normalizeAndCountElements(doc, isParse5Html) {
     const remaining = this.maxTotalNodes - this.totalNodes;
     let count = 0;
-    const stack = [root];
+    const stack = [];
+    const top = getElementChildren(doc);
+    for (let i = top.length - 1; i >= 0; i--) stack.push(top[i]);
     while (stack.length > 0) {
       const cur = stack.pop();
       count += 1;
       if (count > remaining) {
         throw new Error(`单次调用解析的 DOM 节点总数超过上限（最多 ${this.maxTotalNodes} 个）`);
       }
-      const children = getElementChildren(cur);
-      for (let i = 0; i < children.length; i++) {
-        stack.push(children[i]);
+      if (isParse5Html && cur.content && Array.isArray(cur.content.childNodes) && cur.content.childNodes.length > 0) {
+        const tmplChildren = cur.content.childNodes;
+        for (const tc of tmplChildren) {
+          tc.parentNode = cur;
+        }
+        cur.childNodes = tmplChildren;
+        cur.content = null;
       }
+      const ch = getElementChildren(cur);
+      for (let i = ch.length - 1; i >= 0; i--) stack.push(ch[i]);
     }
     return count;
   }

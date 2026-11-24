@@ -881,6 +881,86 @@ test('Round 3: shared zip-vectors.json (incl. dual.zip PoC) and shared dom-vecto
   } finally {
     await host.dispose();
   }
+
+  // Round 5 Items #1, #3, #4: ALL 85 matrixCases (parse5 HTML5 + canonical serialization),
+  // O(N*S) memoized selectors (< 1s), step budget & deadline timeout, exact recount on 95k adoption agency
+  const { PluginDomParser, DomTimeoutError } = await import('../src/dom.js');
+  assert.ok(domVectors.matrixCases.length >= 85);
+  for (const mc of domVectors.matrixCases) {
+    const p = new PluginDomParser();
+    let threw = false;
+    let actual = null;
+    try {
+      const root = mc.mode === 'xml' ? p.parseXml(mc.input) : p.parseHtml(mc.input);
+      const id = mc.target === '#root' ? root : p.selectFirstId(root, mc.target);
+      if (id <= 0) actual = null;
+      else if (mc.op === 'tag') actual = p.tag(id);
+      else if (mc.op === 'text') actual = p.text(id);
+      else if (mc.op === 'html') actual = p.html(id);
+      else if (mc.op === 'outer') actual = p.outerHtml(id);
+      else if (mc.op === 'attrs') actual = p.attrsJson(id);
+      else if (mc.op === 'children') actual = p.childrenIds(id).map((x) => p.tag(x)).join(',');
+      else if (mc.op.startsWith('attr:')) actual = p.attr(id, mc.op.slice(5));
+      else if (mc.op.startsWith('all:')) actual = p.selectAllIds(id, mc.op.slice(4)).map((x) => `${p.tag(x)}=${p.text(x)}`).join('|');
+    } catch {
+      threw = true;
+    }
+    if (mc.throws) {
+      assert.equal(threw, true, `matrixCase #${mc.id} must throw`);
+    } else {
+      assert.equal(threw, false, `matrixCase #${mc.id} must not throw`);
+      assert.equal(actual, mc.expected, `matrixCase #${mc.id} mismatch`);
+    }
+  }
+
+  // Pathological selector complexity tests (< 1s each)
+  {
+    const p = new PluginDomParser();
+    const r = p.parseHtml('<div>'.repeat(500));
+    const t0 = Date.now();
+    assert.equal(p.selectAllIds(r, 'span div div div div').length, 0);
+    assert.ok(Date.now() - t0 < 1000, '500 nested divs selector must complete in < 1s');
+  }
+  {
+    const p = new PluginDomParser();
+    const r = p.parseHtml('<ul>' + '<li>x</li>'.repeat(2000) + '</ul>');
+    const t1 = Date.now();
+    assert.equal(p.selectAllIds(r, 'b ~ li ~ li').length, 0);
+    assert.ok(Date.now() - t1 < 1000, '2000 li b ~ li ~ li must complete in < 1s');
+    const t2 = Date.now();
+    assert.equal(p.selectAllIds(r, 'b ~ li ~ li ~ li').length, 0);
+    assert.ok(Date.now() - t2 < 1000, '2000 li b ~ li ~ li ~ li must complete in < 1s');
+  }
+  {
+    const p = new PluginDomParser();
+    const r = p.parseHtml('<ul>' + '<li>x</li>'.repeat(100_000) + '</ul>');
+    for (const [sel, count] of [['li:nth-child(2n+1)', 50_000], ['li:last-child', 1], ['li:nth-last-of-type(3n+1)', 33_334]]) {
+      const t = Date.now();
+      assert.equal(p.selectAllIds(r, sel).length, count);
+      assert.ok(Date.now() - t < 1000, `100k li ${sel} must complete in < 1s`);
+    }
+  }
+  // Step budget, deadline timeout, adoption agency 95k recount, unified element count excluding #document
+  {
+    const tight = new PluginDomParser(8, 4 * 1024 * 1024, 200_000, 500);
+    const r = tight.parseHtml('<ul>' + '<li>x</li>'.repeat(2000) + '</ul>');
+    assert.throws(() => tight.selectAllIds(r, 'li'), /步数超过上限/);
+
+    const exp = new PluginDomParser();
+    const rx = exp.parseHtml('<ul>' + '<li>x</li>'.repeat(3000) + '</ul>');
+    exp.setCallDeadlineMs(Date.now() - 1);
+    assert.throws(() => exp.selectAllIds(rx, 'li'), DomTimeoutError);
+
+    const amp = new PluginDomParser();
+    assert.throws(() => amp.parseHtml('<b><p>x</b>y</p>'.repeat(95_000)), /节点总数超过上限/);
+    assert.equal(amp.totalNodes, 0);
+
+    const cnt = new PluginDomParser();
+    cnt.parseHtml('<p>x</p>');
+    assert.equal(cnt.totalNodes, 4);
+    cnt.parseXml('<r><a/></r>');
+    assert.equal(cnt.totalNodes, 6);
+  }
 });
 
 test('Round 3: host memory caps, tool/host parity, redirect safe-headers, cookie warnings, unawaited Promise check, immutable globals', async () => {
@@ -983,6 +1063,22 @@ test('Round 3: host memory caps, tool/host parity, redirect safe-headers, cookie
           }
           const results = await Promise.all(ps);
           return { results };
+        }
+        if (m === 'fetch-bad-method') {
+          await ctx.fetch('https://api.example.com/small', { method: 'G'.repeat(500) });
+          return { ok: true };
+        }
+        if (m === 'fetch-bad-redirect') {
+          await ctx.fetch('https://api.example.com/small', { redirect: 'follow'.repeat(500) });
+          return { ok: true };
+        }
+        if (m === 'fetch-body-budget-flood') {
+          const body = 'B'.repeat(1800 * 1024);
+          const ps = [];
+          for (let i = 0; i < 6; i++) {
+            ps.push(ctx.fetch('https://api.example.com/slow-hold?i=' + i, { method: 'POST', body }).then(() => 'ok', (e) => 'err:' + (e.message || e)));
+          }
+          return { results: await Promise.all(ps) };
         }
         if (m === 'immutable-globals') {
           return ['__d3_invoke', '__d3_invoke_optional', '__d3_exports', '__d3_eval_probe'].map((n) => {
@@ -1115,6 +1211,13 @@ test('Round 3: host memory caps, tool/host parity, redirect safe-headers, cookie
     assert.equal(qOk.length, 20, `Expected 4 active + 16 queued = 20 ok, got ${qOk.length}`);
     assert.equal(qErrors.length, 5, `Expected 5 rejected above queue cap 16, got ${qErrors.length}`);
     assert.ok(qErrors.every((e) => e.includes('排队')));
+
+    // Round 5 Item #5: method/redirect length pre-checks + 8 MB queued+active request body cap
+    await assert.rejects(() => host.invoke('browse', { categoryId: 'fetch-bad-method' }), (e) => e instanceof PluginCallError && e.code === 'Internal');
+    await assert.rejects(() => host.invoke('browse', { categoryId: 'fetch-bad-redirect' }), (e) => e instanceof PluginCallError && e.code === 'Internal');
+    const bbRes = await host.invoke('browse', { categoryId: 'fetch-body-budget-flood' });
+    assert.ok(bbRes.results.some((r) => String(r).startsWith('err:')), '6 x 1.8 MB concurrent POSTs must trip 8 MB queued+active request body cap');
+    assert.equal(host.fetchGateway.requestBodyBudget.used, 0);
 
     // Item #12: __d3_invoke etc. non-writable & non-configurable
     const globals = await host.invoke('browse', { categoryId: 'immutable-globals' });

@@ -48,8 +48,9 @@ enum class StereoHint { MONO, SBS, OU, VR180, VR360, MVHEVC }
  *
  * **Plugin security note (§11.3)**: For [SourceKind.PLUGIN] sources, [url] and
  * [headers] are read-only metadata/cache keys ONLY. UI callers MUST NOT pass
- * them to an unguarded HTTP client or image loader; load bytes exclusively
- * through `PluginImages.loadBytes(source, artwork)`.
+ * them to an unguarded HTTP client or image loader (`Artworks.load` rejects
+ * `sourceKind == SourceKind.PLUGIN`); load bitmaps exclusively through
+ * `PluginImages.loadBitmap(source, artwork)`.
  */
 data class Artwork(
     val url: String,
@@ -57,6 +58,7 @@ data class Artwork(
     val isVideoFrame: Boolean = false,
     val cacheKey: String = url,
     val blurhash: String? = null,
+    val sourceKind: SourceKind? = null,
 )
 
 data class PersonCredit(
@@ -187,6 +189,7 @@ data class PlaybackInfo(
     val expiresAtMs: Long? = null,
     val nextItemId: String? = null,
     val sessionId: String? = null,
+    val sourceKind: SourceKind? = null,
 )
 
 /** The source cannot be reached right now; the wall shows it as "连不上". */

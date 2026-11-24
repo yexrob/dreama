@@ -3,9 +3,10 @@ import https from 'node:https';
 import { PluginCookieJar } from './cookies.js';
 import { NetworkPolicyError, originKey } from './network-policy.js';
 
-/** §11.1 (B2): 8 MB single fetch response cap, 4 concurrent fetches, 16 queued, 16 MB in-flight bytes, 2 MB req body, 32 KB req headers, 8 KB URL. */
+/** §11.1 (B2): 8 MB single fetch response cap, 4 concurrent fetches, 16 queued, 16 MB in-flight response bytes, 2 MB req body, 8 MB total queued+active req bodies, 32 KB req headers, 8 KB URL. */
 export const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 export const MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024;
+export const MAX_QUEUED_REQUEST_BODY_BYTES = 8 * 1024 * 1024;
 export const MAX_REQUEST_URL_BYTES = 8 * 1024;
 export const MAX_REQUEST_HEADERS_BYTES = 32 * 1024;
 export const MAX_FETCH_META_JSON_BYTES = 3 * 1024 * 1024;
@@ -116,6 +117,7 @@ export class FetchGateway {
     this.maxConcurrent = opts.maxConcurrent ?? MAX_CONCURRENT_FETCHES;
     this.maxQueued = opts.maxQueued ?? MAX_QUEUED_FETCHES;
     this.inFlightBudget = opts.inFlightBudget ?? new InFlightByteBudget(opts.maxInFlightBytes ?? MAX_INFLIGHT_BYTES);
+    this.requestBodyBudget = opts.requestBodyBudget ?? new InFlightByteBudget(opts.maxQueuedRequestBodyBytes ?? MAX_QUEUED_REQUEST_BODY_BYTES);
     this.maxRedirects = opts.maxRedirects ?? MAX_REDIRECTS;
     this.transportOverride = opts.transportOverride ?? null;
     this.semaphore = new AsyncSemaphore(this.maxConcurrent, this.maxQueued);

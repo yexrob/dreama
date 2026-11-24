@@ -4,8 +4,8 @@ import path from 'node:path';
 import { getQuickJS } from 'quickjs-emscripten';
 import { pluginCrypto } from './crypto.js';
 import { PluginCookieJar } from './cookies.js';
-import { PluginDomParser } from './dom.js';
-import { FetchGateway, MAX_FETCH_META_JSON_BYTES } from './fetch-gateway.js';
+import { DomTimeoutError, PluginDomParser } from './dom.js';
+import { FetchGateway, FetchRequestTooLargeError, MAX_FETCH_META_JSON_BYTES, MAX_QUEUED_REQUEST_BODY_BYTES } from './fetch-gateway.js';
 import { PluginLocale } from './locale.js';
 import { MAX_LOG_MESSAGE_BYTES, PluginLogger, truncateUtf8 } from './logger.js';
 import { NetworkPolicy, extractUserHosts } from './network-policy.js';
@@ -442,6 +442,7 @@ export class QuickJsPluginHost {
   async _evalAsyncExpr(expr, timeoutMs) {
     const vm = this.vm;
     this.deadlineMs = Date.now() + timeoutMs;
+    this.domParser.setCallDeadlineMs(this.deadlineMs);
 
     let timer = null;
     let timedOut = false;
@@ -508,7 +509,7 @@ export class QuickJsPluginHost {
 
   _mapHostError(err) {
     if (err instanceof PluginCallError) return err;
-    if (err instanceof HostExecutionTimeoutError || this._lastCallTimedOut || this._interruptTriggered) {
+    if (err instanceof HostExecutionTimeoutError || err instanceof DomTimeoutError || this._lastCallTimedOut || this._interruptTriggered) {
       this._lastCallTimedOut = true;
       return new PluginCallError('Unavailable', '插件调用超时，请重试。');
     }
@@ -648,34 +649,55 @@ export class QuickJsPluginHost {
       }
       const req = JSON.parse(rawStr);
       this.fetchGateway.validateRequestLimits(req.url, req.headers, null);
+      let reservedReqBodyBytes = 0;
       if (req.bodyBase64 !== undefined) {
-        const approxBytes = Math.floor((String(req.bodyBase64).length * 3) / 4);
+        const str = String(req.bodyBase64);
+        const approxBytes = Math.floor((str.length * 3) / 4);
         if (approxBytes > this.fetchGateway.maxRequestBodyBytes + 3) {
           throw new RangeError('请求体超过大小限制（上限 2 MB）');
         }
+        reservedReqBodyBytes = str.length;
       } else if (req.bodyText !== undefined) {
-        if (Buffer.byteLength(String(req.bodyText), 'utf8') > this.fetchGateway.maxRequestBodyBytes) {
+        const byteLen = Buffer.byteLength(String(req.bodyText), 'utf8');
+        if (byteLen > this.fetchGateway.maxRequestBodyBytes) {
           throw new RangeError('请求体超过大小限制（上限 2 MB）');
         }
+        reservedReqBodyBytes = byteLen;
       }
-      const resp = await this.fetchGateway.withSlot(async (signal) => {
-        let body = null;
-        if (req.bodyBase64 !== undefined) {
-          body = Buffer.from(req.bodyBase64, 'base64');
-          this.fetchGateway.validateRequestLimits(req.url, req.headers, body);
-        } else if (req.bodyText !== undefined) {
-          body = Buffer.from(req.bodyText, 'utf8');
-          this.fetchGateway.validateRequestLimits(req.url, req.headers, body);
+      if (reservedReqBodyBytes > 0) {
+        try {
+          this.fetchGateway.requestBodyBudget.reserve(reservedReqBodyBytes);
+        } catch {
+          throw new FetchRequestTooLargeError(
+            `排队及在途请求体总量超过上限（${Math.round(MAX_QUEUED_REQUEST_BODY_BYTES / (1024 * 1024))} MB）`,
+          );
         }
-        return this.fetchGateway._execute({
-          url: req.url,
-          method: req.method,
-          headers: req.headers,
-          body,
-          timeoutMs: req.timeoutMs,
-          redirect: req.redirect,
-        }, this.defaultTimeoutMs, signal);
-      });
+      }
+      let resp;
+      try {
+        resp = await this.fetchGateway.withSlot(async (signal) => {
+          let body = null;
+          if (req.bodyBase64 !== undefined) {
+            body = Buffer.from(req.bodyBase64, 'base64');
+            this.fetchGateway.validateRequestLimits(req.url, req.headers, body);
+          } else if (req.bodyText !== undefined) {
+            body = Buffer.from(req.bodyText, 'utf8');
+            this.fetchGateway.validateRequestLimits(req.url, req.headers, body);
+          }
+          return this.fetchGateway._execute({
+            url: req.url,
+            method: req.method,
+            headers: req.headers,
+            body,
+            timeoutMs: req.timeoutMs,
+            redirect: req.redirect,
+          }, this.defaultTimeoutMs, signal);
+        });
+      } finally {
+        if (reservedReqBodyBytes > 0) {
+          this.fetchGateway.requestBodyBudget.release(reservedReqBodyBytes);
+        }
+      }
       if (gen !== this.callGen) {
         throw new Error('请求已取消');
       }

@@ -1,5 +1,14 @@
 package com.limelight.local.plugin
 
+import com.limelight.local.media.Artwork
+import com.limelight.local.media.Item
+import com.limelight.local.media.ItemKind
+import com.limelight.local.media.PlaybackInfo
+import com.limelight.local.media.SourceKind
+import kotlinx.serialization.json.Json
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -57,7 +66,8 @@ class PluginBoundaryGuardTest {
             Regex("""\bMediaMetadataRetriever\b""") to "MediaMetadataRetriever (forbidden for plugin URLs; use PluginImages.loadBitmap / ExoPlayer Format)",
             Regex("""\bArtworks\.load\b""") to "Artworks.load (forbidden for plugin artwork; use PluginImages.loadBitmap)",
         )
-        val rawPlaybackFieldAccess = Regex("""\b(?:info|playbackInfo|pb)\.(?:url|headers)\b""")
+        val rawPlaybackFieldAccess = Regex("""\b[a-zA-Z_][a-zA-Z0-9_]*\.(?:url|headers)\b""")
+        val playbackTypeMention = Regex("""\bPlaybackInfo\b""")
         val pluginMarkerRegex = Regex("""\b(?:PluginMediaSource|SourceKind\.PLUGIN)\b""")
 
         val violations = ArrayList<String>()
@@ -80,6 +90,19 @@ class PluginBoundaryGuardTest {
 
                 // Rule 2: Inside local/, audit raw HTTP/player clients and PlaybackInfo.url/headers access
                 if (rel.startsWith(localPkgPrefix)) {
+                    if (rel == "com/limelight/local/media/Artworks.kt") {
+                        // Artworks.kt is explicitly allowed to check `SourceKind.PLUGIN` ONLY to reject it at runtime
+                        if (!codeOnly.contains("art.sourceKind == SourceKind.PLUGIN") ||
+                            !codeOnly.contains("throw UnsupportedOperationException")
+                        ) {
+                            violations += "$rel must retain runtime rejection guard for SourceKind.PLUGIN"
+                        }
+                        if (codeOnly.contains("PluginMediaSource")) {
+                            violations += "$rel must not handle PluginMediaSource directly"
+                        }
+                        return@forEach
+                    }
+
                     val mentionsPlugin = pluginMarkerRegex.containsMatchIn(codeOnly)
                     val isLegacyAllowlisted = rel in legacyLocalRawClientFiles
 
@@ -93,7 +116,7 @@ class PluginBoundaryGuardTest {
                         }
                     }
 
-                    if (rawPlaybackFieldAccess.containsMatchIn(codeOnly)) {
+                    if (playbackTypeMention.containsMatchIn(codeOnly) && rawPlaybackFieldAccess.containsMatchIn(codeOnly)) {
                         if (!isLegacyAllowlisted) {
                             violations += "$rel directly accesses PlaybackInfo.url/headers outside audited legacy allowlist (use PluginPlayback instead)"
                         } else if (mentionsPlugin) {
@@ -118,6 +141,105 @@ class PluginBoundaryGuardTest {
                     violations.joinToString("\n") { "  - $it" },
             )
         }
+    }
+
+    @Test
+    fun runtimeGuardsRejectPluginItemsAndPlaybackAtEveryLegacyHostEntryPoint() {
+        val policy = NetworkPolicy(
+            permissions = PluginPermissions(hosts = listOf("cdn.example.com"), lan = false),
+            dnsResolver = { listOf(java.net.InetAddress.getByName("93.184.216.34")) },
+        )
+        val mapper = PluginProtocolMapper(policy)
+
+        val rawDetail = Json.parseToJsonElement(
+            """
+            {
+              "id": "ep-1",
+              "kind": "movie",
+              "title": "Plugin Movie",
+              "poster": {"url": "https://cdn.example.com/poster.jpg", "headers": {"Authorization": "Bearer secret"}},
+              "thumb": "https://cdn.example.com/thumb.jpg",
+              "backdrop": "https://cdn.example.com/backdrop.jpg",
+              "people": [{"name": "Alice", "image": "https://cdn.example.com/alice.jpg"}]
+            }
+            """.trimIndent(),
+        )
+        val item: Item = mapper.mapItem(rawDetail)
+        val poster = item.poster!!
+        val thumb = item.thumb!!
+        val backdrop = item.backdrop!!
+        val personImg = item.people.first().image!!
+
+        // Every Artwork mapped from a plugin MUST carry sourceKind == SourceKind.PLUGIN
+        assertEquals(SourceKind.PLUGIN, poster.sourceKind)
+        assertEquals(SourceKind.PLUGIN, thumb.sourceKind)
+        assertEquals(SourceKind.PLUGIN, backdrop.sourceKind)
+        assertEquals(SourceKind.PLUGIN, personImg.sourceKind)
+        assertTrue(PluginHostGuards.isPluginArtwork(poster))
+
+        val rawPb = Json.parseToJsonElement(
+            """
+            {
+              "url": "https://cdn.example.com/video.m3u8",
+              "headers": {"Authorization": "Bearer secret"}
+            }
+            """.trimIndent(),
+        )
+        val playback: PlaybackInfo = mapper.mapPlayback(rawPb, fallbackTitle = "Plugin Movie")
+        assertEquals(SourceKind.PLUGIN, playback.sourceKind)
+        assertTrue(PluginHostGuards.isPluginPlayback(playback))
+
+        // 1. Artworks.load / Components.kt guard rejects plugin artwork even without explicit sourceKind argument
+        for (art in listOf(poster, thumb, backdrop, personImg)) {
+            try {
+                PluginHostGuards.requireNonPluginArtwork(art)
+                fail("requireNonPluginArtwork must reject plugin artwork ${art.url}")
+            } catch (_: UnsupportedOperationException) {
+            }
+        }
+
+        // 2. WallActivity.launchPlayer / LocalPlayerXR DefaultHttpDataSource guard rejects plugin PlaybackInfo
+        try {
+            PluginHostGuards.requireNonPluginPlayback(playback)
+            fail("requireNonPluginPlayback must reject plugin PlaybackInfo")
+        } catch (_: UnsupportedOperationException) {
+        }
+
+        // 3. MediaMetadataRetriever / MediaExtractor frame probe guard rejects plugin source/artwork/playback
+        try {
+            PluginHostGuards.requireNonPluginFrameProbe(SourceKind.PLUGIN)
+            fail("requireNonPluginFrameProbe must reject SourceKind.PLUGIN")
+        } catch (_: UnsupportedOperationException) {
+        }
+        try {
+            PluginHostGuards.requireNonPluginFrameProbe(null, artwork = poster)
+            fail("requireNonPluginFrameProbe must reject plugin Artwork")
+        } catch (_: UnsupportedOperationException) {
+        }
+
+        // 4. DLNA (local/dlna/, local/wall/CastScreen.kt) & out-of-package cast guard rejects plugin Item/PlaybackInfo
+        try {
+            PluginHostGuards.requireNonPluginCast(SourceKind.PLUGIN, info = playback, item = item)
+            fail("requireNonPluginCast must reject SourceKind.PLUGIN")
+        } catch (_: UnsupportedOperationException) {
+        }
+        try {
+            PluginHostGuards.requireNonPluginCast(null, info = null, item = item)
+            fail("requireNonPluginCast must reject Item containing plugin-stamped Artwork")
+        } catch (_: UnsupportedOperationException) {
+        }
+
+        // Non-plugin Local/WebDAV items pass all guards cleanly
+        val localArt = Artwork(url = "content://media/external/video/1", isVideoFrame = true, sourceKind = SourceKind.LOCAL)
+        val webdavPb = PlaybackInfo(url = "https://nas.example/movie.mp4", sourceKind = SourceKind.WEBDAV)
+        val localItem = Item(id = "loc-1", kind = ItemKind.VIDEO, title = "Local", poster = localArt)
+        assertFalse(PluginHostGuards.isPluginArtwork(localArt))
+        assertFalse(PluginHostGuards.isPluginPlayback(webdavPb))
+        PluginHostGuards.requireNonPluginArtwork(localArt)
+        PluginHostGuards.requireNonPluginPlayback(webdavPb)
+        PluginHostGuards.requireNonPluginFrameProbe(SourceKind.LOCAL, artwork = localArt)
+        PluginHostGuards.requireNonPluginCast(SourceKind.WEBDAV, info = webdavPb, item = localItem)
+        assertNotNull(localArt.url)
     }
 
     private fun stripComments(src: String): String {

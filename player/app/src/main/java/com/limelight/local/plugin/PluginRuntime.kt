@@ -274,6 +274,9 @@ class PluginRuntime(
             context = androidContext,
         )
         qjs.evaluationTimeoutMillis = timeoutMs
+        domParser.setCallDeadlineNanos(
+            System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMs),
+        )
 
         val argJson = arg?.toString() ?: "null"
         val hasArg = arg != null
@@ -373,6 +376,9 @@ class PluginRuntime(
         qjs.memoryLimit = memoryLimitBytes
         qjs.maxStackSize = MAX_STACK_BYTES
         qjs.evaluationTimeoutMillis = timeoutMs
+        domParser.setCallDeadlineNanos(
+            System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMs),
+        )
         bridgeToken = PluginCrypto.hexEncode(PluginCrypto.randomBytes(16))
         creationCount += 1
 
@@ -518,6 +524,7 @@ class PluginRuntime(
         // Note: plain plugin `throw new Error("...timeout...")` or `throw new Error("interrupted")` MUST map to Internal,
         // NOT Unavailable; only genuine host timeout/QuickJS interruption triggers Unavailable & VM rebuild.
         if (t is TimeoutCancellationException || t is QuickJsInterruptedException ||
+            hasCause<DomTimeoutException>(t) ||
             (t is QuickJsException && t.message?.contains("InternalError: interrupted", ignoreCase = true) == true)
         ) {
             logger.warn("Method '$method' timed out; cancelling active requests and rebuilding runtime")
@@ -753,29 +760,50 @@ class PluginRuntime(
                 val timeoutMs = (obj["timeoutMs"] as? JsonPrimitive)?.longOrNull
                 val redirect = (obj["redirect"] as? JsonPrimitive)?.content ?: "follow"
 
-                val resp = fetchGateway.withSlot {
-                    if (gen != callGeneration.get()) {
-                        throw CancellationException("Call already finished")
-                    }
-                    // Decode request body ONLY while holding one of the 4 active execution permits
-                    val bodyBytes = when {
-                        bodyBase64 != null -> PluginCrypto.base64Decode(bodyBase64)
-                        bodyText != null -> bodyText.toByteArray(Charsets.UTF_8)
-                        else -> null
-                    }
-                    fetchGateway.validateRequestBodyBytes(bodyBytes)
-                    withContext(Dispatchers.IO) {
-                        fetchGateway.executeBlocking(
-                            FetchRequest(
-                                url = url,
-                                method = method,
-                                headers = headers,
-                                body = bodyBytes,
-                                contentType = contentType,
-                                timeoutMs = timeoutMs,
-                                redirect = redirect,
-                            ),
+                // Cap total queued + active request body memory across concurrent calls at 8 MB
+                val reservedReqBodyBytes = when {
+                    bodyBase64 != null -> bodyBase64.length.toLong()
+                    bodyText != null -> bodyText.toByteArray(Charsets.UTF_8).size.toLong()
+                    else -> 0L
+                }
+                if (reservedReqBodyBytes > 0L) {
+                    try {
+                        fetchGateway.requestBodyBudget.reserve(reservedReqBodyBytes)
+                    } catch (_: FetchResponseTooLargeException) {
+                        throw FetchRequestTooLargeException(
+                            "排队及在途请求体总量超过上限（${PluginFetchGateway.MAX_QUEUED_REQUEST_BODY_BYTES / (1024 * 1024)} MB）",
                         )
+                    }
+                }
+                val resp = try {
+                    fetchGateway.withSlot {
+                        if (gen != callGeneration.get()) {
+                            throw CancellationException("Call already finished")
+                        }
+                        // Decode request body ONLY while holding one of the 4 active execution permits
+                        val bodyBytes = when {
+                            bodyBase64 != null -> PluginCrypto.base64Decode(bodyBase64)
+                            bodyText != null -> bodyText.toByteArray(Charsets.UTF_8)
+                            else -> null
+                        }
+                        fetchGateway.validateRequestBodyBytes(bodyBytes)
+                        withContext(Dispatchers.IO) {
+                            fetchGateway.executeBlocking(
+                                FetchRequest(
+                                    url = url,
+                                    method = method,
+                                    headers = headers,
+                                    body = bodyBytes,
+                                    contentType = contentType,
+                                    timeoutMs = timeoutMs,
+                                    redirect = redirect,
+                                ),
+                            )
+                        }
+                    }
+                } finally {
+                    if (reservedReqBodyBytes > 0L) {
+                        fetchGateway.requestBodyBudget.release(reservedReqBodyBytes)
                     }
                 }
                 // Reserve buffer bytes against the 16 MB in-flight budget until JS reads or call ends

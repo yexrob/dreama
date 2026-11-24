@@ -5,6 +5,8 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.jsoup.nodes.CDataNode
+import org.jsoup.nodes.Comment
+import org.jsoup.nodes.DataNode
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.nodes.Node
@@ -12,38 +14,34 @@ import org.jsoup.nodes.TextNode
 import org.jsoup.parser.ParseSettings
 import org.jsoup.parser.Parser
 import org.jsoup.parser.StreamParser
+import java.util.IdentityHashMap
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 class DomLimitExceededException(message: String) : IllegalStateException(message)
+class DomTimeoutException(message: String) : IllegalStateException(message)
 
 /**
  * Lazy handle-backed HTML/XML DOM parser for `ctx.parse.html(text)` and
  * `ctx.parse.xml(text)` (§5, §11.1, S4):
  * - Capped at 8 parsed documents per invocation, 4 MB per document, and
- *   [MAX_TOTAL_NODES] (200,000) total element nodes across the invocation
- * - Counts elements DURING parsing via Jsoup [StreamParser] and aborts
- *   immediately on overflow so HTML5 formatting-element reconstruction bombs
- *   cannot amplify memory before the cap trips
- * - Unified semantics with `tools/plugin-kit/src/dom.js`:
- *   - Document root always reports `tag == "#document"`
- *   - `querySelector` / `selectFirst` and `querySelectorAll` / `select` NEVER
- *     match the receiver element itself (browser-standard descendant scoping)
- *   - HTML tags & attribute names are case-insensitive; XML tags & attribute
- *     names are strictly case-sensitive
- *   - Supports namespace-prefixed selectors (`dvb|x`, `*|x`, `|x`)
- *   - Rejects Jsoup-proprietary pseudo-classes (`:eq()`, `:contains()`, etc.)
- *   - `text` skips `<script>`/`<style>` in HTML, uses identical block spacing,
- *     collapses only ASCII whitespace + U+00A0 (preserving Unicode spaces such
- *     as U+2003), and preserves undefined HTML entities (e.g. `&eacute;`) in XML
- *   - `attr(name)` returns `null` when absent and `""` for present boolean attrs
- * - All handles and counters are cleared as soon as the invocation ends
+ *   [MAX_TOTAL_NODES] (200,000) total element nodes (excluding `#document`)
+ * - Counts elements DURING parsing via Jsoup [StreamParser] to abort HTML5
+ *   amplification bombs immediately, then performs an exact post-parse element
+ *   count so adoption-agency clones never bypass the 200k ceiling
+ * - Uses an O(N * S) memoized CSS selector engine with precomputed O(1) sibling
+ *   indices, a strict step budget ([MAX_SELECTOR_STEPS]), and periodic thread
+ *   interrupt + call deadline checks so host-side selector evaluation can never
+ *   hang the plugin thread
+ * - Canonical `html()` / `outerHtml()` serialization with `prettyPrint(false)`
+ *   aligned bit-for-bit with `tools/plugin-kit/src/dom.js` (which uses `parse5`)
  */
 class PluginDomParser(
     private val maxDocsPerCall: Int = MAX_DOCS_PER_CALL,
     private val maxDocBytes: Int = MAX_DOC_BYTES,
     private val maxTotalNodes: Int = MAX_TOTAL_NODES,
+    private val maxSelectorSteps: Int = MAX_SELECTOR_STEPS,
 ) {
     private data class NodeEntry(
         val el: Element,
@@ -55,12 +53,20 @@ class PluginDomParser(
     private val totalNodes = AtomicInteger(0)
     private val nodes = ConcurrentHashMap<Int, NodeEntry>()
 
+    @Volatile
+    private var callDeadlineNanos: Long = Long.MAX_VALUE
+
+    fun setCallDeadlineNanos(deadlineNanos: Long) {
+        callDeadlineNanos = deadlineNanos
+    }
+
     fun parseHtml(html: String): Int {
         enforcePreParseLimits(html)
         val parser = Parser.htmlParser()
             .settings(ParseSettings.htmlDefault)
             .setMaxDepth(MAX_NESTING_DEPTH)
-        val (doc, count) = parseWithStreamingNodeLimit(html, parser)
+        val (doc, count) = parseWithStreamingAndExactCount(html, parser)
+        doc.outputSettings().prettyPrint(false)
         docCount.incrementAndGet()
         totalNodes.addAndGet(count)
         return register(doc, isXml = false)
@@ -72,7 +78,8 @@ class PluginDomParser(
         val parser = Parser.xmlParser()
             .settings(ParseSettings.preserveCase)
             .setMaxDepth(MAX_NESTING_DEPTH)
-        val (doc, count) = parseWithStreamingNodeLimit(sanitized, parser)
+        val (doc, count) = parseWithStreamingAndExactCount(sanitized, parser)
+        doc.outputSettings().prettyPrint(false)
         docCount.incrementAndGet()
         totalNodes.addAndGet(count)
         return register(doc, isXml = true)
@@ -81,14 +88,26 @@ class PluginDomParser(
     fun selectFirstId(nodeId: Int, selector: String): Int {
         val entry = nodes[nodeId] ?: return 0
         val parsed = CssSelectorEngine.parse(selector)
-        val found = CssSelectorEngine.queryFirst(entry.el, parsed, entry.isXml) ?: return 0
+        val found = CssSelectorEngine.queryFirst(
+            scopeRoot = entry.el,
+            selectors = parsed,
+            isXml = entry.isXml,
+            maxSteps = maxSelectorSteps,
+            deadlineNanos = callDeadlineNanos,
+        ) ?: return 0
         return register(found, entry.isXml)
     }
 
     fun selectAllIds(nodeId: Int, selector: String): JsonArray {
         val entry = nodes[nodeId] ?: return JsonArray(emptyList())
         val parsed = CssSelectorEngine.parse(selector)
-        val found = CssSelectorEngine.queryAll(entry.el, parsed, entry.isXml)
+        val found = CssSelectorEngine.queryAll(
+            scopeRoot = entry.el,
+            selectors = parsed,
+            isXml = entry.isXml,
+            maxSteps = maxSelectorSteps,
+            deadlineNanos = callDeadlineNanos,
+        )
         val ids = ArrayList<JsonPrimitive>(found.size)
         for (child in found) {
             ids += JsonPrimitive(register(child, entry.isXml))
@@ -124,8 +143,23 @@ class PluginDomParser(
         return collapseAsciiAndNbspWhitespace(sb.toString())
     }
 
-    fun html(nodeId: Int): String = nodes[nodeId]?.el?.html() ?: ""
-    fun outerHtml(nodeId: Int): String = nodes[nodeId]?.el?.outerHtml() ?: ""
+    fun html(nodeId: Int): String {
+        val entry = nodes[nodeId] ?: return ""
+        val sb = StringBuilder()
+        serializeChildren(entry.el, entry.isXml, sb)
+        return sb.toString()
+    }
+
+    fun outerHtml(nodeId: Int): String {
+        val entry = nodes[nodeId] ?: return ""
+        val sb = StringBuilder()
+        if (entry.el is Document) {
+            serializeChildren(entry.el, entry.isXml, sb)
+        } else {
+            serializeNode(entry.el, entry.isXml, sb)
+        }
+        return sb.toString()
+    }
 
     fun attr(nodeId: Int, name: String): String? {
         val entry = nodes[nodeId] ?: return null
@@ -148,9 +182,19 @@ class PluginDomParser(
         nodes.clear()
         docCount.set(0)
         totalNodes.set(0)
+        callDeadlineNanos = Long.MAX_VALUE
     }
 
     fun currentTotalNodes(): Int = totalNodes.get()
+
+    private fun checkDeadline(deadlineNanos: Long) {
+        if (Thread.currentThread().isInterrupted) {
+            throw DomTimeoutException("DOM 操作已中断")
+        }
+        if (deadlineNanos != Long.MAX_VALUE && System.nanoTime() > deadlineNanos) {
+            throw DomTimeoutException("DOM 操作执行超时")
+        }
+    }
 
     private fun enforcePreParseLimits(text: String) {
         val byteLen = text.toByteArray(Charsets.UTF_8).size
@@ -187,33 +231,63 @@ class PluginDomParser(
     }
 
     /**
-     * Parses [input] incrementally via Jsoup [StreamParser], counting elements
-     * as they are built and aborting IMMEDIATELY via `stop()` once the element
-     * cap is exceeded (preventing HTML5 active-formatting-element amplification
-     * from exhausting host heap before parsing finishes).
+     * Step 1: Parses [input] incrementally via Jsoup [StreamParser], aborting
+     * immediately if emitted element count crosses [remaining] (blocking OOM
+     * amplification bombs during parsing).
+     * Step 2: Performs an exact iterative DFS count over all `Element` nodes
+     * (excluding `#document` itself, matching `tools/plugin-kit/src/dom.js`)
+     * so adoption-agency clones that were not re-emitted still respect the cap.
      */
-    private fun parseWithStreamingNodeLimit(input: String, parser: Parser): Pair<Document, Int> {
+    private fun parseWithStreamingAndExactCount(input: String, parser: Parser): Pair<Document, Int> {
         val remaining = maxTotalNodes - totalNodes.get()
         if (remaining <= 0) {
             throw DomLimitExceededException("单次调用解析的 DOM 节点总数超过上限（最多 $maxTotalNodes 个）")
         }
-        StreamParser(parser).use { sp ->
+        val deadline = callDeadlineNanos
+        val doc = StreamParser(parser).use { sp ->
             sp.parse(input, "")
-            var count = 0
+            var streamed = 0
             val it = sp.iterator()
             while (it.hasNext()) {
                 it.next()
-                count += 1
-                if (count > remaining) {
+                streamed += 1
+                if ((streamed and 1023) == 0) checkDeadline(deadline)
+                // StreamParser may emit `#document` itself (+1 tolerance); exact recount runs below
+                if (streamed > remaining + 1) {
                     sp.stop()
                     throw DomLimitExceededException(
                         "单次调用解析的 DOM 节点总数超过上限（最多 $maxTotalNodes 个）",
                     )
                 }
             }
-            val doc = sp.document()
-            return doc to count.coerceAtLeast(1)
+            sp.document()
         }
+        val actualCount = countElementsStrict(doc, remaining, deadline)
+        return doc to actualCount
+    }
+
+    private fun countElementsStrict(doc: Document, remaining: Int, deadline: Long): Int {
+        var count = 0
+        val stack = ArrayDeque<Element>()
+        val top = doc.children()
+        for (i in top.size - 1 downTo 0) {
+            stack.addLast(top[i])
+        }
+        while (stack.isNotEmpty()) {
+            val cur = stack.removeLast()
+            count += 1
+            if ((count and 1023) == 0) checkDeadline(deadline)
+            if (count > remaining) {
+                throw DomLimitExceededException(
+                    "单次调用解析的 DOM 节点总数超过上限（最多 $maxTotalNodes 个）",
+                )
+            }
+            val ch = cur.children()
+            for (i in ch.size - 1 downTo 0) {
+                stack.addLast(ch[i])
+            }
+        }
+        return count
     }
 
     private fun register(el: Element, isXml: Boolean): Int {
@@ -226,12 +300,16 @@ class PluginDomParser(
         const val MAX_DOCS_PER_CALL = 8
         const val MAX_DOC_BYTES = 4 * 1024 * 1024
         const val MAX_TOTAL_NODES = 200_000
+        const val MAX_SELECTOR_STEPS = 2_000_000
         private const val MAX_NESTING_DEPTH = 512
 
         private val XML_BUILTIN_ENTITIES = setOf("amp", "lt", "gt", "quot", "apos")
-
         private val HTML_SKIP_TEXT_TAGS = setOf("script", "style")
-
+        private val HTML_RAW_TEXT_TAGS = setOf("script", "style", "xmp", "iframe", "noembed", "noframes", "plaintext")
+        private val HTML_VOID_TAGS = setOf(
+            "area", "base", "basefont", "bgsound", "br", "col", "embed", "frame",
+            "hr", "img", "input", "keygen", "link", "meta", "param", "source", "track", "wbr",
+        )
         private val HTML_BLOCK_TAGS = setOf(
             "address", "article", "aside", "blockquote", "body", "br", "caption", "center",
             "col", "colgroup", "dd", "details", "dialog", "dir", "div", "dl", "dt",
@@ -255,6 +333,111 @@ class PluginDomParser(
                 if (a.key.lowercase(Locale.ROOT) == lower) return a.value
             }
             return null
+        }
+
+        private fun serializeChildren(el: Element, isXml: Boolean, out: StringBuilder) {
+            val rawTextParent = !isXml && el !is Document && el.tagName().lowercase(Locale.ROOT) in HTML_RAW_TEXT_TAGS
+            for (child in el.childNodes()) {
+                if (rawTextParent && (child is TextNode || child is DataNode)) {
+                    out.append(if (child is DataNode) child.wholeData else (child as TextNode).wholeText)
+                } else {
+                    serializeNode(child, isXml, out)
+                }
+            }
+        }
+
+        private fun serializeNode(node: Node, isXml: Boolean, out: StringBuilder) {
+            when (node) {
+                is CDataNode -> {
+                    if (isXml) {
+                        out.append("<![CDATA[").append(node.text()).append("]]>")
+                    } else {
+                        appendHtmlText(node.text(), out)
+                    }
+                }
+                is TextNode -> {
+                    if (isXml) appendXmlText(node.wholeText, out)
+                    else appendHtmlText(node.wholeText, out)
+                }
+                is DataNode -> out.append(node.wholeData)
+                is Comment -> out.append("<!--").append(node.data).append("-->")
+                is Element -> {
+                    val tag = if (isXml) node.tagName() else node.tagName().lowercase(Locale.ROOT)
+                    out.append('<').append(tag)
+                    for (a in node.attributes()) {
+                        val key = if (isXml) a.key else a.key.lowercase(Locale.ROOT)
+                        val v = a.value
+                        if (!isXml && v.isEmpty()) {
+                            out.append(' ').append(key)
+                        } else {
+                            out.append(' ').append(key).append("=\"")
+                            if (isXml) appendXmlAttr(v, out) else appendHtmlAttr(v, out)
+                            out.append('"')
+                        }
+                    }
+                    if (isXml) {
+                        if (node.childNodeSize() == 0) {
+                            out.append("/>")
+                        } else {
+                            out.append('>')
+                            serializeChildren(node, true, out)
+                            out.append("</").append(tag).append('>')
+                        }
+                    } else {
+                        out.append('>')
+                        if (tag !in HTML_VOID_TAGS) {
+                            serializeChildren(node, false, out)
+                            out.append("</").append(tag).append('>')
+                        }
+                    }
+                }
+            }
+        }
+
+        private fun appendHtmlText(s: String, out: StringBuilder) {
+            for (c in s) {
+                when (c) {
+                    '&' -> out.append("&amp;")
+                    '\u00A0' -> out.append("&nbsp;")
+                    '<' -> out.append("&lt;")
+                    '>' -> out.append("&gt;")
+                    else -> out.append(c)
+                }
+            }
+        }
+
+        private fun appendHtmlAttr(s: String, out: StringBuilder) {
+            for (c in s) {
+                when (c) {
+                    '&' -> out.append("&amp;")
+                    '\u00A0' -> out.append("&nbsp;")
+                    '"' -> out.append("&quot;")
+                    else -> out.append(c)
+                }
+            }
+        }
+
+        private fun appendXmlText(s: String, out: StringBuilder) {
+            for (c in s) {
+                when (c) {
+                    '&' -> out.append("&amp;")
+                    '<' -> out.append("&lt;")
+                    '>' -> out.append("&gt;")
+                    else -> out.append(c)
+                }
+            }
+        }
+
+        private fun appendXmlAttr(s: String, out: StringBuilder) {
+            for (c in s) {
+                when (c) {
+                    '&' -> out.append("&amp;")
+                    '<' -> out.append("&lt;")
+                    '>' -> out.append("&gt;")
+                    '"' -> out.append("&quot;")
+                    else -> out.append(c)
+                }
+            }
         }
 
         private fun collectXmlText(node: Node, out: StringBuilder) {
@@ -291,15 +474,9 @@ class PluginDomParser(
             }
         }
 
-        /**
-         * Collapses ONLY ASCII whitespace (`[ \t\n\r\f]`) and NBSP (`\u00A0`)
-         * into a single ASCII space and trims leading/trailing ASCII/NBSP spaces,
-         * preserving Unicode whitespace such as U+2003 (EM SPACE) identically to
-         * `tools/plugin-kit/src/dom.js`.
-         */
         internal fun collapseAsciiAndNbspWhitespace(raw: String): String {
             val sb = StringBuilder(raw.length)
-            var inSpace = true // trim leading
+            var inSpace = true
             for (ch in raw) {
                 val isSpace = ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\u000C' || ch == '\u00A0'
                 if (isSpace) {
@@ -318,13 +495,6 @@ class PluginDomParser(
             return sb.toString()
         }
 
-        /**
-         * Preserves undefined named entities (such as HTML `&eacute;` or custom
-         * `&e;`) literally in XML mode by escaping `&name;` to `&amp;name;` outside
-         * CDATA, comments, processing instructions, and DOCTYPE declarations.
-         * Built-in XML entities (`amp`, `lt`, `gt`, `quot`, `apos`) and numeric
-         * references (`&#...;`, `&#x...;`) are untouched.
-         */
         internal fun escapeUndefinedXmlEntities(xml: String): String {
             if (!xml.contains('&')) return xml
             val len = xml.length
@@ -332,7 +502,6 @@ class PluginDomParser(
             var i = 0
             while (i < len) {
                 if (xml[i] == '<') {
-                    // Skip CDATA, comments, processing instructions, and DOCTYPE intact
                     if (xml.startsWith("<![CDATA[", i)) {
                         val end = xml.indexOf("]]>", i + 9)
                         val stop = if (end >= 0) end + 3 else len
@@ -406,25 +575,21 @@ class PluginDomParser(
 }
 
 /**
- * Deterministic, shared-subset CSS selector parser & evaluator used by
+ * Memoized O(N * S) shared-subset CSS selector parser & evaluator used by
  * [PluginDomParser] (mirrored identically in `tools/plugin-kit/src/dom.js`).
  *
- * Supported subset (documented in `docs/plugin-dev.md`):
- * - Selector lists (`A, B`) and combinators (`A B`, `A > B`, `A + B`, `A ~ B`)
- * - Type (`div`, `Representation`), universal (`*`), and namespace-prefixed
- *   type selectors (`dvb|x`, `*|x`, `|x`)
- * - `#id`, `.class`
- * - Attribute selectors (`[attr]`, `=`, `~=`, `|=`, `^=`, `$=`, `*=`, optional `i`/`s` flags)
- * - Standard CSS pseudo-classes: `:first-child`, `:last-child`, `:only-child`,
- *   `:nth-child(...)`, `:nth-last-child(...)`, `:first-of-type`, `:last-of-type`,
- *   `:only-of-type`, `:nth-of-type(...)`, `:nth-last-of-type(...)`,
- *   `:empty`, `:root`, `:not(...)`, `:is(...)`
- *
- * Explicitly rejects Jsoup-proprietary pseudo-classes (`:eq()`, `:lt()`, `:gt()`,
- * `:contains()`, `:matches()`, etc.) so plugins behave identically on Android
- * and `d3plugin`.
+ * Eliminates exponential backtracking on chained descendant (` `) and general
+ * sibling (`~`) combinators via per-`(Element, step)` DP tables, eliminates
+ * O(N^2) sibling scans via lazy O(1) parent sibling-index tables, enforces a
+ * strict step budget ([PluginDomParser.MAX_SELECTOR_STEPS]), and checks thread
+ * interruption / call deadline periodically.
  */
 internal object CssSelectorEngine {
+
+    private const val MAX_PSEUDO_NESTING = 8
+    private const val MEMO_UNCOMPUTED: Byte = 0
+    private const val MEMO_FALSE: Byte = 1
+    private const val MEMO_TRUE: Byte = 2
 
     internal enum class Combinator { DESCENDANT, CHILD, ADJACENT_SIBLING, GENERAL_SIBLING }
     internal enum class AttrOp { EXISTS, EQUALS, INCLUDES, DASH_MATCH, PREFIX, SUFFIX, SUBSTRING }
@@ -433,7 +598,7 @@ internal object CssSelectorEngine {
         val name: String,
         val op: AttrOp,
         val value: String?,
-        val caseFlag: Char?, // 'i', 's', or null
+        val caseFlag: Char?,
     )
 
     internal sealed interface PseudoMatcher {
@@ -451,36 +616,311 @@ internal object CssSelectorEngine {
     }
 
     internal data class CompoundSelector(
-        val nsPrefix: String?, // null = any/unprefixed, "*" = any ns, "" = no ns, "dvb" = prefix
-        val tagName: String?, // null = "*" (any)
+        val nsPrefix: String?,
+        val tagName: String?,
         val ids: List<String>,
         val classes: List<String>,
         val attrs: List<AttrMatcher>,
         val pseudos: List<PseudoMatcher>,
     )
 
-    internal data class ComplexSelector(
-        val head: CompoundSelector,
-        val steps: List<Pair<Combinator, CompoundSelector>>,
+    internal class ComplexSelector(
+        val compounds: Array<CompoundSelector>,
+        val combinators: Array<Combinator>,
     )
 
+    private class SiblingTable(
+        val totalChildren: Int,
+        val childIndex1Based: IdentityHashMap<Element, Int>,
+        val typeIndex1Based: IdentityHashMap<Element, Int>,
+        val typeTotal: IdentityHashMap<Element, Int>,
+        val prevSibling: IdentityHashMap<Element, Element?>,
+    )
+
+    private class SelectorMemo(val stepCount: Int) {
+        val matchStep = IdentityHashMap<Element, ByteArray>()
+        val anyAncestor = IdentityHashMap<Element, ByteArray>()
+        val anyPrevSibling = IdentityHashMap<Element, ByteArray>()
+
+        fun getRow(map: IdentityHashMap<Element, ByteArray>, el: Element): ByteArray =
+            map.getOrPut(el) { ByteArray(stepCount) }
+    }
+
+    private class QueryContext(
+        val isXml: Boolean,
+        val maxSteps: Int,
+        val deadlineNanos: Long,
+    ) {
+        private var steps: Int = 0
+        private val memos = IdentityHashMap<ComplexSelector, SelectorMemo>()
+        private val siblingTables = IdentityHashMap<Element, SiblingTable>()
+
+        fun tick() {
+            val s = ++steps
+            if (s > maxSteps) {
+                throw DomLimitExceededException("CSS 选择器匹配步数超过上限（最多 $maxSteps 步）")
+            }
+            if ((s and 1023) == 0) {
+                if (Thread.currentThread().isInterrupted) {
+                    throw DomTimeoutException("CSS 选择器执行已中断")
+                }
+                if (deadlineNanos != Long.MAX_VALUE && System.nanoTime() > deadlineNanos) {
+                    throw DomTimeoutException("CSS 选择器执行超时")
+                }
+            }
+        }
+
+        fun memoFor(sel: ComplexSelector): SelectorMemo =
+            memos.getOrPut(sel) { SelectorMemo(sel.compounds.size) }
+
+        fun siblingTableFor(parent: Element): SiblingTable {
+            siblingTables[parent]?.let { return it }
+            val children = parent.children()
+            val n = children.size
+            val childIdx = IdentityHashMap<Element, Int>(n)
+            val typeIdx = IdentityHashMap<Element, Int>(n)
+            val typeCounts = HashMap<String, Int>()
+            val tags = ArrayList<String>(n)
+            val prevSib = IdentityHashMap<Element, Element?>(n)
+            var prev: Element? = null
+            for (i in 0 until n) {
+                val c = children[i]
+                tick()
+                childIdx[c] = i + 1
+                prevSib[c] = prev
+                prev = c
+                val tag = if (isXml) c.tagName() else c.tagName().lowercase(Locale.ROOT)
+                val nextTypeCount = (typeCounts[tag] ?: 0) + 1
+                typeCounts[tag] = nextTypeCount
+                typeIdx[c] = nextTypeCount
+                tags.add(tag)
+            }
+            val typeTot = IdentityHashMap<Element, Int>(n)
+            for (i in 0 until n) {
+                typeTot[children[i]] = typeCounts[tags[i]]!!
+            }
+            val table = SiblingTable(n, childIdx, typeIdx, typeTot, prevSib)
+            siblingTables[parent] = table
+            return table
+        }
+
+        fun prevElementSiblingFast(el: Element): Element? {
+            val p = el.parent() ?: return null
+            return siblingTableFor(p).prevSibling[el]
+        }
+
+        fun matchesAny(el: Element, selectors: List<ComplexSelector>): Boolean {
+            for (sel in selectors) {
+                if (evalMatchStep(el, sel, sel.compounds.size - 1)) return true
+            }
+            return false
+        }
+
+        private fun evalMatchStep(el: Element, sel: ComplexSelector, idx: Int): Boolean {
+            val memo = memoFor(sel)
+            val row = memo.getRow(memo.matchStep, el)
+            val cached = row[idx]
+            if (cached != MEMO_UNCOMPUTED) return cached == MEMO_TRUE
+
+            tick()
+            val result = if (!matchesCompound(el, sel.compounds[idx])) {
+                false
+            } else if (idx == 0) {
+                true
+            } else {
+                when (sel.combinators[idx - 1]) {
+                    Combinator.CHILD -> {
+                        val p = el.parent()
+                        p != null && p !is Document && evalMatchStep(p, sel, idx - 1)
+                    }
+                    Combinator.DESCENDANT -> evalAnyAncestorMatches(el, sel, idx - 1)
+                    Combinator.ADJACENT_SIBLING -> {
+                        val prev = prevElementSiblingFast(el)
+                        prev != null && evalMatchStep(prev, sel, idx - 1)
+                    }
+                    Combinator.GENERAL_SIBLING -> evalAnyPrevSiblingMatches(el, sel, idx - 1)
+                }
+            }
+            row[idx] = if (result) MEMO_TRUE else MEMO_FALSE
+            return result
+        }
+
+        /**
+         * Iterative O(1)-amortized DP for descendant combinator:
+         * `anyAnc(el, idx) = matchStep(parent, idx) || anyAnc(parent, idx)`.
+         */
+        private fun evalAnyAncestorMatches(el: Element, sel: ComplexSelector, idx: Int): Boolean {
+            val memo = memoFor(sel)
+            val chain = ArrayList<Element>()
+            var cur: Element = el
+            var baseResult = false
+            while (true) {
+                val ancRow = memo.getRow(memo.anyAncestor, cur)
+                val cached = ancRow[idx]
+                if (cached != MEMO_UNCOMPUTED) {
+                    baseResult = cached == MEMO_TRUE
+                    break
+                }
+                tick()
+                val p = cur.parent()
+                if (p == null || p is Document) {
+                    ancRow[idx] = MEMO_FALSE
+                    baseResult = false
+                    break
+                }
+                if (evalMatchStep(p, sel, idx)) {
+                    ancRow[idx] = MEMO_TRUE
+                    baseResult = true
+                    break
+                }
+                chain.add(cur)
+                cur = p
+            }
+            val fill = if (baseResult) MEMO_TRUE else MEMO_FALSE
+            for (i in chain.size - 1 downTo 0) {
+                memo.getRow(memo.anyAncestor, chain[i])[idx] = fill
+            }
+            return baseResult
+        }
+
+        /**
+         * Iterative O(1)-amortized DP for general sibling combinator (`~`):
+         * `anyPrev(el, idx) = matchStep(prevSib, idx) || anyPrev(prevSib, idx)`.
+         */
+        private fun evalAnyPrevSiblingMatches(el: Element, sel: ComplexSelector, idx: Int): Boolean {
+            val memo = memoFor(sel)
+            val chain = ArrayList<Element>()
+            var cur: Element = el
+            var baseResult = false
+            while (true) {
+                val sibRow = memo.getRow(memo.anyPrevSibling, cur)
+                val cached = sibRow[idx]
+                if (cached != MEMO_UNCOMPUTED) {
+                    baseResult = cached == MEMO_TRUE
+                    break
+                }
+                tick()
+                val prev = prevElementSiblingFast(cur)
+                if (prev == null) {
+                    sibRow[idx] = MEMO_FALSE
+                    baseResult = false
+                    break
+                }
+                if (evalMatchStep(prev, sel, idx)) {
+                    sibRow[idx] = MEMO_TRUE
+                    baseResult = true
+                    break
+                }
+                chain.add(cur)
+                cur = prev
+            }
+            val fill = if (baseResult) MEMO_TRUE else MEMO_FALSE
+            for (i in chain.size - 1 downTo 0) {
+                memo.getRow(memo.anyPrevSibling, chain[i])[idx] = fill
+            }
+            return baseResult
+        }
+
+        private fun matchesCompound(el: Element, comp: CompoundSelector): Boolean {
+            if (el is Document) return false
+            if (comp.nsPrefix != null || comp.tagName != null) {
+                if (!matchesTag(el.tagName(), comp.nsPrefix, comp.tagName, isXml)) return false
+            }
+            for (id in comp.ids) {
+                val actual = PluginDomParser.getElementAttr(el, "id", isXml) ?: return false
+                if (actual != id) return false
+            }
+            if (comp.classes.isNotEmpty()) {
+                val clsAttr = PluginDomParser.getElementAttr(el, "class", isXml) ?: return false
+                val tokens = clsAttr.trim().split(ASCII_WS_REGEX).filter { it.isNotEmpty() }
+                for (c in comp.classes) {
+                    if (c !in tokens) return false
+                }
+            }
+            for (am in comp.attrs) {
+                if (!matchesAttr(el, am, isXml)) return false
+            }
+            for (pm in comp.pseudos) {
+                if (!matchesPseudo(el, pm)) return false
+            }
+            return true
+        }
+
+        private fun matchesPseudo(el: Element, pm: PseudoMatcher): Boolean = when (pm) {
+            PseudoMatcher.FirstChild -> {
+                val p = el.parent() ?: return false
+                siblingTableFor(p).childIndex1Based[el] == 1
+            }
+            PseudoMatcher.LastChild -> {
+                val p = el.parent() ?: return false
+                val t = siblingTableFor(p)
+                t.childIndex1Based[el] == t.totalChildren
+            }
+            PseudoMatcher.OnlyChild -> {
+                val p = el.parent() ?: return false
+                siblingTableFor(p).totalChildren == 1
+            }
+            PseudoMatcher.FirstOfType -> {
+                val p = el.parent() ?: return false
+                siblingTableFor(p).typeIndex1Based[el] == 1
+            }
+            PseudoMatcher.LastOfType -> {
+                val p = el.parent() ?: return false
+                val t = siblingTableFor(p)
+                t.typeIndex1Based[el] == t.typeTotal[el]
+            }
+            PseudoMatcher.OnlyOfType -> {
+                val p = el.parent() ?: return false
+                siblingTableFor(p).typeTotal[el] == 1
+            }
+            PseudoMatcher.Empty -> el.childNodes().none { n ->
+                n is Element || (n is TextNode && n.wholeText.isNotEmpty()) || (n is CDataNode && n.text().isNotEmpty())
+            }
+            PseudoMatcher.Root -> el.parent() is Document
+            is PseudoMatcher.NthChild -> {
+                val p = el.parent() ?: return false
+                val t = siblingTableFor(p)
+                val idx = if (pm.ofType) {
+                    val pos = t.typeIndex1Based[el] ?: return false
+                    val tot = t.typeTotal[el] ?: return false
+                    if (pm.fromEnd) (tot - pos + 1) else pos
+                } else {
+                    val pos = t.childIndex1Based[el] ?: return false
+                    if (pm.fromEnd) (t.totalChildren - pos + 1) else pos
+                }
+                matchesAnPlusB(idx, pm.a, pm.b)
+            }
+            is PseudoMatcher.Not -> !matchesAny(el, pm.inner)
+            is PseudoMatcher.Is -> matchesAny(el, pm.inner)
+        }
+    }
+
+    private val ASCII_WS_REGEX = Regex("[ \\t\\n\\r\\f]+")
+
     fun parse(rawSelector: String): List<ComplexSelector> {
-        val p = SelectorParser(rawSelector)
+        val p = SelectorParser(rawSelector, nestingDepth = 0)
         val list = p.parseSelectorList(eofExpected = true)
         if (list.isEmpty()) throw IllegalArgumentException("无效的 CSS 选择器：$rawSelector")
         return list
     }
 
-    fun queryFirst(scopeRoot: Element, selectors: List<ComplexSelector>, isXml: Boolean): Element? {
-        val docRoot = findDocumentRoot(scopeRoot)
+    fun queryFirst(
+        scopeRoot: Element,
+        selectors: List<ComplexSelector>,
+        isXml: Boolean,
+        maxSteps: Int = PluginDomParser.MAX_SELECTOR_STEPS,
+        deadlineNanos: Long = Long.MAX_VALUE,
+    ): Element? {
+        val ctx = QueryContext(isXml, maxSteps, deadlineNanos)
         val stack = ArrayDeque<Element>()
         val topChildren = scopeRoot.children()
         for (i in topChildren.size - 1 downTo 0) {
             stack.addLast(topChildren[i])
         }
         while (stack.isNotEmpty()) {
+            ctx.tick()
             val el = stack.removeLast()
-            if (matchesAny(el, docRoot, selectors, isXml)) return el
+            if (ctx.matchesAny(el, selectors)) return el
             val ch = el.children()
             for (i in ch.size - 1 downTo 0) {
                 stack.addLast(ch[i])
@@ -489,8 +929,14 @@ internal object CssSelectorEngine {
         return null
     }
 
-    fun queryAll(scopeRoot: Element, selectors: List<ComplexSelector>, isXml: Boolean): List<Element> {
-        val docRoot = findDocumentRoot(scopeRoot)
+    fun queryAll(
+        scopeRoot: Element,
+        selectors: List<ComplexSelector>,
+        isXml: Boolean,
+        maxSteps: Int = PluginDomParser.MAX_SELECTOR_STEPS,
+        deadlineNanos: Long = Long.MAX_VALUE,
+    ): List<Element> {
+        val ctx = QueryContext(isXml, maxSteps, deadlineNanos)
         val out = ArrayList<Element>()
         val stack = ArrayDeque<Element>()
         val topChildren = scopeRoot.children()
@@ -498,8 +944,9 @@ internal object CssSelectorEngine {
             stack.addLast(topChildren[i])
         }
         while (stack.isNotEmpty()) {
+            ctx.tick()
             val el = stack.removeLast()
-            if (matchesAny(el, docRoot, selectors, isXml)) {
+            if (ctx.matchesAny(el, selectors)) {
                 out.add(el)
             }
             val ch = el.children()
@@ -508,107 +955,6 @@ internal object CssSelectorEngine {
             }
         }
         return out
-    }
-
-    private fun findDocumentRoot(el: Element): Element {
-        var cur: Element = el
-        while (cur.parent() != null) {
-            cur = cur.parent()!!
-        }
-        return cur
-    }
-
-    private fun matchesAny(
-        el: Element,
-        docRoot: Element,
-        selectors: List<ComplexSelector>,
-        isXml: Boolean,
-    ): Boolean = selectors.any { matchesComplex(el, docRoot, it, isXml) }
-
-    private fun matchesComplex(
-        el: Element,
-        docRoot: Element,
-        sel: ComplexSelector,
-        isXml: Boolean,
-    ): Boolean {
-        // Match right-to-left: last compound matches el, then follow combinators
-        val compounds = ArrayList<CompoundSelector>(sel.steps.size + 1)
-        val combinators = ArrayList<Combinator>(sel.steps.size)
-        compounds.add(sel.head)
-        for ((comb, comp) in sel.steps) {
-            combinators.add(comb)
-            compounds.add(comp)
-        }
-        return matchesStep(el, docRoot, compounds, combinators, compounds.size - 1, isXml)
-    }
-
-    private fun matchesStep(
-        el: Element,
-        docRoot: Element,
-        compounds: List<CompoundSelector>,
-        combinators: List<Combinator>,
-        idx: Int,
-        isXml: Boolean,
-    ): Boolean {
-        if (!matchesCompound(el, docRoot, compounds[idx], isXml)) return false
-        if (idx == 0) return true
-        val comb = combinators[idx - 1]
-        return when (comb) {
-            Combinator.CHILD -> {
-                val p = el.parent()
-                p != null && p !is Document && matchesStep(p, docRoot, compounds, combinators, idx - 1, isXml)
-            }
-            Combinator.DESCENDANT -> {
-                var p = el.parent()
-                while (p != null && p !is Document) {
-                    if (matchesStep(p, docRoot, compounds, combinators, idx - 1, isXml)) return true
-                    p = p.parent()
-                }
-                false
-            }
-            Combinator.ADJACENT_SIBLING -> {
-                val prev = el.previousElementSibling()
-                prev != null && matchesStep(prev, docRoot, compounds, combinators, idx - 1, isXml)
-            }
-            Combinator.GENERAL_SIBLING -> {
-                var prev = el.previousElementSibling()
-                while (prev != null) {
-                    if (matchesStep(prev, docRoot, compounds, combinators, idx - 1, isXml)) return true
-                    prev = prev.previousElementSibling()
-                }
-                false
-            }
-        }
-    }
-
-    private fun matchesCompound(
-        el: Element,
-        docRoot: Element,
-        comp: CompoundSelector,
-        isXml: Boolean,
-    ): Boolean {
-        if (el is Document) return false
-        if (comp.nsPrefix != null || comp.tagName != null) {
-            if (!matchesTag(el.tagName(), comp.nsPrefix, comp.tagName, isXml)) return false
-        }
-        for (id in comp.ids) {
-            val actual = PluginDomParser.getElementAttr(el, "id", isXml) ?: return false
-            if (actual != id) return false
-        }
-        if (comp.classes.isNotEmpty()) {
-            val clsAttr = PluginDomParser.getElementAttr(el, "class", isXml) ?: return false
-            val tokens = clsAttr.trim().split(Regex("[ \\t\\n\\r\\f]+")).filter { it.isNotEmpty() }
-            for (c in comp.classes) {
-                if (c !in tokens) return false
-            }
-        }
-        for (am in comp.attrs) {
-            if (!matchesAttr(el, am, isXml)) return false
-        }
-        for (pm in comp.pseudos) {
-            if (!matchesPseudo(el, docRoot, pm, isXml)) return false
-        }
-        return true
     }
 
     private fun matchesTag(actualRaw: String, nsPrefix: String?, wantedTag: String?, isXml: Boolean): Boolean {
@@ -643,61 +989,12 @@ internal object CssSelectorEngine {
             AttrOp.EXISTS -> true
             AttrOp.EQUALS -> a == e
             AttrOp.INCLUDES -> e.isNotEmpty() && !e.any { it.isWhitespace() } &&
-                a.trim().split(Regex("[ \\t\\n\\r\\f]+")).any { it == e }
+                a.trim().split(ASCII_WS_REGEX).any { it == e }
             AttrOp.DASH_MATCH -> a == e || a.startsWith("$e-")
             AttrOp.PREFIX -> e.isNotEmpty() && a.startsWith(e)
             AttrOp.SUFFIX -> e.isNotEmpty() && a.endsWith(e)
             AttrOp.SUBSTRING -> e.isNotEmpty() && a.contains(e)
         }
-    }
-
-    private fun matchesPseudo(
-        el: Element,
-        docRoot: Element,
-        pm: PseudoMatcher,
-        isXml: Boolean,
-    ): Boolean = when (pm) {
-        PseudoMatcher.FirstChild -> childIndex(el, fromEnd = false, ofType = false, isXml = isXml) == 1
-        PseudoMatcher.LastChild -> childIndex(el, fromEnd = true, ofType = false, isXml = isXml) == 1
-        PseudoMatcher.OnlyChild -> {
-            val sibs = parentElementChildren(el)
-            sibs != null && sibs.size == 1
-        }
-        PseudoMatcher.FirstOfType -> childIndex(el, fromEnd = false, ofType = true, isXml = isXml) == 1
-        PseudoMatcher.LastOfType -> childIndex(el, fromEnd = true, ofType = true, isXml = isXml) == 1
-        PseudoMatcher.OnlyOfType -> {
-            val sibs = sameTypeSiblings(el, isXml)
-            sibs != null && sibs.size == 1
-        }
-        PseudoMatcher.Empty -> el.childNodes().none { n ->
-            n is Element || (n is TextNode && n.wholeText.isNotEmpty()) || (n is CDataNode && n.text().isNotEmpty())
-        }
-        PseudoMatcher.Root -> el.parent() is Document
-        is PseudoMatcher.NthChild -> {
-            val idx = childIndex(el, pm.fromEnd, pm.ofType, isXml)
-            idx > 0 && matchesAnPlusB(idx, pm.a, pm.b)
-        }
-        is PseudoMatcher.Not -> !matchesAny(el, docRoot, pm.inner, isXml)
-        is PseudoMatcher.Is -> matchesAny(el, docRoot, pm.inner, isXml)
-    }
-
-    private fun parentElementChildren(el: Element): List<Element>? = el.parent()?.children()
-
-    private fun sameTypeSiblings(el: Element, isXml: Boolean): List<Element>? {
-        val sibs = parentElementChildren(el) ?: return null
-        val myTag = if (isXml) el.tagName() else el.tagName().lowercase(Locale.ROOT)
-        return sibs.filter { s ->
-            val t = if (isXml) s.tagName() else s.tagName().lowercase(Locale.ROOT)
-            t == myTag
-        }
-    }
-
-    private fun childIndex(el: Element, fromEnd: Boolean, ofType: Boolean, isXml: Boolean): Int {
-        val list = if (ofType) sameTypeSiblings(el, isXml) else parentElementChildren(el)
-        if (list == null) return -1
-        val pos = list.indexOfFirst { it === el }
-        if (pos < 0) return -1
-        return if (fromEnd) list.size - pos else pos + 1
     }
 
     private fun matchesAnPlusB(index1Based: Int, a: Int, b: Int): Boolean {
@@ -707,7 +1004,10 @@ internal object CssSelectorEngine {
         return (diff / a) >= 0
     }
 
-    private class SelectorParser(private val src: String) {
+    private class SelectorParser(
+        private val src: String,
+        private val nestingDepth: Int,
+    ) {
         private var pos = 0
 
         fun parseSelectorList(eofExpected: Boolean): List<ComplexSelector> {
@@ -732,8 +1032,9 @@ internal object CssSelectorEngine {
 
         private fun parseComplexSelector(): ComplexSelector {
             skipWs()
-            val head = parseCompoundSelector()
-            val steps = ArrayList<Pair<Combinator, CompoundSelector>>()
+            val compounds = ArrayList<CompoundSelector>()
+            val combinators = ArrayList<Combinator>()
+            compounds.add(parseCompoundSelector())
             while (true) {
                 val hadWs = skipWs()
                 if (eof() || peek() == ',' || peek() == ')') break
@@ -743,9 +1044,10 @@ internal object CssSelectorEngine {
                     '~' -> { pos += 1; skipWs(); Combinator.GENERAL_SIBLING }
                     else -> if (hadWs) Combinator.DESCENDANT else break
                 }
-                steps.add(comb to parseCompoundSelector())
+                combinators.add(comb)
+                compounds.add(parseCompoundSelector())
             }
-            return ComplexSelector(head, steps)
+            return ComplexSelector(compounds.toTypedArray(), combinators.toTypedArray())
         }
 
         private fun parseCompoundSelector(): CompoundSelector {
@@ -757,11 +1059,9 @@ internal object CssSelectorEngine {
             val pseudos = ArrayList<PseudoMatcher>()
             var matchedAny = false
 
-            // Optional type / universal / namespace-prefixed type selector
             if (!eof()) {
                 val c = peek()
                 if (c == '|') {
-                    // |local or |*
                     pos += 1
                     nsPrefix = ""
                     tagName = if (peek() == '*') { pos += 1; null } else readIdent()
@@ -789,7 +1089,6 @@ internal object CssSelectorEngine {
                 }
             }
 
-            // Simple selector sequence (#id, .cls, [attr...], :pseudo)
             while (!eof()) {
                 when (peek()) {
                     '#' -> {
@@ -821,7 +1120,7 @@ internal object CssSelectorEngine {
         }
 
         private fun parseAttrSelector(): AttrMatcher {
-            pos += 1 // '['
+            pos += 1
             skipWs()
             val name = readIdent()
             skipWs()
@@ -855,7 +1154,7 @@ internal object CssSelectorEngine {
         }
 
         private fun parsePseudoSelector(): PseudoMatcher {
-            pos += 1 // ':'
+            pos += 1
             if (peek() == ':') {
                 pos += 1
                 val pe = readIdent()
@@ -877,21 +1176,20 @@ internal object CssSelectorEngine {
                     else -> throw IllegalArgumentException("不支持的 CSS 选择器伪类：:$rawName")
                 }
             }
-            pos += 1 // '('
+            pos += 1
             return when (name) {
-                "not" -> {
-                    val inner = parseSelectorList(eofExpected = false)
+                "not", "is" -> {
+                    if (nestingDepth >= MAX_PSEUDO_NESTING) {
+                        throw IllegalArgumentException("CSS 伪类嵌套层数超过上限（最多 $MAX_PSEUDO_NESTING 层）")
+                    }
+                    val sub = SelectorParser(src, nestingDepth + 1)
+                    sub.pos = pos
+                    val inner = sub.parseSelectorList(eofExpected = false)
+                    pos = sub.pos
                     skipWs()
-                    if (peek() != ')') throw IllegalArgumentException(":not() 缺少右括号：'$src'")
+                    if (peek() != ')') throw IllegalArgumentException(":$name() 缺少右括号：'$src'")
                     pos += 1
-                    PseudoMatcher.Not(inner)
-                }
-                "is" -> {
-                    val inner = parseSelectorList(eofExpected = false)
-                    skipWs()
-                    if (peek() != ')') throw IllegalArgumentException(":is() 缺少右括号：'$src'")
-                    pos += 1
-                    PseudoMatcher.Is(inner)
+                    if (name == "not") PseudoMatcher.Not(inner) else PseudoMatcher.Is(inner)
                 }
                 "nth-child", "nth-last-child", "nth-of-type", "nth-last-of-type" -> {
                     val arg = readBalancedParenArg()

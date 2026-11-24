@@ -8,7 +8,10 @@
 
 ## 1. 唯一的对外接入入口
 
-> **关于可见性边界的如实说明**：当前 Android 工程为单一 `:app` Gradle 模块，Kotlin 的 `internal` 修饰符在单模块内对整个 `:app` 可见，并不是跨模块的编译期强隔离。因此，下面把底层工厂收口为 `internal` 属于**接口约定**，同时配合自动化架构守卫单测 [`PluginBoundaryGuardTest.kt`](../../player/app/src/test/java/com/limelight/local/plugin/PluginBoundaryGuardTest.kt) 扫描 `local/plugin/` 包之外对 `PlaybackInfo.url`/`headers`、插件内部类及裸 HTTP/解码客户端的越权调用（一旦发现直接让单测失败）。若后续将插件运行时拆为独立 Gradle 子模块（如 `:plugin-runtime`），这些 `internal` 声明即可自然升级为编译期强制隔离。
+> **关于可见性边界与运行时守卫的如实说明**：当前 Android 工程为单一 `:app` Gradle 模块，Kotlin 的 `internal` 修饰符在单模块内对整个 `:app` 可见，并不是跨模块的编译期强隔离。为此我们采用**三层防护**：
+> 1. **运行时来源标记与强制拒绝（核心防线）**：`PluginProtocolMapper` 会给插件产出的每一条 `Artwork` 与 `PlaybackInfo` 自动打上 `sourceKind = SourceKind.PLUGIN`。`Artworks.load` 与 `Artworks.frame`（`local/media/Artworks.kt`）已在入口直接拒绝 `sourceKind == SourceKind.PLUGIN`（即使上层 UI 未改 `Components.kt`，也无法静默绕过 `NetworkPolicy`）；同时在 `com.limelight.local.plugin` 提供公开守卫 **`PluginHostGuards`**，供界面/播放器/投屏任务在各入口处做运行时兜底拦截。
+> 2. **入口收敛约定**：底层工厂收口为 `internal`，外部只调用 `PluginPlayback`、`PluginImages.loadBitmap`、`PluginPackageManager` 与 `PluginHostGuards`。
+> 3. **自动化架构守卫单测**：[`PluginBoundaryGuardTest.kt`](../../player/app/src/test/java/com/limelight/local/plugin/PluginBoundaryGuardTest.kt) 扫描 `local/plugin/` 之外的源文件并实测 `Artworks.load` 及 `PluginHostGuards` 全部 4 个入口对 `SourceKind.PLUGIN` `Item` 的拒绝行为。若后续将插件运行时拆为独立 Gradle 子模块（如 `:plugin-runtime`），这些 `internal` 声明即可自然升级为编译期强制隔离。
 
 外部界面与播放器只允许调用下面 4 个公开入口：
 
@@ -83,12 +86,12 @@ val bitmap: Bitmap? = PluginImages.loadBitmap(
 
 界面与播放器任务按下面对照表分流，**绝对不能**把 `SourceKind.PLUGIN` 走入现有本机/WebDAV 路径：
 
-| 现有路径 / 禁区 | 位置 | 为什么对插件源禁止 | 插件源唯一正确入口 |
+| 现有路径 / 禁区 | 位置 | 为什么对插件源禁止 | 插件源唯一正确入口与守卫 |
 | --- | --- | --- | --- |
-| `Artworks.load(...)` | `local/media/Artworks.kt:45-100`（调用点 `local/wall/Components.kt:298` `rememberArt`） | 内部 `fetch()` 使用裸 `OkHttpClient`，不校验 `NetworkPolicy`、不锁 DNS、不拦截降级重定向、不剥离跨源头，且直接 `decodeStream` 无 `inJustDecodeBounds` 像素上限 | `PluginImages.loadBitmap(pluginMediaSource, artwork, maxEdgePx = size.px)` |
-| `isVideoFrame` / `MediaMetadataRetriever.setDataSource(url, headers)` | `local/media/Artworks.kt:68-92` 与 `local/LocalPlayerXR.java:450-475`（含 `MediaExtractor.setDataSource`） | 由系统媒体服务直连网络，完全绕过 `NetworkPolicy`、代理禁用与跨源去头 | 封面图走 `PluginImages.loadBitmap`（无图则显示占位图，禁止用 `MediaMetadataRetriever` 抓帧）；播放分辨率与帧率从 ExoPlayer `Player.Listener.onVideoSizeChanged` / `Format.frameRate` 读取 |
-| `WallActivity.launchPlayer` + `DefaultHttpDataSource` | `local/wall/WallActivity.kt:113-124` 与 `local/LocalPlayerXR.java:145` | 直接把 `PlaybackInfo.url` 塞进 `Intent` 并拼 `DefaultHttpDataSource`，绕过网络策略、DNS 锁定、跨源去头、MPD/HLS 子请求校验、备用源切换与 JSON 字幕转换 | 将 `(sourceId, itemId)` 交给播放器，通过 `PluginPlayback.createSessionController(pluginMediaSource)` 或 `PluginPlayback.createMediaSource(...)` 构建 `MediaSource` |
-| DLNA 投屏或任何包外组件（外部 `Intent`、`DownloadManager`、第三方播放器等） | `local/` 投屏及外部拉起路径 | 包外组件与局域网渲染器不受 `NetworkPolicy` 约束，且可能将内网资源或鉴权令牌泄露给外部设备 | 插件源**禁止**投屏或外发 URL；对 `SourceKind.PLUGIN` 隐藏/禁用 DLNA 投屏入口，仅在应用内用 `PluginPlayback` 播放 |
+| `Artworks.load(...)` | `local/media/Artworks.kt:45-100`（调用点 `local/wall/Components.kt:298` `rememberArt`） | 内部 `fetch()` 使用裸 `OkHttpClient`，不校验 `NetworkPolicy`、不锁 DNS、不拦截降级重定向、不剥离跨源头，且直接 `decodeStream` 无 `inJustDecodeBounds` 像素上限 | `Artworks.load` 已内置拒绝 `art.sourceKind == SourceKind.PLUGIN`；界面任务在 `Components.kt:298`（`rememberArt`/`ArtBox`）遇到插件来源必须改调 `PluginImages.loadBitmap(pluginMediaSource, artwork, maxEdgePx = size.px)`，非插件分支调用 `PluginHostGuards.requireNonPluginArtwork(art)` 兜底 |
+| `isVideoFrame` / `MediaMetadataRetriever.setDataSource(url, headers)` | `local/media/Artworks.kt:68-92` 与 `local/LocalPlayerXR.java:450-475`（含 `MediaExtractor.setDataSource`） | 由系统媒体服务直连网络，完全绕过 `NetworkPolicy`、代理禁用与跨源去头 | `Artworks.frame` 已内置拒绝 `SourceKind.PLUGIN`；`LocalPlayerXR.java:450-475` 入口必须先调 `PluginHostGuards.requireNonPluginFrameProbe(sourceKind)`（插件源直接跳过 `MediaMetadataRetriever`/`MediaExtractor`，改用 `PluginImages.loadBitmap` 或占位图，并从 ExoPlayer `Player.Listener.onVideoSizeChanged` / `Format.frameRate` 获取视频尺寸与帧率） |
+| `WallActivity.launchPlayer` + `DefaultHttpDataSource` | `local/wall/WallActivity.kt:113-124` 与 `local/LocalPlayerXR.java:145` | 直接把 `PlaybackInfo.url` 塞进 `Intent` 并拼 `DefaultHttpDataSource`，绕过网络策略、DNS 锁定、跨源去头、MPD/HLS 子请求校验、备用源切换与 JSON 字幕转换 | `WallActivity.launchPlayer` 入口必须先判断 `PluginHostGuards.isPluginPlayback(info)` / `PluginHostGuards.requireNonPluginPlayback(info, sourceKind)`：插件源仅传递 `(sourceId, itemId)` 到播放器，并在播放器内通过 `PluginPlayback.createSessionController(pluginMediaSource)` 或 `PluginPlayback.createMediaSource(...)` 构建 `MediaSource` |
+| DLNA 投屏与包外组件 | `local/dlna/`（`CastReceiver`、`MediaRenderer.kt`、`Didl.kt`、`Ssdp.kt`，当前为头显侧 DLNA 接收端）与 `local/wall/CastScreen.kt`（投屏页），以及外部 `Intent`、`DownloadManager`、第三方播放器 | 包外组件与局域网渲染器不受 `NetworkPolicy` 约束，且可能将内网资源或鉴权令牌泄露给外部设备 | 任何外发投屏或包外拉起入口必须调用 `PluginHostGuards.requireNonPluginCast(sourceKind, info, item)` 拒绝插件源；对 `SourceKind.PLUGIN` 隐藏/禁用投屏与外部打开入口，仅通过 `PluginPlayback` 在应用内播放 |
 
 同时必须遵守以下 3 条红线：
 1. **禁止对 `PluginSourceMismatchException` 自动传 `confirmReplaceFromDifferentSource = true`**，尤其是本地文件安装同 ID 插件时（本地文件安装同 ID 一律按替换处理，必须由用户显式确认）。
