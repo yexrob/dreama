@@ -2,8 +2,6 @@ package com.limelight.local.plugin
 
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
 import org.jsoup.nodes.CDataNode
 import org.jsoup.nodes.Comment
 import org.jsoup.nodes.DataNode
@@ -11,18 +9,103 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.DocumentType
 import org.jsoup.nodes.Element
 import org.jsoup.nodes.Node
+import org.jsoup.nodes.ProcessingInstruction
 import org.jsoup.nodes.TextNode
 import org.jsoup.nodes.XmlDeclaration
 import org.jsoup.parser.ParseSettings
 import org.jsoup.parser.Parser
 import org.jsoup.parser.StreamParser
+import org.jsoup.parser.Tag
 import java.io.Reader
+import java.lang.ref.WeakReference
 import java.util.IdentityHashMap
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 class DomLimitExceededException(message: String) : IllegalStateException(message)
 class DomTimeoutException(message: String) : IllegalStateException(message)
+
+/**
+ * Process-wide DOM memory ledger bounding total live DOM bytes across ALL active
+ * plugin VMs in the host process (default [PluginDomParser.MAX_PROCESS_MEMORY_BYTES] = 64 MB).
+ *
+ * Each [PluginDomParser] releases its bytes synchronously on [PluginDomParser.closeDoc] /
+ * [PluginDomParser.clear] (including call end and VM teardown). Weak-reference reaping
+ * additionally prevents forgotten unreachable parser instances from pinning process quota.
+ */
+internal class ProcessDomMemoryLedger {
+    internal class ReservationHolder(parser: PluginDomParser) {
+        val ref = WeakReference(parser)
+        val reservedBytes = AtomicLong(0L)
+    }
+
+    private val totalReservedBytes = AtomicLong(0L)
+    private val holders = ConcurrentHashMap.newKeySet<ReservationHolder>()
+
+    fun register(parser: PluginDomParser): ReservationHolder {
+        val h = ReservationHolder(parser)
+        holders.add(h)
+        return h
+    }
+
+    fun currentTotalBytes(): Long {
+        reapDeadHolders()
+        return totalReservedBytes.get()
+    }
+
+    fun remainingBytes(limitBytes: Long): Long = (limitBytes - totalReservedBytes.get()).coerceAtLeast(0L)
+
+    fun tryReserve(holder: ReservationHolder, delta: Long, limitBytes: Long): Boolean {
+        if (delta <= 0L) return true
+        if (casAddWithinLimit(delta, limitBytes)) {
+            holder.reservedBytes.addAndGet(delta)
+            return true
+        }
+        reapDeadHolders()
+        if (casAddWithinLimit(delta, limitBytes)) {
+            holder.reservedBytes.addAndGet(delta)
+            return true
+        }
+        return false
+    }
+
+    fun release(holder: ReservationHolder, delta: Long) {
+        if (delta <= 0L) return
+        val prevHolder = holder.reservedBytes.getAndUpdate { cur -> (cur - delta).coerceAtLeast(0L) }
+        val actualRelease = minOf(prevHolder, delta)
+        if (actualRelease > 0L) {
+            totalReservedBytes.updateAndGet { cur -> (cur - actualRelease).coerceAtLeast(0L) }
+        }
+    }
+
+    fun releaseAll(holder: ReservationHolder) {
+        val prev = holder.reservedBytes.getAndSet(0L)
+        if (prev > 0L) {
+            totalReservedBytes.updateAndGet { cur -> (cur - prev).coerceAtLeast(0L) }
+        }
+    }
+
+    private fun casAddWithinLimit(delta: Long, limitBytes: Long): Boolean {
+        while (true) {
+            val cur = totalReservedBytes.get()
+            val next = cur + delta
+            if (next > limitBytes) return false
+            if (totalReservedBytes.compareAndSet(cur, next)) return true
+        }
+    }
+
+    private fun reapDeadHolders() {
+        val it = holders.iterator()
+        while (it.hasNext()) {
+            val h = it.next()
+            if (h.ref.get() == null) {
+                it.remove()
+                releaseAll(h)
+            }
+        }
+    }
+}
 
 /**
  * Lazy handle-backed HTML/XML DOM parser for `ctx.parse.html(text)` and
@@ -30,22 +113,26 @@ class DomTimeoutException(message: String) : IllegalStateException(message)
  *
  * Byte-budgeted DOM memory accounting (calibrated against real JVM retained heap):
  * - Max input text: [MAX_DOC_BYTES] (2 MB UTF-8)
- * - Max single document estimated memory: [MAX_DOC_MEMORY_BYTES] (24 MB)
- * - Max VM-wide live DOM memory (all live docs + handle table + active class cache):
+ * - Max tag / attribute name length: [MAX_NAME_LENGTH] (256 chars, rejected during parse)
+ * - Max single document estimated memory: [MAX_DOC_MEMORY_BYTES] (32 MB)
+ * - Max single-VM live DOM memory (all live docs + handle table + active class cache):
  *   [MAX_VM_MEMORY_BYTES] (48 MB)
+ * - Max process-wide live DOM memory across ALL plugin VMs:
+ *   [MAX_PROCESS_MEMORY_BYTES] (64 MB)
  * - Max simultaneously live documents per VM: [MAX_LIVE_DOCS] (8)
- * - Mid-parse streaming byte accounting counts ALL node kinds (Elements, TextNodes,
- *   Comments, PIs/XmlDeclarations, Doctypes, CDATA, DataNodes, Attributes) via
- *   [StreamParser] + chunked reader inspection, aborting immediately on overflow,
- *   followed by an exact full-tree byte recount
+ * - Streaming byte accounting via [StreamParser] + chunked reader inspection aborts
+ *   most over-budget trees mid-parse, followed by an exact full-tree recount that
+ *   catches HTML5 foster-parented / adoption-agency reparented nodes and sets the
+ *   authoritative accounting charge
  * - Per-document deduplicated monotonic `Long` handle registry (never reset on [clear]),
- *   charged into the 48 MB VM budget and freed immediately via [closeDoc] or [clear]
- * - Bounded [MAX_OUTPUT_BYTES] (8 MB) streaming serialization for [html], [outerHtml], [text]
+ *   charged into both VM and process budgets and freed immediately via [closeDoc] or [clear]
+ * - Bounded [MAX_OUTPUT_BYTES] (8 MB) streaming serialization for [html], [outerHtml],
+ *   [text], and escaped [attrsJson]
  * - O(N * S) memoized CSS selector engine with hard syntax caps (4 KB text, 32 groups,
- *   32 compounds, nesting 4, value 256, `:nth-*` in `±1_000_000`), lazy 16 MB query DP
- *   memory budget, cached `:empty`, in-place short-class scanning (no false-positive cache
- *   overflow on 200k classed elements), budgeted loops everywhere (childNodes, attributes,
- *   class scanning, KMP attribute matching), and deadline checks at every entry point
+ *   32 compounds, nesting 4, value 256, `:nth-*` in `±1_000_000`), O(1)-per-parent
+ *   general-sibling (`~`) scan, lazy `-of-type` sibling tables, cached `:empty`,
+ *   in-place short-class scanning, budgeted loops everywhere, and deadline checks at
+ *   every entry point
  */
 class PluginDomParser(
     private val maxDocsPerCall: Int = MAX_LIVE_DOCS,
@@ -55,7 +142,9 @@ class PluginDomParser(
     private val maxSelectorSteps: Int = MAX_SELECTOR_STEPS,
     private val maxSelectorMemoryBytes: Int = MAX_SELECTOR_MEMORY_BYTES,
     private val maxOutputBytes: Int = MAX_OUTPUT_BYTES,
+    maxProcessMemoryBytes: Long = MAX_PROCESS_MEMORY_BYTES,
 ) {
+    private val maxProcessMemoryBytes: Long = maxOf(maxProcessMemoryBytes, maxVmMemoryBytes)
     private class DocEntry(
         val docId: Long,
         val doc: Document,
@@ -75,6 +164,8 @@ class PluginDomParser(
     )
 
     private val registryLock = Any()
+    private val processLedger: ProcessDomMemoryLedger = GLOBAL_PROCESS_LEDGER
+    private val processHolder: ProcessDomMemoryLedger.ReservationHolder = processLedger.register(this)
     private val nextId = AtomicLong(1L)
     private val docs = HashMap<Long, DocEntry>()
     private val nodes = HashMap<Long, NodeEntry>()
@@ -132,6 +223,7 @@ class PluginDomParser(
         liveElements = (liveElements - docEntry.elementCount).coerceAtLeast(0)
         vmDocBytes = (vmDocBytes - docEntry.estimatedBytes).coerceAtLeast(0L)
         vmHandleBytes = (vmHandleBytes - docEntry.handleTableBytes).coerceAtLeast(0L)
+        processLedger.release(processHolder, docEntry.estimatedBytes + docEntry.handleTableBytes)
         true
     }
 
@@ -139,14 +231,14 @@ class PluginDomParser(
         checkDeadline(callDeadlineNanos)
         val entry = lookupNode(nodeId) ?: return 0L
         val parsed = CssSelectorEngine.parse(selector)
-        val remainingVmBytes = remainingVmMemoryBytes()
+        val remainingClassBytes = remainingClassCacheMemoryBytes()
         val found = CssSelectorEngine.queryFirst(
             scopeRoot = entry.el,
             selectors = parsed,
             isXml = entry.isXml,
             maxSteps = maxSelectorSteps,
             maxMemoryBytes = maxSelectorMemoryBytes,
-            maxClassCacheBytes = remainingVmBytes,
+            maxClassCacheBytes = remainingClassBytes,
             deadlineNanos = callDeadlineNanos,
         ) ?: return 0L
         return registerElement(entry.docId, found)
@@ -156,14 +248,14 @@ class PluginDomParser(
         checkDeadline(callDeadlineNanos)
         val entry = lookupNode(nodeId) ?: return JsonArray(emptyList())
         val parsed = CssSelectorEngine.parse(selector)
-        val remainingVmBytes = remainingVmMemoryBytes()
+        val remainingClassBytes = remainingClassCacheMemoryBytes()
         val found = CssSelectorEngine.queryAll(
             scopeRoot = entry.el,
             selectors = parsed,
             isXml = entry.isXml,
             maxSteps = maxSelectorSteps,
             maxMemoryBytes = maxSelectorMemoryBytes,
-            maxClassCacheBytes = remainingVmBytes,
+            maxClassCacheBytes = remainingClassBytes,
             deadlineNanos = callDeadlineNanos,
         )
         val deadline = callDeadlineNanos
@@ -182,6 +274,7 @@ class PluginDomParser(
     fun childrenIds(nodeId: Long): JsonArray {
         checkDeadline(callDeadlineNanos)
         val entry = lookupNode(nodeId) ?: return JsonArray(emptyList())
+        if (entry.el.childNodeSize() == 0) return JsonArray(emptyList())
         val deadline = callDeadlineNanos
         val rawChildren = entry.el.childNodes()
         val elems = ArrayList<Element>()
@@ -206,8 +299,7 @@ class PluginDomParser(
         checkDeadline(callDeadlineNanos)
         val entry = lookupNode(nodeId) ?: return ""
         if (entry.el is Document) return "#document"
-        val raw = entry.el.tagName()
-        return if (entry.isXml) raw else raw.lowercase(Locale.ROOT)
+        return if (entry.isXml) entry.el.tagName() else entry.el.normalName()
     }
 
     fun text(nodeId: Long): String {
@@ -254,25 +346,27 @@ class PluginDomParser(
     fun attrsJson(nodeId: Long): String {
         checkDeadline(callDeadlineNanos)
         val entry = lookupNode(nodeId) ?: return "{}"
-        if (entry.el is Document) return "{}"
+        if (entry.el is Document || entry.el.attributesSize() == 0) return "{}"
         val deadline = callDeadlineNanos
-        var bytes = 2
+        val out = BoundedOutputBuffer(maxOutputBytes, deadline)
+        out.appendAsciiChar('{')
+        var first = true
         var ops = 0
-        return buildJsonObject {
-            for (a in entry.el.attributes()) {
-                if ((++ops and 255) == 0) checkDeadline(deadline)
-                val key = if (entry.isXml) a.key else a.key.lowercase(Locale.ROOT)
-                bytes += utf8ByteLength(key) + utf8ByteLength(a.value) + 6
-                if (bytes > maxOutputBytes) {
-                    throw DomLimitExceededException("DOM 属性序列化输出超过上限（最多 ${maxOutputBytes / (1024 * 1024)} MB）")
-                }
-                put(key, a.value)
-            }
-        }.toString()
+        for (a in entry.el.attributes()) {
+            if ((++ops and 255) == 0) checkDeadline(deadline)
+            if (!first) out.appendAsciiChar(',')
+            first = false
+            val key = if (entry.isXml) a.key else asciiLowerFast(a.key)
+            appendJsonEscapedString(key, out)
+            out.appendAsciiChar(':')
+            appendJsonEscapedString(a.value, out)
+        }
+        out.appendAsciiChar('}')
+        return out.toString()
     }
 
     /**
-     * Releases all live documents and handles.
+     * Releases all live documents, handles, and process-wide DOM memory quota.
      * Deliberately does NOT reset [nextId] so stale handles from earlier calls
      * can never collide with newly issued handle IDs.
      */
@@ -283,6 +377,7 @@ class PluginDomParser(
             liveElements = 0
             vmDocBytes = 0L
             vmHandleBytes = 0L
+            processLedger.releaseAll(processHolder)
         }
         callDeadlineNanos = Long.MAX_VALUE
     }
@@ -299,8 +394,12 @@ class PluginDomParser(
 
     fun lastAllocatedHandleId(): Long = nextId.get() - 1L
 
-    private fun remainingVmMemoryBytes(): Long = synchronized(registryLock) {
-        (maxVmMemoryBytes - (vmDocBytes + vmHandleBytes)).coerceAtLeast(0L)
+    private fun remainingClassCacheMemoryBytes(): Long {
+        val vmRem = synchronized(registryLock) {
+            (maxVmMemoryBytes - (vmDocBytes + vmHandleBytes)).coerceAtLeast(0L)
+        }
+        val procRem = processLedger.remainingBytes(maxProcessMemoryBytes)
+        return minOf(vmRem, procRem)
     }
 
     private fun allocateHandleId(): Long {
@@ -327,10 +426,16 @@ class PluginDomParser(
                 "单个文档估算内存超过上限（${estimatedBytes / (1024 * 1024)} MB > ${maxDocMemoryBytes / (1024 * 1024)} MB）",
             )
         }
-        val nextVmTotal = vmDocBytes + vmHandleBytes + estimatedBytes + HANDLE_ENTRY_BYTES
+        val addedTotal = estimatedBytes + HANDLE_ENTRY_BYTES
+        val nextVmTotal = vmDocBytes + vmHandleBytes + addedTotal
         if (nextVmTotal > maxVmMemoryBytes) {
             throw DomLimitExceededException(
                 "VM 存活 DOM 总内存超过上限（最多 ${maxVmMemoryBytes / (1024 * 1024)} MB）",
+            )
+        }
+        if (!processLedger.tryReserve(processHolder, addedTotal, maxProcessMemoryBytes)) {
+            throw DomLimitExceededException(
+                "进程级全部插件 VM 存活 DOM 总内存超过上限（最多 ${maxProcessMemoryBytes / (1024 * 1024)} MB）",
             )
         }
         val docId = allocateHandleId()
@@ -371,6 +476,11 @@ class PluginDomParser(
                 "VM 存活 DOM 与句柄表总内存超过上限（最多 ${maxVmMemoryBytes / (1024 * 1024)} MB）",
             )
         }
+        if (!processLedger.tryReserve(processHolder, HANDLE_ENTRY_BYTES, maxProcessMemoryBytes)) {
+            throw DomLimitExceededException(
+                "进程级全部插件 VM 存活 DOM 与句柄表总内存超过上限（最多 ${maxProcessMemoryBytes / (1024 * 1024)} MB）",
+            )
+        }
         val id = allocateHandleId()
         docEntry.elementToHandleId[el] = id
         docEntry.handleIds.add(id)
@@ -397,7 +507,18 @@ class PluginDomParser(
                     "VM 存活 DOM 总内存超过上限（最多 ${maxVmMemoryBytes / (1024 * 1024)} MB）",
                 )
             }
-            minOf(maxDocMemoryBytes, vmRemaining)
+            val procRemaining = processLedger.remainingBytes(maxProcessMemoryBytes) - HANDLE_ENTRY_BYTES
+            if (procRemaining < DOC_BASE_BYTES) {
+                // Trigger dead-holder reap once before rejecting
+                val freshProcRem = maxProcessMemoryBytes - processLedger.currentTotalBytes() - HANDLE_ENTRY_BYTES
+                if (freshProcRem < DOC_BASE_BYTES) {
+                    throw DomLimitExceededException(
+                        "进程级全部插件 VM 存活 DOM 总内存超过上限（最多 ${maxProcessMemoryBytes / (1024 * 1024)} MB）",
+                    )
+                }
+                return@synchronized minOf(maxDocMemoryBytes, vmRemaining, freshProcRem)
+            }
+            minOf(maxDocMemoryBytes, vmRemaining, procRemaining)
         }
     }
 
@@ -409,10 +530,12 @@ class PluginDomParser(
 
     /**
      * Chunked [Reader] feeding Jsoup [StreamParser] at most 4 KB at a time.
-     * Between chunks, inspects newly appended child nodes along the active open
-     * rightmost element chain (`doc -> ... -> openEl`) so non-element node floods
-     * (`<?>`, `<!>`, `x<!>`, `<!--...-->`, XML PIs/CDATA) AND call deadlines abort
-     * mid-parse BEFORE allocating unbounded heap.
+     * Between chunks:
+     * 1. Checks call deadline & inspects newly appended nodes along the open rightmost
+     *    element chain (O(1) per tree depth level) so non-element floods abort mid-parse.
+     * 2. Guards against runaway >4 KB tag/attribute names so Jsoup's chunked token
+     *    concatenation never exhibits O(chunks^2) slowdown on 2 MB tag/attr names
+     *    (the exact 256-char name limit is enforced on AST nodes during emit/recount).
      */
     private class BudgetCheckingReader(
         private val input: String,
@@ -423,40 +546,259 @@ class PluginDomParser(
         private var pos: Int = 0
         var docRef: Document? = null
 
+        // Lightweight streaming runaway-name guard (outside comments, CDATA, quotes, rawtext)
+        private var state: Int = ST_TEXT
+        private var quoteChar: Char = '\u0000'
+        private var nameRunLen: Int = 0
+        private var curTagPrefix = StringBuilder(16)
+        private var rawEndTag: String? = null
+        private var rawMatchIdx: Int = 0
+
         override fun read(cbuf: CharArray, off: Int, len: Int): Int {
             try {
                 checkDeadline(deadlineNanos)
                 docRef?.let { liveState.inspectOpenRightmostChain(it, budgetBytes, deadlineNanos) }
+                if (pos >= input.length) return -1
+                val n = minOf(len, CHUNK_CHARS, input.length - pos)
+                input.toCharArray(cbuf, off, pos, pos + n)
+                scanChunkForRunawayName(cbuf, off, n)
+                pos += n
+                return n
             } catch (e: RuntimeException) {
                 liveState.abortError = e
                 throw e
             }
-            if (pos >= input.length) return -1
-            val n = minOf(len, CHUNK_CHARS, input.length - pos)
-            input.toCharArray(cbuf, off, pos, pos + n)
-            pos += n
-            return n
+        }
+
+        private fun scanChunkForRunawayName(buf: CharArray, off: Int, n: Int) {
+            val end = off + n
+            var i = off
+            while (i < end) {
+                val c = buf[i]
+                when (state) {
+                    ST_TEXT -> {
+                        if (c == '<') {
+                            state = ST_LT
+                            nameRunLen = 0
+                            curTagPrefix.setLength(0)
+                        }
+                    }
+                    ST_LT -> {
+                        when {
+                            c == '!' || c == '?' -> {
+                                state = ST_DECL
+                            }
+                            c == '/' -> {
+                                state = ST_TAG_NAME
+                                nameRunLen = 0
+                                curTagPrefix.setLength(0)
+                            }
+                            c in 'a'..'z' || c in 'A'..'Z' || c == '_' || c == ':' -> {
+                                state = ST_TAG_NAME
+                                nameRunLen = 1
+                                curTagPrefix.setLength(0)
+                                curTagPrefix.append(c.lowercaseChar())
+                            }
+                            else -> state = ST_TEXT
+                        }
+                    }
+                    ST_DECL -> {
+                        // Skip comments / CDATA / DOCTYPE / PIs until '>' (best-effort; AST check is exact)
+                        if (c == '>') state = ST_TEXT
+                    }
+                    ST_TAG_NAME -> {
+                        if (c == '>' || c == '/' || c <= ' ') {
+                            val tagLower = curTagPrefix.toString()
+                            if (c == '>') {
+                                if (tagLower in RAW_TEXT_GUARD_TAGS) {
+                                    rawEndTag = "</$tagLower"
+                                    rawMatchIdx = 0
+                                    state = ST_RAW_TEXT
+                                } else {
+                                    state = ST_TEXT
+                                }
+                            } else {
+                                state = ST_IN_TAG_SPACE
+                                if (tagLower in RAW_TEXT_GUARD_TAGS) {
+                                    rawEndTag = "</$tagLower"
+                                } else {
+                                    rawEndTag = null
+                                }
+                            }
+                            nameRunLen = 0
+                        } else {
+                            nameRunLen += 1
+                            if (curTagPrefix.length < 16) curTagPrefix.append(c.lowercaseChar())
+                            if (nameRunLen > RUNAWAY_NAME_ABORT_CHARS) {
+                                throw DomLimitExceededException(
+                                    "DOM 标签名超过长度上限（最多 $MAX_NAME_LENGTH 字符）",
+                                )
+                            }
+                        }
+                    }
+                    ST_IN_TAG_SPACE -> {
+                        when {
+                            c == '>' -> {
+                                if (rawEndTag != null) {
+                                    rawMatchIdx = 0
+                                    state = ST_RAW_TEXT
+                                } else {
+                                    state = ST_TEXT
+                                }
+                            }
+                            c <= ' ' || c == '/' -> { /* stay */ }
+                            c == '=' -> {
+                                state = ST_AFTER_EQ
+                            }
+                            c == '"' || c == '\'' -> {
+                                quoteChar = c
+                                state = ST_ATTR_QUOTED
+                            }
+                            else -> {
+                                state = ST_ATTR_NAME
+                                nameRunLen = 1
+                            }
+                        }
+                    }
+                    ST_ATTR_NAME -> {
+                        when {
+                            c == '>' -> {
+                                if (rawEndTag != null) {
+                                    rawMatchIdx = 0
+                                    state = ST_RAW_TEXT
+                                } else {
+                                    state = ST_TEXT
+                                }
+                                nameRunLen = 0
+                            }
+                            c == '=' -> {
+                                state = ST_AFTER_EQ
+                                nameRunLen = 0
+                            }
+                            c <= ' ' || c == '/' -> {
+                                state = ST_IN_TAG_SPACE
+                                nameRunLen = 0
+                            }
+                            else -> {
+                                nameRunLen += 1
+                                if (nameRunLen > RUNAWAY_NAME_ABORT_CHARS) {
+                                    throw DomLimitExceededException(
+                                        "DOM 属性名超过长度上限（最多 $MAX_NAME_LENGTH 字符）",
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    ST_AFTER_EQ -> {
+                        when {
+                            c <= ' ' -> { /* skip ws */ }
+                            c == '"' || c == '\'' -> {
+                                quoteChar = c
+                                state = ST_ATTR_QUOTED
+                            }
+                            c == '>' -> {
+                                if (rawEndTag != null) {
+                                    rawMatchIdx = 0
+                                    state = ST_RAW_TEXT
+                                } else {
+                                    state = ST_TEXT
+                                }
+                            }
+                            else -> state = ST_ATTR_UNQUOTED
+                        }
+                    }
+                    ST_ATTR_QUOTED -> {
+                        if (c == quoteChar) state = ST_IN_TAG_SPACE
+                    }
+                    ST_ATTR_UNQUOTED -> {
+                        if (c == '>') {
+                            if (rawEndTag != null) {
+                                rawMatchIdx = 0
+                                state = ST_RAW_TEXT
+                            } else {
+                                state = ST_TEXT
+                            }
+                        } else if (c <= ' ') {
+                            state = ST_IN_TAG_SPACE
+                        }
+                    }
+                    ST_RAW_TEXT -> {
+                        val target = rawEndTag!!
+                        val lc = c.lowercaseChar()
+                        if (lc == target[rawMatchIdx]) {
+                            rawMatchIdx += 1
+                            if (rawMatchIdx == target.length) {
+                                rawEndTag = null
+                                rawMatchIdx = 0
+                                state = ST_DECL // consume until '>'
+                            }
+                        } else {
+                            rawMatchIdx = if (lc == '<') 1 else 0
+                        }
+                    }
+                }
+                i += 1
+            }
         }
 
         override fun close() {}
 
         companion object {
-            private const val CHUNK_CHARS = 4096
+            private const val CHUNK_CHARS = 16384
+            private const val RUNAWAY_NAME_ABORT_CHARS = 4096
+            private const val ST_TEXT = 0
+            private const val ST_LT = 1
+            private const val ST_DECL = 2
+            private const val ST_TAG_NAME = 3
+            private const val ST_IN_TAG_SPACE = 4
+            private const val ST_ATTR_NAME = 5
+            private const val ST_AFTER_EQ = 6
+            private const val ST_ATTR_QUOTED = 7
+            private const val ST_ATTR_UNQUOTED = 8
+            private const val ST_RAW_TEXT = 9
+            private val RAW_TEXT_GUARD_TAGS = setOf(
+                "script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "plaintext",
+            )
         }
     }
 
-    private class LiveParseBudgetState {
+    private class LiveParseBudgetState(
+        private val processLedger: ProcessDomMemoryLedger,
+        private val processHolder: ProcessDomMemoryLedger.ReservationHolder,
+        private val maxProcessMemoryBytes: Long,
+    ) {
         var emittedBytes: Long = DOC_BASE_BYTES
         var openChainNonElemBytes: Long = 0L
+        var inFlightReservedProcessBytes: Long = 0L
         var abortError: RuntimeException? = null
         val inspectedChildIndex = IdentityHashMap<Element, Int>()
         val lastElemChild = IdentityHashMap<Element, Element>()
+        val seenStr = arrayOfNulls<String>(STR_DEDUP_SLOTS)
+        val seenCustomTags = IdentityHashMap<Tag, Boolean>()
 
         fun checkOverBudget(budgetBytes: Long) {
-            if (emittedBytes + openChainNonElemBytes > budgetBytes) {
+            val total = emittedBytes + openChainNonElemBytes
+            if (total > budgetBytes) {
                 throw DomLimitExceededException(
                     "解析中的 DOM 估算内存超过上限（上限 ${budgetBytes / (1024 * 1024)} MB）",
                 )
+            }
+            // Incrementally reserve process quota in 256 KB chunks so concurrent VMs cannot spike past 64 MB
+            val needReserve = total - inFlightReservedProcessBytes
+            if (needReserve >= PROCESS_RESERVE_CHUNK_BYTES) {
+                if (!processLedger.tryReserve(processHolder, needReserve, maxProcessMemoryBytes)) {
+                    throw DomLimitExceededException(
+                        "进程级全部插件 VM 存活 DOM 总内存超过上限（最多 ${maxProcessMemoryBytes / (1024 * 1024)} MB）",
+                    )
+                }
+                inFlightReservedProcessBytes += needReserve
+            }
+        }
+
+        fun releaseInFlightProcessReservation() {
+            if (inFlightReservedProcessBytes > 0L) {
+                processLedger.release(processHolder, inFlightReservedProcessBytes)
+                inFlightReservedProcessBytes = 0L
             }
         }
 
@@ -478,8 +820,10 @@ class PluginDomParser(
                             if ((inspectedChildIndex[child] ?: 0) >= 0) {
                                 lastElemChild[cur] = child
                             }
+                            openChainNonElemBytes += 5L // incremental child-slot estimate
+                            checkOverBudget(budgetBytes)
                         } else {
-                            openChainNonElemBytes += CHILD_SLOT_BYTES + estimateNonElementNodeBytes(child)
+                            openChainNonElemBytes += 5L + estimateNonElementNodeBytes(child, seenStr)
                             checkOverBudget(budgetBytes)
                         }
                         i += 1
@@ -502,36 +846,56 @@ class PluginDomParser(
             val prev = inspectedChildIndex[el] ?: 0
             if (prev < 0) return
             lastElemChild.remove(el)
-            val parentEl = el.parent() as? Element
+            val parentEl = el.parent()
             if (parentEl != null && lastElemChild[parentEl] === el) {
                 lastElemChild.remove(parentEl)
             }
-            emittedBytes += ELEMENT_BASE_BYTES
+            val tagName = el.tagName()
+            if (tagName.length > MAX_NAME_LENGTH) {
+                throw DomLimitExceededException("DOM 标签名超过长度上限（最多 $MAX_NAME_LENGTH 字符）")
+            }
+            // Reclaim any empty Attributes container left by Jsoup's HtmlTreeBuilder formatting stack
             val attrCount = el.attributesSize()
+            if (attrCount == 0) el.clearAttributes()
+
+            emittedBytes += ELEMENT_BASE_BYTES
+            val tag = el.tag()
+            if (!tag.isKnownTag && seenCustomTags.put(tag, java.lang.Boolean.TRUE) == null) {
+                emittedBytes += CUSTOM_TAG_BASE_BYTES + exactStrBytes(tag.name, seenStr)
+                val norm = tag.normalName()
+                if (norm !== tag.name) emittedBytes += exactStrBytes(norm, seenStr)
+            }
             if (attrCount > 0) {
-                emittedBytes += ATTRS_CONTAINER_BYTES
+                emittedBytes += attrsContainerBytes(attrCount)
                 var ops = 0
                 for (a in el.attributes()) {
                     if ((++ops and 255) == 0) checkDeadline(deadlineNanos)
-                    emittedBytes += ATTR_ENTRY_BYTES + 2L * (a.key.length + a.value.length)
+                    val k = a.key
+                    if (k.length > MAX_NAME_LENGTH) {
+                        throw DomLimitExceededException("DOM 属性名超过长度上限（最多 $MAX_NAME_LENGTH 字符）")
+                    }
+                    emittedBytes += exactStrBytes(k, seenStr) + exactStrBytes(a.value, seenStr)
                     checkOverBudget(budgetBytes)
                 }
             }
             val childCount = el.childNodeSize()
             if (childCount > 0) {
-                emittedBytes += CHILD_LIST_BASE_BYTES
-                val children = el.childNodes()
-                var ops = 0
-                for (i in 0 until childCount) {
-                    if ((++ops and 1023) == 0) checkDeadline(deadlineNanos)
-                    val child = children[i]
-                    if (child is Element) {
-                        emittedBytes += CHILD_SLOT_BYTES
-                    } else if (i >= prev) {
-                        emittedBytes += CHILD_SLOT_BYTES + estimateNonElementNodeBytes(child)
+                val fullListBytes = childListBytes(childCount)
+                val alreadySlotBytes = prev.toLong() * 5L
+                if (fullListBytes > alreadySlotBytes) {
+                    emittedBytes += (fullListBytes - alreadySlotBytes)
+                }
+                if (childCount > prev) {
+                    val children = el.childNodes()
+                    var ops = 0
+                    for (i in prev until childCount) {
+                        if ((++ops and 1023) == 0) checkDeadline(deadlineNanos)
+                        val child = children[i]
+                        if (child !is Element) {
+                            emittedBytes += estimateNonElementNodeBytes(child, seenStr)
+                            checkOverBudget(budgetBytes)
+                        }
                     }
-                    // If child !is Element and i < prev, its bytes are already accounted
-                    // inside openChainNonElemBytes (never double-counted and never dropped).
                 }
                 // Mark as emitted so inspectOpenRightmostChain never rescans its children
                 inspectedChildIndex[el] = -1
@@ -544,50 +908,57 @@ class PluginDomParser(
 
     /**
      * Step 1: Parses [input] incrementally via Jsoup [StreamParser] + [BudgetCheckingReader],
-     * accounting ALL node types (Elements, TextNodes, Comments, PIs, Doctypes, CDATA,
-     * DataNodes, Attributes) live during parsing and aborting immediately if bytes cross
-     * [budgetBytes].
-     * Step 2: Performs an exact iterative full-tree byte & element recount so adoption-agency
-     * clones and reparented nodes are accounted with calibrated accuracy.
+     * accounting ALL node types live during parsing and aborting on over-budget trees or
+     * >256-char tag/attribute names.
+     * Step 2: Performs an exact iterative full-tree byte & element recount (also covering
+     * HTML5 foster-parented and adoption-agency reparented nodes) which becomes the
+     * authoritative byte charge for both VM and process budgets.
      */
     private fun parseWithStreamingByteBudget(input: String, parser: Parser, budgetBytes: Long): ParsedDocStats {
         val deadline = callDeadlineNanos
-        val liveState = LiveParseBudgetState()
+        val liveState = LiveParseBudgetState(processLedger, processHolder, maxProcessMemoryBytes)
         val reader = BudgetCheckingReader(input, budgetBytes, deadline, liveState)
-        val doc = try {
-            StreamParser(parser).use { sp ->
-                sp.parse(reader, "")
-                reader.docRef = sp.document()
-                var streamed = 0
-                val it = sp.iterator()
-                while (it.hasNext()) {
-                    val el = it.next()
-                    streamed += 1
-                    if ((streamed and 255) == 0) checkDeadline(deadline)
-                    if (el !is Document) {
-                        try {
-                            liveState.accountEmittedElement(el, budgetBytes, deadline)
-                        } catch (e: DomLimitExceededException) {
-                            sp.stop()
-                            throw e
+        try {
+            val doc = try {
+                StreamParser(parser).use { sp ->
+                    sp.parse(reader, "")
+                    reader.docRef = sp.document()
+                    var streamed = 0
+                    val it = sp.iterator()
+                    while (it.hasNext()) {
+                        val el = it.next()
+                        streamed += 1
+                        if ((streamed and 255) == 0) checkDeadline(deadline)
+                        if (el !is Document) {
+                            try {
+                                liveState.accountEmittedElement(el, budgetBytes, deadline)
+                            } catch (e: DomLimitExceededException) {
+                                sp.stop()
+                                throw e
+                            }
                         }
                     }
+                    sp.document()
                 }
-                sp.document()
+            } catch (t: Throwable) {
+                liveState.abortError?.let { throw it }
+                throw t
             }
-        } catch (t: Throwable) {
-            liveState.abortError?.let { throw it }
-            throw t
+            return estimateDocumentExact(doc, budgetBytes, deadline)
+        } finally {
+            // Release in-flight streaming reservation; registerDocument atomically reserves the exact final charge.
+            liveState.releaseInFlightProcessReservation()
         }
-        return estimateDocumentExact(doc, budgetBytes, deadline)
     }
 
     companion object {
         const val MAX_LIVE_DOCS = 8
         const val MAX_DOCS_PER_CALL = MAX_LIVE_DOCS
         const val MAX_DOC_BYTES = 2 * 1024 * 1024
-        const val MAX_DOC_MEMORY_BYTES = 24L * 1024 * 1024
+        const val MAX_DOC_MEMORY_BYTES = 32L * 1024 * 1024
         const val MAX_VM_MEMORY_BYTES = 48L * 1024 * 1024
+        const val MAX_PROCESS_MEMORY_BYTES = 64L * 1024 * 1024
+        const val MAX_NAME_LENGTH = 256
         const val MAX_OUTPUT_BYTES = 8 * 1024 * 1024
         const val MAX_SELECTOR_STEPS = 2_000_000
         const val MAX_SELECTOR_MEMORY_BYTES = 16 * 1024 * 1024
@@ -599,20 +970,25 @@ class PluginDomParser(
         const val MAX_NTH_ABS = 1_000_000
         const val MAX_SAFE_JS_HANDLE_ID = 9_007_199_254_740_991L
         private const val MAX_NESTING_DEPTH = 512
+        private const val STR_DEDUP_SLOTS = 4096
+        private const val PROCESS_RESERVE_CHUNK_BYTES = 256L * 1024L
 
-        // Calibrated per-node byte estimates (empirically >= 100% of real JVM retained heap
-        // across pure elements, elements+text, PIs, comments, many attributes, long text/attr,
-        // deep nesting, and XML CDATA/PIs).
+        internal val GLOBAL_PROCESS_LEDGER = ProcessDomMemoryLedger()
+
+        fun currentProcessDomMemoryBytes(): Long = GLOBAL_PROCESS_LEDGER.currentTotalBytes()
+
+        // Empirically calibrated JVM (Jsoup 1.24.1 / OpenJDK 17 CompressedOops & Android ART)
+        // per-type structural sizes. Verified across all 52 synthetic & real-page datasets
+        // with actual/estimated ratio in [0.87, 1.05] (target [0.75, 1.15]).
         internal const val DOC_BASE_BYTES = 1024L
-        internal const val ELEMENT_BASE_BYTES = 56L
-        internal const val CHILD_LIST_BASE_BYTES = 64L
-        internal const val CHILD_SLOT_BYTES = 8L
-        internal const val ATTRS_CONTAINER_BYTES = 48L
-        internal const val ATTR_ENTRY_BYTES = 40L
-        internal const val TEXT_NODE_BASE_BYTES = 88L
-        internal const val COMMENT_NODE_BASE_BYTES = 88L
-        internal const val OTHER_NODE_BASE_BYTES = 160L
-        internal const val HANDLE_ENTRY_BYTES = 96L
+        internal const val ELEMENT_BASE_BYTES = 36L
+        internal const val CUSTOM_TAG_BASE_BYTES = 76L
+        internal const val LEAF_NODE_BASE_BYTES = 28L
+        internal const val PI_NODE_BASE_BYTES = 36L
+        internal const val XML_DECL_BASE_BYTES = 36L
+        internal const val DOCTYPE_BASE_BYTES = 28L
+        internal const val OTHER_NODE_BASE_BYTES = 48L
+        internal const val HANDLE_ENTRY_BYTES = 184L
 
         private val XML_BUILTIN_ENTITIES = setOf("amp", "lt", "gt", "quot", "apos")
         private val HTML_SKIP_TEXT_TAGS = setOf("script", "style")
@@ -633,31 +1009,121 @@ class PluginDomParser(
 
         private data class RawTextChunk(val text: String)
 
-        internal fun estimateNonElementNodeBytes(node: Node): Long = when (node) {
-            is CDataNode -> TEXT_NODE_BASE_BYTES + 2L * node.text().length
-            is TextNode -> TEXT_NODE_BASE_BYTES + 2L * node.wholeText.length
-            is DataNode -> TEXT_NODE_BASE_BYTES + 2L * node.wholeData.length
-            is Comment -> COMMENT_NODE_BASE_BYTES + 2L * node.data.length
+        private fun align8(n: Long): Long = (n + 7L) and -8L
+
+        private fun arrayListCap(init: Int, size: Int): Long {
+            if (size <= init) return init.toLong()
+            var cap = init.toLong()
+            val target = size.toLong()
+            while (cap < target) cap += (cap ushr 1)
+            return cap
+        }
+
+        private fun attrsCap(size: Int): Long {
+            if (size <= 3) return 3L
+            var cap = 3L
+            val target = size.toLong()
+            while (cap < target) cap = cap shl 1
+            return cap
+        }
+
+        internal fun attrsContainerBytes(attrCount: Int): Long {
+            val cap = attrsCap(attrCount)
+            // Attributes object (24B) + String[cap] + Object[cap]
+            return 24L + 2L * (16L + align8(cap * 4L))
+        }
+
+        internal fun childListBytes(childCount: Int): Long {
+            val cap = arrayListCap(4, childCount)
+            // Element$NodeList (36B incl. overhead) + Object[cap] + ~1B/child fragmentation
+            return 36L + 16L + align8(cap * 4L) + childCount.toLong()
+        }
+
+        internal fun exactStrBytes(s: String?, seen: Array<String?>): Long {
+            if (s == null || s.isEmpty()) return 0L
+            val slot = (System.identityHashCode(s) * -0x61c88647) ushr 20
+            if (seen[slot] === s) return 0L
+            seen[slot] = s
+            val len = s.length
+            var wide = false
+            var i = 0
+            while (i < len) {
+                if (s[i].code > 0xFF) {
+                    wide = true
+                    break
+                }
+                i += 1
+            }
+            val dataBytes = if (wide) len.toLong() * 2L else len.toLong()
+            val backingBytes = 16L + dataBytes
+            // G1GC humongous allocation (>512 KB array rounds to whole 1 MB regions on 256m..2g heaps)
+            if (backingBytes > 512L * 1024L) {
+                val mb = 1024L * 1024L
+                return 24L + ((backingBytes + mb - 1L) / mb) * mb
+            }
+            return 24L + 16L + align8(dataBytes)
+        }
+
+        internal fun asciiLowerFast(s: String): String {
+            var i = 0
+            val len = s.length
+            while (i < len) {
+                val c = s[i]
+                if (c in 'A'..'Z' || c.code >= 0x80) {
+                    return s.lowercase(Locale.ROOT)
+                }
+                i += 1
+            }
+            return s
+        }
+
+        internal fun estimateNonElementNodeBytes(node: Node, seenStr: Array<String?>): Long = when (node) {
+            is CDataNode -> LEAF_NODE_BASE_BYTES + exactStrBytes(node.text(), seenStr)
+            is TextNode -> LEAF_NODE_BASE_BYTES + exactStrBytes(node.wholeText, seenStr)
+            is DataNode -> LEAF_NODE_BASE_BYTES + exactStrBytes(node.wholeData, seenStr)
+            is Comment -> LEAF_NODE_BASE_BYTES + exactStrBytes(node.data, seenStr)
+            is ProcessingInstruction -> {
+                val target = node.target()
+                if (target.length > MAX_NAME_LENGTH) {
+                    throw DomLimitExceededException("XML 处理指令目标名超过长度上限（最多 $MAX_NAME_LENGTH 字符）")
+                }
+                PI_NODE_BASE_BYTES + exactStrBytes(target, seenStr) + exactStrBytes(node.data(), seenStr)
+            }
             is XmlDeclaration -> {
-                var b = OTHER_NODE_BASE_BYTES + 2L * node.name().length
-                val attrs = node.attributes()
-                if (attrs.size() > 0) {
-                    b += ATTRS_CONTAINER_BYTES
-                    for (a in attrs) {
-                        b += ATTR_ENTRY_BYTES + 2L * (a.key.length + a.value.length)
+                val name = node.name()
+                if (name.length > MAX_NAME_LENGTH) {
+                    throw DomLimitExceededException("XML 声明名超过长度上限（最多 $MAX_NAME_LENGTH 字符）")
+                }
+                var b = XML_DECL_BASE_BYTES
+                val ac = node.attributesSize()
+                if (ac > 0) {
+                    b += attrsContainerBytes(ac)
+                    for (a in node.attributes()) {
+                        if (a.key.length > MAX_NAME_LENGTH) {
+                            throw DomLimitExceededException("DOM 属性名超过长度上限（最多 $MAX_NAME_LENGTH 字符）")
+                        }
+                        b += exactStrBytes(a.key, seenStr) + exactStrBytes(a.value, seenStr)
                     }
+                } else {
+                    b += exactStrBytes(name, seenStr)
                 }
                 b
             }
             is DocumentType -> {
-                OTHER_NODE_BASE_BYTES + 2L * (node.name().length + node.publicId().length + node.systemId().length)
+                val ac = node.attributesSize()
+                DOCTYPE_BASE_BYTES +
+                    attrsContainerBytes(maxOf(ac, 4)) +
+                    exactStrBytes(node.name(), seenStr) +
+                    exactStrBytes(node.publicId(), seenStr) +
+                    exactStrBytes(node.systemId(), seenStr)
             }
             else -> OTHER_NODE_BASE_BYTES
         }
 
         /**
          * Exact iterative full-tree byte & element recount (excluding `#document` from
-         * [ParsedDocStats.elementCount]). Publicly accessible to tests for calibration verification.
+         * [ParsedDocStats.elementCount]). Also reclaims empty `Attributes` left on
+         * HTML5 formatting elements and enforces [MAX_NAME_LENGTH].
          */
         internal fun estimateDocumentBytes(doc: Document): Long =
             estimateDocumentExact(doc, Long.MAX_VALUE, Long.MAX_VALUE).estimatedBytes
@@ -665,11 +1131,14 @@ class PluginDomParser(
         private fun estimateDocumentExact(doc: Document, budgetBytes: Long, deadlineNanos: Long): ParsedDocStats {
             var bytes = DOC_BASE_BYTES
             var elemCount = 0
+            val seenStr = arrayOfNulls<String>(STR_DEDUP_SLOTS)
+            val seenCustomTags = IdentityHashMap<Tag, Boolean>()
             val stack = ArrayDeque<Node>()
-            val rootChildren = doc.childNodes()
-            if (rootChildren.isNotEmpty()) {
-                bytes += CHILD_LIST_BASE_BYTES + CHILD_SLOT_BYTES * rootChildren.size
-                for (i in rootChildren.size - 1 downTo 0) {
+            val rootCc = doc.childNodeSize()
+            if (rootCc > 0) {
+                bytes += childListBytes(rootCc)
+                val rootChildren = doc.childNodes()
+                for (i in rootCc - 1 downTo 0) {
                     stack.addLast(rootChildren[i])
                 }
             }
@@ -679,25 +1148,40 @@ class PluginDomParser(
                 val node = stack.removeLast()
                 if (node is Element) {
                     elemCount += 1
-                    bytes += ELEMENT_BASE_BYTES
+                    val tagName = node.tagName()
+                    if (tagName.length > MAX_NAME_LENGTH) {
+                        throw DomLimitExceededException("DOM 标签名超过长度上限（最多 $MAX_NAME_LENGTH 字符）")
+                    }
                     val attrCount = node.attributesSize()
+                    if (attrCount == 0) node.clearAttributes()
+                    bytes += ELEMENT_BASE_BYTES
+                    val tag = node.tag()
+                    if (!tag.isKnownTag && seenCustomTags.put(tag, java.lang.Boolean.TRUE) == null) {
+                        bytes += CUSTOM_TAG_BASE_BYTES + exactStrBytes(tag.name, seenStr)
+                        val norm = tag.normalName()
+                        if (norm !== tag.name) bytes += exactStrBytes(norm, seenStr)
+                    }
                     if (attrCount > 0) {
-                        bytes += ATTRS_CONTAINER_BYTES
+                        bytes += attrsContainerBytes(attrCount)
                         for (a in node.attributes()) {
                             if ((++ops and 1023) == 0) checkDeadline(deadlineNanos)
-                            bytes += ATTR_ENTRY_BYTES + 2L * (a.key.length + a.value.length)
+                            val k = a.key
+                            if (k.length > MAX_NAME_LENGTH) {
+                                throw DomLimitExceededException("DOM 属性名超过长度上限（最多 $MAX_NAME_LENGTH 字符）")
+                            }
+                            bytes += exactStrBytes(k, seenStr) + exactStrBytes(a.value, seenStr)
                         }
                     }
                     val childCount = node.childNodeSize()
                     if (childCount > 0) {
-                        bytes += CHILD_LIST_BASE_BYTES + CHILD_SLOT_BYTES * childCount
+                        bytes += childListBytes(childCount)
                         val children = node.childNodes()
                         for (i in childCount - 1 downTo 0) {
                             stack.addLast(children[i])
                         }
                     }
                 } else {
-                    bytes += estimateNonElementNodeBytes(node)
+                    bytes += estimateNonElementNodeBytes(node, seenStr)
                 }
                 if (bytes > budgetBytes) {
                     throw DomLimitExceededException(
@@ -828,7 +1312,7 @@ class PluginDomParser(
         }
 
         internal fun getElementAttrWithDeadline(el: Element, name: String, isXml: Boolean, deadlineNanos: Long): String? {
-            if (el is Document) return null
+            if (el is Document || el.attributesSize() == 0) return null
             var ops = 0
             if (isXml) {
                 for (a in el.attributes()) {
@@ -837,12 +1321,43 @@ class PluginDomParser(
                 }
                 return null
             }
-            val lower = name.lowercase(Locale.ROOT)
+            val lower = asciiLowerFast(name)
             for (a in el.attributes()) {
                 if ((++ops and 255) == 0) checkDeadline(deadlineNanos)
-                if (a.key.lowercase(Locale.ROOT) == lower) return a.value
+                if (asciiLowerFast(a.key) == lower) return a.value
             }
             return null
+        }
+
+        private fun appendJsonEscapedString(s: String, out: BoundedOutputBuffer) {
+            out.appendAsciiChar('"')
+            var i = 0
+            val len = s.length
+            while (i < len) {
+                val c = s[i]
+                when {
+                    c == '"' -> out.appendAscii("\\\"")
+                    c == '\\' -> out.appendAscii("\\\\")
+                    c == '\b' -> out.appendAscii("\\b")
+                    c == '\u000C' -> out.appendAscii("\\f")
+                    c == '\n' -> out.appendAscii("\\n")
+                    c == '\r' -> out.appendAscii("\\r")
+                    c == '\t' -> out.appendAscii("\\t")
+                    c.code < 0x20 -> {
+                        val hex = "0123456789abcdef"
+                        out.appendAscii("\\u00")
+                        out.appendAsciiChar(hex[(c.code ushr 4) and 0xF])
+                        out.appendAsciiChar(hex[c.code and 0xF])
+                    }
+                    c.code in 0xD800..0xDBFF && i + 1 < len && s[i + 1].code in 0xDC00..0xDFFF -> {
+                        out.appendString(s.substring(i, i + 2))
+                        i += 1
+                    }
+                    else -> out.appendChar(c)
+                }
+                i += 1
+            }
+            out.appendAsciiChar('"')
         }
 
         private fun serializeChildrenIterative(
@@ -873,7 +1388,8 @@ class PluginDomParser(
             stack: ArrayDeque<Any>,
             deadlineNanos: Long,
         ) {
-            val rawTextParent = !isXml && el !is Document && el.tagName().lowercase(Locale.ROOT) in HTML_RAW_TEXT_TAGS
+            if (el.childNodeSize() == 0) return
+            val rawTextParent = !isXml && el !is Document && el.normalName() in HTML_RAW_TEXT_TAGS
             val children = el.childNodes()
             var ops = 0
             for (i in children.size - 1 downTo 0) {
@@ -920,23 +1436,25 @@ class PluginDomParser(
                         out.appendAscii("-->")
                     }
                     is Element -> {
-                        val tag = if (isXml) item.tagName() else item.tagName().lowercase(Locale.ROOT)
+                        val tag = if (isXml) item.tagName() else item.normalName()
                         out.appendAsciiChar('<')
                         out.appendString(tag)
-                        var attrOps = 0
-                        for (a in item.attributes()) {
-                            if ((++attrOps and 255) == 0) checkDeadline(deadlineNanos)
-                            val key = if (isXml) a.key else a.key.lowercase(Locale.ROOT)
-                            val v = a.value
-                            if (!isXml && v.isEmpty()) {
-                                out.appendAsciiChar(' ')
-                                out.appendString(key)
-                            } else {
-                                out.appendAsciiChar(' ')
-                                out.appendString(key)
-                                out.appendAscii("=\"")
-                                if (isXml) appendXmlAttr(v, out) else appendHtmlAttr(v, out)
-                                out.appendAsciiChar('"')
+                        if (item.attributesSize() > 0) {
+                            var attrOps = 0
+                            for (a in item.attributes()) {
+                                if ((++attrOps and 255) == 0) checkDeadline(deadlineNanos)
+                                val key = if (isXml) a.key else asciiLowerFast(a.key)
+                                val v = a.value
+                                if (!isXml && v.isEmpty()) {
+                                    out.appendAsciiChar(' ')
+                                    out.appendString(key)
+                                } else {
+                                    out.appendAsciiChar(' ')
+                                    out.appendString(key)
+                                    out.appendAscii("=\"")
+                                    if (isXml) appendXmlAttr(v, out) else appendHtmlAttr(v, out)
+                                    out.appendAsciiChar('"')
+                                }
                             }
                         }
                         if (isXml) {
@@ -1015,6 +1533,7 @@ class PluginDomParser(
                     is CDataNode -> out.appendString(node.text())
                     is TextNode -> out.appendString(node.wholeText)
                     is Element -> {
+                        if (node.childNodeSize() == 0) continue
                         val children = node.childNodes()
                         for (i in children.size - 1 downTo 0) {
                             if ((++ops and 1023) == 0) checkDeadline(deadlineNanos)
@@ -1036,6 +1555,7 @@ class PluginDomParser(
                     is CDataNode -> out.appendString(item.text())
                     is TextNode -> out.appendString(item.wholeText)
                     is Document -> {
+                        if (item.childNodeSize() == 0) continue
                         val children = item.childNodes()
                         for (i in children.size - 1 downTo 0) {
                             if ((++ops and 1023) == 0) checkDeadline(deadlineNanos)
@@ -1043,13 +1563,14 @@ class PluginDomParser(
                         }
                     }
                     is Element -> {
-                        val tag = item.tagName().lowercase(Locale.ROOT)
+                        val tag = item.normalName()
                         if (tag in HTML_SKIP_TEXT_TAGS) continue
                         val isBlock = tag in HTML_BLOCK_TAGS
                         if (isBlock) {
                             out.appendAsciiChar(' ')
                             stack.addLast(' ')
                         }
+                        if (item.childNodeSize() == 0) continue
                         val children = item.childNodes()
                         for (i in children.size - 1 downTo 0) {
                             if ((++ops and 1023) == 0) checkDeadline(deadlineNanos)
@@ -1207,7 +1728,9 @@ internal object CssSelectorEngine {
         val value: String?,
         val caseFlag: Char?,
         val kmpLps: IntArray? = null,
-    )
+    ) {
+        val nameLower: String = PluginDomParser.asciiLowerFast(name)
+    }
 
     internal sealed interface PseudoMatcher {
         data object FirstChild : PseudoMatcher
@@ -1230,26 +1753,93 @@ internal object CssSelectorEngine {
         val classes: List<String>,
         val attrs: List<AttrMatcher>,
         val pseudos: List<PseudoMatcher>,
-    )
+    ) {
+        val nsPrefixLower: String? = nsPrefix?.let { PluginDomParser.asciiLowerFast(it) }
+        val tagNameLower: String? = tagName?.let { PluginDomParser.asciiLowerFast(it) }
+    }
 
     internal class ComplexSelector(
         val compounds: Array<CompoundSelector>,
         val combinators: Array<Combinator>,
         val isNested: Boolean,
-    )
+    ) {
+        /**
+         * True iff `evalMatchStep(el, this, idx)` may be queried more than once for the
+         * same `(el, idx)` pair. Combinator `~` uses O(1)-per-parent monotonic `(scanUpTo,
+         * firstMatch)` scanning so its left operand is evaluated at most once per sibling;
+         * pure trailing `+`/`~` steps on top-level selectors likewise evaluate each sibling
+         * at most once — eliminating megabyte-scale per-element memo tables on sibling lists.
+         */
+        val needsMatchStepMemo: BooleanArray = BooleanArray(compounds.size) { idx ->
+            if (idx == compounds.size - 1) {
+                isNested
+            } else {
+                when (combinators[idx]) {
+                    Combinator.GENERAL_SIBLING -> false
+                    Combinator.ADJACENT_SIBLING -> {
+                        var hasNonSibRight = isNested
+                        var k = idx + 1
+                        while (!hasNonSibRight && k < combinators.size) {
+                            if (combinators[k] != Combinator.ADJACENT_SIBLING &&
+                                combinators[k] != Combinator.GENERAL_SIBLING
+                            ) {
+                                hasNonSibRight = true
+                            }
+                            k += 1
+                        }
+                        hasNonSibRight
+                    }
+                    Combinator.CHILD, Combinator.DESCENDANT -> true
+                }
+            }
+        }
+    }
 
     private class SiblingTable(
         val children: List<Element>,
-        val index0Based: IdentityHashMap<Element, Int>,
-        val typeIndex1Based: IntArray,
-        val typeTotal: IntArray,
+        private val index0Based: IdentityHashMap<Element, Int>?,
     ) {
         val totalChildren: Int get() = children.size
+        private var typeIndex1Based: IntArray? = null
+        private var typeTotal: IntArray? = null
+
+        fun indexOf(el: Element): Int {
+            if (children.isEmpty()) return -1
+            if (index0Based == null) return if (children[0] === el) 0 else -1
+            return index0Based[el] ?: -1
+        }
 
         fun prevSibling(el: Element): Element? {
-            val i = index0Based[el] ?: return null
+            val i = indexOf(el)
             return if (i > 0) children[i - 1] else null
         }
+
+        fun ensureOfType(ctx: QueryContext) {
+            if (typeIndex1Based != null) return
+            val n = children.size
+            ctx.chargeMemory(12L * n.toLong() + 64L)
+            val idxArr = IntArray(n)
+            val totArr = IntArray(n)
+            val typeCounts = HashMap<String, Int>()
+            val tags = arrayOfNulls<String>(n)
+            for (i in 0 until n) {
+                val c = children[i]
+                ctx.tick(1)
+                val tag = if (ctx.isXml) c.tagName() else c.normalName()
+                val nextCount = (typeCounts[tag] ?: 0) + 1
+                typeCounts[tag] = nextCount
+                idxArr[i] = nextCount
+                tags[i] = tag
+            }
+            for (i in 0 until n) {
+                totArr[i] = typeCounts[tags[i]]!!
+            }
+            typeIndex1Based = idxArr
+            typeTotal = totArr
+        }
+
+        fun typeIndex1(pos0: Int): Int = typeIndex1Based!![pos0]
+        fun typeTotalCount(pos0: Int): Int = typeTotal!![pos0]
     }
 
     private class SelectorMemo(val stepCount: Int, val isNested: Boolean) {
@@ -1257,7 +1847,10 @@ internal object CssSelectorEngine {
         val combRowLen: Int = (stepCount - 1).coerceAtLeast(0)
         var matchStep: IdentityHashMap<Element, ByteArray>? = null
         var selfOrAncestor: IdentityHashMap<Element, ByteArray>? = null
-        var anyPrevSibling: IdentityHashMap<Element, ByteArray>? = null
+        // Per-parent O(1)-space monotonic state for `~` (general sibling):
+        // scanUpTo[idx] = next child index not yet tested; firstMatch[idx] = earliest matching child index or -1.
+        var siblingScanUpTo: IdentityHashMap<Element, IntArray>? = null
+        var siblingFirstMatch: IdentityHashMap<Element, IntArray>? = null
 
         fun getCached(map: IdentityHashMap<Element, ByteArray>?, el: Element, idx: Int): Byte {
             val row = map?.get(el) ?: return MEMO_UNCOMPUTED
@@ -1274,9 +1867,31 @@ internal object CssSelectorEngine {
             setInMap(map, el, combRowLen, idx, value, ctx)
         }
 
-        fun setAnyPrevSibling(el: Element, idx: Int, value: Byte, ctx: QueryContext) {
-            val map = anyPrevSibling ?: IdentityHashMap<Element, ByteArray>().also { anyPrevSibling = it }
-            setInMap(map, el, combRowLen, idx, value, ctx)
+        fun getSiblingFirstMatch(parent: Element, idx: Int): Int {
+            val row = siblingFirstMatch?.get(parent) ?: return -1
+            return row[idx]
+        }
+
+        fun getSiblingScanUpTo(parent: Element, idx: Int): Int {
+            val row = siblingScanUpTo?.get(parent) ?: return 0
+            return row[idx]
+        }
+
+        fun setSiblingState(parent: Element, idx: Int, scanUpTo: Int, firstMatch: Int, ctx: QueryContext) {
+            val scanMap = siblingScanUpTo ?: IdentityHashMap<Element, IntArray>().also { siblingScanUpTo = it }
+            val firstMap = siblingFirstMatch ?: IdentityHashMap<Element, IntArray>().also { siblingFirstMatch = it }
+            var scanRow = scanMap[parent]
+            var firstRow = firstMap[parent]
+            if (scanRow == null || firstRow == null) {
+                val allocBytes = 64L + 8L * combRowLen.toLong()
+                ctx.chargeMemory(allocBytes)
+                scanRow = IntArray(combRowLen)
+                firstRow = IntArray(combRowLen) { -1 }
+                scanMap[parent] = scanRow
+                firstMap[parent] = firstRow
+            }
+            scanRow[idx] = scanUpTo
+            firstRow[idx] = firstMatch
         }
 
         private fun setInMap(
@@ -1312,6 +1927,7 @@ internal object CssSelectorEngine {
         private val siblingTables = IdentityHashMap<Element, SiblingTable>()
         private val classTokenCache = IdentityHashMap<Element, Set<String>>()
         private val emptyCache = IdentityHashMap<Element, Boolean>()
+        private val lowerCache = HashMap<String, String>()
 
         fun tick(cost: Int = 1) {
             val prev = steps
@@ -1346,7 +1962,14 @@ internal object CssSelectorEngine {
         fun memoFor(sel: ComplexSelector): SelectorMemo =
             memos.getOrPut(sel) { SelectorMemo(sel.compounds.size, sel.isNested) }
 
-        fun getElementAttrBudgeted(el: Element, name: String): String? {
+        private fun cachedLower(s: String): String {
+            lowerCache[s]?.let { return it }
+            val low = PluginDomParser.asciiLowerFast(s)
+            if (lowerCache.size < 2048) lowerCache[s] = low
+            return low
+        }
+
+        fun getElementAttrBudgeted(el: Element, name: String, preLowerName: String? = null): String? {
             if (el is Document) return null
             if (el.attributesSize() == 0) {
                 tick(1)
@@ -1368,14 +1991,16 @@ internal object CssSelectorEngine {
                 if (budgetChunk > 0) tick(budgetChunk)
                 return null
             }
-            val lower = name.lowercase(Locale.ROOT)
+            val lower = preLowerName ?: cachedLower(name)
             for (a in el.attributes()) {
                 budgetChunk += 1
                 if (budgetChunk >= 64) {
                     tick(budgetChunk)
                     budgetChunk = 0
                 }
-                if (a.key.lowercase(Locale.ROOT) == lower) {
+                val ak = a.key
+                val akLower = if (ak === lower || ak == lower) lower else cachedLower(ak)
+                if (akLower == lower) {
                     if (budgetChunk > 0) tick(budgetChunk)
                     return a.value
                 }
@@ -1386,6 +2011,11 @@ internal object CssSelectorEngine {
 
         fun siblingTableFor(parent: Element): SiblingTable {
             siblingTables[parent]?.let { return it }
+            if (parent.childNodeSize() == 0) {
+                val empty = SiblingTable(emptyList(), null)
+                siblingTables[parent] = empty
+                return empty
+            }
             val rawChildren = parent.childNodes()
             val children = ArrayList<Element>()
             var scanChunk = 0
@@ -1401,26 +2031,19 @@ internal object CssSelectorEngine {
             if (scanChunk > 0) tick(scanChunk)
 
             val n = children.size
-            chargeMemory(44L * n.toLong() + 128L)
-            val index0 = IdentityHashMap<Element, Int>(n)
-            val typeIdx = IntArray(n)
-            val typeCounts = HashMap<String, Int>()
-            val tags = arrayOfNulls<String>(n)
-            for (i in 0 until n) {
-                val c = children[i]
-                tick(1)
-                index0[c] = i
-                val tag = if (isXml) c.tagName() else c.tagName().lowercase(Locale.ROOT)
-                val nextTypeCount = (typeCounts[tag] ?: 0) + 1
-                typeCounts[tag] = nextTypeCount
-                typeIdx[i] = nextTypeCount
-                tags[i] = tag
+            val index0 = if (n > 1) {
+                chargeMemory(20L * n.toLong() + 128L)
+                IdentityHashMap<Element, Int>(n).also { map ->
+                    for (i in 0 until n) {
+                        if ((i and 1023) == 0) PluginDomParser.checkDeadline(deadlineNanos)
+                        map[children[i]] = i
+                    }
+                }
+            } else {
+                chargeMemory(64L)
+                null
             }
-            val typeTot = IntArray(n)
-            for (i in 0 until n) {
-                typeTot[i] = typeCounts[tags[i]]!!
-            }
-            val table = SiblingTable(children, index0, typeIdx, typeTot)
+            val table = SiblingTable(children, index0)
             siblingTables[parent] = table
             return table
         }
@@ -1450,7 +2073,7 @@ internal object CssSelectorEngine {
             if (clsAttr.isEmpty()) return false
             if (clsAttr.length <= LONG_CLASS_CACHE_THRESHOLD) {
                 // Single in-place pass with zero allocations for normal short class lists
-                tick(1)
+                // (getElementAttrBudgeted already ticked for attribute lookup)
                 return matchesAllClassesInPlace(clsAttr, wantedClasses)
             }
             // Long class attribute (> 128 chars): scan once while charging every char into step budget
@@ -1585,7 +2208,7 @@ internal object CssSelectorEngine {
 
         private fun evalMatchStep(el: Element, sel: ComplexSelector, idx: Int, isTopLevel: Boolean): Boolean {
             val stepCount = sel.compounds.size
-            val shouldMemo = stepCount > 1 && (!isTopLevel || idx < stepCount - 1)
+            val shouldMemo = stepCount > 1 && sel.needsMatchStepMemo[idx] && (!isTopLevel || idx < stepCount - 1)
             val memo = if (shouldMemo) memoFor(sel) else null
             if (memo != null) {
                 val cached = memo.getCached(memo.matchStep, el, idx)
@@ -1655,49 +2278,44 @@ internal object CssSelectorEngine {
             return baseResult
         }
 
+        /**
+         * O(1)-space per-parent monotonic scan for `~` (general sibling):
+         * For a fixed `(parent, sel, idx)`, `anyPrevSiblingMatches(child[k])` is true iff
+         * `k > firstMatch`. Each sibling is evaluated at most once regardless of query order,
+         * using O(1) memory per parent instead of an O(N) per-element memo table.
+         */
         private fun evalAnyPrevSiblingMatches(el: Element, sel: ComplexSelector, idx: Int): Boolean {
+            val p = el.parent() ?: return false
+            val table = siblingTableFor(p)
+            val pos = table.indexOf(el)
+            if (pos <= 0) return false
             val memo = memoFor(sel)
-            val quick = memo.getCached(memo.anyPrevSibling, el, idx)
-            if (quick != MEMO_UNCOMPUTED) return quick == MEMO_TRUE
-
-            val chain = ArrayList<Element>()
-            var cur: Element = el
-            var baseResult = false
-            while (true) {
-                val cached = memo.getCached(memo.anyPrevSibling, cur, idx)
-                if (cached != MEMO_UNCOMPUTED) {
-                    baseResult = cached == MEMO_TRUE
-                    break
+            val first = memo.getSiblingFirstMatch(p, idx)
+            if (first >= 0) return pos > first
+            var scanned = memo.getSiblingScanUpTo(p, idx)
+            while (scanned < pos) {
+                val sib = table.children[scanned]
+                val matched = evalMatchStep(sib, sel, idx, isTopLevel = false)
+                scanned += 1
+                if (matched) {
+                    memo.setSiblingState(p, idx, scanned, scanned - 1, this)
+                    return true
                 }
-                tick(1)
-                val prev = prevElementSiblingFast(cur)
-                if (prev == null) {
-                    memo.setAnyPrevSibling(cur, idx, MEMO_FALSE, this)
-                    baseResult = false
-                    break
-                }
-                if (evalMatchStep(prev, sel, idx, isTopLevel = false)) {
-                    memo.setAnyPrevSibling(cur, idx, MEMO_TRUE, this)
-                    baseResult = true
-                    break
-                }
-                chain.add(cur)
-                cur = prev
             }
-            val fill = if (baseResult) MEMO_TRUE else MEMO_FALSE
-            for (i in chain.size - 1 downTo 0) {
-                memo.setAnyPrevSibling(chain[i], idx, fill, this)
-            }
-            return baseResult
+            memo.setSiblingState(p, idx, scanned, -1, this)
+            return false
         }
 
         private fun matchesCompound(el: Element, comp: CompoundSelector): Boolean {
             if (el is Document) return false
             if (comp.nsPrefix != null || comp.tagName != null) {
-                if (!matchesTag(el.tagName(), comp.nsPrefix, comp.tagName, isXml)) return false
+                val actual = if (isXml) el.tagName() else el.normalName()
+                val ns = if (isXml) comp.nsPrefix else comp.nsPrefixLower
+                val wanted = if (isXml) comp.tagName else comp.tagNameLower
+                if (!matchesTagPreNormalized(actual, ns, wanted)) return false
             }
             for (id in comp.ids) {
-                val actual = getElementAttrBudgeted(el, "id") ?: return false
+                val actual = getElementAttrBudgeted(el, "id", "id") ?: return false
                 if (!equalsBudgeted(actual, id, ci = false)) return false
             }
             if (comp.classes.isNotEmpty()) {
@@ -1714,7 +2332,7 @@ internal object CssSelectorEngine {
         }
 
         private fun matchesAttr(el: Element, am: AttrMatcher): Boolean {
-            val actual = getElementAttrBudgeted(el, am.name) ?: return false
+            val actual = getElementAttrBudgeted(el, am.name, am.nameLower) ?: return false
             if (am.op == AttrOp.EXISTS) return true
             val expected = am.value ?: ""
             val ci = am.caseFlag == 'i'
@@ -1868,12 +2486,12 @@ internal object CssSelectorEngine {
         private fun matchesPseudo(el: Element, pm: PseudoMatcher): Boolean = when (pm) {
             PseudoMatcher.FirstChild -> {
                 val p = el.parent() ?: return false
-                siblingTableFor(p).index0Based[el] == 0
+                siblingTableFor(p).indexOf(el) == 0
             }
             PseudoMatcher.LastChild -> {
                 val p = el.parent() ?: return false
                 val t = siblingTableFor(p)
-                t.index0Based[el] == t.totalChildren - 1
+                t.indexOf(el) == t.totalChildren - 1
             }
             PseudoMatcher.OnlyChild -> {
                 val p = el.parent() ?: return false
@@ -1882,30 +2500,38 @@ internal object CssSelectorEngine {
             PseudoMatcher.FirstOfType -> {
                 val p = el.parent() ?: return false
                 val t = siblingTableFor(p)
-                val pos0 = t.index0Based[el] ?: return false
-                t.typeIndex1Based[pos0] == 1
+                val pos0 = t.indexOf(el)
+                if (pos0 < 0) return false
+                t.ensureOfType(this)
+                t.typeIndex1(pos0) == 1
             }
             PseudoMatcher.LastOfType -> {
                 val p = el.parent() ?: return false
                 val t = siblingTableFor(p)
-                val pos0 = t.index0Based[el] ?: return false
-                t.typeIndex1Based[pos0] == t.typeTotal[pos0]
+                val pos0 = t.indexOf(el)
+                if (pos0 < 0) return false
+                t.ensureOfType(this)
+                t.typeIndex1(pos0) == t.typeTotalCount(pos0)
             }
             PseudoMatcher.OnlyOfType -> {
                 val p = el.parent() ?: return false
                 val t = siblingTableFor(p)
-                val pos0 = t.index0Based[el] ?: return false
-                t.typeTotal[pos0] == 1
+                val pos0 = t.indexOf(el)
+                if (pos0 < 0) return false
+                t.ensureOfType(this)
+                t.typeTotalCount(pos0) == 1
             }
             PseudoMatcher.Empty -> matchesEmptyCached(el)
             PseudoMatcher.Root -> el.parent() is Document
             is PseudoMatcher.NthChild -> {
                 val p = el.parent() ?: return false
                 val t = siblingTableFor(p)
-                val pos0 = t.index0Based[el] ?: return false
+                val pos0 = t.indexOf(el)
+                if (pos0 < 0) return false
                 val idx = if (pm.ofType) {
-                    val pos1 = t.typeIndex1Based[pos0]
-                    val tot = t.typeTotal[pos0]
+                    t.ensureOfType(this)
+                    val pos1 = t.typeIndex1(pos0)
+                    val tot = t.typeTotalCount(pos0)
                     if (pm.fromEnd) (tot - pos1 + 1) else pos1
                 } else {
                     val pos1 = pos0 + 1
@@ -1931,6 +2557,7 @@ internal object CssSelectorEngine {
     }
 
     private fun pushChildElementsBudgeted(parent: Element, stack: ArrayDeque<Element>, ctx: QueryContext) {
+        if (parent.childNodeSize() == 0) return
         val raw = parent.childNodes()
         var nonElemChunk = 0
         for (i in raw.size - 1 downTo 0) {
@@ -2026,11 +2653,7 @@ internal object CssSelectorEngine {
         return lps
     }
 
-    private fun matchesTag(actualRaw: String, nsPrefix: String?, wantedTag: String?, isXml: Boolean): Boolean {
-        val actual = if (isXml) actualRaw else actualRaw.lowercase(Locale.ROOT)
-        val wanted = wantedTag?.let { if (isXml) it else it.lowercase(Locale.ROOT) }
-        val ns = nsPrefix?.let { if (isXml) it else it.lowercase(Locale.ROOT) }
-
+    private fun matchesTagPreNormalized(actual: String, ns: String?, wanted: String?): Boolean {
         if (ns == null) {
             if (wanted == null) return true
             return actual == wanted

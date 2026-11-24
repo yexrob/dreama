@@ -367,6 +367,7 @@ class PluginRuntime(
         }
         quickJs = null
         initialized = false
+        domParser.clear()
         runCatching { cookieJar.flush() }
     }
 

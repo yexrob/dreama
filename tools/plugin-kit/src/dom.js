@@ -4,24 +4,28 @@ import * as parse5 from 'parse5';
 /**
  * §11.1 (S4) Byte-budgeted DOM parser mirroring Android `PluginDomParser.kt`:
  * - Max input text: 2 MB UTF-8
- * - Max single document estimated memory: 24 MB
- * - Max VM-wide live DOM memory (live docs + handle table + active class cache): 48 MB
+ * - Max tag / attribute name length: 256 chars (rejected during parse)
+ * - Max single document estimated memory: 32 MB
+ * - Max single-VM live DOM memory (live docs + handle table + active class cache): 48 MB
+ * - Max process-wide live DOM memory across ALL plugin VMs: 64 MB
  * - Max simultaneously live documents per VM: 8
- * - Max serialization output (`html()`, `outerHtml()`, `text()`, `attrsJson()`): 8 MB
- * - Mid-parse streaming byte accounting for ALL node kinds (Elements, Text, Comments,
- *   PIs, Doctypes, CDATA, Attributes) via parse5 custom `treeAdapter` + XML pre-scan,
- *   followed by exact full-tree recount
+ * - Max serialization output (`html()`, `outerHtml()`, `text()`, escaped `attrsJson()`): 8 MB
+ * - Calibrated separately for V8 `parse5` HTML and `linkedom` XML trees (empirical
+ *   `realHeap / estimated` in `[0.78, 1.10]`, target `[0.60, 1.25]`), with `ConsString`
+ *   flattening and exact post-parse full-tree recount
  * - Per-document deduplicated monotonic handle IDs (never reset on `clear()`)
  * - O(N * S) memoized CSS selector engine with hard syntax caps (4 KB, 32 groups,
- *   32 compounds, nesting 4, value 256, `:nth-*` ±1e6), 16 MB query DP memory budget,
- *   cached `:empty`, in-place short-class scanning (no false-positive cache overflow on
- *   200k classed elements), budgeted loops everywhere, and entry deadline checks
+ *   32 compounds, nesting 4, value 256, `:nth-*` ±1e6), O(1)-per-parent `~` scan,
+ *   lazy `-of-type` sibling tables, cached `:empty`, in-place short-class scanning,
+ *   budgeted loops everywhere, and entry deadline checks
  */
 export const MAX_LIVE_DOCS = 8;
 export const MAX_DOCS_PER_CALL = MAX_LIVE_DOCS;
 export const MAX_DOC_BYTES = 2 * 1024 * 1024;
-export const MAX_DOC_MEMORY_BYTES = 24 * 1024 * 1024;
+export const MAX_DOC_MEMORY_BYTES = 32 * 1024 * 1024;
 export const MAX_VM_MEMORY_BYTES = 48 * 1024 * 1024;
+export const MAX_PROCESS_MEMORY_BYTES = 64 * 1024 * 1024;
+export const MAX_NAME_LENGTH = 256;
 export const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 export const MAX_SELECTOR_STEPS = 2_000_000;
 export const MAX_SELECTOR_MEMORY_BYTES = 16 * 1024 * 1024;
@@ -32,22 +36,173 @@ export const MAX_PSEUDO_NESTING = 4;
 export const MAX_SELECTOR_VALUE_LENGTH = 256;
 export const MAX_NTH_ABS = 1_000_000;
 
-// Calibrated per-node byte estimates matching Android PluginDomParser.kt identically
+// Calibrated V8 per-node byte constants (separate for parse5 HTML & linkedom XML)
 export const DOC_BASE_BYTES = 1024;
-export const ELEMENT_BASE_BYTES = 56;
-export const CHILD_LIST_BASE_BYTES = 64;
-export const CHILD_SLOT_BYTES = 8;
-export const ATTRS_CONTAINER_BYTES = 48;
-export const ATTR_ENTRY_BYTES = 40;
-export const TEXT_NODE_BASE_BYTES = 88;
-export const COMMENT_NODE_BASE_BYTES = 88;
-export const OTHER_NODE_BASE_BYTES = 160;
-export const HANDLE_ENTRY_BYTES = 96;
+export const HTML_ELEMENT_BASE_BYTES = 152;
+export const HTML_CHILD_LIST_BASE_BYTES = 140;
+export const HTML_CHILD_SLOT_BYTES = 8;
+export const HTML_ATTRS_CONTAINER_BYTES = 120;
+export const HTML_ATTR_ENTRY_BYTES = 56;
+export const HTML_DISTINCT_TAG_BYTES = 24;
+export const HTML_TEXT_NODE_BASE_BYTES = 64;
+export const HTML_COMMENT_NODE_BASE_BYTES = 54;
+export const HTML_OTHER_NODE_BASE_BYTES = 160;
+
+export const XML_ELEMENT_BASE_BYTES = 430;
+export const XML_ATTRS_CONTAINER_BYTES = 40;
+export const XML_ATTR_ENTRY_BYTES = 265;
+export const XML_CDATA_NODE_BASE_BYTES = 275;
+export const XML_TEXT_NODE_BASE_BYTES = 175;
+export const XML_COMMENT_NODE_BASE_BYTES = 175;
+export const XML_OTHER_NODE_BASE_BYTES = 160;
+
+// Legacy exported aliases kept for external callers/tests
+export const ELEMENT_BASE_BYTES = HTML_ELEMENT_BASE_BYTES;
+export const CHILD_LIST_BASE_BYTES = HTML_CHILD_LIST_BASE_BYTES;
+export const CHILD_SLOT_BYTES = HTML_CHILD_SLOT_BYTES;
+export const ATTRS_CONTAINER_BYTES = HTML_ATTRS_CONTAINER_BYTES;
+export const ATTR_ENTRY_BYTES = HTML_ATTR_ENTRY_BYTES;
+export const TEXT_NODE_BASE_BYTES = HTML_TEXT_NODE_BASE_BYTES;
+export const COMMENT_NODE_BASE_BYTES = HTML_COMMENT_NODE_BASE_BYTES;
+export const OTHER_NODE_BASE_BYTES = HTML_OTHER_NODE_BASE_BYTES;
+export const HANDLE_ENTRY_BYTES = 128;
 
 const MEMO_UNCOMPUTED = 0;
 const MEMO_FALSE = 1;
 const MEMO_TRUE = 2;
 const LONG_CLASS_CACHE_THRESHOLD = 128;
+const PROCESS_RESERVE_CHUNK_BYTES = 256 * 1024;
+
+class ProcessDomMemoryLedger {
+  constructor() {
+    this.totalReservedBytes = 0;
+    this.holders = new Set();
+    this._registry = typeof FinalizationRegistry === 'function'
+      ? new FinalizationRegistry((holder) => {
+        this.holders.delete(holder);
+        this.releaseAll(holder);
+      })
+      : null;
+  }
+
+  register(parser) {
+    const holder = {
+      ref: typeof WeakRef === 'function' ? new WeakRef(parser) : null,
+      reservedBytes: 0,
+    };
+    this.holders.add(holder);
+    if (this._registry) this._registry.register(parser, holder);
+    return holder;
+  }
+
+  reapDeadHolders() {
+    for (const h of this.holders) {
+      if (h.ref && h.ref.deref() === undefined) {
+        this.holders.delete(h);
+        this.releaseAll(h);
+      }
+    }
+  }
+
+  currentTotalBytes() {
+    this.reapDeadHolders();
+    return this.totalReservedBytes;
+  }
+
+  remainingBytes(limitBytes) {
+    return Math.max(0, limitBytes - this.totalReservedBytes);
+  }
+
+  tryReserve(holder, delta, limitBytes) {
+    if (delta <= 0) return true;
+    if (this.totalReservedBytes + delta <= limitBytes) {
+      this.totalReservedBytes += delta;
+      holder.reservedBytes += delta;
+      return true;
+    }
+    this.reapDeadHolders();
+    if (this.totalReservedBytes + delta <= limitBytes) {
+      this.totalReservedBytes += delta;
+      holder.reservedBytes += delta;
+      return true;
+    }
+    return false;
+  }
+
+  release(holder, delta) {
+    if (delta <= 0) return;
+    const actual = Math.min(holder.reservedBytes, delta);
+    if (actual > 0) {
+      holder.reservedBytes -= actual;
+      this.totalReservedBytes = Math.max(0, this.totalReservedBytes - actual);
+    }
+  }
+
+  releaseAll(holder) {
+    const prev = holder.reservedBytes;
+    if (prev > 0) {
+      holder.reservedBytes = 0;
+      this.totalReservedBytes = Math.max(0, this.totalReservedBytes - prev);
+    }
+  }
+}
+
+const GLOBAL_PROCESS_LEDGER = new ProcessDomMemoryLedger();
+
+export function currentProcessDomMemoryBytes() {
+  return GLOBAL_PROCESS_LEDGER.currentTotalBytes();
+}
+
+function flattenStrV8(s) {
+  if (typeof s !== 'string' || s.length < 16) return s;
+  return Buffer.from(s, 'utf8').toString('utf8');
+}
+
+function strBytesV8(s) {
+  if (!s || !s.length) return 0;
+  let wide = false;
+  for (let i = 0; i < s.length; i++) {
+    if (s.charCodeAt(i) > 0xFF) { wide = true; break; }
+  }
+  const data = wide ? s.length * 2 : s.length;
+  return 16 + ((data + 7) & ~7);
+}
+
+function asciiLowerFast(s) {
+  const str = String(s ?? '');
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    if ((c >= 65 && c <= 90) || c >= 0x80) return str.toLowerCase();
+  }
+  return str;
+}
+
+function appendJsonEscapedString(s, out) {
+  out.appendAscii('"');
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    let rep = null;
+    if (code === 0x22) rep = '\\"';
+    else if (code === 0x5C) rep = '\\\\';
+    else if (code === 0x08) rep = '\\b';
+    else if (code === 0x0C) rep = '\\f';
+    else if (code === 0x0A) rep = '\\n';
+    else if (code === 0x0D) rep = '\\r';
+    else if (code === 0x09) rep = '\\t';
+    else if (code < 0x20) rep = '\\u00' + code.toString(16).padStart(2, '0');
+    if (rep !== null) {
+      if (i > start) out.appendString(s.slice(start, i));
+      out.appendAscii(rep);
+      start = i + 1;
+    } else if (i - start >= 4096) {
+      out.appendString(s.slice(start, i + 1));
+      start = i + 1;
+    }
+  }
+  if (start < s.length) out.appendString(s.slice(start));
+  out.appendAscii('"');
+}
 
 export class DomLimitExceededError extends Error {
   constructor(message = 'DOM 资源超限') {
@@ -524,7 +679,21 @@ class SelectorParser {
       combinators.push(comb);
       compounds.push(this.parseCompoundSelector());
     }
-    return { compounds, combinators, isNested: this.nestingDepth > 0 };
+    const isNested = this.nestingDepth > 0;
+    const needsMatchStepMemo = compounds.map((_, idx) => {
+      if (idx === compounds.length - 1) return isNested;
+      const comb = combinators[idx];
+      if (comb === '~') return false;
+      if (comb === '+') {
+        if (isNested) return true;
+        for (let k = idx + 1; k < combinators.length; k++) {
+          if (combinators[k] !== '+' && combinators[k] !== '~') return true;
+        }
+        return false;
+      }
+      return true;
+    });
+    return { compounds, combinators, isNested, needsMatchStepMemo };
   }
 
   parseCompoundSelector() {
@@ -593,17 +762,27 @@ class SelectorParser {
     if (!matchedAny) {
       throw new Error(`无效的 CSS 选择器：'${this.src}'（位置 ${this.pos}）`);
     }
-    return { nsPrefix, tagName, ids, classes, attrs, pseudos };
+    return {
+      nsPrefix,
+      nsPrefixLower: nsPrefix === null ? null : asciiLowerFast(nsPrefix),
+      tagName,
+      tagNameLower: tagName === null ? null : asciiLowerFast(tagName),
+      ids,
+      classes,
+      attrs,
+      pseudos,
+    };
   }
 
   parseAttrSelector() {
     this.pos += 1;
     this.skipWs();
     const name = this.readIdent();
+    const nameLower = asciiLowerFast(name);
     this.skipWs();
     if (this.peek() === ']') {
       this.pos += 1;
-      return { name, op: 'exists', value: null, caseFlag: null, kmpLps: null };
+      return { name, nameLower, op: 'exists', value: null, caseFlag: null, kmpLps: null };
     }
     let op;
     if (this.src.startsWith('~=', this.pos)) { this.pos += 2; op = '~='; }
@@ -631,7 +810,7 @@ class SelectorParser {
     }
     this.pos += 1;
     const kmpLps = (op === '*=' && value.length > 0) ? buildKmpLps(value, caseFlag === 'i') : null;
-    return { name, op, value, caseFlag, kmpLps };
+    return { name, nameLower, op, value, caseFlag, kmpLps };
   }
 
   parsePseudoSelector() {
@@ -814,10 +993,7 @@ function parseSelector(rawSelector) {
   return new SelectorParser(s, 0).parseSelectorList(true);
 }
 
-function matchesTag(actualRaw, nsPrefix, wantedTag, isXml) {
-  const actual = isXml ? String(actualRaw || '') : String(actualRaw || '').toLowerCase();
-  const wanted = wantedTag === null ? null : (isXml ? wantedTag : wantedTag.toLowerCase());
-  const ns = nsPrefix === null ? null : (isXml ? nsPrefix : nsPrefix.toLowerCase());
+function matchesTagPreNormalized(actual, ns, wanted) {
   if (ns === null) {
     if (wanted === null) return true;
     return actual === wanted;
@@ -851,6 +1027,7 @@ class QueryContext {
     this.siblingTables = new Map();
     this.classTokenCache = new Map();
     this.emptyCache = new Map();
+    this.lowerCache = new Map();
   }
 
   tick(cost = 1) {
@@ -883,7 +1060,15 @@ class QueryContext {
     }
   }
 
-  getElementAttrBudgeted(el, name) {
+  cachedLower(s) {
+    let low = this.lowerCache.get(s);
+    if (low !== undefined) return low;
+    low = asciiLowerFast(s);
+    if (this.lowerCache.size < 2048) this.lowerCache.set(s, low);
+    return low;
+  }
+
+  getElementAttrBudgeted(el, name, preLowerName = null) {
     if (!el || isDocumentNode(el)) return null;
     const attrs = getElementAttributes(el);
     if (attrs.length === 0) {
@@ -906,14 +1091,15 @@ class QueryContext {
       if (budgetChunk > 0) this.tick(budgetChunk);
       return null;
     }
-    const lower = String(name).toLowerCase();
+    const lower = preLowerName ?? this.cachedLower(String(name));
     for (let i = 0; i < attrs.length; i++) {
       budgetChunk += 1;
       if (budgetChunk >= 64) {
         this.tick(budgetChunk);
         budgetChunk = 0;
       }
-      if (String(attrs[i].name).toLowerCase() === lower) {
+      const ak = attrs[i].name;
+      if (ak === lower || this.cachedLower(String(ak)) === lower) {
         if (budgetChunk > 0) this.tick(budgetChunk);
         return attrs[i].value ?? '';
       }
@@ -932,7 +1118,8 @@ class QueryContext {
         combRowLen: Math.max(0, stepCount - 1),
         matchStep: null,
         selfOrAncestor: null,
-        anyPrevSibling: null,
+        siblingScanUpTo: null,
+        siblingFirstMatch: null,
       };
       this.memos.set(sel, m);
     }
@@ -961,6 +1148,34 @@ class QueryContext {
     row[idx] = value;
   }
 
+  getSiblingFirstMatch(memo, parent, idx) {
+    const row = memo.siblingFirstMatch?.get(parent);
+    return row ? row[idx] : -1;
+  }
+
+  getSiblingScanUpTo(memo, parent, idx) {
+    const row = memo.siblingScanUpTo?.get(parent);
+    return row ? row[idx] : 0;
+  }
+
+  setSiblingState(memo, parent, idx, scanUpTo, firstMatch) {
+    if (!memo.siblingScanUpTo) {
+      memo.siblingScanUpTo = new Map();
+      memo.siblingFirstMatch = new Map();
+    }
+    let scanRow = memo.siblingScanUpTo.get(parent);
+    let firstRow = memo.siblingFirstMatch.get(parent);
+    if (!scanRow || !firstRow) {
+      this.chargeMemory(64 + 8 * memo.combRowLen);
+      scanRow = new Int32Array(memo.combRowLen);
+      firstRow = new Int32Array(memo.combRowLen).fill(-1);
+      memo.siblingScanUpTo.set(parent, scanRow);
+      memo.siblingFirstMatch.set(parent, firstRow);
+    }
+    scanRow[idx] = scanUpTo;
+    firstRow[idx] = firstMatch;
+  }
+
   siblingTableFor(parent) {
     let table = this.siblingTables.get(parent);
     if (table) return table;
@@ -978,17 +1193,47 @@ class QueryContext {
     if (scanChunk > 0) this.tick(scanChunk);
 
     const n = children.length;
-    this.chargeMemory(44 * n + 128);
-    const index0Based = new Map();
+    let index0Based = null;
+    if (n > 1) {
+      this.chargeMemory(20 * n + 128);
+      index0Based = new Map();
+      for (let i = 0; i < n; i++) {
+        if ((i & 1023) === 0) checkDeadline(this.deadlineMs);
+        index0Based.set(children[i], i);
+      }
+    } else {
+      this.chargeMemory(64);
+    }
+    table = {
+      children,
+      totalChildren: n,
+      index0Based,
+      typeIndex1Based: null,
+      typeTotal: null,
+      indexOf(el) {
+        if (n === 0) return -1;
+        if (!index0Based) return children[0] === el ? 0 : -1;
+        const pos = index0Based.get(el);
+        return pos === undefined ? -1 : pos;
+      },
+    };
+    this.siblingTables.set(parent, table);
+    return table;
+  }
+
+  ensureOfType(table) {
+    if (table.typeIndex1Based !== null) return;
+    const n = table.totalChildren;
+    this.chargeMemory(12 * n + 64);
     const typeIndex1Based = new Int32Array(n);
     const typeTotal = new Int32Array(n);
     const typeCounts = new Map();
     const tags = new Array(n);
     for (let i = 0; i < n; i++) {
-      const c = children[i];
+      const c = table.children[i];
       this.tick(1);
-      index0Based.set(c, i);
-      const tag = this.isXml ? getRawTagName(c) : getRawTagName(c).toLowerCase();
+      const rawTag = getRawTagName(c);
+      const tag = this.isXml ? rawTag : this.cachedLower(rawTag);
       const cnt = (typeCounts.get(tag) || 0) + 1;
       typeCounts.set(tag, cnt);
       typeIndex1Based[i] = cnt;
@@ -997,17 +1242,16 @@ class QueryContext {
     for (let i = 0; i < n; i++) {
       typeTotal[i] = typeCounts.get(tags[i]);
     }
-    table = { children, totalChildren: n, index0Based, typeIndex1Based, typeTotal };
-    this.siblingTables.set(parent, table);
-    return table;
+    table.typeIndex1Based = typeIndex1Based;
+    table.typeTotal = typeTotal;
   }
 
   prevElementSiblingFast(el) {
     const p = getParentNode(el);
     if (!p) return null;
     const t = this.siblingTableFor(p);
-    const i = t.index0Based.get(el);
-    return (i !== undefined && i > 0) ? t.children[i - 1] : null;
+    const i = t.indexOf(el);
+    return i > 0 ? t.children[i - 1] : null;
   }
 
   matchesClasses(el, wantedClasses) {
@@ -1022,7 +1266,6 @@ class QueryContext {
     const clsAttr = this.getElementAttrBudgeted(el, 'class');
     if (!clsAttr) return false;
     if (clsAttr.length <= LONG_CLASS_CACHE_THRESHOLD) {
-      this.tick(1);
       return this._matchesAllClassesInPlace(clsAttr, wantedClasses);
     }
     const tokens = new Set();
@@ -1136,7 +1379,7 @@ class QueryContext {
 
   evalMatchStep(el, sel, idx, isTopLevel) {
     const stepCount = sel.compounds.length;
-    const shouldMemo = stepCount > 1 && (!isTopLevel || idx < stepCount - 1);
+    const shouldMemo = stepCount > 1 && sel.needsMatchStepMemo[idx] && (!isTopLevel || idx < stepCount - 1);
     const memo = shouldMemo ? this.memoFor(sel) : null;
     if (memo) {
       const cached = this.getCached(memo.matchStep, el, idx);
@@ -1206,48 +1449,39 @@ class QueryContext {
   }
 
   evalAnyPrevSiblingMatches(el, sel, idx) {
+    const p = getParentNode(el);
+    if (!p) return false;
+    const table = this.siblingTableFor(p);
+    const pos = table.indexOf(el);
+    if (pos <= 0) return false;
     const memo = this.memoFor(sel);
-    const quick = this.getCached(memo.anyPrevSibling, el, idx);
-    if (quick !== MEMO_UNCOMPUTED) return quick === MEMO_TRUE;
-
-    const chain = [];
-    let cur = el;
-    let baseResult = false;
-    while (true) {
-      const cached = this.getCached(memo.anyPrevSibling, cur, idx);
-      if (cached !== MEMO_UNCOMPUTED) {
-        baseResult = cached === MEMO_TRUE;
-        break;
+    const first = this.getSiblingFirstMatch(memo, p, idx);
+    if (first >= 0) return pos > first;
+    let scanned = this.getSiblingScanUpTo(memo, p, idx);
+    while (scanned < pos) {
+      const sib = table.children[scanned];
+      const matched = this.evalMatchStep(sib, sel, idx, false);
+      scanned += 1;
+      if (matched) {
+        this.setSiblingState(memo, p, idx, scanned, scanned - 1);
+        return true;
       }
-      this.tick(1);
-      const prev = this.prevElementSiblingFast(cur);
-      if (!prev) {
-        this.setCached(memo, 'anyPrevSibling', memo.combRowLen, cur, idx, MEMO_FALSE);
-        baseResult = false;
-        break;
-      }
-      if (this.evalMatchStep(prev, sel, idx, false)) {
-        this.setCached(memo, 'anyPrevSibling', memo.combRowLen, cur, idx, MEMO_TRUE);
-        baseResult = true;
-        break;
-      }
-      chain.push(cur);
-      cur = prev;
     }
-    const fill = baseResult ? MEMO_TRUE : MEMO_FALSE;
-    for (let i = chain.length - 1; i >= 0; i--) {
-      this.setCached(memo, 'anyPrevSibling', memo.combRowLen, chain[i], idx, fill);
-    }
-    return baseResult;
+    this.setSiblingState(memo, p, idx, scanned, -1);
+    return false;
   }
 
   matchesCompound(el, comp) {
     if (!isElementNode(el)) return false;
     if (comp.nsPrefix !== null || comp.tagName !== null) {
-      if (!matchesTag(getRawTagName(el), comp.nsPrefix, comp.tagName, this.isXml)) return false;
+      const rawTag = getRawTagName(el);
+      const actual = this.isXml ? rawTag : this.cachedLower(rawTag);
+      const ns = this.isXml ? comp.nsPrefix : comp.nsPrefixLower;
+      const wanted = this.isXml ? comp.tagName : comp.tagNameLower;
+      if (!matchesTagPreNormalized(actual, ns, wanted)) return false;
     }
     for (const id of comp.ids) {
-      const actual = this.getElementAttrBudgeted(el, 'id');
+      const actual = this.getElementAttrBudgeted(el, 'id', 'id');
       if (actual === null || !this._equalsBudgeted(actual, id, false)) return false;
     }
     if (comp.classes.length > 0) {
@@ -1264,7 +1498,7 @@ class QueryContext {
   }
 
   matchesAttr(el, am) {
-    const actual = this.getElementAttrBudgeted(el, am.name);
+    const actual = this.getElementAttrBudgeted(el, am.name, am.nameLower);
     if (actual === null) return false;
     if (am.op === 'exists') return true;
     const expected = am.value ?? '';
@@ -1417,13 +1651,13 @@ class QueryContext {
     switch (pm.kind) {
       case 'first-child': {
         const p = getParentNode(el);
-        return Boolean(p) && this.siblingTableFor(p).index0Based.get(el) === 0;
+        return Boolean(p) && this.siblingTableFor(p).indexOf(el) === 0;
       }
       case 'last-child': {
         const p = getParentNode(el);
         if (!p) return false;
         const t = this.siblingTableFor(p);
-        return t.index0Based.get(el) === t.totalChildren - 1;
+        return t.indexOf(el) === t.totalChildren - 1;
       }
       case 'only-child': {
         const p = getParentNode(el);
@@ -1433,22 +1667,28 @@ class QueryContext {
         const p = getParentNode(el);
         if (!p) return false;
         const t = this.siblingTableFor(p);
-        const pos0 = t.index0Based.get(el);
-        return pos0 !== undefined && t.typeIndex1Based[pos0] === 1;
+        const pos0 = t.indexOf(el);
+        if (pos0 < 0) return false;
+        this.ensureOfType(t);
+        return t.typeIndex1Based[pos0] === 1;
       }
       case 'last-of-type': {
         const p = getParentNode(el);
         if (!p) return false;
         const t = this.siblingTableFor(p);
-        const pos0 = t.index0Based.get(el);
-        return pos0 !== undefined && t.typeIndex1Based[pos0] === t.typeTotal[pos0];
+        const pos0 = t.indexOf(el);
+        if (pos0 < 0) return false;
+        this.ensureOfType(t);
+        return t.typeIndex1Based[pos0] === t.typeTotal[pos0];
       }
       case 'only-of-type': {
         const p = getParentNode(el);
         if (!p) return false;
         const t = this.siblingTableFor(p);
-        const pos0 = t.index0Based.get(el);
-        return pos0 !== undefined && t.typeTotal[pos0] === 1;
+        const pos0 = t.indexOf(el);
+        if (pos0 < 0) return false;
+        this.ensureOfType(t);
+        return t.typeTotal[pos0] === 1;
       }
       case 'empty':
         return this.matchesEmptyCached(el);
@@ -1458,10 +1698,11 @@ class QueryContext {
         const p = getParentNode(el);
         if (!p) return false;
         const t = this.siblingTableFor(p);
-        const pos0 = t.index0Based.get(el);
-        if (pos0 === undefined) return false;
+        const pos0 = t.indexOf(el);
+        if (pos0 < 0) return false;
         let idx;
         if (pm.ofType) {
+          this.ensureOfType(t);
           const pos1 = t.typeIndex1Based[pos0];
           const tot = t.typeTotal[pos0];
           idx = pm.fromEnd ? (tot - pos1 + 1) : pos1;
@@ -1522,65 +1763,105 @@ function queryDescendants(scopeRoot, selectors, isXml, firstOnly, maxSteps, maxM
  * Doctype, Attributes) live during HTML5 parsing and aborts immediately when
  * estimated bytes cross `budgetBytes` or the call deadline expires.
  */
-function createBudgetedParse5TreeAdapter(budgetBytes, deadlineMs) {
+function createBudgetedParse5TreeAdapter(budgetBytes, deadlineMs, processLedger, processHolder, maxProcessMemoryBytes) {
   const base = parse5.defaultTreeAdapter;
   let bytes = DOC_BASE_BYTES;
   let ops = 0;
+  let inFlightReserved = 0;
+  const distinctTags = new Set();
 
   function charge(add) {
     bytes += add;
-    if ((++ops & 1023) === 0) checkDeadline(deadlineMs);
+    if ((++ops & 255) === 0) checkDeadline(deadlineMs);
     if (bytes > budgetBytes) {
       throw new DomLimitExceededError(
         `解析中的 DOM 估算内存超过上限（上限 ${Math.round(budgetBytes / (1024 * 1024))} MB）`,
       );
     }
+    const needReserve = bytes - inFlightReserved;
+    if (needReserve >= PROCESS_RESERVE_CHUNK_BYTES) {
+      if (!processLedger.tryReserve(processHolder, needReserve, maxProcessMemoryBytes)) {
+        throw new DomLimitExceededError(
+          `进程级全部插件 VM 存活 DOM 总内存超过上限（最多 ${Math.round(maxProcessMemoryBytes / (1024 * 1024))} MB）`,
+        );
+      }
+      inFlightReserved += needReserve;
+    }
+  }
+
+  function releaseInFlight() {
+    if (inFlightReserved > 0) {
+      processLedger.release(processHolder, inFlightReserved);
+      inFlightReserved = 0;
+    }
   }
 
   return {
     ...base,
+    _releaseInFlight: releaseInFlight,
     createElement(tagName, namespaceURI, attrs) {
-      let add = ELEMENT_BASE_BYTES;
+      const tn = String(tagName ?? '');
+      if (tn.length > MAX_NAME_LENGTH) {
+        throw new DomLimitExceededError(`DOM 标签名超过长度上限（最多 ${MAX_NAME_LENGTH} 字符）`);
+      }
+      let add = HTML_ELEMENT_BASE_BYTES;
+      if (!distinctTags.has(tn)) {
+        distinctTags.add(tn);
+        add += HTML_DISTINCT_TAG_BYTES + strBytesV8(tn);
+      }
       if (attrs && attrs.length > 0) {
-        add += ATTRS_CONTAINER_BYTES;
+        add += HTML_ATTRS_CONTAINER_BYTES;
         for (let i = 0; i < attrs.length; i++) {
           const a = attrs[i];
-          add += ATTR_ENTRY_BYTES + 2 * ((a.name ? a.name.length : 0) + (a.value ? a.value.length : 0));
+          const k = String(a.name ?? '');
+          if (k.length > MAX_NAME_LENGTH) {
+            throw new DomLimitExceededError(`DOM 属性名超过长度上限（最多 ${MAX_NAME_LENGTH} 字符）`);
+          }
+          add += HTML_ATTR_ENTRY_BYTES + strBytesV8(a.value ?? '');
+          if (k.length > 2) add += Math.min(24, k.length * 2);
         }
       }
       charge(add);
       return base.createElement(tagName, namespaceURI, attrs);
     },
     createCommentNode(data) {
-      charge(COMMENT_NODE_BASE_BYTES + 2 * (data ? data.length : 0));
+      const d = String(data ?? '');
+      charge(HTML_COMMENT_NODE_BASE_BYTES + (d.length >= 16 ? strBytesV8(d) : (d.length > 0 ? 8 : 0)));
       return base.createCommentNode(data);
     },
     createTextNode(value) {
-      charge(TEXT_NODE_BASE_BYTES + 2 * (value ? value.length : 0));
+      const v = String(value ?? '');
+      charge(HTML_TEXT_NODE_BASE_BYTES + (v.length >= 16 ? strBytesV8(v) : (v.length > 0 ? 16 : 0)));
       return base.createTextNode(value);
     },
     setDocumentType(document, name, publicId, systemId) {
-      charge(OTHER_NODE_BASE_BYTES + 2 * ((name?.length || 0) + (publicId?.length || 0) + (systemId?.length || 0)));
+      charge(HTML_OTHER_NODE_BASE_BYTES);
       return base.setDocumentType(document, name, publicId, systemId);
     },
     appendChild(parentNode, newNode) {
       const ch = base.getChildNodes(parentNode);
-      charge(ch && ch.length === 0 ? CHILD_LIST_BASE_BYTES + CHILD_SLOT_BYTES : CHILD_SLOT_BYTES);
+      charge(ch && ch.length === 0 ? HTML_CHILD_LIST_BASE_BYTES + HTML_CHILD_SLOT_BYTES : HTML_CHILD_SLOT_BYTES);
       return base.appendChild(parentNode, newNode);
     },
     insertBefore(parentNode, newNode, referenceNode) {
-      charge(CHILD_SLOT_BYTES);
+      const ch = base.getChildNodes(parentNode);
+      charge(ch && ch.length === 0 ? HTML_CHILD_LIST_BASE_BYTES + HTML_CHILD_SLOT_BYTES : HTML_CHILD_SLOT_BYTES);
       return base.insertBefore(parentNode, newNode, referenceNode);
     },
     insertText(parentNode, text) {
       const ch = base.getChildNodes(parentNode);
       const prev = ch && ch.length > 0 ? ch[ch.length - 1] : null;
       const isNewTextNode = !prev || !base.isTextNode(prev);
-      charge((isNewTextNode ? (TEXT_NODE_BASE_BYTES + CHILD_SLOT_BYTES) : 0) + 2 * (text ? text.length : 0));
+      const t = String(text ?? '');
+      const slotAdd = isNewTextNode
+        ? ((ch && ch.length === 0 ? HTML_CHILD_LIST_BASE_BYTES : 0) + HTML_CHILD_SLOT_BYTES + HTML_TEXT_NODE_BASE_BYTES)
+        : 0;
+      charge(slotAdd + t.length);
       return base.insertText(parentNode, text);
     },
     insertTextBefore(parentNode, text, referenceNode) {
-      charge(TEXT_NODE_BASE_BYTES + CHILD_SLOT_BYTES + 2 * (text ? text.length : 0));
+      const t = String(text ?? '');
+      charge(HTML_TEXT_NODE_BASE_BYTES + HTML_CHILD_SLOT_BYTES + t.length);
       return base.insertTextBefore(parentNode, text, referenceNode);
     },
     adoptAttributes(recipient, attrs) {
@@ -1588,7 +1869,12 @@ function createBudgetedParse5TreeAdapter(budgetBytes, deadlineMs) {
         let add = 0;
         for (let i = 0; i < attrs.length; i++) {
           const a = attrs[i];
-          add += ATTR_ENTRY_BYTES + 2 * ((a.name ? a.name.length : 0) + (a.value ? a.value.length : 0));
+          const k = String(a.name ?? '');
+          if (k.length > MAX_NAME_LENGTH) {
+            throw new DomLimitExceededError(`DOM 属性名超过长度上限（最多 ${MAX_NAME_LENGTH} 字符）`);
+          }
+          add += HTML_ATTR_ENTRY_BYTES + strBytesV8(a.value ?? '');
+          if (k.length > 2) add += Math.min(24, k.length * 2);
         }
         charge(add);
       }
@@ -1598,8 +1884,8 @@ function createBudgetedParse5TreeAdapter(budgetBytes, deadlineMs) {
 }
 
 /**
- * Fast XML-aware lower-bound pre-scan skipping `<![CDATA[...]]>` and quoted
- * attribute values so huge comment / PI / element XML floods abort BEFORE
+ * Fast XML-aware lower-bound pre-scan calibrated for `linkedom` V8 layout,
+ * enforcing `MAX_NAME_LENGTH` and aborting oversized XML inputs BEFORE
  * `linkedom` allocates an oversized tree.
  */
 function preScanXmlLowerBound(xml, budgetBytes, deadlineMs) {
@@ -1614,41 +1900,78 @@ function preScanXmlLowerBound(xml, budgetBytes, deadlineMs) {
       if (xml.startsWith('<![CDATA[', i)) {
         const end = xml.indexOf(']]>', i + 9);
         const stop = end >= 0 ? end + 3 : len;
-        est += TEXT_NODE_BASE_BYTES + CHILD_SLOT_BYTES + 2 * Math.max(0, (end >= 0 ? end : len) - (i + 9));
+        est += XML_CDATA_NODE_BASE_BYTES + Math.max(0, (end >= 0 ? end : len) - (i + 9));
         i = stop;
       } else if (xml.startsWith('<!--', i)) {
         const end = xml.indexOf('-->', i + 4);
         const stop = end >= 0 ? end + 3 : len;
-        est += COMMENT_NODE_BASE_BYTES + CHILD_SLOT_BYTES + 2 * Math.max(0, (end >= 0 ? end : len) - (i + 4));
+        est += XML_COMMENT_NODE_BASE_BYTES + Math.max(0, (end >= 0 ? end : len) - (i + 4));
         i = stop;
       } else if (xml.startsWith('<?', i)) {
         const end = xml.indexOf('?>', i + 2);
         const stop = end >= 0 ? end + 2 : len;
-        est += OTHER_NODE_BASE_BYTES + CHILD_SLOT_BYTES;
+        let tEnd = i + 2;
+        while (tEnd < stop && !isAsciiWsCode(xml.charCodeAt(tEnd)) && xml.charCodeAt(tEnd) !== 63) tEnd += 1;
+        if (tEnd - (i + 2) > MAX_NAME_LENGTH) {
+          throw new DomLimitExceededError(`XML 处理指令目标名超过长度上限（最多 ${MAX_NAME_LENGTH} 字符）`);
+        }
+        // linkedom drops XML PIs so only charge minimal scan cost here
+        est += 16;
         i = stop;
       } else if (i + 1 < len && xml.charCodeAt(i + 1) === 47) { // '</'
         const end = xml.indexOf('>', i + 2);
         i = end >= 0 ? end + 1 : len;
       } else if (i + 1 < len && xml.charCodeAt(i + 1) === 33) { // '<!'
         const end = xml.indexOf('>', i + 2);
-        est += COMMENT_NODE_BASE_BYTES + CHILD_SLOT_BYTES;
+        est += XML_OTHER_NODE_BASE_BYTES;
         i = end >= 0 ? end + 1 : len;
       } else {
-        est += ELEMENT_BASE_BYTES + CHILD_SLOT_BYTES;
+        est += XML_ELEMENT_BASE_BYTES;
         i += 1;
-        // Skip tag header respecting quoted attributes
+        // Scan tag name
+        const tnStart = i;
+        while (i < len) {
+          const c = xml.charCodeAt(i);
+          if (c === 62 || c === 47 || isAsciiWsCode(c)) break;
+          i += 1;
+        }
+        if (i - tnStart > MAX_NAME_LENGTH) {
+          throw new DomLimitExceededError(`DOM 标签名超过长度上限（最多 ${MAX_NAME_LENGTH} 字符）`);
+        }
+        // Scan attributes inside tag header respecting quotes
+        let attrCount = 0;
         let quote = 0;
+        let inAttrName = false;
+        let attrNameLen = 0;
+        let afterEq = false;
         while (i < len) {
           const c = xml.charCodeAt(i);
           if (quote !== 0) {
-            if (c === quote) quote = 0;
-          } else if (c === 34 || c === 39) {
-            quote = c;
+            if (c === quote) { quote = 0; afterEq = false; }
           } else if (c === 62) {
             i += 1;
             break;
+          } else if (c === 34 || c === 39) {
+            quote = c;
+            inAttrName = false;
+            attrNameLen = 0;
+          } else if (c === 61) {
+            if (inAttrName) { attrCount += 1; inAttrName = false; attrNameLen = 0; }
+            afterEq = true;
+          } else if (isAsciiWsCode(c) || c === 47) {
+            if (inAttrName) { attrCount += 1; inAttrName = false; attrNameLen = 0; }
+            if (afterEq && c === 47) afterEq = false;
+          } else if (!afterEq) {
+            inAttrName = true;
+            attrNameLen += 1;
+            if (attrNameLen > MAX_NAME_LENGTH) {
+              throw new DomLimitExceededError(`DOM 属性名超过长度上限（最多 ${MAX_NAME_LENGTH} 字符）`);
+            }
           }
           i += 1;
+        }
+        if (attrCount > 0) {
+          est += XML_ATTRS_CONTAINER_BYTES + attrCount * XML_ATTR_ENTRY_BYTES;
         }
       }
       if (est > budgetBytes) {
@@ -1660,7 +1983,7 @@ function preScanXmlLowerBound(xml, budgetBytes, deadlineMs) {
       const nextLt = xml.indexOf('<', i);
       const stop = nextLt >= 0 ? nextLt : len;
       if (stop > i) {
-        est += TEXT_NODE_BASE_BYTES + CHILD_SLOT_BYTES + 2 * (stop - i);
+        est += XML_TEXT_NODE_BASE_BYTES + (stop - i);
         if (est > budgetBytes) {
           throw new DomLimitExceededError(
             `待解析 XML 估算内存超过上限（上限 ${Math.round(budgetBytes / (1024 * 1024))} MB）`,
@@ -1681,14 +2004,30 @@ export class PluginDomParser {
     maxVmMemoryBytes = MAX_VM_MEMORY_BYTES,
     maxSelectorMemoryBytes = MAX_SELECTOR_MEMORY_BYTES,
     maxOutputBytes = MAX_OUTPUT_BYTES,
+    maxProcessMemoryBytes = MAX_PROCESS_MEMORY_BYTES,
   ) {
-    this.maxDocsPerCall = maxDocsPerCall;
-    this.maxDocBytes = maxDocBytes;
-    this.maxDocMemoryBytes = maxDocMemoryBytes;
-    this.maxSelectorSteps = maxSelectorSteps;
-    this.maxVmMemoryBytes = maxVmMemoryBytes;
-    this.maxSelectorMemoryBytes = maxSelectorMemoryBytes;
-    this.maxOutputBytes = maxOutputBytes;
+    if (maxDocsPerCall && typeof maxDocsPerCall === 'object') {
+      const opts = maxDocsPerCall;
+      this.maxDocsPerCall = opts.maxDocsPerCall ?? MAX_LIVE_DOCS;
+      this.maxDocBytes = opts.maxDocBytes ?? MAX_DOC_BYTES;
+      this.maxDocMemoryBytes = opts.maxDocMemoryBytes ?? MAX_DOC_MEMORY_BYTES;
+      this.maxSelectorSteps = opts.maxSelectorSteps ?? MAX_SELECTOR_STEPS;
+      this.maxVmMemoryBytes = opts.maxVmMemoryBytes ?? MAX_VM_MEMORY_BYTES;
+      this.maxSelectorMemoryBytes = opts.maxSelectorMemoryBytes ?? MAX_SELECTOR_MEMORY_BYTES;
+      this.maxOutputBytes = opts.maxOutputBytes ?? MAX_OUTPUT_BYTES;
+      this.maxProcessMemoryBytes = opts.maxProcessMemoryBytes ?? Math.max(MAX_PROCESS_MEMORY_BYTES, this.maxVmMemoryBytes);
+    } else {
+      this.maxDocsPerCall = maxDocsPerCall;
+      this.maxDocBytes = maxDocBytes;
+      this.maxDocMemoryBytes = maxDocMemoryBytes;
+      this.maxSelectorSteps = maxSelectorSteps;
+      this.maxVmMemoryBytes = maxVmMemoryBytes;
+      this.maxSelectorMemoryBytes = maxSelectorMemoryBytes;
+      this.maxOutputBytes = maxOutputBytes;
+      this.maxProcessMemoryBytes = Math.max(maxProcessMemoryBytes, maxVmMemoryBytes);
+    }
+    this._processLedger = GLOBAL_PROCESS_LEDGER;
+    this._processHolder = this._processLedger.register(this);
     this.nextId = 1;
     this.docs = new Map();
     this.nodes = new Map();
@@ -1723,10 +2062,22 @@ export class PluginDomParser {
     checkDeadline(this.deadlineMs);
     const text = String(html ?? '');
     const budgetBytes = this._checkPreParseLimits(text);
-    const adapter = createBudgetedParse5TreeAdapter(budgetBytes, this.deadlineMs);
-    const document = parse5.parse(text, { treeAdapter: adapter });
-    const { elementCount, estimatedBytes } = this._normalizeAndEstimateDoc(document, true, budgetBytes);
-    return this._registerDocument(document, false, elementCount, estimatedBytes);
+    const adapter = createBudgetedParse5TreeAdapter(
+      budgetBytes,
+      this.deadlineMs,
+      this._processLedger,
+      this._processHolder,
+      this.maxProcessMemoryBytes,
+    );
+    let document;
+    let stats;
+    try {
+      document = parse5.parse(text, { treeAdapter: adapter });
+      stats = this._normalizeAndEstimateDoc(document, true, budgetBytes);
+    } finally {
+      adapter._releaseInFlight();
+    }
+    return this._registerDocument(document, false, stats.elementCount, stats.estimatedBytes);
   }
 
   parseXml(xml) {
@@ -1751,6 +2102,7 @@ export class PluginDomParser {
     this.totalNodes = Math.max(0, this.totalNodes - docEntry.elementCount);
     this.vmDocBytes = Math.max(0, this.vmDocBytes - docEntry.estimatedBytes);
     this.vmHandleBytes = Math.max(0, this.vmHandleBytes - docEntry.handleTableBytes);
+    this._processLedger.release(this._processHolder, docEntry.estimatedBytes + docEntry.handleTableBytes);
     return true;
   }
 
@@ -1760,6 +2112,7 @@ export class PluginDomParser {
     if (!entry) return -1;
     const parsed = parseSelector(selector);
     const remVm = Math.max(0, this.maxVmMemoryBytes - (this.vmDocBytes + this.vmHandleBytes));
+    const remProc = this._processLedger.remainingBytes(this.maxProcessMemoryBytes);
     const found = queryDescendants(
       entry.el,
       parsed,
@@ -1767,7 +2120,7 @@ export class PluginDomParser {
       true,
       this.maxSelectorSteps,
       this.maxSelectorMemoryBytes,
-      remVm,
+      Math.min(remVm, remProc),
       this.deadlineMs,
     );
     if (!found) return -1;
@@ -1780,6 +2133,7 @@ export class PluginDomParser {
     if (!entry) return [];
     const parsed = parseSelector(selector);
     const remVm = Math.max(0, this.maxVmMemoryBytes - (this.vmDocBytes + this.vmHandleBytes));
+    const remProc = this._processLedger.remainingBytes(this.maxProcessMemoryBytes);
     const list = queryDescendants(
       entry.el,
       parsed,
@@ -1787,7 +2141,7 @@ export class PluginDomParser {
       false,
       this.maxSelectorSteps,
       this.maxSelectorMemoryBytes,
-      remVm,
+      Math.min(remVm, remProc),
       this.deadlineMs,
     );
     const out = new Array(list.length);
@@ -1819,7 +2173,7 @@ export class PluginDomParser {
     if (!entry) return '';
     if (entry.isDocument) return '#document';
     const raw = getRawTagName(entry.el);
-    return entry.isXml ? raw : raw.toLowerCase();
+    return entry.isXml ? raw : asciiLowerFast(raw);
   }
 
   text(nodeId) {
@@ -1867,26 +2221,30 @@ export class PluginDomParser {
   attrsJson(nodeId) {
     checkDeadline(this.deadlineMs);
     const entry = this.nodes.get(nodeId);
-    const attrs = {};
-    let bytes = 2;
+    if (!entry || entry.isDocument) return '{}';
+    const attrs = getElementAttributes(entry.el);
+    if (attrs.length === 0) return '{}';
+    const out = new BoundedOutputBuffer(this.maxOutputBytes, this.deadlineMs);
+    out.appendAscii('{');
+    let first = true;
     let ops = 0;
-    if (entry && !entry.isDocument) {
-      for (const a of getElementAttributes(entry.el)) {
-        if ((++ops & 255) === 0) checkDeadline(this.deadlineMs);
-        const key = entry.isXml ? a.name : String(a.name).toLowerCase();
-        const val = a.value ?? '';
-        bytes += utf8ByteLength(key) + utf8ByteLength(val) + 6;
-        if (bytes > this.maxOutputBytes) {
-          throw new DomLimitExceededError(`DOM 属性序列化输出超过上限（最多 ${Math.round(this.maxOutputBytes / (1024 * 1024))} MB）`);
-        }
-        attrs[key] = val;
-      }
+    for (let i = 0; i < attrs.length; i++) {
+      if ((++ops & 255) === 0) checkDeadline(this.deadlineMs);
+      if (!first) out.appendAscii(',');
+      first = false;
+      const a = attrs[i];
+      const key = entry.isXml ? String(a.name ?? '') : asciiLowerFast(a.name);
+      const val = String(a.value ?? '');
+      appendJsonEscapedString(key, out);
+      out.appendAscii(':');
+      appendJsonEscapedString(val, out);
     }
-    return JSON.stringify(attrs);
+    out.appendAscii('}');
+    return out.toString();
   }
 
   /**
-   * Releases all live documents and handles.
+   * Releases all live documents, handles, and process-wide DOM memory quota.
    * Deliberately does NOT reset `nextId` so stale handles never collide.
    */
   clear() {
@@ -1895,6 +2253,7 @@ export class PluginDomParser {
     this.totalNodes = 0;
     this.vmDocBytes = 0;
     this.vmHandleBytes = 0;
+    this._processLedger.releaseAll(this._processHolder);
     this.deadlineMs = Infinity;
   }
 
@@ -1951,7 +2310,7 @@ export class PluginDomParser {
         continue;
       }
       if (!isElementNode(item)) continue;
-      const tag = getRawTagName(item).toLowerCase();
+      const tag = asciiLowerFast(getRawTagName(item));
       if (HTML_SKIP_TEXT_TAGS.has(tag)) continue;
       const isBlock = HTML_BLOCK_TAGS.has(tag);
       if (isBlock) {
@@ -1977,21 +2336,32 @@ export class PluginDomParser {
     if (vmRem < DOC_BASE_BYTES) {
       throw new DomLimitExceededError(`VM 存活 DOM 总内存超过上限（最多 ${Math.round(this.maxVmMemoryBytes / (1024 * 1024))} MB）`);
     }
-    return Math.min(this.maxDocMemoryBytes, vmRem);
+    let procRem = this._processLedger.remainingBytes(this.maxProcessMemoryBytes) - HANDLE_ENTRY_BYTES;
+    if (procRem < DOC_BASE_BYTES) {
+      procRem = this.maxProcessMemoryBytes - this._processLedger.currentTotalBytes() - HANDLE_ENTRY_BYTES;
+      if (procRem < DOC_BASE_BYTES) {
+        throw new DomLimitExceededError(
+          `进程级全部插件 VM 存活 DOM 总内存超过上限（最多 ${Math.round(this.maxProcessMemoryBytes / (1024 * 1024))} MB）`,
+        );
+      }
+    }
+    return Math.min(this.maxDocMemoryBytes, vmRem, procRem);
   }
 
   /**
-   * Flattens `<template>.content` in parse5 trees and computes exact calibrated
-   * estimated bytes across ALL node kinds (Elements, Text, Comments, CDATA, PIs,
-   * Doctype, Attributes), enforcing `budgetBytes`.
+   * Flattens `<template>.content` and long V8 `ConsString` values in parse5 trees,
+   * enforces `MAX_NAME_LENGTH`, and computes exact calibrated V8 estimated bytes
+   * across ALL node kinds separately for `parse5` HTML and `linkedom` XML.
    */
   _normalizeAndEstimateDoc(doc, isParse5Html, budgetBytes) {
+    const isXmlDoc = !isParse5Html;
     let bytes = DOC_BASE_BYTES;
     let elementCount = 0;
+    const distinctTags = isXmlDoc ? null : new Set();
     const stack = [];
     const rootChildren = getChildNodes(doc);
     if (rootChildren.length > 0) {
-      bytes += CHILD_LIST_BASE_BYTES + CHILD_SLOT_BYTES * rootChildren.length;
+      if (!isXmlDoc) bytes += HTML_CHILD_LIST_BASE_BYTES + HTML_CHILD_SLOT_BYTES * rootChildren.length;
       for (let i = rootChildren.length - 1; i >= 0; i--) stack.push(rootChildren[i]);
     }
     let ops = 0;
@@ -2001,37 +2371,80 @@ export class PluginDomParser {
       if (!cur) continue;
       if (isElementNode(cur)) {
         elementCount += 1;
-        bytes += ELEMENT_BASE_BYTES;
+        const tn = getRawTagName(cur);
+        if (tn.length > MAX_NAME_LENGTH) {
+          throw new DomLimitExceededError(`DOM 标签名超过长度上限（最多 ${MAX_NAME_LENGTH} 字符）`);
+        }
         if (isParse5Html && cur.content && Array.isArray(cur.content.childNodes) && cur.content.childNodes.length > 0) {
           const tmplChildren = cur.content.childNodes;
           for (const tc of tmplChildren) tc.parentNode = cur;
           cur.childNodes = tmplChildren;
           cur.content = null;
         }
-        const attrs = getElementAttributes(cur);
-        if (attrs.length > 0) {
-          bytes += ATTRS_CONTAINER_BYTES;
-          for (let i = 0; i < attrs.length; i++) {
-            if ((++ops & 1023) === 0) checkDeadline(this.deadlineMs);
-            const a = attrs[i];
-            bytes += ATTR_ENTRY_BYTES + 2 * ((a.name ? String(a.name).length : 0) + (a.value ? String(a.value).length : 0));
+        if (isXmlDoc) {
+          bytes += XML_ELEMENT_BASE_BYTES;
+          const attrs = getElementAttributes(cur);
+          if (attrs.length > 0) {
+            bytes += XML_ATTRS_CONTAINER_BYTES;
+            for (let i = 0; i < attrs.length; i++) {
+              if ((++ops & 1023) === 0) checkDeadline(this.deadlineMs);
+              const a = attrs[i];
+              const k = String(a.name ?? '');
+              if (k.length > MAX_NAME_LENGTH) {
+                throw new DomLimitExceededError(`DOM 属性名超过长度上限（最多 ${MAX_NAME_LENGTH} 字符）`);
+              }
+              bytes += XML_ATTR_ENTRY_BYTES + strBytesV8(k) + strBytesV8(a.value ?? '');
+            }
+          }
+          const ch = getChildNodes(cur);
+          for (let i = ch.length - 1; i >= 0; i--) stack.push(ch[i]);
+        } else {
+          bytes += HTML_ELEMENT_BASE_BYTES;
+          if (!distinctTags.has(tn)) {
+            distinctTags.add(tn);
+            bytes += HTML_DISTINCT_TAG_BYTES + strBytesV8(tn);
+          }
+          const attrs = getElementAttributes(cur);
+          if (attrs.length > 0) {
+            bytes += HTML_ATTRS_CONTAINER_BYTES;
+            for (let i = 0; i < attrs.length; i++) {
+              if ((++ops & 1023) === 0) checkDeadline(this.deadlineMs);
+              const a = attrs[i];
+              const k = String(a.name ?? '');
+              if (k.length > MAX_NAME_LENGTH) {
+                throw new DomLimitExceededError(`DOM 属性名超过长度上限（最多 ${MAX_NAME_LENGTH} 字符）`);
+              }
+              if (typeof a.value === 'string' && a.value.length >= 16) {
+                a.value = flattenStrV8(a.value);
+              }
+              bytes += HTML_ATTR_ENTRY_BYTES + strBytesV8(a.value ?? '');
+              if (k.length > 2) bytes += Math.min(24, k.length * 2);
+            }
+          }
+          const ch = getChildNodes(cur);
+          if (ch.length > 0) {
+            bytes += HTML_CHILD_LIST_BASE_BYTES + HTML_CHILD_SLOT_BYTES * ch.length;
+            for (let i = ch.length - 1; i >= 0; i--) stack.push(ch[i]);
           }
         }
-        const ch = getChildNodes(cur);
-        if (ch.length > 0) {
-          bytes += CHILD_LIST_BASE_BYTES + CHILD_SLOT_BYTES * ch.length;
-          for (let i = ch.length - 1; i >= 0; i--) stack.push(ch[i]);
+      } else if (isCDataNode(cur)) {
+        bytes += (isXmlDoc ? XML_CDATA_NODE_BASE_BYTES : 80) + strBytesV8(getNodeTextValue(cur));
+      } else if (isTextNode(cur)) {
+        if (!isXmlDoc && typeof cur.value === 'string' && cur.value.length >= 16) {
+          cur.value = flattenStrV8(cur.value);
         }
-      } else if (isTextNode(cur) || isCDataNode(cur)) {
-        bytes += TEXT_NODE_BASE_BYTES + 2 * getNodeTextValue(cur).length;
+        const v = getNodeTextValue(cur);
+        bytes += (isXmlDoc ? XML_TEXT_NODE_BASE_BYTES : HTML_TEXT_NODE_BASE_BYTES) +
+          (v.length >= 16 ? strBytesV8(v) : (v.length > 0 ? 16 : 0));
       } else if (isCommentNode(cur)) {
-        bytes += COMMENT_NODE_BASE_BYTES + 2 * getNodeCommentData(cur).length;
+        if (!isXmlDoc && typeof cur.data === 'string' && cur.data.length >= 16) {
+          cur.data = flattenStrV8(cur.data);
+        }
+        const d = getNodeCommentData(cur);
+        bytes += (isXmlDoc ? XML_COMMENT_NODE_BASE_BYTES : HTML_COMMENT_NODE_BASE_BYTES) +
+          (d.length >= 16 ? strBytesV8(d) : (d.length > 0 ? 8 : 0));
       } else {
-        const extra = (cur.name ? String(cur.name).length : 0) +
-          (cur.data ? String(cur.data).length : 0) +
-          (cur.publicId ? String(cur.publicId).length : 0) +
-          (cur.systemId ? String(cur.systemId).length : 0);
-        bytes += OTHER_NODE_BASE_BYTES + 2 * extra;
+        bytes += isXmlDoc ? XML_OTHER_NODE_BASE_BYTES : HTML_OTHER_NODE_BASE_BYTES;
       }
       if (bytes > budgetBytes) {
         throw new DomLimitExceededError(
@@ -2051,9 +2464,15 @@ export class PluginDomParser {
         `单个文档估算内存超过上限（最多 ${Math.round(this.maxDocMemoryBytes / (1024 * 1024))} MB）`,
       );
     }
-    if (this.vmDocBytes + this.vmHandleBytes + estimatedBytes + HANDLE_ENTRY_BYTES > this.maxVmMemoryBytes) {
+    const addedTotal = estimatedBytes + HANDLE_ENTRY_BYTES;
+    if (this.vmDocBytes + this.vmHandleBytes + addedTotal > this.maxVmMemoryBytes) {
       throw new DomLimitExceededError(
         `VM 存活 DOM 总内存超过上限（最多 ${Math.round(this.maxVmMemoryBytes / (1024 * 1024))} MB）`,
+      );
+    }
+    if (!this._processLedger.tryReserve(this._processHolder, addedTotal, this.maxProcessMemoryBytes)) {
+      throw new DomLimitExceededError(
+        `进程级全部插件 VM 存活 DOM 总内存超过上限（最多 ${Math.round(this.maxProcessMemoryBytes / (1024 * 1024))} MB）`,
       );
     }
     const docId = this._allocateHandleId();
@@ -2089,6 +2508,11 @@ export class PluginDomParser {
     if (this.vmDocBytes + this.vmHandleBytes + HANDLE_ENTRY_BYTES > this.maxVmMemoryBytes) {
       throw new DomLimitExceededError(
         `VM 存活 DOM 与句柄表总内存超过上限（最多 ${Math.round(this.maxVmMemoryBytes / (1024 * 1024))} MB）`,
+      );
+    }
+    if (!this._processLedger.tryReserve(this._processHolder, HANDLE_ENTRY_BYTES, this.maxProcessMemoryBytes)) {
+      throw new DomLimitExceededError(
+        `进程级全部插件 VM 存活 DOM 与句柄表总内存超过上限（最多 ${Math.round(this.maxProcessMemoryBytes / (1024 * 1024))} MB）`,
       );
     }
     const id = this._allocateHandleId();

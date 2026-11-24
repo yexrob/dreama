@@ -906,6 +906,8 @@ test('Round 3: shared zip-vectors.json (incl. dual.zip PoC) and shared dom-vecto
       else if (mc.op.startsWith('all:')) actual = p.selectAllIds(id, mc.op.slice(4)).map((x) => `${p.tag(x)}=${p.text(x)}`).join('|');
     } catch {
       threw = true;
+    } finally {
+      p.clear();
     }
     if (mc.throws) {
       assert.equal(threw, true, `matrixCase #${mc.id} must throw`);
@@ -920,50 +922,64 @@ test('Round 3: shared zip-vectors.json (incl. dual.zip PoC) and shared dom-vecto
   // Pathological selector complexity tests (< 1s each)
   {
     const p = new PluginDomParser();
-    const r = p.parseHtml('<div>'.repeat(500));
-    const t0 = Date.now();
-    assert.equal(p.selectAllIds(r, 'span div div div div').length, 0);
-    assert.ok(Date.now() - t0 < 1000, '500 nested divs selector must complete in < 1s');
+    try {
+      const r = p.parseHtml('<div>'.repeat(500));
+      const t0 = Date.now();
+      assert.equal(p.selectAllIds(r, 'span div div div div').length, 0);
+      assert.ok(Date.now() - t0 < 1000, '500 nested divs selector must complete in < 1s');
+    } finally { p.clear(); }
   }
   {
     const p = new PluginDomParser();
-    const r = p.parseHtml('<ul>' + '<li>x</li>'.repeat(2000) + '</ul>');
-    const t1 = Date.now();
-    assert.equal(p.selectAllIds(r, 'b ~ li ~ li').length, 0);
-    assert.ok(Date.now() - t1 < 1000, '2000 li b ~ li ~ li must complete in < 1s');
-    const t2 = Date.now();
-    assert.equal(p.selectAllIds(r, 'b ~ li ~ li ~ li').length, 0);
-    assert.ok(Date.now() - t2 < 1000, '2000 li b ~ li ~ li ~ li must complete in < 1s');
+    try {
+      const r = p.parseHtml('<ul>' + '<li>x</li>'.repeat(2000) + '</ul>');
+      const t1 = Date.now();
+      assert.equal(p.selectAllIds(r, 'b ~ li ~ li').length, 0);
+      assert.ok(Date.now() - t1 < 1000, '2000 li b ~ li ~ li must complete in < 1s');
+      const t2 = Date.now();
+      assert.equal(p.selectAllIds(r, 'b ~ li ~ li ~ li').length, 0);
+      assert.ok(Date.now() - t2 < 1000, '2000 li b ~ li ~ li ~ li must complete in < 1s');
+    } finally { p.clear(); }
   }
   {
     const p = new PluginDomParser();
-    const r = p.parseHtml('<ul>' + '<li>x</li>'.repeat(100_000) + '</ul>');
-    for (const [sel, count] of [['li:nth-child(2n+1)', 50_000], ['li:last-child', 1], ['li:nth-last-of-type(3n+1)', 33_334]]) {
-      const t = Date.now();
-      assert.equal(p.selectAllIds(r, sel).length, count);
-      assert.ok(Date.now() - t < 1000, `100k li ${sel} must complete in < 1s`);
-    }
+    try {
+      const r = p.parseHtml('<ul>' + '<li>x</li>'.repeat(80_000) + '</ul>');
+      for (const [sel, count] of [['li:nth-child(2n+1)', 40_000], ['li:last-child', 1], ['li:nth-last-of-type(3n+1)', 26_667]]) {
+        const t = Date.now();
+        assert.equal(p.selectAllIds(r, sel).length, count);
+        assert.ok(Date.now() - t < 1000, `80k li ${sel} must complete in < 1s`);
+      }
+    } finally { p.clear(); }
   }
   // Step budget, deadline timeout, adoption agency 95k recount, unified element count excluding #document
   {
-    const tight = new PluginDomParser(8, 2 * 1024 * 1024, 24 * 1024 * 1024, 500);
-    const r = tight.parseHtml('<ul>' + '<li>x</li>'.repeat(2000) + '</ul>');
-    assert.throws(() => tight.selectAllIds(r, 'li'), DomLimitExceededError);
+    const tight = new PluginDomParser(8, 2 * 1024 * 1024, 32 * 1024 * 1024, 500);
+    try {
+      const r = tight.parseHtml('<ul>' + '<li>x</li>'.repeat(2000) + '</ul>');
+      assert.throws(() => tight.selectAllIds(r, 'li'), DomLimitExceededError);
+    } finally { tight.clear(); }
 
     const exp = new PluginDomParser();
-    const rx = exp.parseHtml('<ul>' + '<li>x</li>'.repeat(3000) + '</ul>');
-    exp.setCallDeadlineMs(Date.now() - 1);
-    assert.throws(() => exp.selectAllIds(rx, 'li'), DomTimeoutError);
+    try {
+      const rx = exp.parseHtml('<ul>' + '<li>x</li>'.repeat(3000) + '</ul>');
+      exp.setCallDeadlineMs(Date.now() - 1);
+      assert.throws(() => exp.selectAllIds(rx, 'li'), DomTimeoutError);
+    } finally { exp.clear(); }
 
     const amp = new PluginDomParser();
-    assert.throws(() => amp.parseHtml('<b><p>x</b>y</p>'.repeat(95_000)), DomLimitExceededError);
-    assert.equal(amp.totalNodes, 0);
+    try {
+      assert.throws(() => amp.parseHtml('<b><p>x</b>y</p>'.repeat(95_000)), DomLimitExceededError);
+      assert.equal(amp.totalNodes, 0);
+    } finally { amp.clear(); }
 
     const cnt = new PluginDomParser();
-    cnt.parseHtml('<p>x</p>');
-    assert.equal(cnt.totalNodes, 4);
-    cnt.parseXml('<r><a/></r>');
-    assert.equal(cnt.totalNodes, 6);
+    try {
+      cnt.parseHtml('<p>x</p>');
+      assert.equal(cnt.totalNodes, 4);
+      cnt.parseXml('<r><a/></r>');
+      assert.equal(cnt.totalNodes, 6);
+    } finally { cnt.clear(); }
   }
 });
 
@@ -1052,13 +1068,14 @@ test('Round 6: selector hard caps, 16 MB memo budget, budgeted attr/class, dedup
     p.clear();
   }
 
-  // 4. Required #4: 190k <i> + select('*') looped 40x -> deduplicated handles; 8 live docs / 400k live elements / doc.close()
+  // 4. Required #4: 110k <i> + select('*') looped 40x -> deduplicated handles; 8 live docs / 48 MB VM cap / doc.close()
   {
     const p = new PluginDomParser();
-    const root = p.parseHtml(html190k);
+    const html110k = '<div>' + '<i></i>'.repeat(110_000) + '</div>'; // ~16.8 MiB V8
+    const root = p.parseHtml(html110k);
     const first = p.selectAllIds(root, '*');
     const expectedHandles = p.handleCount;
-    assert.equal(expectedHandles, 190_005);
+    assert.equal(expectedHandles, 110_005);
     for (let i = 0; i < 40; i++) {
       const t = Date.now();
       const ids = p.selectAllIds(root, '*');
@@ -1067,18 +1084,19 @@ test('Round 6: selector hard caps, 16 MB memo budget, budgeted attr/class, dedup
       assert.equal(p.handleCount, expectedHandles, `handle count leaked on iter #${i}`);
     }
 
-    const root2 = p.parseHtml(html190k); // 11.60 + 17.39 handles + 11.60 = 40.59 MiB <= 48 MiB
+    // 16.8 MiB doc1 + 13.4 MiB handles + 16.8 MiB doc2 = 47.0 MiB <= 48 MiB
+    const root2 = p.parseHtml(html110k);
     assert.equal(p.docCount, 2);
-    assert.equal(p.totalNodes, 380_008);
-    const html150k = '<div>' + '<i></i>'.repeat(150_000) + '</div>'; // 9.16 MiB -> 49.75 MiB > 48 MiB VM cap
-    assert.throws(() => p.parseHtml(html150k), DomLimitExceededError);
+    assert.equal(p.totalNodes, 220_008);
+    const html50k = '<div>' + '<i></i>'.repeat(50_000) + '</div>'; // ~7.6 MiB -> 54.6 MiB > 48 MiB VM cap
+    assert.throws(() => p.parseHtml(html50k), DomLimitExceededError);
 
     assert.equal(p.closeDoc(root), true);
     assert.equal(p.docCount, 1);
-    assert.equal(p.totalNodes, 190_004);
-    const root3 = p.parseHtml(html150k);
+    assert.equal(p.totalNodes, 110_004);
+    const root3 = p.parseHtml(html50k);
     assert.equal(p.docCount, 2);
-    assert.equal(p.totalNodes, 340_008);
+    assert.equal(p.totalNodes, 160_008);
     p.closeDoc(root2);
     p.closeDoc(root3);
     assert.equal(p.docCount, 0);
@@ -1114,6 +1132,9 @@ test('Round 6: selector hard caps, 16 MB memo budget, budgeted attr/class, dedup
     assert.ok(stepErr instanceof DomLimitExceededError);
     assert.ok(memErr instanceof DomLimitExceededError);
     assert.equal(stepErr.constructor, memErr.constructor);
+    p.clear();
+    stepP.clear();
+    memP.clear();
   }
 
   // 6. Real QuickJS host: doc.close() loop (> 8 sequential docs), 9 unclosed docs fails, bridge RangeError trapped
@@ -1180,7 +1201,7 @@ test('Round 7: byte-budgeted DOM (2 MB/24 MB/48 MB), :empty caching & loop ticks
     const pi2Mb = '<?>'.repeat(Math.floor((2 * 1024 * 1024) / 3) - 10);
     const textCmt2Mb = 'x<!>'.repeat(Math.floor((2 * 1024 * 1024) / 4) - 10);
     const elemText200k = '<i>x'.repeat(200_000);
-    const elemText100k = '<i>x'.repeat(100_000);
+    const elemText60k = '<i>x'.repeat(60_000); // ~21 MB V8 each
 
     for (const bad of [pi2Mb, textCmt2Mb, elemText200k]) {
       const t = Date.now();
@@ -1190,9 +1211,9 @@ test('Round 7: byte-budgeted DOM (2 MB/24 MB/48 MB), :empty caching & loop ticks
       assert.equal(p.currentVmMemoryBytes, 0);
     }
 
-    // 2 x (<i>x * 100k) = ~43.2 MB <= 48 MB succeeds, then select('*') hits 48 MB VM budget
-    const d1 = p.parseHtml(elemText100k);
-    const d2 = p.parseHtml(elemText100k);
+    // 2 x (<i>x * 60k) (~21 MB each = ~42 MB <= 48 MB) succeeds, then select('*') hits 48 MB VM budget
+    const d1 = p.parseHtml(elemText60k);
+    const d2 = p.parseHtml(elemText60k);
     assert.throws(() => p.selectAllIds(d1, '*'), DomLimitExceededError);
     p.closeDoc(d1);
     p.closeDoc(d2);
@@ -1200,10 +1221,10 @@ test('Round 7: byte-budgeted DOM (2 MB/24 MB/48 MB), :empty caching & loop ticks
 
     // 8 simultaneous live docs near the 48 MB VM cap + select('*') + outerHtml
     const nearCapDocs = [
-      '<div>' + '<i>x</i>'.repeat(20_000) + '</div>',
-      '<div>' + '<i class="a b"></i>'.repeat(25_000) + '</div>',
+      '<div>' + '<i>x</i>'.repeat(10_000) + '</div>',
+      '<div>' + '<i class="a b"></i>'.repeat(12_000) + '</div>',
       '<div>' + '<!--c-->'.repeat(45_000) + '<p>ok</p></div>',
-      '<div>' + '<i></i>'.repeat(65_000) + '</div>',
+      '<div>' + '<i></i>'.repeat(25_000) + '</div>',
     ];
     const roots = [];
     for (let i = 0; i < 8; i++) roots.push(p.parseHtml(nearCapDocs[i % 4]));
@@ -1268,19 +1289,33 @@ test('Round 7: byte-budgeted DOM (2 MB/24 MB/48 MB), :empty caching & loop ticks
     smallOut.clear();
   }
 
-  // 4. 200,000 classed elements on `.a`, `i.a`, `.a.b`, `.a .b` under default 16 MB selector memory budget
+  // 4. 200,000 classed elements on `.a`, `i.a`, `.a.b`, `.a .b`, `.a ~ .b` under default 16 MB selector memory budget
   {
     const defP = new PluginDomParser();
-    const rDef = defP.parseHtml('<div class="a">' + '<p class="a b">'.repeat(120_000) + '</div>');
-    assert.equal(defP.selectAllIds(rDef, '.a').length, 120_001);
-    assert.equal(defP.selectAllIds(rDef, 'p.a').length, 120_000);
-    assert.equal(defP.selectAllIds(rDef, '.a.b').length, 120_000);
-    assert.equal(defP.selectAllIds(rDef, '.a .b').length, 120_000);
+    const rDef = defP.parseHtml('<div class="a">' + '<p class="a b">'.repeat(70_000) + '</div>');
+    assert.equal(defP.selectAllIds(rDef, '.a').length, 70_001);
+    assert.equal(defP.selectAllIds(rDef, 'p.a').length, 70_000);
+    assert.equal(defP.selectAllIds(rDef, '.a.b').length, 70_000);
+    assert.equal(defP.selectAllIds(rDef, '.a .b').length, 70_000);
     defP.clear();
 
-    const p200k = new PluginDomParser(8, 4 * 1024 * 1024, 48 * 1024 * 1024, 2_000_000, 80 * 1024 * 1024, 16 * 1024 * 1024);
+    const p200k = new PluginDomParser({
+      maxDocBytes: 4 * 1024 * 1024,
+      maxDocMemoryBytes: 128 * 1024 * 1024,
+      maxVmMemoryBytes: 256 * 1024 * 1024,
+      maxProcessMemoryBytes: 256 * 1024 * 1024,
+      maxSelectorMemoryBytes: 16 * 1024 * 1024,
+    });
     const r200k = p200k.parseHtml('<div class="a">' + '<i class="a b"></i>'.repeat(200_000) + '</div>');
-    for (const [sel, expected] of [['.a', 200_001], ['i.a', 200_000], ['.a.b', 200_000], ['.a .b', 200_000]]) {
+    for (const [sel, expected] of [
+      ['.a', 200_001],
+      ['i.a', 200_000],
+      ['.a.b', 200_000],
+      ['.a .b', 200_000],
+      ['.a ~ .b', 199_999],
+      ['.zz ~ .a', 0],
+      ['i.a + i.b', 199_999],
+    ]) {
       const t = Date.now();
       assert.equal(p200k.selectAllIds(r200k, sel).length, expected, `200k classed selector ${sel}`);
       assert.ok(Date.now() - t < 1000, `200k classed selector ${sel} exceeded 1s`);
@@ -1297,7 +1332,144 @@ test('Round 7: byte-budgeted DOM (2 MB/24 MB/48 MB), :empty caching & loop ticks
     assert.ok(id2 > id1, `nextId must not reset on clear(): id1=${id1} id2=${id2}`);
     assert.equal(p.tag(id1), '');
     assert.equal(p.tag(id2), '#document');
+    p.clear();
   }
+});
+
+test('Round 8: Node V8 calibration [0.60, 1.25] (HTML + XML + real pages), 64 MB process budget, 256-char name cap, escaped attrsJson cap', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const {
+    PluginDomParser,
+    DomLimitExceededError,
+    MAX_PROCESS_MEMORY_BYTES,
+    currentProcessDomMemoryBytes,
+  } = await import('../src/dom.js');
+
+  // 1. 256-char tag/attr name cap (HTML & XML)
+  {
+    const p = new PluginDomParser();
+    const okTag = 't'.repeat(256);
+    const okAttr = 'a'.repeat(256);
+    const rOk = p.parseHtml(`<${okTag} ${okAttr}="1"></${okTag}>`);
+    assert.equal(p.selectAllIds(rOk, okTag).length, 1);
+    p.clear();
+
+    assert.throws(() => p.parseHtml(`<${'t'.repeat(257)}></${'t'.repeat(257)}>`), DomLimitExceededError);
+    assert.throws(() => p.parseHtml(`<p ${'k'.repeat(257)}="1"></p>`), DomLimitExceededError);
+    assert.throws(() => p.parseHtml(`<${'t'.repeat(2_000_000)}>`), DomLimitExceededError);
+    assert.throws(() => p.parseXml(`<r><${'T'.repeat(257)}/></r>`), DomLimitExceededError);
+    assert.throws(() => p.parseXml(`<r><a ${'K'.repeat(257)}="1"/></r>`), DomLimitExceededError);
+    p.clear();
+  }
+
+  // 2. Escaped attrsJson 8 MB output cap (2 MB '\u0001' -> 12 MB JSON)
+  {
+    const p = new PluginDomParser();
+    const rCtrl = p.parseHtml("<p a='" + '\u0001'.repeat(2_000_000) + "'></p>");
+    const pId = p.selectFirstId(rCtrl, 'p');
+    const t = Date.now();
+    assert.throws(() => p.attrsJson(pId), DomLimitExceededError);
+    assert.ok(Date.now() - t < 1000);
+    const rSmall = p.parseHtml('<p a="x\n\t\u0001&quot;\\y"></p>');
+    const parsed = JSON.parse(p.attrsJson(p.selectFirstId(rSmall, 'p')));
+    assert.equal(parsed.a, 'x\n\t\u0001"\\y');
+    p.clear();
+  }
+
+  // 3. Process-wide 64 MB budget across two live PluginDomParser instances
+  {
+    const baseProc = currentProcessDomMemoryBytes();
+    const vm1 = new PluginDomParser();
+    const vm2 = new PluginDomParser();
+    try {
+      const chunk = '<div>' + '<p a="b">hi</p>'.repeat(32_000) + '</div>'; // ~17.7 MiB V8 each
+      const r1a = vm1.parseHtml(chunk);
+      const r1b = vm1.parseHtml(chunk); // vm1 ~35.4 MiB <= 48 MiB
+      const r2a = vm2.parseHtml(chunk); // proc ~53.1 MiB <= 64 MiB
+      assert.ok(r1a > 0 && r1b > 0 && r2a > 0);
+      assert.ok(currentProcessDomMemoryBytes() <= MAX_PROCESS_MEMORY_BYTES);
+      assert.throws(() => vm2.parseHtml(chunk), DomLimitExceededError); // ~70.8 MiB > 64 MiB process cap
+      vm1.clear();
+      // After vm1 clears, vm2 can now allocate!
+      const r2b = vm2.parseHtml(chunk);
+      assert.ok(r2b > 0);
+    } finally {
+      vm1.clear();
+      vm2.clear();
+    }
+    assert.equal(currentProcessDomMemoryBytes(), baseProc);
+  }
+
+  // 4. Child Node `--expose-gc` subprocess calibrating realHeap / est in [0.60, 1.25]
+  //    across HTML shapes, XML shapes (incl. xelem, xuniqtag, xattr, xcdata), and realistic pages!
+  const domModuleUrl = new URL('../src/dom.js', import.meta.url).href;
+  const calibScript = `
+    const { PluginDomParser } = await import(${JSON.stringify(domModuleUrl)});
+    const gc = () => { for (let i = 0; i < 4; i++) global.gc(); return process.memoryUsage().heapUsed; };
+    const MAX = 2 * 1024 * 1024 - 64;
+    const fill = (pre, unit, post, f) => pre + unit.repeat(Math.floor(((MAX - pre.length - post.length) / unit.length) * f)) + post;
+    const uniq = (pre, mk, post, f) => { const parts=[pre]; let len=pre.length, i=0; while (len < MAX*f - 40) { const u = mk(i++); parts.push(u); len += u.length; } parts.push(post); return parts.join(''); };
+    const words = ['alpha','beta','gamma','delta','视频','电影','剧集','第一季','HD','1080p'];
+    const w = (i, k) => words[(i*7+k)%words.length];
+    function build(lim, head, row, tail) { const parts=[head]; let n=Buffer.byteLength(head)+Buffer.byteLength(tail), i=0; for(;;){ const r=row(i++); const b=Buffer.byteLength(r); if(n+b>lim) break; parts.push(r); n+=b; } parts.push(tail); return parts.join(''); }
+    const cases = [
+      ['pi', false, fill('', '<?>', '', 0.15)],
+      ['bogus', false, fill('', '<!>', '', 0.15)],
+      ['textcmt', false, fill('', 'x<!>', '', 0.15)],
+      ['elem', false, fill('<div>', '<p></p>', '</div>', 0.35)],
+      ['elemshort', false, fill('', '<i>', '', 0.15)],
+      ['elemtext', false, fill('<div>', '<p>x</p>', '</div>', 0.35)],
+      ['attr1', false, fill('<div>', '<p a=b></p>', '</div>', 0.35)],
+      ['manyattr', false, fill('<div>', '<p a b c d e f g h i j k l m n o q r s t u v w x y z></p>', '</div>', 0.35)],
+      ['manyattr3', false, (() => { const parts=['<div>']; let len=5,i=0; while (len < MAX*0.35-200) { let u='<p'; for (let j=0;j<40;j++) u+=' '+(i++).toString(36); u+='></p>'; parts.push(u); len+=u.length; } parts.push('</div>'); return parts.join(''); })()],
+      ['uniqtag', false, uniq('<div>', (i)=>{const t='t'+i.toString(36); return '<'+t+'></'+t+'>';}, '</div>', 0.35)],
+      ['uniqtagopen', false, uniq('<div>', (i)=>'<t'+i.toString(36)+'/>', '</div>', 0.35)],
+      ['deep', false, fill('', '<div>'.repeat(500)+'</div>'.repeat(500), '', 0.35)],
+      ['fostercmt', false, fill('<table><b>', '<!>', '', 0.15)],
+      ['xelem', true, fill('<r>', '<a/>', '</r>', 0.20)],
+      ['xcdata', true, fill('<r>', '<![CDATA[]]>', '</r>', 0.35)],
+      ['xuniqtag', true, uniq('<r>', (i)=>'<t'+i.toString(36)+'/>', '</r>', 0.25)],
+      ['xattr', true, fill('<r>', "<a b='c' d='e'/>", '</r>', 0.25)],
+      ['pages/article.html', false, build(2*1048576-256, '<html><body><article>', (i)=>'<p>'+(w(i,1)+' ').repeat(20)+'<a href="#n'+i+'">['+i+']</a> '+(w(i,2)+' ').repeat(10)+'</p>\\n', '</article></body></html>')],
+      ['pages/list.html', false, build(2*1048576-256, '<!DOCTYPE html><html><head><meta charset="utf-8"></head><body><ul class="items">\\n', (i)=>'<li class="item card" data-id="'+i+'"><a class="title" href="/v/'+i+'.html" title="'+w(i,3)+'"><img src="/p/'+i+'.jpg" alt="'+w(i,4)+'" loading="lazy"></a><span class="meta">'+w(i,5)+' · '+(i%60)+'分钟</span><span class="tag">'+w(i,6)+'</span></li>\\n', '</ul></body></html>')],
+      ['pages/table_pretty.html', false, build(1048576, '<!DOCTYPE html>\\n<html>\\n<body>\\n<table>\\n<tbody>\\n', (i)=>'  <tr>\\n    <td>'+i+'</td>\\n    <td><a href="/item/'+i+'">'+w(i,1)+' '+w(i,2)+'</a></td>\\n    <td class="size">'+((i*37)%9999)+' MB</td>\\n  </tr>\\n', '</tbody>\\n</table>\\n</body>\\n</html>\\n')],
+      ['pages/table_min.html', false, build(800000, '<html><body><table>', (i)=>'<tr><td>'+(i%100)+'</td><td>'+w(i,1)+'</td><td>'+(i%7)+'</td><td>x</td></tr>', '</table></body></html>')],
+      ['pages/mpd_timeline.xml', true, build(800000, '<?xml version="1.0"?>\\n<MPD><Period><AdaptationSet><SegmentTemplate><SegmentTimeline>\\n', (i)=>'          <S t="'+(i*180000)+'" d="180000"/>\\n', '</SegmentTimeline></SegmentTemplate></AdaptationSet></Period></MPD>\\n')],
+      ['pages/rss.xml', true, build(1048576, '<?xml version="1.0"?>\\n<rss><channel>\\n', (i)=>'  <item>\\n    <title>'+w(i,1)+' '+i+'</title>\\n    <link>https://example.com/p/'+i+'</link>\\n    <description><![CDATA[<p>'+w(i,2)+'</p>]]></description>\\n  </item>\\n', '</channel></rss>\\n')],
+      ['pages2/apache15.html', false, build(1572000, '<html><body><table>\\n', (i)=>'<tr><td valign="top"><img src="/icons/movie.gif" alt="[VID]"></td><td><a href="Show.S01E'+String(i).padStart(4,'0')+'.mkv">Show.S01E'+String(i).padStart(4,'0')+'.mkv</a></td><td>1.2G</td></tr>\\n', '</table></body></html>\\n')],
+      ['pages2/tracker2.html', false, build(1200000, '<html><body><table class="list">\\n', (i)=>'<tr class="'+(i%2?'odd':'even')+'">\\n  <td class="cat"><a href="/cat/5">TV</a></td>\\n  <td class="name"><a href="/t/'+i+'">Show S01E'+i+' 1080p</a></td>\\n  <td class="size">1.5 GB</td>\\n</tr>\\n', '</table></body></html>\\n')],
+    ];
+    // Warmup
+    { const w = new PluginDomParser(); const r = w.parseHtml('<p a="1">hi</p>'); w.outerHtml(r); w.text(r); w.selectAllIds(r, '*'); w.clear(); const rx = w.parseXml('<r><a b="1"/><![CDATA[x]]></r>'); w.outerHtml(rx); w.clear(); }
+
+    function checkOne(name, xml, inp) {
+      const p = new PluginDomParser({ maxDocMemoryBytes: 128<<20, maxVmMemoryBytes: 256<<20, maxProcessMemoryBytes: 256<<20 });
+      const h0 = gc();
+      const root = xml ? p.parseXml(inp) : p.parseHtml(inp);
+      const est = p.currentVmMemoryBytes;
+      const real = gc() - h0;
+      const ratio = real / est;
+      try { p.outerHtml(root); } catch {}
+      try { p.text(root); } catch {}
+      const realPost = gc() - h0;
+      const ratioPost = realPost / est;
+      console.log('NODE_R8CALIB ' + name.padEnd(25) + ' real=' + (real/1048576).toFixed(2) + 'MB est=' + (est/1048576).toFixed(2) + 'MB ratio=' + ratio.toFixed(3) + ' post=' + ratioPost.toFixed(3));
+      p.clear();
+      if (ratio < 0.60 || ratio > 1.25) {
+        throw new Error('Node shape ' + name + ' real/est=' + ratio.toFixed(3) + ' outside [0.60, 1.25]');
+      }
+      if (ratioPost < 0.60 || ratioPost > 1.25) {
+        throw new Error('Node shape ' + name + ' post-ser real/est=' + ratioPost.toFixed(3) + ' outside [0.60, 1.25]');
+      }
+    }
+    for (const [name, xml, inp] of cases) checkOne(name, xml, inp);
+    console.log('NODE_R8CALIB_PASSED');
+  `;
+  const out = execFileSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', calibScript], {
+    encoding: 'utf8',
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  assert.ok(out.includes('NODE_R8CALIB_PASSED'), `Node Round 8 calibration failed:\n${out}`);
 });
 
 test('Round 3: host memory caps, tool/host parity, redirect safe-headers, cookie warnings, unawaited Promise check, immutable globals', async () => {
