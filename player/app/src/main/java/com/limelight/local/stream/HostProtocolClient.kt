@@ -60,31 +60,83 @@ class CallCancelToken {
     }
 }
 
-/** Persists TOFU (Trust On First Use) SHA-256 certificate fingerprints per depth3d Host id. */
+/**
+ * Cryptographic binding persisted ONLY after a user-initiated pair completes successfully against
+ * a verified depth3d Host. Binds the Host TLS certificate fingerprint to the paired GameStream
+ * computer UUID and GameStream server certificate fingerprint.
+ */
+data class HostPairedTrust(
+    val hostFingerprint: String,
+    val computerUuid: String,
+    val gsCertFingerprint: String,
+)
+
+/** Persists pinned Host TLS SHA-256 fingerprints and pairing trust per depth3d Host id. */
 interface HostCertPinStore {
     fun getFingerprint(hostId: String): String?
-    fun saveFingerprint(hostId: String, sha256Hex: String)
+    fun getPairedTrust(hostId: String): HostPairedTrust?
+    fun savePairedTrust(hostId: String, trust: HostPairedTrust)
     fun clearFingerprint(hostId: String)
 }
 
 class InMemoryHostCertPinStore : HostCertPinStore {
-    private val map = HashMap<String, String>()
-    @Synchronized override fun getFingerprint(hostId: String): String? = map[hostId]
-    @Synchronized override fun saveFingerprint(hostId: String, sha256Hex: String) { map[hostId] = sha256Hex }
-    @Synchronized override fun clearFingerprint(hostId: String) { map.remove(hostId) }
+    private val trusts = HashMap<String, HostPairedTrust>()
+
+    @Synchronized
+    override fun getFingerprint(hostId: String): String? = trusts[hostId]?.hostFingerprint
+
+    @Synchronized
+    override fun getPairedTrust(hostId: String): HostPairedTrust? = trusts[hostId]
+
+    @Synchronized
+    override fun savePairedTrust(hostId: String, trust: HostPairedTrust) {
+        trusts[hostId] = trust
+    }
+
+    @Synchronized
+    override fun clearFingerprint(hostId: String) {
+        trusts.remove(hostId)
+    }
 }
 
 class SharedPrefsHostCertPinStore(context: Context) : HostCertPinStore {
     private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
     override fun getFingerprint(hostId: String): String? = prefs.getString(hostId, null)
-    override fun saveFingerprint(hostId: String, sha256Hex: String) {
-        prefs.edit().putString(hostId, sha256Hex).apply()
+
+    override fun getPairedTrust(hostId: String): HostPairedTrust? {
+        val savedFp = prefs.getString(hostId, null) ?: return null
+        val raw = prefs.getString(PAIRED_PREFIX + hostId, null) ?: return null
+        val parts = raw.split('|')
+        if (parts.size != 3) return null
+        val fp = parts[0]
+        val uuid = parts[1]
+        val gsFp = parts[2]
+        if (fp.isBlank() || uuid.isBlank() || gsFp.isBlank()) return null
+        if (!fp.equals(savedFp, ignoreCase = true)) return null
+        return HostPairedTrust(hostFingerprint = fp, computerUuid = uuid, gsCertFingerprint = gsFp)
     }
+
+    override fun savePairedTrust(hostId: String, trust: HostPairedTrust) {
+        prefs.edit()
+            .putString(hostId, trust.hostFingerprint)
+            .putString(
+                PAIRED_PREFIX + hostId,
+                "${trust.hostFingerprint}|${trust.computerUuid}|${trust.gsCertFingerprint}",
+            )
+            .apply()
+    }
+
     override fun clearFingerprint(hostId: String) {
-        prefs.edit().remove(hostId).apply()
+        prefs.edit()
+            .remove(hostId)
+            .remove(PAIRED_PREFIX + hostId)
+            .apply()
     }
+
     companion object {
         private const val PREFS_NAME = "depth3d_host_cert_pins"
+        private const val PAIRED_PREFIX = "paired_trust:"
     }
 }
 
@@ -149,6 +201,11 @@ sealed interface MediaCredsResult {
 }
 
 interface HostProtocolApi {
+    /**
+     * Probes `/depth3d/v1/info` without ever persisting a certificate pin (B3/S2).
+     * Verifies `info.id == hostId` and protocol version, returning the observed TLS cert
+     * fingerprint in memory.
+     */
     fun getInfo(
         address: String,
         port: Int,
@@ -157,6 +214,12 @@ interface HostProtocolApi {
         cancelToken: CallCancelToken? = null,
     ): HostInfoResult
 
+    /**
+     * Sends `/depth3d/v1/pair` strictly pinned to [expectedFingerprint] (obtained from a verified
+     * [getInfo] call). Never saves a pin on any response; pin persistence happens only after the
+     * full pairing flow completes (B2/B3/S2). Never sends a client cert unless the host already has
+     * a matching saved paired pin (B1).
+     */
     fun requestAutoPair(
         address: String,
         port: Int,
@@ -164,17 +227,25 @@ interface HostProtocolApi {
         deviceName: String,
         deviceId: String,
         pin: String,
+        expectedFingerprint: String,
         presentClientCert: Boolean = false,
         approvedNewFingerprint: String? = null,
         cancelToken: CallCancelToken? = null,
     ): AutoPairResult
 
+    /**
+     * Requests `/depth3d/v1/media` ONLY if [hostId] has a persisted [HostPairedTrust] matching
+     * [expectedComputerUuid] and [expectedGsCertFingerprint], AND the TLS handshake certificate
+     * matches the persisted Host fingerprint. Refuses to dial, send client cert, send
+     * `X-Depth3d-Device`, or accept WebDAV credentials otherwise (B1).
+     */
     fun getMediaCredentials(
         address: String,
         port: Int,
         hostId: String,
         deviceId: String,
-        approvedNewFingerprint: String? = null,
+        expectedComputerUuid: String,
+        expectedGsCertFingerprint: String,
         cancelToken: CallCancelToken? = null,
     ): MediaCredsResult
 }
@@ -183,11 +254,12 @@ interface HostProtocolApi {
  * Client for the depth3d Host v1 HTTPS control API (docs/specs/host-protocol.md).
  *
  * Security guarantees:
- * - Never pins a server certificate on an unverified mDNS id: /info verifies `info.id == hostId`
- *   and protocol version before saving the first-use SHA-256 fingerprint.
- * - Certificate-change approval pins ONLY the exact SHA-256 fingerprint the user confirmed.
- * - First-time /pair omits the client certificate; paired /pair and /media present the pairing
- *   client certificate so Mac Host authenticates paired headsets by certificate fingerprint.
+ * - `/info` never persists a certificate pin; first-use discovery stays in memory only (B3).
+ * - `/pair` requires an explicit [expectedFingerprint] from a verified `/info` (`info.id == hostId`)
+ *   and pins the TLS handshake to that exact fingerprint; never persists on 403/408/500/503 (B2/S2).
+ * - `/media` strictly requires a persisted [HostPairedTrust] binding (saved Host fingerprint +
+ *   paired computer UUID + paired GameStream cert fingerprint) and verifies the TLS server cert
+ *   matches that exact saved fingerprint before sending client cert or `X-Depth3d-Device` (B1).
  * - Never logs PINs, passwords, or key material.
  */
 class HttpHostProtocolClient(
@@ -224,10 +296,17 @@ class HttpHostProtocolClient(
             }
         }
 
-        internal fun formatHostUrl(address: String, port: Int, path: String): String {
-            val host = if (address.contains(':') && !address.startsWith('[')) "[$address]" else address
-            return "https://$host:$port$path"
+        internal fun formatAuthorityHost(address: String): String {
+            val trimmed = address.trim()
+            return if (trimmed.contains(':') && !trimmed.startsWith('[')) "[$trimmed]" else trimmed
         }
+
+        internal fun formatHostUrl(address: String, port: Int, path: String): String =
+            "https://${formatAuthorityHost(address)}:$port$path"
+
+        /** Formats an HTTP base URL for WebDAV, bracketing IPv6 literals per RFC 3986 (M5). */
+        fun formatWebDavUrl(address: String, port: Int): String =
+            "http://${formatAuthorityHost(address)}:$port"
 
         internal fun escapeJson(value: String): String {
             val sb = StringBuilder(value.length + 8)
@@ -297,11 +376,16 @@ class HttpHostProtocolClient(
         val url = formatHostUrl(address, port, "/depth3d/v1/info")
         LimeLog.info("depth3d: host GET /depth3d/v1/info -> $address:$port")
         val observed = AtomicReference<String?>(null)
+        val savedPin = pinStore.getFingerprint(hostId)
+        val policy = CertPinPolicy.ObserveOrPinned(
+            savedFingerprint = savedPin,
+            approvedNewFingerprint = approvedNewFingerprint,
+        )
         return try {
             val client = buildClient(
                 hostId = hostId,
+                policy = policy,
                 presentClientCert = false,
-                approvedNewFingerprint = approvedNewFingerprint,
                 readTimeoutMs = infoReadTimeoutMs,
                 observedFingerprintOut = observed,
             )
@@ -322,7 +406,7 @@ class HttpHostProtocolClient(
                                 return HostInfoResult.IdentityMismatch(hostId, info.id)
                             }
                             val fp = observed.get() ?: return HostInfoResult.Failed("missing server cert")
-                            commitPinIfEligible(hostId, fp, approvedNewFingerprint)
+                            // Never persist pin during /info (B3/S2): return observed fingerprint in memory only.
                             HostInfoResult.Ok(info, fp)
                         }
                         426 -> HostInfoResult.UpgradeRequired
@@ -352,20 +436,45 @@ class HttpHostProtocolClient(
         deviceName: String,
         deviceId: String,
         pin: String,
+        expectedFingerprint: String,
         presentClientCert: Boolean,
         approvedNewFingerprint: String?,
         cancelToken: CallCancelToken?,
     ): AutoPairResult {
         if (cancelToken?.isCancelled == true) return AutoPairResult.Cancelled
+        val expected = expectedFingerprint.trim()
+        if (expected.isEmpty()) {
+            return AutoPairResult.Failed("unverified host fingerprint")
+        }
+
+        val savedPin = pinStore.getFingerprint(hostId)
+        val pairedTrust = pinStore.getPairedTrust(hostId)
+        if (savedPin != null && !savedPin.equals(expected, ignoreCase = true)) {
+            if (approvedNewFingerprint == null || !approvedNewFingerprint.equals(expected, ignoreCase = true)) {
+                return AutoPairResult.CertificateChanged(hostId, savedPin, expected)
+            }
+        }
+
+        // B1: Never send a client certificate on any connection without a matching saved paired pin.
+        val allowClientCert = presentClientCert &&
+            savedPin != null &&
+            pairedTrust != null &&
+            savedPin.equals(expected, ignoreCase = true) &&
+            pairedTrust.hostFingerprint.equals(savedPin, ignoreCase = true)
+
         val url = formatHostUrl(address, port, "/depth3d/v1/pair")
         val payload = "{\"device\":\"${escapeJson(deviceName)}\",\"deviceId\":\"${escapeJson(deviceId)}\",\"pin\":\"${escapeJson(pin)}\"}"
-        LimeLog.info("depth3d: host POST /depth3d/v1/pair -> $address:$port (device=$deviceName, clientCert=$presentClientCert)")
+        LimeLog.info("depth3d: host POST /depth3d/v1/pair -> $address:$port (device=$deviceName, clientCert=$allowClientCert)")
         val observed = AtomicReference<String?>(null)
+        val policy = CertPinPolicy.ExactOnly(
+            expectedFingerprint = expected,
+            reportedExpectedForError = savedPin ?: expected,
+        )
         return try {
             val client = buildClient(
                 hostId = hostId,
-                presentClientCert = presentClientCert,
-                approvedNewFingerprint = approvedNewFingerprint,
+                policy = policy,
+                presentClientCert = allowClientCert,
                 readTimeoutMs = pairReadTimeoutMs,
                 observedFingerprintOut = observed,
             )
@@ -379,12 +488,11 @@ class HttpHostProtocolClient(
                 call.execute().use { resp ->
                     val body = resp.body.string()
                     val fp = observed.get()
-                    if (fp != null && approvedNewFingerprint != null &&
-                        approvedNewFingerprint.equals(fp, ignoreCase = true) &&
-                        resp.code != 426
-                    ) {
-                        pinStore.saveFingerprint(hostId, fp)
+                    if (fp == null || !fp.equals(expected, ignoreCase = true)) {
+                        return AutoPairResult.Failed("unexpected server cert")
                     }
+                    // Never write pinStore here on 403/408/500/503 or even 200;
+                    // the caller commits HostPairedTrust ONLY after the entire pairing succeeds (B3/S2).
                     when (resp.code) {
                         200 -> if (parsePairOkJson(body)) AutoPairResult.Approved else AutoPairResult.Failed("pair response not ok")
                         403 -> AutoPairResult.Rejected
@@ -415,23 +523,46 @@ class HttpHostProtocolClient(
         port: Int,
         hostId: String,
         deviceId: String,
-        approvedNewFingerprint: String?,
+        expectedComputerUuid: String,
+        expectedGsCertFingerprint: String,
         cancelToken: CallCancelToken?,
     ): MediaCredsResult {
         if (cancelToken?.isCancelled == true) return MediaCredsResult.Cancelled
+
+        // B1: Refuse to open any /media connection unless:
+        // 1) hostId has a persisted pinned certificate fingerprint,
+        // 2) pairing was completed with this exact fingerprinted host + computerUuid + gsCertFingerprint,
+        // 3) we have the pairing client certificate to authenticate with mutual TLS.
+        val savedPin = pinStore.getFingerprint(hostId)
+        val pairedTrust = pinStore.getPairedTrust(hostId)
+        if (savedPin.isNullOrBlank() ||
+            pairedTrust == null ||
+            !pairedTrust.hostFingerprint.equals(savedPin, ignoreCase = true) ||
+            !pairedTrust.computerUuid.equals(expectedComputerUuid, ignoreCase = true) ||
+            !pairedTrust.gsCertFingerprint.equals(expectedGsCertFingerprint, ignoreCase = true)
+        ) {
+            LimeLog.info("depth3d: skipping /depth3d/v1/media for $hostId (missing verified paired cert pin)")
+            return MediaCredsResult.Unauthorized
+        }
+
         val keyManagers = buildClientKeyManagers()
         if (keyManagers == null) {
             LimeLog.warning("depth3d: skipping /depth3d/v1/media because pairing client certificate is unavailable")
             return MediaCredsResult.Unauthorized
         }
+
         val url = formatHostUrl(address, port, "/depth3d/v1/media")
         LimeLog.info("depth3d: host GET /depth3d/v1/media -> $address:$port")
         val observed = AtomicReference<String?>(null)
+        val policy = CertPinPolicy.ExactOnly(
+            expectedFingerprint = savedPin,
+            reportedExpectedForError = savedPin,
+        )
         return try {
             val client = buildClient(
                 hostId = hostId,
+                policy = policy,
                 presentClientCert = true,
-                approvedNewFingerprint = approvedNewFingerprint,
                 readTimeoutMs = infoReadTimeoutMs,
                 observedFingerprintOut = observed,
                 precomputedKeyManagers = keyManagers,
@@ -445,6 +576,9 @@ class HttpHostProtocolClient(
             val unregister = cancelToken?.registerCall(call)
             try {
                 call.execute().use { resp ->
+                    if (!savedPin.equals(observed.get(), ignoreCase = true)) {
+                        return MediaCredsResult.Unauthorized
+                    }
                     when (resp.code) {
                         200 -> {
                             val creds = parseMediaCredsJson(resp.body.string())
@@ -472,25 +606,29 @@ class HttpHostProtocolClient(
         }
     }
 
-    private fun commitPinIfEligible(hostId: String, observed: String, approvedNewFingerprint: String?) {
-        val saved = pinStore.getFingerprint(hostId)
-        when {
-            saved == null -> pinStore.saveFingerprint(hostId, observed)
-            saved.equals(observed, ignoreCase = true) -> Unit
-            approvedNewFingerprint != null && approvedNewFingerprint.equals(observed, ignoreCase = true) ->
-                pinStore.saveFingerprint(hostId, observed)
-        }
+    private sealed interface CertPinPolicy {
+        /** Used only by `/info`: observes cert if unpinned; verifies against saved/approved pin if pinned. */
+        data class ObserveOrPinned(
+            val savedFingerprint: String?,
+            val approvedNewFingerprint: String?,
+        ) : CertPinPolicy
+
+        /** Used by `/pair` and `/media`: strictly requires the server cert to match [expectedFingerprint]. */
+        data class ExactOnly(
+            val expectedFingerprint: String,
+            val reportedExpectedForError: String,
+        ) : CertPinPolicy
     }
 
     private fun buildClient(
         hostId: String,
+        policy: CertPinPolicy,
         presentClientCert: Boolean,
-        approvedNewFingerprint: String?,
         readTimeoutMs: Long,
         observedFingerprintOut: AtomicReference<String?>,
         precomputedKeyManagers: Array<KeyManager>? = null,
     ): OkHttpClient {
-        val trustManager = TofuTrustManager(pinStore, hostId, approvedNewFingerprint, observedFingerprintOut)
+        val trustManager = PinningTrustManager(hostId, policy, observedFingerprintOut)
         val keyManagers = when {
             !presentClientCert -> null
             precomputedKeyManagers != null -> precomputedKeyManagers
@@ -503,7 +641,7 @@ class HttpHostProtocolClient(
             .readTimeout(readTimeoutMs, TimeUnit.MILLISECONDS)
             .writeTimeout(connectTimeoutMs, TimeUnit.MILLISECONDS)
             .sslSocketFactory(sslContext.socketFactory, trustManager)
-            // Self-signed LAN host certificates are pinned by SHA-256 fingerprint via TofuTrustManager.
+            // Self-signed LAN host certificates are pinned by SHA-256 fingerprint via PinningTrustManager.
             .hostnameVerifier(HostnameVerifier { _, _ -> true })
             .build()
     }
@@ -540,10 +678,9 @@ class HttpHostProtocolClient(
         return null
     }
 
-    private class TofuTrustManager(
-        private val store: HostCertPinStore,
+    private class PinningTrustManager(
         private val hostId: String,
-        private val approvedNewFingerprint: String?,
+        private val policy: CertPinPolicy,
         private val observedOut: AtomicReference<String?>,
     ) : X509TrustManager {
         override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
@@ -554,13 +691,22 @@ class HttpHostProtocolClient(
             }
             val fingerprint = sha256Hex(chain[0])
             observedOut.set(fingerprint)
-            val saved = store.getFingerprint(hostId)
-            when {
-                // First contact: defer persisting the pin until /info verifies info.id == hostId.
-                saved == null -> Unit
-                saved.equals(fingerprint, ignoreCase = true) -> Unit
-                approvedNewFingerprint != null && approvedNewFingerprint.equals(fingerprint, ignoreCase = true) -> Unit
-                else -> throw HostCertificateChangedException(hostId, saved, fingerprint)
+            when (policy) {
+                is CertPinPolicy.ObserveOrPinned -> {
+                    val saved = policy.savedFingerprint
+                    when {
+                        saved == null -> Unit
+                        saved.equals(fingerprint, ignoreCase = true) -> Unit
+                        policy.approvedNewFingerprint != null &&
+                            policy.approvedNewFingerprint.equals(fingerprint, ignoreCase = true) -> Unit
+                        else -> throw HostCertificateChangedException(hostId, saved, fingerprint)
+                    }
+                }
+                is CertPinPolicy.ExactOnly -> {
+                    if (!policy.expectedFingerprint.equals(fingerprint, ignoreCase = true)) {
+                        throw HostCertificateChangedException(hostId, policy.reportedExpectedForError, fingerprint)
+                    }
+                }
             }
         }
 

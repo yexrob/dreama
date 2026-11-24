@@ -42,7 +42,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.limelight.LimeLog
 import com.limelight.R
+import com.limelight.local.stream.AndroidStringLookup
 import com.limelight.local.stream.PhoneInputCopy
+import com.limelight.local.stream.PhoneInputErrorHelper
 import com.limelight.local.stream.PhoneInputServer
 import com.limelight.local.stream.PhoneSubmitResult
 import com.limelight.local.stream.QrCodeMatrix
@@ -98,6 +100,7 @@ fun PhoneInputSheet(
             onDispose { }
         } else {
             val copy = PhoneInputCopy.from(context, mode)
+            val strings = AndroidStringLookup(context)
             val server = try {
                 PhoneInputServer(
                     copy = copy,
@@ -126,24 +129,12 @@ fun PhoneInputSheet(
                                         Pair(true, onSubmit(submitted))
                                     }
                                     if (outcome == null) {
-                                        UserFacingError(
-                                            title = context.getString(
-                                                R.string.err_net_timeout_title,
-                                                context.getString(R.string.stream_action_add_pc),
-                                            ),
-                                            detail = context.getString(R.string.err_net_timeout_detail),
-                                        )
+                                        PhoneInputErrorHelper.timeoutError(strings, mode)
                                     } else {
                                         outcome.second
                                     }
                                 } catch (_: Exception) {
-                                    UserFacingError(
-                                        title = context.getString(
-                                            R.string.err_action_failed_title,
-                                            context.getString(R.string.stream_action_add_pc),
-                                        ),
-                                        detail = context.getString(R.string.err_action_failed_detail),
-                                    )
+                                    PhoneInputErrorHelper.failedError(strings, mode)
                                 }
                                 withContext(Dispatchers.Main.immediate) {
                                     busy = false
@@ -156,7 +147,9 @@ fun PhoneInputSheet(
                                 if (err == null) {
                                     PhoneSubmitResult.Accepted
                                 } else {
-                                    PhoneSubmitResult.Rejected("${err.title}：${err.detail}")
+                                    PhoneSubmitResult.Rejected(
+                                        PhoneInputErrorHelper.formatRejectedReason(strings, err),
+                                    )
                                 }
                             }
                         } catch (_: InterruptedException) {

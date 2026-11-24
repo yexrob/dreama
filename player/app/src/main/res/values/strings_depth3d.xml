@@ -455,4 +455,46 @@
     <string name="service_discovery_label">depth3d 局域网发现服务</string>
     <string name="service_computer_manager_label">depth3d 电脑连接管理服务</string>
     <string name="service_usb_driver_label">depth3d USB 手柄服务</string>
+
+    <!-- Additional localized copy for AirPlay, DLNA, Library, Detail, Local source, WebDAV, and formatting -->
+    <string name="stream_default_desktop_name">桌面</string>
+    <string name="err_join_colon">%1$s：%2$s</string>
+    <string name="err_join_comma">%1$s，%2$s</string>
+    <string name="phone_action_rename_device">修改设备名</string>
+
+    <string name="airplay_failed_title">投屏没有启动</string>
+    <string name="airplay_failed_with_reason">投屏没有启动：%1$s</string>
+    <string name="airplay_connecting_prefix">正在连接</string>
+
+    <string name="dlna_body">在同一个 Wi-Fi 里，从手机上的视频 App 选择这个名字。</string>
+    <string name="dlna_casting_title">正在播放手机投屏 · %1$s</string>
+    <string name="dlna_no_network_body">投屏需要头显和手机在同一个 Wi-Fi 里。</string>
+    <string name="dlna_failed_title">投屏接收没能启动</string>
+    <string name="dlna_failed_body">关掉 depth3d 再打开试试；还不行就重启头显的 Wi-Fi。</string>
+    <string name="dlna_starting">正在打开投屏接收…</string>
+    <string name="dlna_untitled">手机投屏</string>
+    <string name="dlna_notif_text">手机和头显连同一个 Wi-Fi，在视频 App 里点「投屏」</string>
+
+    <string name="library_count_suffix"> · %1$d 个</string>
+    <string name="library_add_webdav">添加 WebDAV</string>
+    <string name="library_found_webdav">找到 %1$s</string>
+    <string name="library_webdav_desc">Google Drive 等网盘</string>
+    <string name="library_manage_sources">管理播放源</string>
+    <string name="library_empty_videos">这里还没有视频。</string>
+    <string name="library_source_unreachable">连不上「%1$s」</string>
+    <string name="library_storage_hint">头显里的视频要先允许 depth3d 读取。</string>
+    <string name="library_source_offline_hint">提供它的电脑可能关机了，或者不在这个 Wi-Fi 里。</string>
+    <string name="library_check_settings">检查设置</string>
+    <string name="library_source_missing">这个播放源已经不在了</string>
+
+    <string name="detail_restart">从头播放</string>
+
+    <string name="source_local_name">本机</string>
+    <string name="source_local_desc">头显存储</string>
+    <string name="source_local_recent">最近添加</string>
+    <string name="source_local_all_videos">全部视频</string>
+
+    <string name="webdav_err_auth">用户名或密码不对，请检查后重试。</string>
+    <string name="webdav_err_server">媒体服务响应异常，请确认服务正在运行。</string>
+    <string name="webdav_err_parse">无法读取目录内容，请检查共享地址设置。</string>
 </resources>

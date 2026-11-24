@@ -77,9 +77,10 @@ import com.limelight.local.stream.StreamingController
  */
 @Composable
 fun CastScreen(model: WallModel, nav: WallNav) {
+    val context = LocalContext.current
     val streaming = model.streaming
     val dlna by CastReceiver.status.collectAsState()
-    val copy = dlnaCastCopy(dlna)
+    val copy = dlnaCastCopy(context, dlna)
     val air by AirPlayState.status.collectAsStateWithLifecycle()
     val computers by streaming.computers.collectAsState()
     val discovering by streaming.discovering.collectAsState()

@@ -37,6 +37,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.limelight.R
+import com.limelight.local.WebDav
 import kotlinx.coroutines.launch
 
 /**
@@ -101,6 +102,12 @@ fun WebDavSheet(model: WallModel, nav: WallNav, suggested: String) {
                                     pass.text.trim().toString(),
                                 )
                                 nav.closeWebDav()
+                            } catch (e: WebDav.WebDavException) {
+                                error = when (e.reason) {
+                                    WebDav.WebDavException.Reason.UNAUTHORIZED -> context.getString(R.string.webdav_err_auth)
+                                    WebDav.WebDavException.Reason.HTTP_ERROR -> context.getString(R.string.webdav_err_server)
+                                    WebDav.WebDavException.Reason.PARSE_ERROR -> context.getString(R.string.webdav_err_parse)
+                                }
                             } catch (e: Exception) {
                                 error = context.getString(R.string.webdav_connect_failed)
                             } finally {

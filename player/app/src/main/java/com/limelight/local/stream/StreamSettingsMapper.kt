@@ -667,25 +667,40 @@ object DecoderCrashRecovery {
     const val TOMBSTONE_PREFS_NAME = "DecoderTombstone"
     const val KEY_CRASH_COUNT = "CrashCount"
     const val KEY_LAST_NOTIFIED = "LastNotifiedCrashCount"
+    const val KEY_LAST_AUTO_RESET = "LastAutoResetCrashCount"
 
-    fun checkAndPrepare(tombstone: PrefsStore, streamingPrefs: PrefsStore): CrashRecoveryPrompt? {
+    fun checkAndPrepare(
+        tombstone: PrefsStore,
+        streamingPrefs: PrefsStore,
+        isGen1: Boolean = false,
+    ): CrashRecoveryPrompt? {
         val crashCount = tombstone.getInt(KEY_CRASH_COUNT, 0)
         val lastNotified = tombstone.getInt(KEY_LAST_NOTIFIED, 0)
         if (crashCount <= 0 || crashCount == lastNotified) {
             return null
         }
         return if (crashCount % 3 == 0) {
-            PreferenceConfiguration.resetStreamingSettings(streamingPrefs.asSharedPreferences())
+            // M3: Run auto-reset at most once per crash count even across repeated onStart() calls
+            // before the user dismisses the recovery card.
+            if (tombstone.getInt(KEY_LAST_AUTO_RESET, 0) != crashCount) {
+                PreferenceConfiguration.resetStreamingSettings(streamingPrefs.asSharedPreferences(), isGen1)
+                tombstone.putInt(KEY_LAST_AUTO_RESET, crashCount)
+            }
             CrashRecoveryPrompt(crashCount = crashCount, autoResetApplied = true)
         } else {
             CrashRecoveryPrompt(crashCount = crashCount, autoResetApplied = false)
         }
     }
 
-    fun resetDefaultsAndClear(tombstone: PrefsStore, streamingPrefs: PrefsStore) {
-        PreferenceConfiguration.resetStreamingSettings(streamingPrefs.asSharedPreferences())
+    fun resetDefaultsAndClear(
+        tombstone: PrefsStore,
+        streamingPrefs: PrefsStore,
+        isGen1: Boolean = false,
+    ) {
+        PreferenceConfiguration.resetStreamingSettings(streamingPrefs.asSharedPreferences(), isGen1)
         tombstone.putInt(KEY_CRASH_COUNT, 0)
         tombstone.putInt(KEY_LAST_NOTIFIED, 0)
+        tombstone.putInt(KEY_LAST_AUTO_RESET, 0)
     }
 
     fun acknowledge(tombstone: PrefsStore, crashCount: Int) {

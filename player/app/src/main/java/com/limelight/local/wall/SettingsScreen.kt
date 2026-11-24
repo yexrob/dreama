@@ -581,7 +581,11 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
                                 BuildConfig.VERSION_NAME
                             }
                             Text(
-                                "${stringResource(R.string.settings_about_version_title)}：$ver",
+                                stringResource(
+                                    R.string.err_join_colon,
+                                    stringResource(R.string.settings_about_version_title),
+                                    ver,
+                                ),
                                 style = WallType.Caption.copy(fontFeatureSettings = "tnum"),
                                 color = Wall.Text3,
                                 modifier = Modifier.padding(top = 12.dp),

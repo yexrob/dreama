@@ -149,6 +149,7 @@
             android:launchMode="singleTask"
             android:excludeFromRecents="true"
             android:theme="@style/StreamTheme"
+            android:preferMinimalPostProcessing="true"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

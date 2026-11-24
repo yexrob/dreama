@@ -219,24 +219,28 @@ class ComputerListStateTest {
             name = "A-Offline",
             state = ComputerDetails.State.OFFLINE,
             pairState = PairingManager.PairState.PAIRED,
+            activeAddress = "192.168.1.11",
         )
         val discovering = rawComputer(
             uuid = "u-disc",
             name = "B-Discovering",
             state = ComputerDetails.State.UNKNOWN,
             pairState = PairingManager.PairState.PAIRED,
+            activeAddress = "192.168.1.12",
         )
         val unpaired = rawComputer(
             uuid = "u-unpaired",
             name = "C-Unpaired",
             state = ComputerDetails.State.ONLINE,
             pairState = PairingManager.PairState.NOT_PAIRED,
+            activeAddress = "192.168.1.13",
         )
         val paired = rawComputer(
             uuid = "u-paired",
             name = "D-Paired",
             state = ComputerDetails.State.ONLINE,
             pairState = PairingManager.PairState.PAIRED,
+            activeAddress = "192.168.1.14",
         )
         val streaming = rawComputer(
             uuid = "u-stream",
@@ -244,6 +248,7 @@ class ComputerListStateTest {
             state = ComputerDetails.State.ONLINE,
             pairState = PairingManager.PairState.PAIRED,
             runningGameId = 1001,
+            activeAddress = "192.168.1.15",
         )
 
         val merged = ComputerListMerger.merge(
@@ -310,5 +315,112 @@ class ComputerListStateTest {
         assertNull("Least recently used key 'b' should be evicted", cache.get("b"))
         assertEquals(3, cache.get("c"))
         assertEquals(4, cache.get("d"))
+    }
+
+    @Test
+    fun s5_mergesNewLiveHostWithLegacyOfflineDirectPairedServiceOnSameAddressOrId() {
+        val liveHost = DiscoveredHost(
+            id = "new-host-uuid",
+            name = "书房 MacBook",
+            address = "192.168.1.50",
+            controlPort = 47990,
+            gsPort = 47989,
+            pairMode = "auto",
+        )
+        // Previously directly paired Sunshine service on the same Mac, now offline with an old UUID
+        // (even on a different legacy port 48000!)
+        val oldOfflineDirect = rawComputer(
+            uuid = "legacy-sunshine-uuid",
+            name = "Old Mac Sunshine",
+            state = ComputerDetails.State.OFFLINE,
+            pairState = PairingManager.PairState.PAIRED,
+            activeAddress = null,
+            activePort = 0,
+            mac = "11:22:33:44:55:66",
+        ).copy(localAddress = "192.168.1.50", localPort = 48000)
+
+        val mergedSingle = ComputerListMerger.merge(
+            computers = listOf(oldOfflineDirect),
+            discoveredHosts = listOf(liveHost),
+        )
+        assertEquals("S5: Legacy offline PC + live Host must merge into 1 row", 1, mergedSingle.size)
+        val item = mergedSingle.single()
+        assertEquals("host:new-host-uuid", item.id)
+        assertEquals("书房 MacBook", item.name)
+        assertEquals(ComputerStatus.ONLINE_UNPAIRED, item.status)
+        assertTrue(item.isDepth3dHost)
+        assertTrue("Should preserve WoL MAC from absorbed record", item.canWake)
+
+        // When BOTH old offline record AND live online record exist for the same Host -> still 1 row!
+        val newOnlineGs = rawComputer(
+            uuid = "new-host-uuid",
+            name = "MacBook",
+            state = ComputerDetails.State.ONLINE,
+            pairState = PairingManager.PairState.PAIRED,
+            activeAddress = "192.168.1.50",
+            activePort = 47989,
+        )
+        val mergedBoth = ComputerListMerger.merge(
+            computers = listOf(oldOfflineDirect, newOnlineGs),
+            discoveredHosts = listOf(liveHost),
+        )
+        assertEquals("S5: Old offline + new online + Host must collapse into 1 row", 1, mergedBoth.size)
+        assertEquals("new-host-uuid", mergedBoth.single().id)
+        assertEquals(ComputerStatus.ONLINE_PAIRED, mergedBoth.single().status)
+        assertEquals("书房 MacBook", mergedBoth.single().name)
+
+        // Same host.id where GameStream cache is stale OFFLINE while Host mDNS is live -> prioritize Host!
+        val staleSameId = rawComputer(
+            uuid = "new-host-uuid",
+            name = "MacBook",
+            state = ComputerDetails.State.OFFLINE,
+            pairState = PairingManager.PairState.PAIRED,
+            activeAddress = "192.168.1.99",
+            activePort = 47989,
+        )
+        val mergedStaleId = ComputerListMerger.merge(
+            computers = listOf(staleSameId),
+            discoveredHosts = listOf(liveHost),
+        )
+        assertEquals(1, mergedStaleId.size)
+        assertEquals(ComputerStatus.ONLINE_PAIRED, mergedStaleId.single().status)
+        assertEquals("192.168.1.50", mergedStaleId.single().address)
+
+        // Distinct ONLINE service on same IP but different port (48000 vs 47989) remains separate!
+        val otherOnlineVm = rawComputer(
+            uuid = "vm-online-uuid",
+            name = "Windows VM",
+            state = ComputerDetails.State.ONLINE,
+            pairState = PairingManager.PairState.PAIRED,
+            activeAddress = "192.168.1.50",
+            activePort = 48000,
+        )
+        val mergedDistinctVm = ComputerListMerger.merge(
+            computers = listOf(otherOnlineVm),
+            discoveredHosts = listOf(liveHost),
+        )
+        assertEquals(2, mergedDistinctVm.size)
+    }
+
+    @Test
+    fun m4_networkChangeTrackerDetectsBothOfflineRecoveryAndDirectWifiToWifiSwitch() {
+        val tracker = NetworkChangeTracker(initialNetworkId = 100L)
+
+        // Initial registration callback for the already-active Wi-Fi does NOT trigger reset
+        assertFalse(tracker.onAvailable(100L))
+
+        // Direct switch from Wi-Fi A (100L) to Wi-Fi B (200L) without intermediate offline state -> MUST trigger reset!
+        assertTrue(
+            "M4: Direct Wi-Fi A -> Wi-Fi B switch must trigger backoff reset",
+            tracker.onAvailable(200L),
+        )
+        assertEquals(200L, tracker.currentNetworkId())
+        assertFalse(tracker.onAvailable(200L))
+
+        // Going offline then coming back on Wi-Fi C (300L) -> MUST trigger reset!
+        tracker.onLost(200L, fallbackActiveId = null)
+        assertNull(tracker.currentNetworkId())
+        assertTrue(tracker.onAvailable(300L))
+        assertEquals(300L, tracker.currentNetworkId())
     }
 }

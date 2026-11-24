@@ -84,49 +84,98 @@ class StreamSettingsMapperTest {
     }
 
     @Test
-    fun freshStoreDefaultsExactlyMatchPreferenceConfiguration() {
-        val store = MapPrefsStore()
-        // Non-Gen1 default FPS in PreferenceConfiguration is 90 (not 72!).
-        val snap = StreamSettingsMapper.read(store, isGen1Headset = false)
-        assertExactParityWithPreferenceConfiguration(store, isGen1 = false)
+    fun s1_freshStoreDefaultsSeparatelyCoverNonGen1AndGen1WithoutTautology() {
+        // Non-Gen1 (e.g. Quest 3 / PICO 4 Ultra): literal expected defaults are 2560x1440 @ 90 fps
+        val nonGen1Store = MapPrefsStore()
+        assertEquals("2560x1440", PreferenceConfiguration.defaultResolution(false))
+        assertEquals("90", PreferenceConfiguration.defaultFps(false))
+        val nonGen1Cfg = PreferenceConfiguration.readPreferences(nonGen1Store, false)
+        val nonGen1Ui = StreamSettingsMapper.read(nonGen1Store, isGen1Headset = false)
 
-        assertEquals(StreamResolution.R1440P, snap.resolution)
-        assertEquals(StreamFps.FPS_90, snap.fps)
-        assertEquals(90, snap.actualFps)
-        assertTrue("90 fps default should trigger 3D lag warning", snap.warn3dLag)
-        assertEquals(BitratePreset.AUTO, snap.bitratePreset)
-        assertEquals(StreamCodec.AUTO, snap.codec)
-        assertEquals(MouseMode.RELATIVE, snap.mouseMode)
-        assertTrue(snap.multiController)
-        assertFalse(snap.flipFaceButtons)
-        assertEquals(GamepadToggleShortcut.MENU_GRIP, snap.gamepadShortcut)
-        assertEquals(DepthStrength.STANDARD, snap.depthStrength)
-        assertEquals(DepthQualityMode.QUALITY, snap.depthQuality)
-        assertTrue(snap.sharpening)
-        assertFalse(snap.supersampling)
-        assertEquals(ScreenSizePreset.MEDIUM, snap.screenSize)
-        assertEquals(ScreenDistancePreset.MEDIUM, snap.screenDistance)
-        assertFalse(snap.curvedScreen)
-        assertEquals(VrEnvironmentPreset.VOID, snap.environment)
-        assertTrue(snap.doffGrace)
-        assertTrue(snap.handTracking)
-        assertTrue(snap.showRay)
-        assertTrue(snap.pointerSleep)
-        assertFalse(snap.headAim)
-        assertTrue(snap.clickSound)
-        assertEquals(FileLogMode.BASIC, snap.fileLog)
+        assertEquals(2560, nonGen1Cfg.width)
+        assertEquals(1440, nonGen1Cfg.height)
+        assertEquals(90, nonGen1Cfg.fps)
+        assertEquals(PreferenceConfiguration.getDefaultBitrate("2560x1440", "90"), nonGen1Cfg.bitrate)
+        assertEquals(StreamResolution.R1440P, nonGen1Ui.resolution)
+        assertEquals(StreamFps.FPS_90, nonGen1Ui.fps)
+        assertEquals(90, nonGen1Ui.actualFps)
+        assertEquals(nonGen1Cfg.bitrate, nonGen1Ui.actualBitrateKbps)
+        assertTrue("Non-Gen1 90 fps default should trigger 3D lag warning", nonGen1Ui.warn3dLag)
+        assertEquals(BitratePreset.AUTO, nonGen1Ui.bitratePreset)
+        assertEquals(StreamCodec.AUTO, nonGen1Ui.codec)
+        assertEquals(MouseMode.RELATIVE, nonGen1Ui.mouseMode)
+        assertTrue(nonGen1Ui.multiController)
+        assertFalse(nonGen1Ui.flipFaceButtons)
+        assertEquals(GamepadToggleShortcut.MENU_GRIP, nonGen1Ui.gamepadShortcut)
+        assertEquals(DepthStrength.STANDARD, nonGen1Ui.depthStrength)
+        assertEquals(DepthQualityMode.QUALITY, nonGen1Ui.depthQuality)
+        assertTrue(nonGen1Ui.sharpening)
+        assertFalse(nonGen1Ui.supersampling)
+        assertEquals(ScreenSizePreset.MEDIUM, nonGen1Ui.screenSize)
+        assertEquals(ScreenDistancePreset.MEDIUM, nonGen1Ui.screenDistance)
+        assertFalse(nonGen1Ui.curvedScreen)
+        assertEquals(VrEnvironmentPreset.VOID, nonGen1Ui.environment)
+        assertTrue(nonGen1Ui.doffGrace)
+        assertTrue(nonGen1Ui.handTracking)
+        assertTrue(nonGen1Ui.showRay)
+        assertTrue(nonGen1Ui.pointerSleep)
+        assertFalse(nonGen1Ui.headAim)
+        assertTrue(nonGen1Ui.clickSound)
+        assertEquals(FileLogMode.BASIC, nonGen1Ui.fileLog)
 
-        // Gen1 headset without explicit FPS still matches PreferenceConfiguration's effective reader
-        assertExactParityWithPreferenceConfiguration(store, isGen1 = true)
-        val gen1 = StreamSettingsMapper.read(store, isGen1Headset = true)
-        assertEquals(DepthQualityMode.SMOOTH, gen1.depthQuality)
+        // Gen1 (e.g. PICO 4 / Quest 2): literal expected defaults are 2560x1440 @ 72 fps even with empty prefs!
+        val gen1Store = MapPrefsStore()
+        assertEquals("2560x1440", PreferenceConfiguration.defaultResolution(true))
+        assertEquals("72", PreferenceConfiguration.defaultFps(true))
+        val gen1Cfg = PreferenceConfiguration.readPreferences(gen1Store, true)
+        val gen1Ui = StreamSettingsMapper.read(gen1Store, isGen1Headset = true)
 
-        // When Gen1 perf profile seeds 72 fps (as Depth3dApp does on first launch), UI shows 72 fps
-        store.putString(StreamSettingsMapper.KEY_FPS, "72")
-        val gen1Seeded = StreamSettingsMapper.read(store, isGen1Headset = true)
-        assertEquals(StreamFps.FPS_72, gen1Seeded.fps)
-        assertFalse(gen1Seeded.warn3dLag)
-        assertExactParityWithPreferenceConfiguration(store, isGen1 = true)
+        assertEquals(2560, gen1Cfg.width)
+        assertEquals(1440, gen1Cfg.height)
+        assertEquals(72, gen1Cfg.fps)
+        assertEquals(PreferenceConfiguration.getDefaultBitrate("2560x1440", "72"), gen1Cfg.bitrate)
+        assertEquals(StreamResolution.R1440P, gen1Ui.resolution)
+        assertEquals(StreamFps.FPS_72, gen1Ui.fps)
+        assertEquals(72, gen1Ui.actualFps)
+        assertEquals(gen1Cfg.bitrate, gen1Ui.actualBitrateKbps)
+        assertFalse("Gen1 72 fps default must NOT trigger 3D lag warning", gen1Ui.warn3dLag)
+        assertEquals(DepthQualityMode.SMOOTH, gen1Ui.depthQuality)
+    }
+
+    @Test
+    fun s1_resetStreamingSettingsPreservesGen172FpsAndNonGen190Fps() {
+        // PICO 4 (Gen1): user changed to 4K 90fps; reset MUST return to 72 fps (NOT 90 fps!)
+        val gen1 = MapPrefsStore()
+        StreamSettingsMapper.setResolution(gen1, StreamResolution.R4K, isGen1 = true)
+        StreamSettingsMapper.setFps(gen1, StreamFps.FPS_90, isGen1 = true)
+        StreamSettingsMapper.setCodec(gen1, StreamCodec.HEVC)
+        StreamSettingsMapper.setBitratePreset(gen1, BitratePreset.SHARP, isGen1 = true)
+
+        PreferenceConfiguration.resetStreamingSettings(gen1, true)
+        assertEquals("72", gen1.getString(StreamSettingsMapper.KEY_FPS, null))
+        assertEquals("2560x1440", gen1.getString(StreamSettingsMapper.KEY_RESOLUTION, null))
+        assertEquals(72, PreferenceConfiguration.readPreferences(gen1, true).fps)
+        assertEquals(2560, PreferenceConfiguration.readPreferences(gen1, true).width)
+        val gen1Snap = StreamSettingsMapper.read(gen1, isGen1Headset = true)
+        assertEquals(StreamFps.FPS_72, gen1Snap.fps)
+        assertEquals(72, gen1Snap.actualFps)
+        assertFalse(gen1Snap.warn3dLag)
+        assertEquals(PreferenceConfiguration.getDefaultBitrate("2560x1440", "72"), gen1Snap.actualBitrateKbps)
+
+        // Non-Gen1: user changed to 720p 60fps; reset MUST return to 90 fps
+        val nonGen1 = MapPrefsStore()
+        StreamSettingsMapper.setResolution(nonGen1, StreamResolution.R720P, isGen1 = false)
+        StreamSettingsMapper.setFps(nonGen1, StreamFps.FPS_60, isGen1 = false)
+
+        PreferenceConfiguration.resetStreamingSettings(nonGen1, false)
+        assertEquals("90", nonGen1.getString(StreamSettingsMapper.KEY_FPS, null))
+        assertEquals("2560x1440", nonGen1.getString(StreamSettingsMapper.KEY_RESOLUTION, null))
+        assertEquals(90, PreferenceConfiguration.readPreferences(nonGen1, false).fps)
+        val nonGen1Snap = StreamSettingsMapper.read(nonGen1, isGen1Headset = false)
+        assertEquals(StreamFps.FPS_90, nonGen1Snap.fps)
+        assertEquals(90, nonGen1Snap.actualFps)
+        assertTrue(nonGen1Snap.warn3dLag)
+        assertEquals(PreferenceConfiguration.getDefaultBitrate("2560x1440", "90"), nonGen1Snap.actualBitrateKbps)
     }
 
     @Test
@@ -308,48 +357,64 @@ class StreamSettingsMapperTest {
     }
 
     @Test
-    fun decoderCrashRecoveryPromptsAndAutoResetsEveryThirdCrash() {
+    fun s1_m3_decoderCrashRecoveryRespectsGen1DefaultsAndAutoResetsOnlyOncePerCrashCount() {
         val tombstone = MapPrefsStore()
         val streaming = MapPrefsStore()
 
         // No crashes -> no prompt
-        assertNull(DecoderCrashRecovery.checkAndPrepare(tombstone, streaming))
+        assertNull(DecoderCrashRecovery.checkAndPrepare(tombstone, streaming, isGen1 = true))
 
-        // Customize streaming settings, then simulate 1 decoder crash
-        StreamSettingsMapper.setResolution(streaming, StreamResolution.R4K, isGen1 = false)
-        StreamSettingsMapper.setFps(streaming, StreamFps.FPS_90, isGen1 = false)
+        // Customize streaming settings on Gen1, then simulate 1 decoder crash
+        StreamSettingsMapper.setResolution(streaming, StreamResolution.R4K, isGen1 = true)
+        StreamSettingsMapper.setFps(streaming, StreamFps.FPS_90, isGen1 = true)
         StreamSettingsMapper.setCodec(streaming, StreamCodec.HEVC)
-        StreamSettingsMapper.setBitratePreset(streaming, BitratePreset.SHARP, isGen1 = false)
+        StreamSettingsMapper.setBitratePreset(streaming, BitratePreset.SHARP, isGen1 = true)
         tombstone.putInt(DecoderCrashRecovery.KEY_CRASH_COUNT, 1)
 
-        val p1 = DecoderCrashRecovery.checkAndPrepare(tombstone, streaming)
+        val p1 = DecoderCrashRecovery.checkAndPrepare(tombstone, streaming, isGen1 = true)
         assertNotNull(p1)
         assertEquals(1, p1!!.crashCount)
         assertFalse(p1.autoResetApplied)
-        // Not auto-reset yet on 1st crash
-        assertEquals(StreamResolution.R4K, StreamSettingsMapper.read(streaming, false).resolution)
+        assertEquals(StreamResolution.R4K, StreamSettingsMapper.read(streaming, isGen1Headset = true).resolution)
 
         // Acknowledging suppresses repeat prompt for the same crash count
         DecoderCrashRecovery.acknowledge(tombstone, 1)
-        assertNull(DecoderCrashRecovery.checkAndPrepare(tombstone, streaming))
+        assertNull(DecoderCrashRecovery.checkAndPrepare(tombstone, streaming, isGen1 = true))
 
-        // Manual reset restores default streaming settings and clears tombstone counters
+        // Manual reset on Gen1 restores 72 fps (NOT 90 fps) and clears tombstone counters
         tombstone.putInt(DecoderCrashRecovery.KEY_CRASH_COUNT, 2)
-        DecoderCrashRecovery.resetDefaultsAndClear(tombstone, streaming)
+        DecoderCrashRecovery.resetDefaultsAndClear(tombstone, streaming, isGen1 = true)
         assertEquals(0, tombstone.getInt(DecoderCrashRecovery.KEY_CRASH_COUNT, -1))
-        assertEquals(StreamResolution.R1440P, StreamSettingsMapper.read(streaming, false).resolution)
-        assertEquals(StreamCodec.AUTO, StreamSettingsMapper.read(streaming, false).codec)
-        assertEquals(BitratePreset.AUTO, StreamSettingsMapper.read(streaming, false).bitratePreset)
+        assertEquals(StreamResolution.R1440P, StreamSettingsMapper.read(streaming, isGen1Headset = true).resolution)
+        assertEquals(72, PreferenceConfiguration.readPreferences(streaming, true).fps)
+        assertEquals(StreamFps.FPS_72, StreamSettingsMapper.read(streaming, isGen1Headset = true).fps)
+        assertEquals(StreamCodec.AUTO, StreamSettingsMapper.read(streaming, isGen1Headset = true).codec)
+        assertEquals(BitratePreset.AUTO, StreamSettingsMapper.read(streaming, isGen1Headset = true).bitratePreset)
 
-        // 3rd consecutive crash automatically resets streaming settings
-        StreamSettingsMapper.setResolution(streaming, StreamResolution.R4K, isGen1 = false)
+        // 3rd consecutive crash on Gen1 automatically resets streaming settings back to 72 fps
+        StreamSettingsMapper.setResolution(streaming, StreamResolution.R4K, isGen1 = true)
+        StreamSettingsMapper.setFps(streaming, StreamFps.FPS_90, isGen1 = true)
         StreamSettingsMapper.setCodec(streaming, StreamCodec.HEVC)
         tombstone.putInt(DecoderCrashRecovery.KEY_CRASH_COUNT, 3)
-        val p3 = DecoderCrashRecovery.checkAndPrepare(tombstone, streaming)
-        assertNotNull(p3)
-        assertTrue(p3!!.autoResetApplied)
-        assertEquals(StreamResolution.R1440P, StreamSettingsMapper.read(streaming, false).resolution)
-        assertEquals(StreamCodec.AUTO, StreamSettingsMapper.read(streaming, false).codec)
+
+        val p3First = DecoderCrashRecovery.checkAndPrepare(tombstone, streaming, isGen1 = true)
+        assertNotNull(p3First)
+        assertTrue(p3First!!.autoResetApplied)
+        assertEquals(StreamResolution.R1440P, StreamSettingsMapper.read(streaming, isGen1Headset = true).resolution)
+        assertEquals(72, PreferenceConfiguration.readPreferences(streaming, true).fps)
+        assertEquals(StreamFps.FPS_72, StreamSettingsMapper.read(streaming, isGen1Headset = true).fps)
+
+        // M3: Before dismissing the card, user picks 4K in Settings and returns to Cast (another onStart).
+        // Auto-reset MUST NOT run a second time for crashCount=3!
+        StreamSettingsMapper.setResolution(streaming, StreamResolution.R4K, isGen1 = true)
+        val p3Repeat = DecoderCrashRecovery.checkAndPrepare(tombstone, streaming, isGen1 = true)
+        assertNotNull("Card should remain visible until user dismisses it", p3Repeat)
+        assertTrue(p3Repeat!!.autoResetApplied)
+        assertEquals(
+            "M3: Repeated onStart must NOT re-reset settings for the same crashCount",
+            StreamResolution.R4K,
+            StreamSettingsMapper.read(streaming, isGen1Headset = true).resolution,
+        )
     }
 
     @Test

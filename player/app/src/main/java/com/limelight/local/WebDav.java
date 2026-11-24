@@ -117,6 +117,24 @@ public final class WebDav {
                 .apply();
     }
 
+    /** Typed WebDAV error so UI layers render localized Chinese copy without raw codes/exceptions. */
+    public static final class WebDavException extends IOException {
+        public enum Reason {
+            UNAUTHORIZED,
+            HTTP_ERROR,
+            PARSE_ERROR,
+        }
+
+        public final Reason reason;
+        public final int statusCode;
+
+        public WebDavException(Reason reason, int statusCode, String debugMessage, Throwable cause) {
+            super(debugMessage, cause);
+            this.reason = reason;
+            this.statusCode = statusCode;
+        }
+    }
+
     /** Files and folders directly under path (which starts with "/"). Network, not on main. */
     public static List<Item> list(Server s, String path) throws IOException {
         Request req = new Request.Builder()
@@ -128,16 +146,16 @@ public final class WebDav {
                 .build();
         try (Response r = HTTP.newCall(req).execute()) {
             if (r.code() == 401) {
-                throw new IOException("用户名或密码不对");
+                throw new WebDavException(WebDavException.Reason.UNAUTHORIZED, 401, "HTTP 401", null);
             }
             if (r.code() != 207) {
-                throw new IOException("服务器返回 " + r.code());
+                throw new WebDavException(WebDavException.Reason.HTTP_ERROR, r.code(), "HTTP " + r.code(), null);
             }
             List<Item> items = parse(r.body().byteStream(), path);
             Collections.sort(items);
             return items;
         } catch (org.xmlpull.v1.XmlPullParserException e) {
-            throw new IOException("目录解析失败: " + e.getMessage());
+            throw new WebDavException(WebDavException.Reason.PARSE_ERROR, 0, "XML parse error", e);
         }
     }
 

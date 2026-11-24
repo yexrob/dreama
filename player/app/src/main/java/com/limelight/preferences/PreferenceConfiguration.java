@@ -955,8 +955,22 @@ public class PreferenceConfiguration {
     // The stored rate in range, or where this headset starts with nothing
     // stored
     static int storedDepthRate(SharedPreferences prefs, boolean gen1) {
-        return clampDepthRate(prefs.getInt(VR_DEPTH_RATE_PREF_STRING,
-                gen1 ? GEN1_DEPTH_RATE : DEFAULT_VR_DEPTH_RATE));
+        return clampDepthRate(prefs.getInt(VR_DEPTH_RATE_PREF_STRING, defaultDepthRate(gen1)));
+    }
+
+    /** Single source of truth for per-headset default resolution (display, read, reset, seed). */
+    public static String defaultResolution(boolean isGen1) {
+        return isGen1 ? GEN1_RESOLUTION : DEFAULT_RESOLUTION;
+    }
+
+    /** Single source of truth for per-headset default FPS (display, read, reset, seed). */
+    public static String defaultFps(boolean isGen1) {
+        return isGen1 ? GEN1_FPS : DEFAULT_FPS;
+    }
+
+    /** Single source of truth for per-headset default 3D depth rate. */
+    public static int defaultDepthRate(boolean isGen1) {
+        return isGen1 ? GEN1_DEPTH_RATE : DEFAULT_VR_DEPTH_RATE;
     }
 
     // Moves a stored cadence to the rate it stood for, once, under the same
@@ -1022,17 +1036,20 @@ public class PreferenceConfiguration {
         SharedPreferences.Editor editor = prefs.edit();
         StringBuilder applied = new StringBuilder();
         if (seedResolution) {
-            editor.putString(RESOLUTION_PREF_STRING, GEN1_RESOLUTION);
-            applied.append(GEN1_RESOLUTION);
+            String defRes = defaultResolution(true);
+            editor.putString(RESOLUTION_PREF_STRING, defRes);
+            applied.append(defRes);
         }
         if (seedFps) {
-            editor.putString(FPS_PREF_STRING, GEN1_FPS);
-            applied.append(applied.length() > 0 ? " " : "").append(GEN1_FPS).append(" fps");
+            String defFps = defaultFps(true);
+            editor.putString(FPS_PREF_STRING, defFps);
+            applied.append(applied.length() > 0 ? " " : "").append(defFps).append(" fps");
         }
         if (seedDepthRate) {
-            editor.putInt(VR_DEPTH_RATE_PREF_STRING, GEN1_DEPTH_RATE);
+            int defRate = defaultDepthRate(true);
+            editor.putInt(VR_DEPTH_RATE_PREF_STRING, defRate);
             applied.append(applied.length() > 0 ? " " : "").append("depth ")
-                    .append(GEN1_DEPTH_RATE).append(" maps/s");
+                    .append(defRate).append(" maps/s");
         }
         editor.putBoolean(GEN1_PROFILE_PREF_STRING, appliedAny);
         editor.apply();
@@ -1127,13 +1144,17 @@ public class PreferenceConfiguration {
 
     public static int getDefaultBitrate(Context context) {
         SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
-        return getDefaultBitrate(prefs);
+        return getDefaultBitrate(prefs, isXr2Gen1Headset());
     }
 
     public static int getDefaultBitrate(SharedPreferences prefs) {
+        return getDefaultBitrate(prefs, isXr2Gen1Headset());
+    }
+
+    public static int getDefaultBitrate(SharedPreferences prefs, boolean isGen1) {
         return getDefaultBitrate(
-                prefs.getString(RESOLUTION_PREF_STRING, DEFAULT_RESOLUTION),
-                prefs.getString(FPS_PREF_STRING, DEFAULT_FPS));
+                prefs.getString(RESOLUTION_PREF_STRING, defaultResolution(isGen1)),
+                prefs.getString(FPS_PREF_STRING, defaultFps(isGen1)));
     }
 
     private static FormatOption getVideoFormatValue(SharedPreferences prefs) {
@@ -1199,18 +1220,24 @@ public class PreferenceConfiguration {
     }
 
     public static void resetStreamingSettings(Context context) {
-        resetStreamingSettings(PreferenceManager.getDefaultSharedPreferences(context));
+        resetStreamingSettings(PreferenceManager.getDefaultSharedPreferences(context), isXr2Gen1Headset());
     }
 
     public static void resetStreamingSettings(SharedPreferences prefs) {
-        // We consider resolution, FPS, bitrate, HDR, and video format as "streaming settings" here
+        resetStreamingSettings(prefs, isXr2Gen1Headset());
+    }
+
+    public static void resetStreamingSettings(SharedPreferences prefs, boolean isGen1) {
+        // We consider resolution, FPS, bitrate, HDR, and video format as "streaming settings" here.
+        // Restore headset-appropriate defaults via defaultResolution/defaultFps so Gen 1 headsets
+        // (e.g. PICO 4) return to 72 fps rather than non-Gen 1 90 fps.
         prefs.edit()
                 .remove(BITRATE_PREF_STRING)
                 .remove(BITRATE_PREF_OLD_STRING)
                 .remove(DEPTH3D_BITRATE_PRESET_PREF_STRING)
                 .remove(LEGACY_RES_FPS_PREF_STRING)
-                .remove(RESOLUTION_PREF_STRING)
-                .remove(FPS_PREF_STRING)
+                .putString(RESOLUTION_PREF_STRING, defaultResolution(isGen1))
+                .putString(FPS_PREF_STRING, defaultFps(isGen1))
                 .remove(VIDEO_FORMAT_PREF_STRING)
                 .remove(ENABLE_HDR_PREF_STRING)
                 .remove(UNLOCK_FPS_STRING)
@@ -1323,8 +1350,8 @@ public class PreferenceConfiguration {
                     .apply();
         }
         else {
-            // Use the new preference location
-            String resStr = prefs.getString(RESOLUTION_PREF_STRING, PreferenceConfiguration.DEFAULT_RESOLUTION);
+            // Use the new preference location with per-headset defaults
+            String resStr = prefs.getString(RESOLUTION_PREF_STRING, defaultResolution(isGen1));
 
             // Convert legacy resolution strings to the new style
             if (!resStr.contains("x")) {
@@ -1334,7 +1361,7 @@ public class PreferenceConfiguration {
 
             config.width = PreferenceConfiguration.getWidthFromResolutionString(resStr);
             config.height = PreferenceConfiguration.getHeightFromResolutionString(resStr);
-            config.fps = Integer.parseInt(prefs.getString(FPS_PREF_STRING, PreferenceConfiguration.DEFAULT_FPS));
+            config.fps = Integer.parseInt(prefs.getString(FPS_PREF_STRING, defaultFps(isGen1)));
         }
 
         if (!prefs.contains(SMALL_ICONS_PREF_STRING)) {
@@ -1355,7 +1382,7 @@ public class PreferenceConfiguration {
         // This must happen after the preferences migration to ensure the preferences are populated
         config.bitrate = prefs.getInt(BITRATE_PREF_STRING, prefs.getInt(BITRATE_PREF_OLD_STRING, 0) * 1000);
         if (config.bitrate == 0) {
-            config.bitrate = getDefaultBitrate(prefs);
+            config.bitrate = getDefaultBitrate(prefs, isGen1);
         }
 
         String audioConfig = prefs.getString(AUDIO_CONFIG_PREF_STRING, DEFAULT_AUDIO_CONFIG);

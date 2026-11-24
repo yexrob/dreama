@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.provider.MediaStore
+import com.limelight.R
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -20,7 +21,12 @@ import kotlinx.coroutines.withContext
 class LocalVideoSource(context: Context) : MediaSource {
     private val app = context.applicationContext
 
-    override val source = Source(ID, "本机", SourceKind.LOCAL, "头显存储")
+    override val source = Source(
+        ID,
+        app.getString(R.string.source_local_name),
+        SourceKind.LOCAL,
+        app.getString(R.string.source_local_desc),
+    )
 
     private class Row(
         val id: Long,
@@ -38,7 +44,7 @@ class LocalVideoSource(context: Context) : MediaSource {
         if (rows.isEmpty()) {
             return emptyList()
         }
-        return listOf(Shelf(Category(ALL, "最近添加", rows.size), rows.take(HOME_ROW).map(::item)))
+        return listOf(Shelf(Category(ALL, app.getString(R.string.source_local_recent), rows.size), rows.take(HOME_ROW).map(::item)))
     }
 
     override suspend fun browse(categoryId: String, page: Int): Page<Item> {
@@ -74,7 +80,7 @@ class LocalVideoSource(context: Context) : MediaSource {
             return emptyList()
         }
         val out = ArrayList<Item>()
-        out += Item(ALL, ItemKind.FOLDER, "全部视频", childCount = rows.size,
+        out += Item(ALL, ItemKind.FOLDER, app.getString(R.string.source_local_all_videos), childCount = rows.size,
             previews = rows.take(4).map(::art))
         // query() is newest first, so the folder with the newest video leads
         rows.groupBy { it.bucketId }.values.forEach { inBucket ->
@@ -108,7 +114,7 @@ class LocalVideoSource(context: Context) : MediaSource {
 
     private suspend fun query(where: String?, args: Array<String>?): List<Row> = withContext(Dispatchers.IO) {
         if (!hasPermission(app)) {
-            throw SourceNeedsSetupException("需要允许访问存储")
+            throw SourceNeedsSetupException(app.getString(R.string.home_empty_local_perm))
         }
         val cols = arrayOf(
             MediaStore.Video.Media._ID,

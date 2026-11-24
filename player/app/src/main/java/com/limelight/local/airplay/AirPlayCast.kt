@@ -35,9 +35,11 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.addPathNodes
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.limelight.LimeLog
+import com.limelight.R
 import com.limelight.local.wall.ButtonKind
 import com.limelight.local.wall.Notice
 import com.limelight.local.wall.Wall
@@ -59,12 +61,21 @@ val AirPlayState.Status.takesPage: Boolean
 @Composable
 fun AirPlayNotice(status: AirPlayState.Status) {
     when (status.phase) {
-        AirPlayState.Phase.WAITING -> WaitingNotice("正在等待投屏")
-        AirPlayState.Phase.MIRRORING ->
-            Notice(AirPlayState.phrase("正在显示", status.client, "的屏幕"), WallIcons.Cast, danger = false)
-        AirPlayState.Phase.FAILED ->
-            Notice("投屏没有启动" + (status.problem?.let { "：$it" } ?: ""))
-        else -> Notice("正在准备投屏…", WallIcons.Cast, danger = false)
+        AirPlayState.Phase.WAITING -> WaitingNotice(stringResource(R.string.cast_waiting))
+        AirPlayState.Phase.MIRRORING -> Notice(
+            AirPlayState.phrase(
+                stringResource(R.string.airplay_notif_showing_prefix),
+                status.client,
+                stringResource(R.string.airplay_notif_showing_suffix),
+            ),
+            WallIcons.Cast,
+            danger = false,
+        )
+        AirPlayState.Phase.FAILED -> Notice(
+            status.problem?.let { stringResource(R.string.airplay_failed_with_reason, it) }
+                ?: stringResource(R.string.airplay_failed_title),
+        )
+        else -> Notice(stringResource(R.string.cast_preparing), WallIcons.Cast, danger = false)
     }
 }
 
@@ -75,18 +86,18 @@ fun AirPlayTakeover(status: AirPlayState.Status) {
     if (status.phase == AirPlayState.Phase.NO_WIFI) {
         Centered(
             { Icon(WifiIcon, null, Modifier.size(40.dp), tint = Wall.Danger) },
-            "还没连上 Wi-Fi",
-            "投屏和串流需要头显和 iPad、手机、电脑在同一个 Wi-Fi 里。",
+            stringResource(R.string.cast_no_wifi_title),
+            stringResource(R.string.cast_no_wifi_body),
         ) {
-            WallButton("打开 Wi-Fi 设置", { openWifiSettings(context) }, kind = ButtonKind.Primary)
+            WallButton(stringResource(R.string.action_open_wifi), { openWifiSettings(context) }, kind = ButtonKind.Primary)
         }
     } else {
         Centered(
             { Spinner() },
-            AirPlayState.phrase("正在连接", status.client, ""),
-            "画面一出来就会自动进入 3D 播放。",
+            AirPlayState.phrase(stringResource(R.string.airplay_connecting_prefix), status.client, ""),
+            stringResource(R.string.cast_connecting_body),
         ) {
-            WallButton("取消", { AirPlayService.disconnect() }, kind = ButtonKind.Plain)
+            WallButton(stringResource(R.string.action_cancel), { AirPlayService.disconnect() }, kind = ButtonKind.Plain)
         }
     }
 }

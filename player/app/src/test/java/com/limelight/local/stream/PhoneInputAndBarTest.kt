@@ -84,25 +84,44 @@ class PhoneInputAndBarTest {
             assertFalse("QR URL must not leak 4-digit fallback code", server.qrUrl.contains("4289"))
 
             // Review #3: Zero GET oracle — wrong token vs right token both return 200 form
-            // without indicating whether the credential is valid.
+            // targeting /submit-qr without indicating whether the token is valid.
             val getWrongToken = httpGet("http://127.0.0.1:${server.boundPort}/?t=wrong_token_value")
             val getRightToken = httpGet(server.qrUrl)
             assertEquals(200, getWrongToken.first)
             assertEquals(200, getRightToken.first)
+            assertTrue(getWrongToken.second.contains("action=\"/submit-qr\""))
+            assertTrue(getRightToken.second.contains("action=\"/submit-qr\""))
             assertTrue(getWrongToken.second.contains("name=\"token\" value=\"wrong_token_value\""))
             assertTrue(getRightToken.second.contains("name=\"token\" value=\"${server.token}\""))
 
-            // Zero GET oracle on ?code=: wrong code vs right code produce IDENTICAL 200 response!
+            // Zero GET oracle on ?code=: wrong code vs right code produce IDENTICAL 200 response targeting /submit!
             val getWrongCode = httpGet("http://127.0.0.1:${server.boundPort}/?code=0000")
             val getRightCode = httpGet("http://127.0.0.1:${server.boundPort}/?code=4289")
             assertEquals(200, getWrongCode.first)
             assertEquals(200, getRightCode.first)
+            assertTrue(getWrongCode.second.contains("action=\"/submit\""))
             assertEquals("GET must not differ by ?code= validity", getWrongCode.second, getRightCode.second)
+
+            // M8: QR submission path (/submit-qr) MUST reject the 4-digit code as a substitute for token!
+            acceptNext.set(true)
+            val qrWithCodeOnly = postFormWithBody(
+                "http://127.0.0.1:${server.boundPort}/submit-qr",
+                "code=4289&value=192.168.1.99",
+            )
+            assertEquals("M8: /submit-qr must reject 4-digit code", 403, qrWithCodeOnly.first)
+            assertNull("onSubmitted must not be invoked when /submit-qr receives code", received.get())
+
+            val qrWithWrongTokenAndValidCode = postFormWithBody(
+                "http://127.0.0.1:${server.boundPort}/submit-qr",
+                "token=wrong&code=4289&value=192.168.1.99",
+            )
+            assertEquals("M8: /submit-qr must reject wrong token even with valid 4-digit code", 403, qrWithWrongTokenAndValidCode.first)
+            assertNull(received.get())
 
             // Review #3: Phone must NOT see success page if headset rejects the submission!
             acceptNext.set(false)
             val rejected = postFormWithBody(
-                "http://127.0.0.1:${server.boundPort}/submit",
+                "http://127.0.0.1:${server.boundPort}/submit-qr",
                 "token=${server.token}&value=192.168.1.250",
             )
             assertEquals(400, rejected.first)
@@ -113,7 +132,7 @@ class PhoneInputAndBarTest {
             // Now headset confirms acceptance -> phone sees 200 success page
             acceptNext.set(true)
             val accepted = postFormWithBody(
-                "http://127.0.0.1:${server.boundPort}/submit",
+                "http://127.0.0.1:${server.boundPort}/submit-qr",
                 "token=${server.token}&value=%E5%AE%A2%E5%8E%85%E7%9A%84+depth3d",
             )
             assertEquals(200, accepted.first)
@@ -150,22 +169,60 @@ class PhoneInputAndBarTest {
     }
 
     @Test
-    fun slowStalledClientCannotBlockRealPhoneSubmission() {
+    fun m2_eightSlowlorisTrickleClientsCannotStarveRealPhoneAndAreKilledAtDeadline() {
         PhoneInputServer(
             displayHost = "127.0.0.1",
             copy = addPcCopy,
             code = "5566",
             bindAddress = InetAddress.getLoopbackAddress(),
             port = 0,
+            socketTimeoutMs = 300,
+            requestDeadlineMs = 450L,
             onSubmitted = { PhoneSubmitResult.Accepted },
         ).start().use { server ->
-            // Open a malicious/slow client that writes partial headers and stalls
-            val slowSocket = Socket(InetAddress.getLoopbackAddress(), server.boundPort)
+            // Open 8 slowloris clients (equal to MAX_CONCURRENT_CONNECTIONS) that trickle 1 byte
+            // every 80ms (< socketTimeoutMs) to defeat naive per-read timeouts!
+            val slowSockets = ArrayList<Socket>(8)
+            val trickleThreads = ArrayList<Thread>(8)
+            val closedByServer = CountDownLatch(8)
             try {
-                slowSocket.outputStream.write("POST /submit HTTP/1.1\r\nHost: x\r\n".toByteArray(StandardCharsets.US_ASCII))
-                slowSocket.outputStream.flush()
+                repeat(PhoneInputServer.MAX_CONCURRENT_CONNECTIONS) { idx ->
+                    val s = Socket(InetAddress.getLoopbackAddress(), server.boundPort)
+                    slowSockets += s
+                    val t = Thread({
+                        try {
+                            val out = s.outputStream
+                            out.write("POST /submit HTTP/1.1\r\nHost: x\r\nX-Slow: ".toByteArray(StandardCharsets.US_ASCII))
+                            out.flush()
+                            // Trickle bytes slowly past requestDeadlineMs; server must close us!
+                            var i = 0
+                            while (i < 40) {
+                                Thread.sleep(80)
+                                out.write('a'.code)
+                                out.flush()
+                                // Probe for server-side EOF
+                                s.soTimeout = 10
+                                try {
+                                    if (s.inputStream.read() == -1) break
+                                } catch (_: java.net.SocketTimeoutException) {
+                                }
+                                i++
+                            }
+                        } catch (_: Exception) {
+                        } finally {
+                            closedByServer.countDown()
+                        }
+                    }, "slowloris-$idx").apply {
+                        isDaemon = true
+                        start()
+                    }
+                    trickleThreads += t
+                }
 
-                // While slowSocket is open and stalled, a real phone completes quickly
+                // Wait briefly so all 8 slow clients have established connections
+                Thread.sleep(100)
+
+                // Even while all 8 slow sockets are active, a real phone submission succeeds quickly!
                 val startNs = System.nanoTime()
                 val (status, body) = postFormWithBody(
                     "http://127.0.0.1:${server.boundPort}/submit",
@@ -174,14 +231,64 @@ class PhoneInputAndBarTest {
                 val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
                 assertEquals(200, status)
                 assertTrue(body.contains("头显已收下"))
-                assertTrue("Real phone should not be stalled by slow client (${elapsedMs}ms)", elapsedMs < 1500L)
+                assertTrue("M2: Real phone must not be starved by 8 slow sockets (${elapsedMs}ms)", elapsedMs < 1500L)
+
+                // All 8 slowloris trickle sockets must be terminated by the server at/near requestDeadlineMs
+                assertTrue(
+                    "M2: All 8 slowloris clients must be closed by requestDeadlineMs",
+                    closedByServer.await(2_000L, TimeUnit.MILLISECONDS),
+                )
             } finally {
-                try {
-                    slowSocket.close()
-                } catch (_: Exception) {
+                slowSockets.forEach {
+                    try { it.close() } catch (_: Exception) {}
                 }
+                trickleThreads.forEach { it.interrupt() }
             }
         }
+    }
+
+    @Test
+    fun m6_s4_phoneInputErrorsMatchModeAndDlnaCastCopyLoadsFromResources() {
+        val strings = XmlStringLookup
+
+        // M6: Timeout & failure copy must say "添加电脑" in ADD_COMPUTER mode and "修改设备名" in DEVICE_NAME mode
+        val addTimeout = PhoneInputErrorHelper.timeoutError(strings, PhoneInputServer.Mode.ADD_COMPUTER)
+        assertTrue(addTimeout.title.contains("添加电脑"))
+        assertFalse(addTimeout.title.contains("修改设备名"))
+
+        val renameTimeout = PhoneInputErrorHelper.timeoutError(strings, PhoneInputServer.Mode.DEVICE_NAME)
+        assertTrue("M6: Rename timeout must say 修改设备名, got: ${renameTimeout.title}", renameTimeout.title.contains("修改设备名"))
+        assertFalse("M6: Rename timeout must NOT say 添加电脑", renameTimeout.title.contains("添加电脑"))
+
+        val renameFailed = PhoneInputErrorHelper.failedError(strings, PhoneInputServer.Mode.DEVICE_NAME)
+        assertTrue(renameFailed.title.contains("修改设备名"))
+        assertFalse(renameFailed.title.contains("添加电脑"))
+
+        val formatted = PhoneInputErrorHelper.formatRejectedReason(strings, renameTimeout)
+        assertTrue(formatted.contains(renameTimeout.title))
+        assertTrue(formatted.contains(renameTimeout.detail))
+
+        // S4: DlnaCastStatus uses XML string resources cleanly across all phases
+        val waiting = com.limelight.local.wall.dlnaCastCopy(
+            strings,
+            com.limelight.local.dlna.ReceiverStatus("我的 depth3d", com.limelight.local.dlna.ReceiverStatus.Phase.WAITING),
+        )
+        assertFalse(waiting.danger)
+        assertTrue(waiting.notice.contains("等待投屏"))
+        assertTrue(waiting.phoneHowTo.contains("我的 depth3d"))
+
+        val noWifi = com.limelight.local.wall.dlnaCastCopy(
+            strings,
+            com.limelight.local.dlna.ReceiverStatus("我的 depth3d", com.limelight.local.dlna.ReceiverStatus.Phase.NO_NETWORK),
+        )
+        assertTrue(noWifi.danger)
+        assertTrue(noWifi.notice.contains("Wi-Fi"))
+
+        val casting = com.limelight.local.wall.dlnaCastCopy(
+            strings,
+            com.limelight.local.dlna.ReceiverStatus("我的 depth3d", com.limelight.local.dlna.ReceiverStatus.Phase.WAITING, casting = "测试电影"),
+        )
+        assertTrue(casting.notice.contains("测试电影"))
     }
 
     @Test

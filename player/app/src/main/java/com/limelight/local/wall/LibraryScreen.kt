@@ -32,9 +32,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.limelight.R
 import com.limelight.local.media.Item
 import com.limelight.local.media.LocalVideoSource
 import com.limelight.local.media.MediaSource
@@ -111,16 +113,19 @@ fun LibraryScreen(model: WallModel, nav: WallNav) {
         Column(Modifier.offset(40.dp, 120.dp).width(392.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             for (s in sources) {
                 val count = (model.shelves[s.source.id] as? Load.Ready)?.value?.firstOrNull()?.category?.count
-                ListRow(s.source.name, sub = s.source.description + (count?.let { " · $it 个" } ?: ""),
+                val countSuffix = count?.let { stringResource(R.string.library_count_suffix, it) } ?: ""
+                ListRow(s.source.name, sub = s.source.description + countSuffix,
                     lead = s.icon(), selected = s == selected) { selectedId = s.source.id }
             }
             if (sources.none { it.source.kind == SourceKind.WEBDAV }) {
-                ListRow("添加 WebDAV", sub = found?.let { "找到 ${it.substringAfter("://")}" } ?: "Google Drive 等网盘",
+                val webDavSub = found?.let { stringResource(R.string.library_found_webdav, it.substringAfter("://")) }
+                    ?: stringResource(R.string.library_webdav_desc)
+                ListRow(stringResource(R.string.library_add_webdav), sub = webDavSub,
                     lead = WallIcons.Plus) { nav.editWebDav(found) }
             }
         }
         Box(Modifier.offset(64.dp, 620.dp)) {
-            WallButton("管理播放源", { nav.editWebDav(found) }, icon = WallIcons.Gear, kind = ButtonKind.Ghost, small = true)
+            WallButton(stringResource(R.string.library_manage_sources), { nav.editWebDav(found) }, icon = WallIcons.Gear, kind = ButtonKind.Ghost, small = true)
         }
         if (selected != null) {
             Column(Modifier.offset(488.dp, 120.dp)) {
@@ -146,12 +151,14 @@ private fun FolderPane(src: MediaSource, listing: Listing, nav: WallNav) {
             userScrollEnabled = false) {
             items(6) { Skeleton(Modifier.height(148.dp), Wall.Radius) }
         }
-        listing.items.isEmpty() -> Text("这里还没有视频。", style = WallType.Body, color = Wall.Text2)
+        listing.items.isEmpty() -> Text(stringResource(R.string.library_empty_videos), style = WallType.Body, color = Wall.Text2)
         else -> LazyVerticalGrid(GridCells.Fixed(3), Modifier.height(480.dp),
             horizontalArrangement = Arrangement.spacedBy(24.dp), verticalArrangement = Arrangement.spacedBy(24.dp),
             contentPadding = PaddingValues(top = 8.dp, bottom = 64.dp)) {
             items(listing.items, key = { it.id }) { item ->
-                FolderTile(item.title, item.childCount?.let { "$it 个" } ?: item.subtitle?.takeIf { it.isNotEmpty() },
+                val countLabel = item.childCount?.let { stringResource(R.string.home_folder_count, it) }
+                    ?: item.subtitle?.takeIf { it.isNotEmpty() }
+                FolderTile(item.title, countLabel,
                     item.previews.ifEmpty { listOfNotNull(item.poster) }, { nav.item(src, item) },
                     Modifier.height(148.dp))
             }
@@ -165,17 +172,23 @@ private fun SourceProblem(src: MediaSource, error: Throwable, nav: WallNav, retr
     val setup = error is SourceNeedsSetupException
     Column(Modifier.width(660.dp)) {
         Icon(WallIcons.Alert, null, Modifier.size(48.dp), tint = if (setup) Wall.Text2 else Wall.Danger)
-        Text(if (setup) error.message ?: "需要设置" else "连不上「${src.source.name}」", style = WallType.Head,
-            modifier = Modifier.padding(top = 20.dp))
-        Text(if (setup) "头显里的视频要先允许 depth3d 读取。" else "提供它的电脑可能关机了，或者不在这个 Wi-Fi 里。",
-            style = WallType.Body, color = Wall.Text2, modifier = Modifier.padding(top = 8.dp))
+        Text(
+            if (setup) error.message ?: stringResource(R.string.home_source_needs_setup)
+            else stringResource(R.string.library_source_unreachable, src.source.name),
+            style = WallType.Head,
+            modifier = Modifier.padding(top = 20.dp),
+        )
+        Text(
+            stringResource(if (setup) R.string.library_storage_hint else R.string.library_source_offline_hint),
+            style = WallType.Body, color = Wall.Text2, modifier = Modifier.padding(top = 8.dp),
+        )
         Row(Modifier.padding(top = 36.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             if (setup) {
-                WallButton("允许访问", nav.storage, kind = ButtonKind.Primary)
+                WallButton(stringResource(R.string.home_source_allow_access), nav.storage, kind = ButtonKind.Primary)
             } else {
-                WallButton("重试", retry, icon = WallIcons.Refresh, kind = ButtonKind.Primary)
+                WallButton(stringResource(R.string.action_retry), retry, icon = WallIcons.Refresh, kind = ButtonKind.Primary)
                 if (src.source.kind == SourceKind.WEBDAV) {
-                    WallButton("检查设置", { nav.editWebDav() })
+                    WallButton(stringResource(R.string.library_check_settings), { nav.editWebDav() })
                 }
             }
         }
@@ -211,7 +224,7 @@ fun GridScreen(model: WallModel, nav: WallNav, page: Page.Grid) {
     Box(Modifier.fillMaxSize()) {
         val error = listing.error
         when {
-            src == null -> Box(Modifier.offset(64.dp, 160.dp)) { Notice("这个播放源已经不在了") }
+            src == null -> Box(Modifier.offset(64.dp, 160.dp)) { Notice(stringResource(R.string.library_source_missing)) }
             error != null && listing.items.isEmpty() -> Box(Modifier.offset(64.dp, 160.dp)) {
                 SourceProblem(src, error, nav) { retry(listing) }
             }
@@ -219,14 +232,15 @@ fun GridScreen(model: WallModel, nav: WallNav, page: Page.Grid) {
                 horizontalArrangement = Arrangement.spacedBy(24.dp)) {
                 repeat(6) { Skeleton(Modifier.size(cellW, cellH), 14.dp) }
             }
-            listing.items.isEmpty() -> Text("这里还没有视频。", style = WallType.Body, color = Wall.Text2,
+            listing.items.isEmpty() -> Text(stringResource(R.string.library_empty_videos), style = WallType.Body, color = Wall.Text2,
                 modifier = Modifier.offset(64.dp, 160.dp))
             else -> LazyVerticalGrid(GridCells.Fixed(6), Modifier.fillMaxSize(), state = grid,
                 contentPadding = PaddingValues(start = Wall.Margin, end = Wall.Margin, top = 128.dp, bottom = 64.dp),
                 horizontalArrangement = Arrangement.spacedBy(24.dp), verticalArrangement = Arrangement.spacedBy(26.dp)) {
                 items(listing.items, key = { it.id }) { item ->
                     if (item.isFolder) {
-                        FolderTile(item.title, item.childCount?.let { "$it 个" }, item.previews,
+                        val countLabel = item.childCount?.let { stringResource(R.string.home_folder_count, it) }
+                        FolderTile(item.title, countLabel, item.previews,
                             { nav.item(src, item) }, Modifier.size(cellW, cellH))
                     } else {
                         Poster(item.title, item.poster, { nav.item(src, item) }, width = cellW, height = cellH)
@@ -243,7 +257,8 @@ fun GridScreen(model: WallModel, nav: WallNav, page: Page.Grid) {
                 modifier = Modifier.weight(1f, fill = false))
             val n = page.count ?: listing.items.size.takeIf { listing.next == null && it > 0 }
             src?.let {
-                Text(it.source.name + (n?.let { c -> " · $c 个" } ?: ""), style = WallType.Caption, color = Wall.Text2)
+                val countSuffix = n?.let { c -> stringResource(R.string.library_count_suffix, c) } ?: ""
+                Text(it.source.name + countSuffix, style = WallType.Caption, color = Wall.Text2)
             }
         }
     }

@@ -2,8 +2,8 @@ package com.limelight.local.stream
 
 /**
  * Pure-JVM exponential backoff tracker for host `/info` probing and `/media` synchronization.
- * Retries transient failures on a bounded schedule and resets cleanly on Wi-Fi recovery or
- * host re-discovery.
+ * Retries transient failures on a bounded schedule and resets cleanly on Wi-Fi recovery,
+ * network switches, or host re-discovery.
  */
 class HostRetryTracker(
     private val backoffScheduleMs: LongArray = DEFAULT_BACKOFF_MS,
@@ -58,7 +58,7 @@ class HostRetryTracker(
         entries.remove(key)
     }
 
-    /** Resets all backoff & completion states (e.g., Wi-Fi recovered). */
+    /** Resets all backoff & completion states (e.g., Wi-Fi recovered or switched). */
     @Synchronized
     fun resetAll() {
         entries.clear()
@@ -67,6 +67,33 @@ class HostRetryTracker(
     companion object {
         val DEFAULT_BACKOFF_MS = longArrayOf(3_000L, 10_000L, 30_000L, 60_000L)
     }
+}
+
+/**
+ * Pure-JVM active network identity tracker (M4).
+ * Reports a network change both on offline -> online recovery AND when switching directly
+ * from Wi-Fi A to Wi-Fi B without an intervening offline state, while suppressing the initial
+ * callback fired for the already-active network upon registration.
+ */
+class NetworkChangeTracker(initialNetworkId: Long? = null) {
+    private var activeId: Long? = initialNetworkId
+
+    @Synchronized
+    fun onAvailable(networkId: Long): Boolean {
+        if (activeId == networkId) return false
+        activeId = networkId
+        return true
+    }
+
+    @Synchronized
+    fun onLost(networkId: Long, fallbackActiveId: Long?) {
+        if (activeId == networkId) {
+            activeId = fallbackActiveId
+        }
+    }
+
+    @Synchronized
+    fun currentNetworkId(): Long? = activeId
 }
 
 /**
