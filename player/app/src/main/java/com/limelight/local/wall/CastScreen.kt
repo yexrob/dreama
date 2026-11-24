@@ -370,6 +370,7 @@ fun PcCard(
         !computer.streamReady && computer.streamNotReadyReason != null ->
             stringResource(R.string.stream_status_not_ready, computer.streamNotReadyReason!!)
         computer.isPairedOffline -> stringResource(R.string.stream_status_paired_offline)
+        computer.isPairedConnecting -> stringResource(R.string.stream_status_paired_connecting)
         computer.needsHostTrustSetup && computer.isOnline ->
             stringResource(R.string.stream_status_needs_host_setup)
         computer.status == ComputerStatus.ONLINE_STREAMING -> stringResource(R.string.stream_status_streaming)
@@ -382,7 +383,7 @@ fun PcCard(
     }
     val subColor = when {
         !computer.streamReady -> Wall.Danger
-        computer.isPairedOffline -> Wall.Text2
+        computer.isPairedOffline || computer.isPairedConnecting -> Wall.Text2
         computer.needsHostTrustSetup && computer.isOnline -> Wall.Accent
         computer.status == ComputerStatus.ONLINE_STREAMING -> Wall.Accent
         hovered -> Wall.Text
@@ -778,7 +779,10 @@ private fun PcActionSheet(
                         ListRow(stringResource(R.string.pc_action_pair), lead = WallIcons.Computer, onClick = onPair)
                     }
                     ComputerStatus.OFFLINE, ComputerStatus.DISCOVERING -> {
-                        if (computer.isPairedOffline || (computer.isSaved && computer.raw?.pairState == com.limelight.nvstream.http.PairingManager.PairState.PAIRED)) {
+                        if (computer.isPairedOffline ||
+                            computer.isPairedConnecting ||
+                            (computer.isSaved && computer.raw?.pairState == com.limelight.nvstream.http.PairingManager.PairState.PAIRED)
+                        ) {
                             ListRow(stringResource(R.string.pc_action_retry_connect), lead = WallIcons.Refresh, onClick = onConnect)
                         }
                         if (computer.canWake) {

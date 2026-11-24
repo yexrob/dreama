@@ -26,8 +26,10 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -90,6 +92,10 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
     var showRenameSheet by remember { mutableStateOf(false) }
     var showLicenseSheet by remember { mutableStateOf(false) }
     var resetPoseConfirmed by remember { mutableStateOf(false) }
+    var showResetPairingConfirm by remember { mutableStateOf(false) }
+    var resettingPairing by remember { mutableStateOf(false) }
+    var resetPairingResult by remember { mutableStateOf<Boolean?>(null) }
+    val coroutineScope = rememberCoroutineScope()
 
     fun update(block: () -> Unit) {
         block()
@@ -113,6 +119,7 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
                 ) {
                     selectedCategory = cat
                     resetPoseConfirmed = false
+                    resetPairingResult = null
                 }
             }
         }
@@ -557,6 +564,23 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
                             )
                         }
                     }
+                    item("reset-pairing") {
+                        SettingRow(
+                            title = stringResource(R.string.settings_reset_pairing_title),
+                            sub = when (resetPairingResult) {
+                                true -> stringResource(R.string.settings_reset_pairing_done)
+                                false -> stringResource(R.string.settings_reset_pairing_failed)
+                                null -> stringResource(R.string.settings_reset_pairing_sub)
+                            },
+                        ) {
+                            WallButton(
+                                text = stringResource(R.string.settings_reset_pairing_btn),
+                                onClick = { showResetPairingConfirm = true },
+                                small = true,
+                                enabled = !resettingPairing,
+                            )
+                        }
+                    }
                 }
 
                 SettingsCategory.ABOUT -> {
@@ -665,6 +689,57 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
 
         if (showLicenseSheet) {
             GplLicenseSheet { showLicenseSheet = false }
+        }
+
+        if (showResetPairingConfirm) {
+            ResetPairingConfirmSheet(
+                onConfirm = {
+                    showResetPairingConfirm = false
+                    resettingPairing = true
+                    coroutineScope.launch {
+                        resetPairingResult = model.streaming.resetPairingIdentity()
+                        resettingPairing = false
+                    }
+                },
+                onDismiss = { showResetPairingConfirm = false },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ResetPairingConfirmSheet(
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(Wall.Scrim)
+            .clickable(remember { MutableInteractionSource() }, indication = null) { onDismiss() },
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            Modifier
+                .width(640.dp)
+                .shadow(40.dp, RoundedCornerShape(Wall.RadiusXl))
+                .clip(RoundedCornerShape(Wall.RadiusXl))
+                .background(Wall.Sheet)
+                .clickable(remember { MutableInteractionSource() }, indication = null) {}
+                .padding(horizontal = 44.dp, vertical = 36.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text(stringResource(R.string.settings_reset_pairing_confirm_title), style = WallType.Head)
+            Text(
+                stringResource(R.string.settings_reset_pairing_confirm_body),
+                style = WallType.Body,
+                color = Wall.Text2,
+                modifier = Modifier.padding(top = 4.dp, bottom = 16.dp),
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                WallButton(stringResource(R.string.settings_reset_pairing_confirm_btn), onConfirm, kind = ButtonKind.Primary)
+                WallButton(stringResource(R.string.action_cancel), onDismiss)
+            }
         }
     }
 }

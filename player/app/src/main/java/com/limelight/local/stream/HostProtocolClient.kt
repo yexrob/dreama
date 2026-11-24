@@ -242,6 +242,8 @@ sealed interface PairCompleteResult {
     data class Completed(val mediaPort: Int?) : PairCompleteResult
     data object NotPaired : PairCompleteResult
     data object TicketExpired : PairCompleteResult
+    data object ClientCertMismatch : PairCompleteResult
+    data object MissingComputerIdentity : PairCompleteResult
     data object Unauthorized : PairCompleteResult
     data object Forbidden : PairCompleteResult
     data object UpgradeRequired : PairCompleteResult
@@ -684,9 +686,9 @@ class HttpHostProtocolClient(
         if (!expectedClientCertFingerprint.isNullOrBlank() &&
             !expectedClientCertFingerprint.equals(clientCertFp, ignoreCase = true)
         ) {
-            // Ticket is bound to the client cert presented on /pair (host-protocol.md 3676b2b).
+            // Ticket is bound to the client cert presented on /pair (host-protocol.md 3676b2b, R6 #9c).
             LimeLog.warning("depth3d: local client cert changed between /pair and /pair/complete")
-            return PairCompleteResult.TicketExpired
+            return PairCompleteResult.ClientCertMismatch
         }
 
         val url = formatHostUrl(address, port, "/depth3d/v1/pair/complete")

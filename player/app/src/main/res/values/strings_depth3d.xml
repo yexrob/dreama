@@ -108,6 +108,7 @@
     <string name="stream_status_unpaired_auto">一键配对 · 点一下连接</string>
     <string name="stream_status_offline">已离线</string>
     <string name="stream_status_discovering">正在刷新状态…</string>
+    <string name="stream_status_paired_connecting">已配对 · 正在连接…</string>
     <string name="stream_status_not_ready">暂未就绪 · %1$s</string>
     <string name="stream_more_actions">更多</string>
 
@@ -138,10 +139,10 @@
     <string name="pair_pin_title">在「%1$s」上输入这 4 个数字</string>
     <string name="pair_pin_waiting">正在等待电脑确认…</string>
     <string name="pair_fallback_manual">改用 4 位配对码</string>
-    <string name="pair_cert_title">「%1$s」的安全证书变了</string>
-    <string name="pair_cert_body">如果电脑刚重装过系统或更新了服务，请核对下方完整指纹后点「信任并继续」；否则请取消。</string>
-    <string name="pair_cert_old_label">原证书指纹</string>
-    <string name="pair_cert_new_label">新证书指纹</string>
+    <string name="pair_cert_title">「%1$s」的身份变了</string>
+    <string name="pair_cert_body">如果电脑刚重装过系统或更新了服务，请核对下方编号后点「信任并继续」；否则请取消。</string>
+    <string name="pair_cert_old_label">原来的身份编号</string>
+    <string name="pair_cert_new_label">现在的身份编号</string>
     <string name="pair_cert_trust">信任并继续</string>
     <string name="stream_connecting_title">正在连接「%1$s」…</string>
     <string name="stream_connecting_app_title">正在打开「%1$s」…</string>
@@ -194,27 +195,33 @@
     <string name="err_autopair_cooldown_detail_sec">请等待 %1$d 秒后再点重试。</string>
     <string name="err_autopair_cooldown_detail">请稍等片刻后再点重试。</string>
     <string name="err_pair_complete_not_paired_title">电脑还没记录下这台头显</string>
-    <string name="err_pair_complete_not_paired_detail">请稍等几秒再点重试，或回到电脑上检查是否已点「允许」。</string>
-    <string name="err_pair_complete_expired_title">这次配对等太久了</string>
-    <string name="err_pair_complete_expired_detail">这次配对等太久了，请重新配对并在电脑上点「允许」。</string>
-    <string name="err_pair_complete_unauth_title">这台头显暂时无法证明身份</string>
-    <string name="err_pair_complete_unauth_detail">头显里的配对信息不完整，请退出并重新打开 depth3d 后再配对。</string>
+    <string name="err_pair_complete_not_paired_detail">电脑端刚完成确认，可能还需要一两秒同步，请稍等片刻再点重试。</string>
+    <string name="err_pair_complete_expired_title">这次配对已经过期</string>
+    <string name="err_pair_complete_expired_detail">等待确认的时间太长，这次确认已经作废，请点重试并在电脑上重新点「允许」。</string>
+    <string name="err_pair_complete_cert_mismatch_title">头显的配对信息中途变了</string>
+    <string name="err_pair_complete_cert_mismatch_detail">配对过程中头显的本机信息发生了变化，之前的确认已作废，请点重试重新配对。</string>
+    <string name="err_pair_missing_uuid_title">没有读到电脑的唯一标识</string>
+    <string name="err_pair_missing_uuid_detail">这台电脑返回的信息不完整，请先返回投屏页刷新列表，或重启电脑上的串流服务后再试。</string>
+    <string name="err_pair_complete_unauth_title">头显的配对信息损坏了</string>
+    <string name="err_pair_complete_unauth_detail">请前往「设置 → 隐私」点击「重置配对信息」，然后再重新和电脑配对。</string>
     <string name="err_pair_complete_forbidden_title">头显和电脑的网络地址变了</string>
     <string name="err_pair_complete_forbidden_detail">请确认头显和电脑连在同一个 Wi-Fi，再重新配对。</string>
     <string name="err_pair_complete_failed_title">没能和电脑完成最后一步确认</string>
     <string name="err_pair_complete_failed_detail">请确认电脑醒着且和头显在同一个 Wi-Fi，再点重试。</string>
     <string name="err_pair_gs_timeout_title">配对等太久了</string>
     <string name="err_pair_gs_timeout_detail">电脑长时间没有完成配对，请确认电脑醒着并打开了 depth3d Host，再点重试。</string>
-    <string name="err_pair_unexpected_done_title">电脑配对状态不一致</string>
-    <string name="err_pair_unexpected_done_detail">这台头显还没和电脑完成串流配对，请点重试重新走完整配对。</string>
+    <string name="err_pair_manual_timeout_title">输入配对码超时</string>
+    <string name="err_pair_manual_timeout_detail">5 分钟内没有在电脑上完成输入，请点重试生成新的配对码。</string>
+    <string name="err_pair_unexpected_done_title">电脑和头显的配对状态不一致</string>
+    <string name="err_pair_unexpected_done_detail">这台头显和电脑还没有配对好，请点重试重新配对。</string>
     <string name="err_host_upgrade_title">请更新电脑上的 depth3d Host</string>
     <string name="err_host_upgrade_detail">电脑端版本和当前头显不兼容，更新电脑端后再试。</string>
     <string name="err_host_service_down_title">电脑上的串流服务没有运行</string>
     <string name="err_host_service_down_detail">请在电脑上打开 depth3d Host 并确认串流服务已就绪，再点重试。</string>
     <string name="err_host_id_mismatch_title">电脑身份信息不一致</string>
     <string name="err_host_id_mismatch_detail">发现的电脑标识和回应不匹配，已出于安全原因取消连接，请确认局域网设备后重试。</string>
-    <string name="err_cert_changed_title">电脑的安全证书变了</string>
-    <string name="err_cert_changed_detail">如果电脑刚重装过系统或服务，点「信任并继续」；否则请取消。</string>
+    <string name="err_cert_changed_title">这台电脑的身份变了</string>
+    <string name="err_cert_changed_detail">如果电脑刚重装过系统或服务，请核对后点「信任并继续」；否则请取消。</string>
     <string name="err_autopair_failed_title">没有连上电脑的快速配对服务</string>
     <string name="err_autopair_failed_detail">可以点重试，或者改用 4 位配对码手动配对。</string>
     <string name="err_host_not_ready_title">电脑还没准备好串流</string>
@@ -318,7 +325,7 @@
     <string name="settings_cat_input">手柄与手势</string>
     <string name="settings_cat_input_sub">手势、射线、指针与音效</string>
     <string name="settings_cat_privacy">隐私</string>
-    <string name="settings_cat_privacy_sub">本地运行日志</string>
+    <string name="settings_cat_privacy_sub">本地运行日志、重置配对信息</string>
     <string name="settings_cat_about">关于</string>
     <string name="settings_cat_about_sub">版本、开源许可与第三方组件</string>
 
@@ -435,6 +442,14 @@
     <string name="settings_log_off">关闭</string>
     <string name="settings_log_basic">基础</string>
     <string name="settings_log_verbose">详细</string>
+    <string name="settings_reset_pairing_title">重置配对信息</string>
+    <string name="settings_reset_pairing_sub">重新生成头显本机配对身份并清除已保存的电脑记录，重置后需重新和电脑配对</string>
+    <string name="settings_reset_pairing_btn">重置配对信息</string>
+    <string name="settings_reset_pairing_confirm_title">确认重置配对信息？</string>
+    <string name="settings_reset_pairing_confirm_body">重置后会为头显生成新的配对身份，并清除已保存的电脑配对信息，之前配对过的电脑需要重新配对。</string>
+    <string name="settings_reset_pairing_confirm_btn">确认重置</string>
+    <string name="settings_reset_pairing_done">已重置配对信息，请回到投屏页重新和电脑配对</string>
+    <string name="settings_reset_pairing_failed">重置配对信息失败，请重启应用后再试</string>
 
     <!-- Settings: About & Licenses -->
     <string name="settings_about_product">depth3d</string>
@@ -494,7 +509,7 @@
     <string name="action_retry_countdown">%1$d 秒后重试</string>
     <string name="pc_action_retry_connect">重试连接</string>
     <string name="pair_gs_cert_title">「%1$s」的身份变了</string>
-    <string name="pair_gs_cert_body">这台电脑的串流安全标识和以前不一样。如果电脑重装过系统或串流服务，点「信任并继续」；否则请取消。</string>
+    <string name="pair_gs_cert_body">这台电脑的身份和以前不一样。如果电脑刚重装过系统或服务，请核对下方编号后点「信任并继续」；否则请取消。</string>
 
     <string name="dlna_body">在同一个 Wi-Fi 里，从手机上的视频 App 选择这个名字。</string>
     <string name="dlna_casting_title">正在播放手机投屏 · %1$s</string>

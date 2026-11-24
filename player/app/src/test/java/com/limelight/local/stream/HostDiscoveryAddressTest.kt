@@ -1,7 +1,9 @@
 package com.limelight.local.stream
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.net.Inet6Address
 import java.net.InetAddress
@@ -84,5 +86,38 @@ class HostDiscoveryAddressTest {
         val deduped = HostDiscovery.deduplicateEndpoints(listOf(imposter, real, duplicateReal))
         assertEquals(2, deduped.size)
         assertEquals(setOf("192.168.1.50", "192.168.1.99"), deduped.map { it.address }.toSet())
+    }
+
+    @Test
+    fun r6_6_unaddressedServiceLostDoesNotEvictFreshHostSharingServiceName() {
+        var nowMs = 1_000L
+        val registry = DiscoveredHostRegistry(clockMs = { nowMs })
+        val staleHost = DiscoveredHost(id = "host-stale", name = "Old Mac", address = "192.168.1.40", controlPort = 47990)
+        val freshHost = DiscoveredHost(id = "host-fresh", name = "Real Mac", address = "192.168.1.50", controlPort = 47990)
+
+        registry.put("depth3d-host", staleHost)
+        nowMs = 11_000L
+        registry.put("depth3d-host", freshHost)
+
+        // At t = 13_000: staleHost age = 12s (>= 10s stale window), freshHost age = 2s (< 10s).
+        // An unaddressed goodbye for "depth3d-host" must prune ONLY staleHost and keep freshHost alive!
+        nowMs = 13_000L
+        assertTrue(registry.removeStaleByServiceName("depth3d-host", HostDiscovery.LOST_STALE_WINDOW_MS))
+        assertTrue(registry.hasEntriesForServiceName("depth3d-host"))
+        val afterFirst = registry.snapshot()
+        assertEquals(1, afterFirst.size)
+        assertEquals("192.168.1.50", afterFirst.single().address)
+
+        // Another unaddressed goodbye while freshHost is still within the stale window must NOT drop it!
+        nowMs = 15_000L
+        assertFalse(registry.removeStaleByServiceName("depth3d-host", HostDiscovery.LOST_STALE_WINDOW_MS))
+        assertEquals(1, registry.snapshot().size)
+        assertEquals("192.168.1.50", registry.snapshot().single().address)
+
+        // Once freshHost itself goes stale without being re-resolved, it is pruned cleanly.
+        nowMs = 25_000L
+        assertTrue(registry.removeStaleByServiceName("depth3d-host", HostDiscovery.LOST_STALE_WINDOW_MS))
+        assertFalse(registry.hasEntriesForServiceName("depth3d-host"))
+        assertTrue(registry.snapshot().isEmpty())
     }
 }

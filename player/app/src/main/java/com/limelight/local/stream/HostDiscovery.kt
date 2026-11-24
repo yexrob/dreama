@@ -78,27 +78,41 @@ data class DiscoveredHost(
  * so two hosts sharing the same mDNS service name at different addresses/ports never overwrite each
  * other (M1), while still deduplicating exact duplicate endpoints (#7).
  */
-internal class DiscoveredHostRegistry {
+internal class DiscoveredHostRegistry(
+    private val clockMs: () -> Long = { System.currentTimeMillis() },
+) {
     data class EntryKey(val serviceName: String, val address: String, val controlPort: Int)
+    private data class Entry(val host: DiscoveredHost, val lastSeenAtMs: Long)
 
-    private val entries = LinkedHashMap<EntryKey, DiscoveredHost>()
+    private val entries = LinkedHashMap<EntryKey, Entry>()
 
     fun put(serviceName: String, host: DiscoveredHost): EntryKey {
         val key = EntryKey(serviceName, RawComputer.normalizeAddress(host.address), host.controlPort)
-        entries[key] = host
+        entries[key] = Entry(host, clockMs())
         return key
     }
 
     fun removeKey(key: EntryKey): Boolean = entries.remove(key) != null
 
-    fun removeByServiceName(serviceName: String): Boolean {
-        val toRemove = entries.keys.filter { it.serviceName == serviceName }
+    /**
+     * Removes ONLY stale entries under [serviceName] that have not been freshly resolved within
+     * [staleAfterMs] (#6), so an unaddressed mDNS goodbye from another peer sharing the same
+     * service name cannot evict a live Host.
+     */
+    fun removeStaleByServiceName(serviceName: String, staleAfterMs: Long): Boolean {
+        val now = clockMs()
+        val toRemove = entries.entries
+            .filter { (k, v) -> k.serviceName == serviceName && now - v.lastSeenAtMs >= staleAfterMs }
+            .map { it.key }
         if (toRemove.isEmpty()) return false
         toRemove.forEach { entries.remove(it) }
         return true
     }
 
-    fun snapshot(): List<DiscoveredHost> = HostDiscovery.deduplicateEndpoints(entries.values)
+    fun hasEntriesForServiceName(serviceName: String): Boolean =
+        entries.keys.any { it.serviceName == serviceName }
+
+    fun snapshot(): List<DiscoveredHost> = HostDiscovery.deduplicateEndpoints(entries.values.map { it.host })
 
     fun clear() = entries.clear()
 }
@@ -144,20 +158,33 @@ class HostDiscovery(context: Context) {
                     val key = serviceInfo.serviceName ?: return
                     val lostAddr = pickAddress(serviceInfo)
                     val lostPort = serviceInfo.port
+                    var shouldReResolve = false
                     synchronized(lock) {
-                        removeCallbackLocked(key)
                         val removed = if (lostAddr != null && lostPort in 1..65535) {
+                            removeCallbackLocked(key)
                             registry.removeKey(
                                 DiscoveredHostRegistry.EntryKey(key, RawComputer.normalizeAddress(lostAddr), lostPort),
                             )
                         } else {
-                            registry.removeByServiceName(key)
+                            // #6: When Android's onServiceLost omits address/port, never wipe freshly
+                            // resolved hosts sharing the same service name; drop only stale entries and
+                            // re-resolve if live entries remain.
+                            val pruned = registry.removeStaleByServiceName(key, LOST_STALE_WINDOW_MS)
+                            if (registry.hasEntriesForServiceName(key)) {
+                                shouldReResolve = true
+                            } else {
+                                removeCallbackLocked(key)
+                            }
+                            pruned
                         }
                         if (removed) {
                             publishLocked()
                         }
                     }
-                    LimeLog.info("depth3d: host mDNS lost $key")
+                    if (shouldReResolve) {
+                        resolve(serviceInfo)
+                    }
+                    LimeLog.info("depth3d: host mDNS lost $key (reResolve=$shouldReResolve)")
                 }
 
                 override fun onDiscoveryStopped(serviceType: String) {
@@ -230,8 +257,9 @@ class HostDiscovery(context: Context) {
 
                     override fun onServiceLost() {
                         synchronized(lock) {
-                            val removed = lastEntryKey?.let { registry.removeKey(it) }
-                                ?: registry.removeByServiceName(key)
+                            // #6: Remove ONLY this callback's exact resolved endpoint; if this callback
+                            // never resolved an IPv4 endpoint, never evict other hosts sharing the name!
+                            val removed = lastEntryKey?.let { registry.removeKey(it) } ?: false
                             if (removed) {
                                 publishLocked()
                             }
@@ -322,6 +350,8 @@ class HostDiscovery(context: Context) {
     }
 
     companion object {
+        internal const val LOST_STALE_WINDOW_MS = 10_000L
+
         /**
          * Selects the IPv4 address to dial out of everything mDNS answered with.
          * Per `docs/specs/host-protocol.md`, all control API and GameStream pairing connections to

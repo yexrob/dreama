@@ -188,6 +188,30 @@ public class AndroidCryptoProvider implements LimelightCryptoProvider {
         }
     }
 
+    /**
+     * Deletes the persisted client certificate/key and generates a fresh key pair (#9a).
+     * Used when the user taps "Reset pairing info" in Settings -> Privacy.
+     */
+    public boolean resetCertKeyPair() {
+        synchronized (globalCryptoLock) {
+            cert = null;
+            key = null;
+            pemCertBytes = null;
+            if (certFile.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                certFile.delete();
+            }
+            if (keyFile.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                keyFile.delete();
+            }
+            if (!generateCertKeyPair()) {
+                return false;
+            }
+            return loadCertKeyPair();
+        }
+    }
+
     public X509Certificate getClientCertificate() {
         // Use a lock here to ensure only one guy will be generating or loading
         // the certificate and key at a time

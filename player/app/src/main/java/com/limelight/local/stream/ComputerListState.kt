@@ -123,6 +123,8 @@ data class StreamingComputer(
     val needsHostTrustSetup: Boolean = false,
     /** True when this computer IS paired (GameStream) and its Host is alive, but streaming is temporarily offline (#3). */
     val isPairedOffline: Boolean = false,
+    /** True when this computer has persisted Host trust and is connecting/refreshing state (#7 / S2). */
+    val isPairedConnecting: Boolean = false,
 ) {
     val isOnline: Boolean
         get() = status == ComputerStatus.ONLINE_PAIRED ||
@@ -274,10 +276,11 @@ object ComputerListMerger {
                 raw = raw,
                 needsHostTrustSetup = false,
                 isPairedOffline = isPairedOffline,
+                isPairedConnecting = status == ComputerStatus.DISCOVERING && raw.pairState == PairingManager.PairState.PAIRED,
             )
         }
 
-        // Pass 2 (#1 + #3 + #7 + #10 + S2 + S3): Process remaining discovered Hosts.
+        // Pass 2 (#1 + #3 + #7 + #10 + S2 + S3 + R6 #7): Process remaining discovered Hosts.
         for (host in discoveredHosts) {
             if (host.endpointKey in consumedEndpoints) continue
             consumedEndpoints += host.endpointKey
@@ -292,9 +295,32 @@ object ComputerListMerger {
                 if (observedFp == null) {
                     continue
                 }
-                // #7: Fingerprint WAS observed and differs from saved trust -> show isolated without
-                // merging into any saved computer.
-                if (!observedFp.equals(existingTrustForId.hostFingerprint, ignoreCase = true)) {
+                if (observedFp.equals(existingTrustForId.hostFingerprint, ignoreCase = true)) {
+                    // R6 #7: Trusted Host whose TLS fingerprint matches, but whose GameStream RawComputer
+                    // record is temporarily missing -> still display this paired computer as connecting!
+                    val displayName = existingTrustForId.savedName?.takeIf { it.isNotBlank() }
+                        ?: info?.name?.takeIf { it.isNotBlank() }
+                        ?: host.name.ifBlank { host.address }
+                    val id = existingTrustForId.computerUuid.ifBlank { "host:${host.endpointKey}" }
+                    result += StreamingComputer(
+                        id = id,
+                        name = displayName,
+                        address = host.address,
+                        gsPort = host.gsPort,
+                        status = ComputerStatus.DISCOVERING,
+                        runningGameId = 0,
+                        canWake = false,
+                        isSaved = true,
+                        host = host,
+                        hostInfo = info,
+                        raw = null,
+                        needsHostTrustSetup = false,
+                        isPairedOffline = false,
+                        isPairedConnecting = true,
+                    )
+                } else {
+                    // #7: Fingerprint WAS observed and differs from saved trust -> show isolated without
+                    // merging into any saved computer.
                     val displayName = host.name.ifBlank { host.address }
                     result += StreamingComputer(
                         id = "host:${host.endpointKey}",

@@ -16,6 +16,7 @@ import android.os.IBinder
 import com.limelight.LimeLog
 import com.limelight.R
 import com.limelight.binding.PlatformBinding
+import com.limelight.binding.crypto.AndroidCryptoProvider
 import com.limelight.computers.ComputerManagerListener
 import com.limelight.computers.ComputerManagerService
 import com.limelight.local.WebDav
@@ -108,6 +109,7 @@ sealed interface RetryAction {
         val approvedNewGsCertFingerprint: String? = null,
         val connectAfterPair: Boolean = false,
         val appOverride: NvApp? = null,
+        val forceStreamUnpaired: Boolean = false,
     ) : RetryAction
 
     data class CompleteHostPair(
@@ -451,6 +453,49 @@ class StreamingController(
         return NetPick.choose(ifaces)?.second
     }
 
+    /**
+     * Deletes and regenerates the headset's local client keypair, clears all persisted Host trust
+     * records, and marks paired computers for re-pairing (R6 #9a).
+     */
+    suspend fun resetPairingIdentity(): Boolean {
+        cancelActiveOperation()
+        val ok = withContext(Dispatchers.IO) {
+            try {
+                AndroidCryptoProvider(app).resetCertKeyPair()
+            } catch (e: Exception) {
+                LimeLog.warning("depth3d: resetPairingIdentity failed: ${e.javaClass.simpleName}")
+                false
+            }
+        }
+        if (!ok) return false
+        for (hostId in pinStore.getAllPairedTrusts().keys.toList()) {
+            pinStore.clearFingerprint(hostId)
+        }
+        observedFingerprintsByEndpoint.clear()
+        hostInfosByEndpoint.clear()
+        failedInfoEndpoints.clear()
+        lastMediaRevisionByEndpoint.clear()
+        forceRefreshMediaEndpoints.clear()
+        infoRetry.resetAll()
+        mediaRetry.resetAll()
+        retryJobs.values.forEach { it.cancel() }
+        retryJobs.clear()
+        val b = binder
+        synchronized(rawComputers) {
+            for ((uuid, details) in rawComputers) {
+                details.pairState = PairingManager.PairState.NOT_PAIRED
+                b?.getComputer(uuid)?.let { it.pairState = PairingManager.PairState.NOT_PAIRED }
+                b?.invalidateStateForComputer(uuid)
+            }
+        }
+        republishComputers()
+        if (foregroundActive) {
+            hostDiscovery.hosts.value.forEach { scheduleHostInfoProbe(it) }
+            b?.startPolling(computerListener)
+        }
+        return true
+    }
+
     fun startPair(
         computer: StreamingComputer,
         forceManualPin: Boolean = false,
@@ -462,6 +507,7 @@ class StreamingController(
             approvedNewFingerprint = approvedNewFingerprint,
             approvedNewGsCertFingerprint = null,
             connectAfterPair = null,
+            forceStreamUnpaired = false,
         )
     }
 
@@ -471,6 +517,7 @@ class StreamingController(
         approvedNewFingerprint: String?,
         approvedNewGsCertFingerprint: String?,
         connectAfterPair: ConnectAfterPairRequest?,
+        forceStreamUnpaired: Boolean = false,
     ) {
         val justCancelled = (System.currentTimeMillis() - lastCancelAtMs) in 0L..RECENT_CANCEL_WINDOW_MS
         lastCancelAtMs = 0L
@@ -487,6 +534,7 @@ class StreamingController(
                     approvedNewGsCertFingerprint = approvedNewGsCertFingerprint,
                     connectAfterPair = connectAfterPair != null,
                     appOverride = connectAfterPair?.appOverride,
+                    forceStreamUnpaired = forceStreamUnpaired,
                 ),
             )
             return
@@ -527,17 +575,16 @@ class StreamingController(
                             approvedNewGsCertFingerprint = approvedNewGsCertFingerprint,
                             connectAfterPair = connectAfterPair != null,
                             appOverride = connectAfterPair?.appOverride,
+                            forceStreamUnpaired = forceStreamUnpaired,
                         ),
                     )
                     resumePollingIfForeground()
                     return@launch
                 }
 
-                val alreadyPairedCert = if (details.pairState == PairingManager.PairState.PAIRED) {
-                    details.serverCert
-                } else {
-                    null
-                }
+                // R6 #1: Key the stream cert change guard off ANY saved serverCert regardless of pairState
+                // (polling falls back to HTTP -> NOT_PAIRED after a streaming reinstall while preserving serverCert).
+                val savedServerCert = details.serverCert
                 val host = computer.host
                 if (host != null && !forceManualPin && computer.isDepth3dHost && computer.autoPairSupported) {
                     _flow.value = StreamFlowState.AutoPairing(
@@ -554,12 +601,13 @@ class StreamingController(
                         deviceId = b.uniqueId,
                         pin = pin,
                         computerUuid = details.uuid.orEmpty(),
-                        alreadyPairedGsCert = alreadyPairedCert,
+                        alreadyPairedGsCert = savedServerCert,
                         approvedNewFingerprint = approvedNewFingerprint,
                         approvedNewGsCertFingerprint = approvedNewGsCertFingerprint,
                         discoveredFingerprint = observedFingerprintsByEndpoint[host.endpointKey],
                         savedName = computer.name,
                         justCancelledPreviousPair = justCancelled,
+                        forceStreamUnpaired = forceStreamUnpaired,
                         token = token,
                         onInfoVerified = { info, fp ->
                             failedInfoEndpoints.remove(host.endpointKey)
@@ -600,13 +648,14 @@ class StreamingController(
                         b = b,
                         outcome = outcome,
                         approvedNewFingerprint = approvedNewFingerprint,
+                        approvedNewGsCertFingerprint = approvedNewGsCertFingerprint,
                         connectAfterPair = connectAfterPair,
                         allowManualFallback = true,
                         pin = pin,
                     )
                 } else if (host != null) {
-                    // B1 + #11 + S3: Manual PIN on a v1 Host NEVER saves HostPairedTrust directly;
-                    // after PIN pairing succeeds, it registers via /pair(next=done) -> /pair/complete 200!
+                    // B1 + #11 + S3 + R6 #1/#2/#3/#8: Manual PIN on a v1 Host NEVER saves HostPairedTrust directly;
+                    // after PIN pairing succeeds, it registers via /pair -> /pair/complete 200!
                     val outcome = HostManualPairOrchestrator.execute(
                         hostApi = hostApi,
                         pinStore = pinStore,
@@ -617,11 +666,12 @@ class StreamingController(
                         deviceId = b.uniqueId,
                         pin = pin,
                         computerUuid = details.uuid.orEmpty(),
-                        alreadyPairedGsCert = alreadyPairedCert,
+                        alreadyPairedGsCert = savedServerCert,
                         approvedNewFingerprint = approvedNewFingerprint,
                         approvedNewGsCertFingerprint = approvedNewGsCertFingerprint,
                         discoveredFingerprint = observedFingerprintsByEndpoint[host.endpointKey],
                         savedName = computer.name,
+                        justCancelledPreviousPair = justCancelled,
                         token = token,
                         onInfoVerified = { info, fp ->
                             failedInfoEndpoints.remove(host.endpointKey)
@@ -639,6 +689,12 @@ class StreamingController(
                                 stageText = app.getString(R.string.pair_auto_wait_allow),
                             )
                         },
+                        onCompletingGameStream = {
+                            _flow.value = StreamFlowState.AutoPairing(
+                                computer = computer,
+                                stageText = app.getString(R.string.pair_auto_completing),
+                            )
+                        },
                         onCompletingPairRecord = {
                             _flow.value = StreamFlowState.AutoPairing(
                                 computer = computer,
@@ -648,6 +704,9 @@ class StreamingController(
                         runGameStreamPair = { activePin, cancelToken ->
                             runGameStreamPair(host, details, b, activePin, cancelToken)
                         },
+                        runAutoGameStreamPair = { activePin, cancelToken ->
+                            runFullGameStreamPair(host, details, b, activePin, cancelToken)
+                        },
                     )
                     handleHostPairOutcome(
                         computer = computer,
@@ -656,6 +715,7 @@ class StreamingController(
                         b = b,
                         outcome = outcome,
                         approvedNewFingerprint = approvedNewFingerprint,
+                        approvedNewGsCertFingerprint = approvedNewGsCertFingerprint,
                         connectAfterPair = connectAfterPair,
                         allowManualFallback = false,
                         pin = pin,
@@ -666,12 +726,12 @@ class StreamingController(
                         is GameStreamPairOutcome.Paired -> {
                             val newCert = gsOutcome.serverCert
                             val mismatch = if (newCert != null) {
-                                StreamCertChangeGuard.detectChange(alreadyPairedCert, newCert, approvedNewGsCertFingerprint)
+                                StreamCertChangeGuard.detectChange(savedServerCert, newCert, approvedNewGsCertFingerprint)
                             } else {
                                 null
                             }
                             if (mismatch != null && newCert != null) {
-                                // S3: Ask before overwriting an already-paired computer's serverCert!
+                                // S3 + R6 #1: Ask before overwriting a saved computer's serverCert!
                                 _flow.value = StreamFlowState.CertConfirm(
                                     computer = computer,
                                     hostId = details.uuid.orEmpty(),
@@ -704,7 +764,7 @@ class StreamingController(
                         GameStreamPairOutcome.TimedOut -> {
                             _flow.value = StreamFlowState.Failed(
                                 computer = computer,
-                                error = StreamErrorMapper.forGameStreamPairTimeout(strings),
+                                error = StreamErrorMapper.forManualPinPairTimeout(strings),
                                 retryAction = RetryAction.Pair(
                                     computer = computer,
                                     forceManualPin = true,
@@ -736,6 +796,7 @@ class StreamingController(
                         approvedNewGsCertFingerprint = approvedNewGsCertFingerprint,
                         connectAfterPair = connectAfterPair != null,
                         appOverride = connectAfterPair?.appOverride,
+                        forceStreamUnpaired = forceStreamUnpaired,
                     ),
                 )
                 resumePollingIfForeground()
@@ -804,6 +865,7 @@ class StreamingController(
                     b = b,
                     outcome = outcome,
                     approvedNewFingerprint = pending.approvedNewFingerprint,
+                    approvedNewGsCertFingerprint = HttpHostProtocolClient.sha256Hex(pending.gsServerCert),
                     connectAfterPair = connectAfterPair,
                     allowManualFallback = false,
                     pin = "",
@@ -832,16 +894,22 @@ class StreamingController(
         b: ComputerManagerService.ComputerManagerBinder,
         outcome: HostAutoPairOutcome,
         approvedNewFingerprint: String?,
+        approvedNewGsCertFingerprint: String?,
         connectAfterPair: ConnectAfterPairRequest?,
         allowManualFallback: Boolean,
         pin: String,
     ) {
-        fun pairRetry(forceManual: Boolean = !allowManualFallback) = RetryAction.Pair(
+        fun pairRetry(
+            forceManual: Boolean = !allowManualFallback,
+            forceStreamUnpaired: Boolean = false,
+        ) = RetryAction.Pair(
             computer = computer,
             forceManualPin = forceManual,
             approvedNewFingerprint = approvedNewFingerprint,
+            approvedNewGsCertFingerprint = approvedNewGsCertFingerprint,
             connectAfterPair = connectAfterPair != null,
             appOverride = connectAfterPair?.appOverride,
+            forceStreamUnpaired = forceStreamUnpaired,
         )
 
         when (outcome) {
@@ -864,7 +932,7 @@ class StreamingController(
             is HostAutoPairOutcome.GameStreamPairedHostSetupIncomplete -> {
                 // B1: GameStream PIN succeeded, but v1 Host /pair + /pair/complete did NOT finish.
                 // Persist ONLY the GameStream cert (NEVER HostPairedTrust!) so the card keeps
-                // "完成设置后可以看这台电脑上的影片" and never silently drops media setup!
+                // prompting the user to finish setup for computer videos.
                 saveGameStreamPairingOnly(computer, details, b, outcome.gsServerCert)
                 if (outcome.hostFailure == HostAutoPairOutcome.Cancelled) {
                     _flow.value = StreamFlowState.Idle
@@ -877,6 +945,7 @@ class StreamingController(
                         b = b,
                         outcome = outcome.hostFailure,
                         approvedNewFingerprint = approvedNewFingerprint,
+                        approvedNewGsCertFingerprint = approvedNewGsCertFingerprint,
                         connectAfterPair = connectAfterPair,
                         allowManualFallback = false,
                         pin = pin,
@@ -959,7 +1028,7 @@ class StreamingController(
                 _flow.value = StreamFlowState.Failed(
                     computer = computer,
                     error = StreamErrorMapper.forUnexpectedDoneWithoutVerifiedStream(strings),
-                    retryAction = pairRetry(forceManual = false),
+                    retryAction = pairRetry(forceManual = false, forceStreamUnpaired = true),
                 )
                 resumePollingIfForeground()
             }
@@ -999,6 +1068,14 @@ class StreamingController(
                     error = StreamErrorMapper.forGameStreamPairTimeout(strings),
                     retryAction = pairRetry(),
                     fallbackPinComputer = if (allowManualFallback) computer else null,
+                )
+                resumePollingIfForeground()
+            }
+            HostAutoPairOutcome.ManualPinTimedOut -> {
+                _flow.value = StreamFlowState.Failed(
+                    computer = computer,
+                    error = StreamErrorMapper.forManualPinPairTimeout(strings),
+                    retryAction = pairRetry(forceManual = true),
                 )
                 resumePollingIfForeground()
             }
@@ -1102,6 +1179,7 @@ class StreamingController(
         expectedComputerUuid = details.uuid,
         pin = pin,
         token = token,
+        pairTimeoutMs = GameStreamPairRunner.MANUAL_GAMESTREAM_PAIR_TIMEOUT_MS,
     )
 
     private fun finalizePairedComputer(
@@ -1177,7 +1255,9 @@ class StreamingController(
                             pin = state.pendingManualPin.orEmpty(),
                             computerUuid = details.uuid.orEmpty(),
                             gsServerCert = manualCert,
+                            alreadyPairedGsCert = details.serverCert,
                             approvedNewFingerprint = state.approvedHostFingerprint,
+                            approvedNewGsCertFingerprint = state.actualFingerprint,
                             savedName = state.computer.name,
                             token = token,
                             onWaitingAllow = {
@@ -1186,11 +1266,20 @@ class StreamingController(
                                     app.getString(R.string.pair_auto_wait_allow),
                                 )
                             },
+                            onCompletingGameStream = {
+                                _flow.value = StreamFlowState.AutoPairing(
+                                    state.computer,
+                                    app.getString(R.string.pair_auto_completing),
+                                )
+                            },
                             onCompletingPairRecord = {
                                 _flow.value = StreamFlowState.AutoPairing(
                                     state.computer,
                                     app.getString(R.string.pair_auto_finalizing),
                                 )
+                            },
+                            runAutoGameStreamPair = { activePin, cancelToken ->
+                                runFullGameStreamPair(host, details, b, activePin, cancelToken)
                             },
                         )
                         handleHostPairOutcome(
@@ -1200,6 +1289,7 @@ class StreamingController(
                             b = b,
                             outcome = outcome,
                             approvedNewFingerprint = state.approvedHostFingerprint,
+                            approvedNewGsCertFingerprint = state.actualFingerprint,
                             connectAfterPair = connectAfter,
                             allowManualFallback = false,
                             pin = state.pendingManualPin.orEmpty(),
@@ -1264,8 +1354,18 @@ class StreamingController(
             )
             return
         }
-        val details = findDetails(computer, b)
-        if (details == null || details.state == ComputerDetails.State.OFFLINE || details.activeAddress == null) {
+        val existingDetails = findDetails(computer, b)
+        if (existingDetails == null && !(computer.isPairedConnecting && computer.host != null)) {
+            _flow.value = StreamFlowState.Failed(
+                computer,
+                StreamErrorMapper.forComputerOffline(strings, computer.name),
+                RetryAction.Connect(computer, appOverride),
+            )
+            return
+        }
+        if (existingDetails != null &&
+            (existingDetails.state == ComputerDetails.State.OFFLINE || existingDetails.activeAddress == null)
+        ) {
             _flow.value = StreamFlowState.Failed(
                 computer,
                 StreamErrorMapper.forComputerOffline(strings, computer.name),
@@ -1283,6 +1383,16 @@ class StreamingController(
         )
         activeOperationJob = scope.launch {
             try {
+                val details = existingDetails ?: ensureDetailsForComputer(computer, b)
+                if (token.isCancelled) return@launch
+                if (details == null || details.state == ComputerDetails.State.OFFLINE || details.activeAddress == null) {
+                    _flow.value = StreamFlowState.Failed(
+                        computer,
+                        StreamErrorMapper.forComputerOffline(strings, computer.name),
+                        RetryAction.Connect(computer, appOverride),
+                    )
+                    return@launch
+                }
                 val host = computer.host
                 if (host != null) {
                     val infoResult = withContext(Dispatchers.IO) {
@@ -1420,6 +1530,7 @@ class StreamingController(
                 } else {
                     null
                 },
+                forceStreamUnpaired = action.forceStreamUnpaired,
             )
             is RetryAction.CompleteHostPair -> retryCompleteHostPair(
                 computer = action.computer,
@@ -1573,21 +1684,24 @@ class StreamingController(
     }
 
     fun removeComputer(computer: StreamingComputer) {
-        val b = binder ?: return
-        val details = findDetails(computer, b) ?: return
-        b.removeComputer(details)
-        synchronized(rawComputers) {
-            rawComputers.remove(details.uuid)
+        val b = binder
+        val details = if (b != null) findDetails(computer, b) else null
+        if (b != null && details != null) {
+            b.removeComputer(details)
+            synchronized(rawComputers) {
+                rawComputers.remove(details.uuid)
+            }
         }
-        // Clear any HostPairedTrust bound to this computer UUID or attached Host
+        // Clear any HostPairedTrust bound to this computer UUID or attached Host (also works when raw is missing, R6 #7).
         computer.host?.let { h ->
             pinStore.clearFingerprint(h.id)
             observedFingerprintsByEndpoint.remove(h.endpointKey)
             infoRetry.clear(h.endpointKey)
             mediaRetry.clear(h.endpointKey)
         }
+        val targetUuid = details?.uuid ?: computer.id
         for ((hostId, trust) in pinStore.getAllPairedTrusts()) {
-            if (trust.computerUuid.equals(details.uuid, ignoreCase = true)) {
+            if (trust.computerUuid.equals(targetUuid, ignoreCase = true)) {
                 pinStore.clearFingerprint(hostId)
             }
         }

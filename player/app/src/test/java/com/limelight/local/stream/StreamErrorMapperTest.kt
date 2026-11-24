@@ -35,6 +35,11 @@ class StreamErrorMapperTest {
         "凭据",
         "来源校验",
         "配对记录",
+        "串流配对",
+        "完整配对",
+        "串流安全标识",
+        "证书指纹",
+        "安全证书",
     )
 
     private fun assertCleanChineseError(err: UserFacingError) {
@@ -75,12 +80,15 @@ class StreamErrorMapperTest {
             StreamErrorMapper.forAutoPair(strings, AutoPairResult.Failed("java.net.ConnectException: refused")),
             StreamErrorMapper.forPairComplete(strings, PairCompleteResult.NotPaired),
             StreamErrorMapper.forPairComplete(strings, PairCompleteResult.TicketExpired),
+            StreamErrorMapper.forPairComplete(strings, PairCompleteResult.ClientCertMismatch),
+            StreamErrorMapper.forPairComplete(strings, PairCompleteResult.MissingComputerIdentity),
             StreamErrorMapper.forPairComplete(strings, PairCompleteResult.Unauthorized),
             StreamErrorMapper.forPairComplete(strings, PairCompleteResult.Forbidden),
             StreamErrorMapper.forPairComplete(strings, PairCompleteResult.UpgradeRequired),
             StreamErrorMapper.forPairComplete(strings, PairCompleteResult.CertificateChanged("id", "aaa", "bbb")),
             StreamErrorMapper.forPairComplete(strings, PairCompleteResult.Failed("socket reset")),
             StreamErrorMapper.forGameStreamPairTimeout(strings),
+            StreamErrorMapper.forManualPinPairTimeout(strings),
             StreamErrorMapper.forUnexpectedDoneWithoutVerifiedStream(strings),
             StreamErrorMapper.forHostNotReady(strings, null),
             StreamErrorMapper.forHostNotReady(strings, "请在系统设置中授予屏幕录制权限"),
@@ -154,6 +162,56 @@ class StreamErrorMapperTest {
         val netRole = strings.get(com.limelight.R.string.settings_tp_net_role)
         assertFalse("M5: settings_tp_net_role should not contain HTTPS: $netRole", netRole.contains("HTTPS", ignoreCase = true))
         assertFalse("M5: settings_tp_net_role should not contain 证书加密: $netRole", netRole.contains("证书加密"))
+
+        // R6 #2: Plain manual PIN timeout copy does NOT mention depth3d Host and reflects 5-minute window
+        val manualTimeout = StreamErrorMapper.forManualPinPairTimeout(strings)
+        assertTrue(manualTimeout.retryable)
+        assertFalse("R6 #2: Manual PIN timeout must not mention Host: $manualTimeout", "${manualTimeout.title} ${manualTimeout.detail}".contains("Host", ignoreCase = true))
+        assertTrue("R6 #2: Manual PIN timeout should mention 5 分钟: ${manualTimeout.detail}", manualTimeout.detail.contains("5 分钟"))
+
+        // R6 #9a: Local identity error states cause + concrete Settings -> Privacy -> 重置配对信息 action
+        val unauthErr = StreamErrorMapper.forPairComplete(strings, PairCompleteResult.Unauthorized)
+        assertFalse(unauthErr.retryable)
+        assertFalse(unauthErr.title.contains("暂时无法证明身份"))
+        assertTrue("R6 #9a: Must guide user to 重置配对信息: ${unauthErr.detail}", unauthErr.detail.contains("重置配对信息"))
+        assertTrue(strings.get(com.limelight.R.string.settings_reset_pairing_title).contains("重置配对信息"))
+
+        // R6 #9b: 409 not_paired detail no longer tells user to check if they clicked Allow
+        val notPairedErr = StreamErrorMapper.forPairComplete(strings, PairCompleteResult.NotPaired)
+        assertFalse("R6 #9b: Must not mention 允许: ${notPairedErr.detail}", notPairedErr.detail.contains("允许"))
+
+        // R6 #9c: Expired title & detail do not repeat; ClientCertMismatch has its own copy
+        val expiredErr = StreamErrorMapper.forPairComplete(strings, PairCompleteResult.TicketExpired)
+        val certMismatchErr = StreamErrorMapper.forPairComplete(strings, PairCompleteResult.ClientCertMismatch)
+        assertFalse("R6 #9c: Expired detail must not repeat title", expiredErr.detail.startsWith(expiredErr.title))
+        assertFalse("R6 #9c: ClientCertMismatch must not reuse expired title", certMismatchErr.title == expiredErr.title)
+        assertFalse("R6 #9c: ClientCertMismatch must not reuse expired detail", certMismatchErr.detail == expiredErr.detail)
+        assertTrue(certMismatchErr.retryable)
+
+        // R6 #9d: Cert confirm page labels and bodies use unified 身份 / 身份编号 vocabulary without jargon
+        val certConfirmStrings = listOf(
+            strings.get(com.limelight.R.string.pair_cert_title, "书房 Mac"),
+            strings.get(com.limelight.R.string.pair_cert_body),
+            strings.get(com.limelight.R.string.pair_cert_old_label),
+            strings.get(com.limelight.R.string.pair_cert_new_label),
+            strings.get(com.limelight.R.string.pair_gs_cert_title, "书房 Mac"),
+            strings.get(com.limelight.R.string.pair_gs_cert_body),
+            strings.get(com.limelight.R.string.err_cert_changed_title),
+        )
+        for (text in certConfirmStrings) {
+            for (token in forbiddenTokens) {
+                assertFalse("R6 #9d: Cert confirm copy must not contain '$token': $text", text.contains(token, ignoreCase = true))
+            }
+        }
+        assertTrue(strings.get(com.limelight.R.string.pair_cert_title, "Mac").contains("身份变了"))
+        assertTrue(strings.get(com.limelight.R.string.pair_gs_cert_title, "Mac").contains("身份变了"))
+        assertTrue(strings.get(com.limelight.R.string.pair_cert_old_label).contains("身份编号"))
+        assertTrue(strings.get(com.limelight.R.string.pair_cert_new_label).contains("身份编号"))
+
+        // R6 #9e: Missing computer UUID gets dedicated accurate copy and retryable=false
+        val missingUuidErr = StreamErrorMapper.forPairComplete(strings, PairCompleteResult.MissingComputerIdentity)
+        assertFalse("R6 #9e: MissingComputerIdentity must NOT show a useless Retry button", missingUuidErr.retryable)
+        assertTrue(missingUuidErr.title.contains("唯一标识"))
     }
 
     @Test

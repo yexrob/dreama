@@ -627,4 +627,45 @@ class ComputerListStateTest {
         assertNull("Imposter must NOT inherit real Mac's RawComputer", imposterCard.raw)
         assertEquals(ComputerStatus.ONLINE_UNPAIRED, imposterCard.status)
     }
+
+    @Test
+    fun r6_7_trustedHostWithMatchingFingerprintAndMissingRawStillShowsPairedConnecting() {
+        val realHost = DiscoveredHost(
+            id = "host-mac-7",
+            name = "MacBook Pro",
+            address = "192.168.1.77",
+            controlPort = 47990,
+            gsPort = 47989,
+            pairMode = "auto",
+        )
+        val trusts = mapOf(
+            "host-mac-7" to HostPairedTrust(
+                hostFingerprint = "fp-real-7",
+                computerUuid = "gs-uuid-7",
+                gsCertFingerprint = "gs-fp-7",
+                savedName = "书房 Mac",
+            ),
+        )
+        val info = HostInfo(1, "MacBook Pro", "host-mac-7", "macos", HostStreamStatus(true, null), HostMediaConfig(8890))
+
+        // GameStream RawComputer list is empty (temporarily missing), but Host trust exists and TLS fp matches!
+        val merged = ComputerListMerger.merge(
+            computers = emptyList(),
+            discoveredHosts = listOf(realHost),
+            hostInfosByEndpoint = mapOf(realHost.endpointKey to info),
+            observedFingerprintsByEndpoint = mapOf(realHost.endpointKey to "fp-real-7"),
+            pairedTrusts = trusts,
+        )
+
+        assertEquals("R6 #7: Trusted Host with matching fp and missing raw must still be shown", 1, merged.size)
+        val card = merged.single()
+        assertEquals("gs-uuid-7", card.id)
+        assertEquals("书房 Mac", card.name)
+        assertEquals("192.168.1.77", card.address)
+        assertEquals(ComputerStatus.DISCOVERING, card.status)
+        assertTrue("R6 #7: Card must be flagged isPairedConnecting so UI displays 已配对 · 正在连接…", card.isPairedConnecting)
+        assertTrue(card.isSaved)
+        assertFalse(card.isPairedOffline)
+        assertEquals(realHost, card.host)
+    }
 }

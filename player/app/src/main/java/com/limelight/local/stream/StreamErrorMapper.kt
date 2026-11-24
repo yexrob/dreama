@@ -155,6 +155,15 @@ object StreamErrorMapper {
             title = s.get(R.string.err_pair_complete_expired_title),
             detail = s.get(R.string.err_pair_complete_expired_detail),
         )
+        PairCompleteResult.ClientCertMismatch -> UserFacingError(
+            title = s.get(R.string.err_pair_complete_cert_mismatch_title),
+            detail = s.get(R.string.err_pair_complete_cert_mismatch_detail),
+        )
+        PairCompleteResult.MissingComputerIdentity -> UserFacingError(
+            title = s.get(R.string.err_pair_missing_uuid_title),
+            detail = s.get(R.string.err_pair_missing_uuid_detail),
+            retryable = false,
+        )
         PairCompleteResult.Unauthorized -> UserFacingError(
             // M3: Local missing client certificate cannot be resolved by retrying the same request.
             title = s.get(R.string.err_pair_complete_unauth_title),
@@ -187,6 +196,11 @@ object StreamErrorMapper {
     fun forGameStreamPairTimeout(s: StringLookup): UserFacingError = UserFacingError(
         title = s.get(R.string.err_pair_gs_timeout_title),
         detail = s.get(R.string.err_pair_gs_timeout_detail),
+    )
+
+    fun forManualPinPairTimeout(s: StringLookup): UserFacingError = UserFacingError(
+        title = s.get(R.string.err_pair_manual_timeout_title),
+        detail = s.get(R.string.err_pair_manual_timeout_detail),
     )
 
     fun forUnexpectedDoneWithoutVerifiedStream(s: StringLookup): UserFacingError = UserFacingError(

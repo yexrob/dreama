@@ -129,6 +129,7 @@ sealed interface GameStreamPairOutcome {
  */
 object GameStreamPairRunner {
     const val DEFAULT_GAMESTREAM_PAIR_TIMEOUT_MS = 75_000L
+    const val MANUAL_GAMESTREAM_PAIR_TIMEOUT_MS = 300_000L
 
     /**
      * Strictly verifies over HTTPS-only (exact [existingServerCert] pinning, no HTTP fallback,
@@ -248,7 +249,7 @@ object GameStreamPairRunner {
     /**
      * Used by manual-PIN / non-Host flows: skips `pm.pair` ONLY if strict HTTPS pinned-cert
      * verification proves the endpoint holds [existingServerCert], else runs full `pm.pair`
-     * with the 75-second timeout cap.
+     * with a 5-minute default timeout cap (R6 #2).
      */
     suspend fun run(
         httpFactory: () -> NvHTTP,
@@ -256,7 +257,7 @@ object GameStreamPairRunner {
         expectedComputerUuid: String? = null,
         pin: String,
         token: CallCancelToken,
-        pairTimeoutMs: Long = DEFAULT_GAMESTREAM_PAIR_TIMEOUT_MS,
+        pairTimeoutMs: Long = MANUAL_GAMESTREAM_PAIR_TIMEOUT_MS,
         delayFn: suspend (Long) -> Unit = { delay(it) },
         ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     ): GameStreamPairOutcome {
@@ -285,7 +286,7 @@ sealed interface HostAutoPairOutcome {
     /**
      * Manual PIN GameStream pairing succeeded on a v1 Host, but registering the headset on the Host
      * (`/pair` + `/pair/complete`) did not finish (B1). Trust is NOT saved; caller keeps GameStream
-     * pairing so the card shows "完成设置后可以看这台电脑上的影片".
+     * pairing so the card keeps prompting the user to finish setup for computer videos.
      */
     data class GameStreamPairedHostSetupIncomplete(
         val hostInfo: HostInfo,
@@ -314,6 +315,7 @@ sealed interface HostAutoPairOutcome {
     data object UnexpectedDoneWithoutVerifiedStream : HostAutoPairOutcome
     data class GameStreamFailed(val state: PairingManager.PairState) : HostAutoPairOutcome
     data object GameStreamTimedOut : HostAutoPairOutcome
+    data object ManualPinTimedOut : HostAutoPairOutcome
     data class PairCompleteFailed(
         val result: PairCompleteResult,
         val pendingComplete: PendingPairComplete? = null,
@@ -325,18 +327,19 @@ sealed interface HostAutoPairOutcome {
 /**
  * Pure-JVM orchestrator implementing `docs/specs/host-protocol.md` v1 two-step pairing:
  * 1. Probes `/info` first and verifies `info.id == hostId` + TLS cert before ever calling `/pair` (B2/#6).
- * 2. If already paired at GameStream layer (`alreadyPairedGsCert != null`), runs strict HTTPS pinned-cert
- *    verification against the same IPv4's GameStream port FIRST (§已经在串流层面配过对的头显, #2/#3, M7).
- *    Only if this succeeds is the client cert presented on `/pair`.
- * 3. Calls `POST /depth3d/v1/pair` (consent only, returns immediately with `next` + `ticket`).
+ * 2. Unless [forceStreamUnpaired] is set, when a saved GameStream `alreadyPairedGsCert` is present,
+ *    runs strict HTTPS pinned-cert verification against the Host's own IPv4 GameStream port FIRST (M7).
+ *    Sets `streamPaired = true` ONLY if that verification succeeds; `false` in all other cases.
+ * 3. Calls `POST /depth3d/v1/pair` (always sending the local client cert + `streamPaired`, consent only).
  *    On immediate post-cancel `429 busy`, waits `retryAfterSec` and retries ONCE automatically (S5).
- * 4. If `next == DONE`: NEVER enters blocking GameStream `pm.pair` (S1)! Uses verified `alreadyPairedGsCert`
- *    if step 2 succeeded; otherwise retries `/pair` without client cert (if sent) or fails immediately!
+ * 4. If `next == DONE`: requires `streamPaired == true` (verified `alreadyPairedGsCert`), skips GameStream
+ *    pairing, and goes directly to `/pair/complete`; if `streamPaired == false`, immediately returns
+ *    [HostAutoPairOutcome.UnexpectedDoneWithoutVerifiedStream] (S1).
  *    If `next == GAMESTREAM`: runs standard GameStream `pm.pair` with 75-second cap (S1) and checks
- *    `StreamCertChangeGuard` before overwriting any existing `serverCert` (S3).
+ *    `StreamCertChangeGuard` against any saved `alreadyPairedGsCert` before completing or overwriting (S3 / R6 #1).
  * 5. Calls `POST /depth3d/v1/pair/complete` via [completeWithRetries] (S4), retrying `409 not_paired`
  *    within 5 s. This is the SOLE place in the entire codebase where `savePairedTrust` is called (B1),
- *    and only when `computerUuid` is non-blank (M4)!
+ *    and only when `computerUuid` is non-blank (M4).
  */
 object HostAutoPairOrchestrator {
     val DEFAULT_NOT_PAIRED_RETRY_DELAYS_MS: List<Long> = listOf(400L, 700L, 1_000L, 1_200L, 1_500L)
@@ -357,6 +360,7 @@ object HostAutoPairOrchestrator {
         discoveredFingerprint: String? = null,
         savedName: String? = null,
         justCancelledPreviousPair: Boolean = false,
+        forceStreamUnpaired: Boolean = false,
         token: CallCancelToken,
         onInfoVerified: (HostInfo, String) -> Unit = { _, _ -> },
         onWaitingAllow: () -> Unit = {},
@@ -370,9 +374,9 @@ object HostAutoPairOrchestrator {
         delayFn: suspend (Long) -> Unit = { delay(it) },
         ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     ): HostAutoPairOutcome {
-        // M4: Refuse to pair if computerUuid is missing (persisting blank uuid produces unreadable trust).
+        // M4 + R6 #9e: Refuse to pair if computerUuid is missing (persisting blank uuid produces unreadable trust).
         if (computerUuid.isBlank()) {
-            return HostAutoPairOutcome.PairCompleteFailed(PairCompleteResult.Failed("missing_computer_uuid"))
+            return HostAutoPairOutcome.PairCompleteFailed(PairCompleteResult.MissingComputerIdentity)
         }
 
         // Step 1 (B2/S2/#6): Mandatory /info verification BEFORE /pair is ever called.
@@ -420,11 +424,11 @@ object HostAutoPairOrchestrator {
                 return HostAutoPairOutcome.InfoFailed(infoRes.detail)
         }
 
-        // Step 2 (host-protocol.md 3676b2b §已经在串流层面配过对的头显, M7):
-        // If we already hold a paired GameStream server cert, strictly verify over HTTPS against
-        // this exact IPv4 endpoint BEFORE calling /pair. Never calls /unpair on cancel!
-        // `streamPaired` is true ONLY if this verification passed; false in ALL other cases.
-        val verifiedExistingGsPair = if (alreadyPairedGsCert != null) {
+        // Step 2 (host-protocol.md 3676b2b, M7, R6 #5):
+        // Unless forceStreamUnpaired is set, if we already hold a saved GameStream server cert,
+        // strictly verify over HTTPS against this exact IPv4 endpoint BEFORE calling /pair.
+        // Never calls /unpair on cancel! `streamPaired` is true ONLY if this verification passed.
+        val verifiedExistingGsPair = if (!forceStreamUnpaired && alreadyPairedGsCert != null) {
             verifyExistingGameStreamPair(token)
         } else {
             false
@@ -613,9 +617,9 @@ object HostAutoPairOrchestrator {
         delayFn: suspend (Long) -> Unit = { delay(it) },
         ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     ): HostAutoPairOutcome {
-        // M4: Never persist a HostPairedTrust with a blank computerUuid!
+        // M4 + R6 #9e: Never persist a HostPairedTrust with a blank computerUuid!
         if (pending.computerUuid.isBlank()) {
-            return HostAutoPairOutcome.PairCompleteFailed(PairCompleteResult.Failed("missing_computer_uuid"))
+            return HostAutoPairOutcome.PairCompleteFailed(PairCompleteResult.MissingComputerIdentity)
         }
 
         val existingTrust = pinStore.getPairedTrust(pending.hostId)
@@ -675,9 +679,11 @@ object HostAutoPairOrchestrator {
                 PairCompleteResult.Cancelled ->
                     return HostAutoPairOutcome.Cancelled
                 PairCompleteResult.TicketExpired,
+                PairCompleteResult.ClientCertMismatch,
+                PairCompleteResult.MissingComputerIdentity,
                 PairCompleteResult.Unauthorized,
                 PairCompleteResult.Forbidden ->
-                    // Ticket invalid / unauthorized / IP changed: cannot reuse this ticket on retry.
+                    // Ticket invalid / client cert changed / missing identity / unauthorized / IP changed: cannot reuse ticket.
                     return HostAutoPairOutcome.PairCompleteFailed(completeRes, pendingComplete = null)
                 is PairCompleteResult.Failed ->
                     // S4: Network failure while ticket is still valid -> attach pendingComplete for direct retry!
@@ -690,13 +696,17 @@ object HostAutoPairOrchestrator {
 }
 
 /**
- * Manual-PIN pairing orchestrator for v1 depth3d Hosts (B1 + #11 + S3):
+ * Manual-PIN pairing orchestrator for v1 depth3d Hosts (B1 + #11 + S3 + R6 #2/#3/#8):
  * 1. Verifies `/info` (`info.id == hostId` + TLS cert).
- * 2. Shows PIN and runs standard GameStream pairing (with 75s cap & S3 serverCert change guard).
- * 3. NEVER persists [HostPairedTrust] directly (B1)! Instead, runs the v1 Host upgrade registration
- *    (`POST /pair` with client cert -> `next:"done"` -> `POST /pair/complete` -> 200 -> `savePairedTrust`).
- * 4. If that Host registration step fails, returns [HostAutoPairOutcome.GameStreamPairedHostSetupIncomplete]
- *    without saving trust so the computer card keeps showing "完成设置后可以看这台电脑上的影片".
+ * 2. Shows PIN and runs standard GameStream pairing (5-minute user entry timeout & S3 serverCert change guard).
+ * 3. NEVER persists [HostPairedTrust] directly (B1)! Instead, registers with the v1 Host via
+ *    `POST /pair` (with client cert + `streamPaired = true`, plus post-cancel single `busy` auto-retry).
+ *    - If Host replies `next = "done"`: calls `POST /pair/complete` -> 200 -> `savePairedTrust`; if this
+ *      fails, returns [HostAutoPairOutcome.GameStreamPairedHostSetupIncomplete] without saving trust.
+ *    - If Host replies `next = "gamestream"` (R6 #3): Host has ALREADY wiped this client cert's engine
+ *      entries and queued `pin`. Immediately runs GameStream pairing again with the same `pin` and same
+ *      `ticket` (75s cap), checks `StreamCertChangeGuard`, then calls `/pair/complete`; if any step fails,
+ *      returns the failure directly WITHOUT saving the wiped pairing.
  */
 object HostManualPairOrchestrator {
     suspend fun execute(
@@ -714,13 +724,17 @@ object HostManualPairOrchestrator {
         approvedNewGsCertFingerprint: String? = null,
         discoveredFingerprint: String? = null,
         savedName: String? = null,
+        justCancelledPreviousPair: Boolean = false,
         token: CallCancelToken,
         onInfoVerified: (HostInfo, String) -> Unit = { _, _ -> },
         onShowPin: () -> Unit = {},
         onWaitingAllow: () -> Unit = {},
+        onCompletingGameStream: () -> Unit = {},
         onCompletingPairRecord: () -> Unit = {},
         runGameStreamPair: suspend (pin: String, token: CallCancelToken) -> GameStreamPairOutcome,
+        runAutoGameStreamPair: (suspend (pin: String, token: CallCancelToken) -> GameStreamPairOutcome)? = null,
         notPairedRetryDelaysMs: List<Long> = HostAutoPairOrchestrator.DEFAULT_NOT_PAIRED_RETRY_DELAYS_MS,
+        busyRetryDelayMs: (Int?) -> Long = { sec -> ((sec ?: 1).coerceIn(1, 5)) * 1_000L },
         clockMs: () -> Long = { System.currentTimeMillis() },
         delayFn: suspend (Long) -> Unit = { delay(it) },
         ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
@@ -779,13 +793,13 @@ object HostManualPairOrchestrator {
             is GameStreamPairOutcome.FailedState ->
                 return HostAutoPairOutcome.GameStreamFailed(gsOutcome.state)
             GameStreamPairOutcome.TimedOut ->
-                return HostAutoPairOutcome.GameStreamTimedOut
+                return HostAutoPairOutcome.ManualPinTimedOut
             GameStreamPairOutcome.Cancelled ->
                 return HostAutoPairOutcome.Cancelled
         }
         if (token.isCancelled) return HostAutoPairOutcome.Cancelled
 
-        // S3: Confirm before overwriting an already-paired computer's GameStream serverCert!
+        // S3 + R6 #1: Confirm before overwriting a previously saved GameStream serverCert!
         val mismatch = StreamCertChangeGuard.detectChange(
             existingServerCert = alreadyPairedGsCert,
             newServerCert = newGsCert,
@@ -800,9 +814,7 @@ object HostManualPairOrchestrator {
             )
         }
 
-        // B1: GameStream manual PIN succeeded! Now register with v1 Host via the upgrade path:
-        // POST /pair (with client cert) -> expect next="done" -> POST /pair/complete -> 200 -> savePairedTrust.
-        // If this Host step fails, NEVER save HostPairedTrust so card keeps "完成设置后可以看这台电脑上的影片"!
+        // B1 + R6 #3/#8: GameStream manual PIN succeeded! Now register with v1 Host via /pair -> /pair/complete.
         return finishHostRegistrationAfterManualPin(
             hostApi = hostApi,
             pinStore = pinStore,
@@ -816,12 +828,18 @@ object HostManualPairOrchestrator {
             pin = pin,
             computerUuid = computerUuid,
             gsServerCert = newGsCert,
+            alreadyPairedGsCert = alreadyPairedGsCert,
             approvedNewFingerprint = approvedNewFingerprint,
+            approvedNewGsCertFingerprint = approvedNewGsCertFingerprint,
             savedName = savedName,
+            justCancelledPreviousPair = justCancelledPreviousPair,
             token = token,
             onWaitingAllow = onWaitingAllow,
+            onCompletingGameStream = onCompletingGameStream,
             onCompletingPairRecord = onCompletingPairRecord,
+            runAutoGameStreamPair = runAutoGameStreamPair,
             notPairedRetryDelaysMs = notPairedRetryDelaysMs,
+            busyRetryDelayMs = busyRetryDelayMs,
             clockMs = clockMs,
             delayFn = delayFn,
             ioDispatcher = ioDispatcher,
@@ -829,7 +847,7 @@ object HostManualPairOrchestrator {
     }
 
     /**
-     * Completes v1 Host registration after manual-PIN GameStream pairing succeeded (B1).
+     * Completes v1 Host registration after manual-PIN GameStream pairing succeeded (B1 + R6 #3/#8).
      * Reused when user confirms [HostAutoPairOutcome.StreamServerCertChanged] after manual PIN.
      */
     suspend fun finishHostRegistrationAfterManualPin(
@@ -845,12 +863,18 @@ object HostManualPairOrchestrator {
         pin: String,
         computerUuid: String,
         gsServerCert: X509Certificate,
+        alreadyPairedGsCert: X509Certificate? = null,
         approvedNewFingerprint: String?,
+        approvedNewGsCertFingerprint: String? = null,
         savedName: String?,
+        justCancelledPreviousPair: Boolean = false,
         token: CallCancelToken,
         onWaitingAllow: () -> Unit = {},
+        onCompletingGameStream: () -> Unit = {},
         onCompletingPairRecord: () -> Unit = {},
+        runAutoGameStreamPair: (suspend (pin: String, token: CallCancelToken) -> GameStreamPairOutcome)? = null,
         notPairedRetryDelaysMs: List<Long> = HostAutoPairOrchestrator.DEFAULT_NOT_PAIRED_RETRY_DELAYS_MS,
+        busyRetryDelayMs: (Int?) -> Long = { sec -> ((sec ?: 1).coerceIn(1, 5)) * 1_000L },
         clockMs: () -> Long = { System.currentTimeMillis() },
         delayFn: suspend (Long) -> Unit = { delay(it) },
         ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
@@ -860,11 +884,11 @@ object HostManualPairOrchestrator {
                 hostInfo = hostInfo,
                 hostFingerprint = hostFingerprint,
                 gsServerCert = gsServerCert,
-                hostFailure = HostAutoPairOutcome.PairCompleteFailed(PairCompleteResult.Failed("missing_computer_uuid")),
+                hostFailure = HostAutoPairOutcome.PairCompleteFailed(PairCompleteResult.MissingComputerIdentity),
             )
         }
         onWaitingAllow()
-        val pairResp = withContext(ioDispatcher) {
+        var pairResp = withContext(ioDispatcher) {
             hostApi.requestAutoPair(
                 address = address,
                 port = controlPort,
@@ -878,6 +902,34 @@ object HostManualPairOrchestrator {
                 cancelToken = token,
             )
         }
+        // R6 #8: Post-cancel transient 429 busy -> wait retryAfterSec and retry ONCE automatically.
+        if (justCancelledPreviousPair && pairResp is AutoPairResult.Busy && !token.isCancelled) {
+            val waitMs = busyRetryDelayMs(pairResp.retryAfterSec)
+            delayFn(waitMs)
+            if (token.isCancelled) {
+                return HostAutoPairOutcome.GameStreamPairedHostSetupIncomplete(
+                    hostInfo = hostInfo,
+                    hostFingerprint = hostFingerprint,
+                    gsServerCert = gsServerCert,
+                    hostFailure = HostAutoPairOutcome.Cancelled,
+                )
+            }
+            onWaitingAllow()
+            pairResp = withContext(ioDispatcher) {
+                hostApi.requestAutoPair(
+                    address = address,
+                    port = controlPort,
+                    hostId = hostId,
+                    deviceName = deviceName,
+                    deviceId = deviceId,
+                    pin = pin,
+                    expectedFingerprint = hostFingerprint,
+                    streamPaired = true,
+                    approvedNewFingerprint = approvedNewFingerprint,
+                    cancelToken = token,
+                )
+            }
+        }
         if (token.isCancelled || pairResp == AutoPairResult.Cancelled) {
             return HostAutoPairOutcome.GameStreamPairedHostSetupIncomplete(
                 hostInfo = hostInfo,
@@ -886,13 +938,13 @@ object HostManualPairOrchestrator {
                 hostFailure = HostAutoPairOutcome.Cancelled,
             )
         }
-        if (pairResp !is AutoPairResult.Approved || pairResp.next != PairNextStep.DONE) {
+        if (pairResp !is AutoPairResult.Approved) {
             val failure = when (pairResp) {
                 AutoPairResult.UpgradeRequired -> HostAutoPairOutcome.UpgradeRequired
                 is AutoPairResult.CertificateChanged ->
                     HostAutoPairOutcome.CertificateChanged(pairResp.hostId, pairResp.expected, pairResp.actual)
-                is AutoPairResult.Approved ->
-                    HostAutoPairOutcome.PairCompleteFailed(PairCompleteResult.NotPaired)
+                is AutoPairResult.StreamServiceUnavailable ->
+                    HostAutoPairOutcome.PairRejectedOrFailed(pairResp, pairResp.reason ?: hostInfo.stream.reason)
                 else -> HostAutoPairOutcome.PairRejectedOrFailed(pairResp, null)
             }
             return HostAutoPairOutcome.GameStreamPairedHostSetupIncomplete(
@@ -903,6 +955,68 @@ object HostManualPairOrchestrator {
             )
         }
 
+        val ticketIssuedAtMs = clockMs()
+        val hostClearedExistingStreamPair: Boolean
+        val finalGsCert: X509Certificate
+        when (pairResp.next) {
+            PairNextStep.DONE -> {
+                hostClearedExistingStreamPair = false
+                finalGsCert = gsServerCert
+            }
+            PairNextStep.GAMESTREAM -> {
+                // R6 #3: Host already cleared this client cert from the streaming engine and queued `pin`.
+                // Never save the wiped GameStream pairing via GameStreamPairedHostSetupIncomplete!
+                hostClearedExistingStreamPair = true
+                val autoGsPair = runAutoGameStreamPair
+                    ?: return HostAutoPairOutcome.PairCompleteFailed(PairCompleteResult.NotPaired)
+                onCompletingGameStream()
+                val rePairedCert = when (val gsOutcome = autoGsPair(pin, token)) {
+                    is GameStreamPairOutcome.Paired -> {
+                        val cert = gsOutcome.serverCert
+                        if (token.isCancelled) return HostAutoPairOutcome.Cancelled
+                        cert ?: return HostAutoPairOutcome.GameStreamFailed(PairingManager.PairState.FAILED)
+                    }
+                    is GameStreamPairOutcome.FailedState ->
+                        return HostAutoPairOutcome.GameStreamFailed(gsOutcome.state)
+                    GameStreamPairOutcome.TimedOut ->
+                        return HostAutoPairOutcome.GameStreamTimedOut
+                    GameStreamPairOutcome.Cancelled ->
+                        return HostAutoPairOutcome.Cancelled
+                }
+                if (token.isCancelled) return HostAutoPairOutcome.Cancelled
+                val mismatch = StreamCertChangeGuard.detectChange(
+                    existingServerCert = alreadyPairedGsCert ?: gsServerCert,
+                    newServerCert = rePairedCert,
+                    approvedNewGsCertFingerprint = approvedNewGsCertFingerprint,
+                )
+                if (mismatch != null) {
+                    val pendingForConfirm = PendingPairComplete(
+                        address = address,
+                        controlPort = controlPort,
+                        hostId = hostId,
+                        hostInfo = hostInfo,
+                        hostFingerprint = hostFingerprint,
+                        ticket = pairResp.ticket,
+                        clientCertFingerprint = pairResp.clientCertFingerprint,
+                        issuedAtMs = ticketIssuedAtMs,
+                        deviceId = deviceId,
+                        deviceName = deviceName,
+                        computerUuid = computerUuid,
+                        gsServerCert = rePairedCert,
+                        approvedNewFingerprint = approvedNewFingerprint,
+                        savedName = savedName,
+                    )
+                    return HostAutoPairOutcome.StreamServerCertChanged(
+                        expectedGsFingerprint = mismatch.expectedFingerprint,
+                        actualGsFingerprint = mismatch.actualFingerprint,
+                        newGsCert = rePairedCert,
+                        pendingComplete = pendingForConfirm,
+                    )
+                }
+                finalGsCert = rePairedCert
+            }
+        }
+
         val pending = PendingPairComplete(
             address = address,
             controlPort = controlPort,
@@ -911,11 +1025,11 @@ object HostManualPairOrchestrator {
             hostFingerprint = hostFingerprint,
             ticket = pairResp.ticket,
             clientCertFingerprint = pairResp.clientCertFingerprint,
-            issuedAtMs = clockMs(),
+            issuedAtMs = ticketIssuedAtMs,
             deviceId = deviceId,
             deviceName = deviceName,
             computerUuid = computerUuid,
-            gsServerCert = gsServerCert,
+            gsServerCert = finalGsCert,
             approvedNewFingerprint = approvedNewFingerprint,
             savedName = savedName,
         )
@@ -929,13 +1043,13 @@ object HostManualPairOrchestrator {
             delayFn = delayFn,
             ioDispatcher = ioDispatcher,
         )
-        return if (completeOutcome is HostAutoPairOutcome.Paired) {
-            completeOutcome
-        } else {
-            HostAutoPairOutcome.GameStreamPairedHostSetupIncomplete(
+        return when {
+            completeOutcome is HostAutoPairOutcome.Paired -> completeOutcome
+            hostClearedExistingStreamPair -> completeOutcome
+            else -> HostAutoPairOutcome.GameStreamPairedHostSetupIncomplete(
                 hostInfo = hostInfo,
                 hostFingerprint = hostFingerprint,
-                gsServerCert = gsServerCert,
+                gsServerCert = finalGsCert,
                 hostFailure = completeOutcome,
             )
         }
