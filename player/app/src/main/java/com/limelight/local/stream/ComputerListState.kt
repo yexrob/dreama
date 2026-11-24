@@ -52,19 +52,10 @@ data class RawComputer(
     }
 
     /**
-     * Exact endpoint match `(address, gsPort)` or explicit id match. Used for matching live
-     * GameStream services to a [DiscoveredHost] (per host-protocol.md §发现).
+     * Exact endpoint match `(address, gsPort)` per `docs/specs/host-protocol.md` §发现.
+     * Never matches an untrusted mDNS `id` or non-spec `gsid` against `uuid` (S3).
      */
-    fun matchesHost(host: DiscoveredHost): Boolean {
-        if (matchesHostExplicitId(host)) return true
-        return matchesEndpointAddressAndPort(host)
-    }
-
-    fun matchesHostExplicitId(host: DiscoveredHost): Boolean {
-        if (uuid.equals(host.id, ignoreCase = true)) return true
-        if (!host.gsId.isNullOrBlank() && uuid.equals(host.gsId, ignoreCase = true)) return true
-        return false
-    }
+    fun matchesHost(host: DiscoveredHost): Boolean = matchesEndpointAddressAndPort(host)
 
     /**
      * Matches `(address, gsPort)` strictly on an ONLINE GameStream service.
@@ -169,8 +160,8 @@ object ComputerListMerger {
      * - (#3) When a paired computer's GameStream record (`raw.uuid != host.id`) temporarily polls
      *   as OFFLINE while its Host is alive, keeps it paired with [StreamingComputer.isPairedOffline]
      *   instead of downgrading to ONLINE_UNPAIRED.
-     * - (#10) Never merges an OFFLINE GameStream record solely by IP address; offline merging uses
-     *   only explicit streaming UUID correspondence (`trust.computerUuid`, `host.id`, or `host.gsId`).
+     * - (#10 + S3) Never merges an OFFLINE GameStream record solely by IP address; offline merging uses
+     *   only verified `trust.computerUuid` (never untrusted mDNS ids).
      * - (#1) Flags online paired computers that have a discovered Host without matching
      *   [HostPairedTrust] via [StreamingComputer.needsHostTrustSetup].
      */
@@ -180,6 +171,7 @@ object ComputerListMerger {
         hostInfosByEndpoint: Map<String, HostInfo> = emptyMap(),
         observedFingerprintsByEndpoint: Map<String, String> = emptyMap(),
         pairedTrusts: Map<String, HostPairedTrust> = emptyMap(),
+        failedInfoEndpoints: Set<String> = emptySet(),
     ): List<StreamingComputer> {
         val validComputers = computers.filter { it.uuid.isNotBlank() }
         val consumedUuids = HashSet<String>()
@@ -192,8 +184,14 @@ object ComputerListMerger {
             trustsByHostIdLower[hostId.lowercase()] = hostId to trust
         }
 
-        // Pass 1 (#7 + #3 + #10): Resolve every trusted Host strictly by verified TLS fingerprint
-        // and explicit streaming computerUuid (never by IP, never accepting spoofed same-id endpoints).
+        // Pass 1 (#7 + #3 + #10 + S2): Resolve every trusted Host strictly by persisted trust.computerUuid.
+        // - If a discovered endpoint has observed fingerprint == trust.hostFingerprint, attach it as verified.
+        // - (S2) If no verified endpoint is observed yet (cold start before /info returns or /info failed),
+        //   merge an unverified same-id endpoint (observedFp == null) onto the trusted computer showing
+        //   DISCOVERING ("正在连接…") or OFFLINE + isPairedOffline ("已配对 · 暂时连不上") rather than
+        //   creating a duplicate ONLINE_UNPAIRED card!
+        // - Only endpoints whose OBSERVED fingerprint is proven DIFFERENT from trust.hostFingerprint are
+        //   left for Pass 2 to display isolated (#7).
         for ((hostIdLower, pair) in trustsByHostIdLower) {
             val trust = pair.second
             val raw = validComputers.firstOrNull {
@@ -205,39 +203,81 @@ object ComputerListMerger {
                     candidate.id.lowercase() == hostIdLower &&
                     observedFingerprintsByEndpoint[candidate.endpointKey]
                         ?.equals(trust.hostFingerprint, ignoreCase = true) == true
-            } ?: continue
+            }
+
+            if (verifiedHost != null) {
+                consumedUuids += raw.uuid
+                consumedEndpoints += verifiedHost.endpointKey
+
+                val info = hostInfosByEndpoint[verifiedHost.endpointKey]
+                val status = computeStatus(raw, hasLiveHostMdns = true)
+                val isPairedOffline = status == ComputerStatus.OFFLINE && raw.pairState == PairingManager.PairState.PAIRED
+                val displayName = trust.savedName?.takeIf { it.isNotBlank() }
+                    ?: raw.name.ifBlank { verifiedHost.name }
+                val gsCertMatches = raw.serverCertFingerprint != null &&
+                    raw.serverCertFingerprint.equals(trust.gsCertFingerprint, ignoreCase = true)
+                val needsSetup = raw.pairState == PairingManager.PairState.PAIRED && raw.hasServerCert && !gsCertMatches
+
+                result += StreamingComputer(
+                    id = raw.uuid,
+                    name = displayName,
+                    address = if (raw.state == ComputerDetails.State.ONLINE) (raw.bestAddress ?: verifiedHost.address) else verifiedHost.address,
+                    gsPort = if (raw.state == ComputerDetails.State.ONLINE && raw.bestPort > 0) raw.bestPort else verifiedHost.gsPort,
+                    status = status,
+                    runningGameId = raw.runningGameId,
+                    canWake = !raw.macAddress.isNullOrBlank(),
+                    isSaved = true,
+                    host = verifiedHost,
+                    hostInfo = info,
+                    raw = raw,
+                    needsHostTrustSetup = needsSetup,
+                    isPairedOffline = isPairedOffline,
+                )
+                continue
+            }
+
+            // S2: Cold start or /info transiently failed -> observedFp is null; merge cleanly without
+            // spawning a duplicate "未配对" card!
+            val unverifiedCandidates = discoveredHosts.filter { candidate ->
+                candidate.endpointKey !in consumedEndpoints &&
+                    candidate.id.lowercase() == hostIdLower &&
+                    observedFingerprintsByEndpoint[candidate.endpointKey] == null
+            }
+            val pendingHost = unverifiedCandidates.firstOrNull { raw.hasAddress(it.address) }
+                ?: unverifiedCandidates.firstOrNull()
+                ?: continue
 
             consumedUuids += raw.uuid
-            consumedEndpoints += verifiedHost.endpointKey
+            consumedEndpoints += pendingHost.endpointKey
 
-            val info = hostInfosByEndpoint[verifiedHost.endpointKey]
-            val status = computeStatus(raw, hasLiveHostMdns = true)
+            val infoFailed = pendingHost.endpointKey in failedInfoEndpoints
+            val status = if (infoFailed || raw.state == ComputerDetails.State.OFFLINE) {
+                ComputerStatus.OFFLINE
+            } else {
+                ComputerStatus.DISCOVERING
+            }
             val isPairedOffline = status == ComputerStatus.OFFLINE && raw.pairState == PairingManager.PairState.PAIRED
-            // #7: Trusted host keeps its saved name (not overwritten by untrusted announcements)
             val displayName = trust.savedName?.takeIf { it.isNotBlank() }
-                ?: raw.name.ifBlank { verifiedHost.name }
-            val gsCertMatches = raw.serverCertFingerprint != null &&
-                raw.serverCertFingerprint.equals(trust.gsCertFingerprint, ignoreCase = true)
-            val needsSetup = raw.pairState == PairingManager.PairState.PAIRED && raw.hasServerCert && !gsCertMatches
+                ?: raw.name.ifBlank { pendingHost.name }
 
             result += StreamingComputer(
                 id = raw.uuid,
                 name = displayName,
-                address = if (raw.state == ComputerDetails.State.ONLINE) (raw.bestAddress ?: verifiedHost.address) else verifiedHost.address,
-                gsPort = if (raw.state == ComputerDetails.State.ONLINE && raw.bestPort > 0) raw.bestPort else verifiedHost.gsPort,
+                address = raw.bestAddress ?: pendingHost.address,
+                gsPort = if (raw.state == ComputerDetails.State.ONLINE && raw.bestPort > 0) raw.bestPort else pendingHost.gsPort,
                 status = status,
                 runningGameId = raw.runningGameId,
                 canWake = !raw.macAddress.isNullOrBlank(),
                 isSaved = true,
-                host = verifiedHost,
-                hostInfo = info,
+                host = pendingHost,
+                hostInfo = null,
                 raw = raw,
-                needsHostTrustSetup = needsSetup,
+                needsHostTrustSetup = false,
                 isPairedOffline = isPairedOffline,
             )
         }
 
-        // Pass 2 (#1 + #3 + #7 + #10): Process remaining discovered Hosts.
+        // Pass 2 (#1 + #3 + #7 + #10 + S2 + S3): Process remaining discovered Hosts.
         for (host in discoveredHosts) {
             if (host.endpointKey in consumedEndpoints) continue
             consumedEndpoints += host.endpointKey
@@ -245,36 +285,43 @@ object ComputerListMerger {
             val info = hostInfosByEndpoint[host.endpointKey]
             val existingTrustForId = trustsByHostIdLower[host.id.lowercase()]?.second
 
-            // #7: If a persisted trust ALREADY exists for host.id (meaning this endpoint failed
-            // fingerprint matching in Pass 1 — e.g. imposter copying id or unapproved cert rotation),
-            // NEVER merge it into any saved computer! Show it isolated so the real computer is untouched.
             if (existingTrustForId != null) {
-                val displayName = host.name.ifBlank { host.address }
-                result += StreamingComputer(
-                    id = "host:${host.endpointKey}",
-                    name = displayName,
-                    address = host.address,
-                    gsPort = host.gsPort,
-                    status = ComputerStatus.ONLINE_UNPAIRED,
-                    runningGameId = 0,
-                    canWake = false,
-                    isSaved = false,
-                    host = host,
-                    hostInfo = info,
-                    raw = null,
-                    needsHostTrustSetup = false,
-                    isPairedOffline = false,
-                )
+                val observedFp = observedFingerprintsByEndpoint[host.endpointKey]
+                // S2: If fingerprint has NOT yet been observed (cold start / /info not returned or failed),
+                // do NOT spawn a duplicate ONLINE_UNPAIRED card for a trusted host id!
+                if (observedFp == null) {
+                    continue
+                }
+                // #7: Fingerprint WAS observed and differs from saved trust -> show isolated without
+                // merging into any saved computer.
+                if (!observedFp.equals(existingTrustForId.hostFingerprint, ignoreCase = true)) {
+                    val displayName = host.name.ifBlank { host.address }
+                    result += StreamingComputer(
+                        id = "host:${host.endpointKey}",
+                        name = displayName,
+                        address = host.address,
+                        gsPort = host.gsPort,
+                        status = ComputerStatus.ONLINE_UNPAIRED,
+                        runningGameId = 0,
+                        canWake = false,
+                        isSaved = false,
+                        host = host,
+                        hostInfo = info,
+                        raw = null,
+                        needsHostTrustSetup = false,
+                        isPairedOffline = false,
+                    )
+                }
                 continue
             }
 
-            // #10: Match ONLY by explicit streaming service UUID (host.id or host.gsId) OR live
-            // ONLINE (address, gsPort) match — NEVER swallow an OFFLINE record of another machine by IP!
+            // S3 + #10 + host-protocol.md §发现:
+            // Match untrusted discovered Hosts ONLY by live ONLINE `(address, gsPort)`.
+            // Never match by untrusted mDNS id / non-spec gsid (S3) and never swallow an OFFLINE record by IP (#10).
             val matched = validComputers.filter { raw ->
-                raw.uuid !in consumedUuids &&
-                    (raw.matchesHostExplicitId(host) || raw.matchesOnlineEndpoint(host))
+                raw.uuid !in consumedUuids && raw.matchesOnlineEndpoint(host)
             }
-            val best = pickBestRawForHost(matched, host)
+            val best = pickBestRawForHost(matched)
 
             val displayName = info?.name?.takeIf { it.isNotBlank() }
                 ?: host.name.takeIf { it.isNotBlank() }
@@ -354,20 +401,14 @@ object ComputerListMerger {
         )
     }
 
-    private fun pickBestRawForHost(candidates: List<RawComputer>, host: DiscoveredHost): RawComputer? {
+    private fun pickBestRawForHost(candidates: List<RawComputer>): RawComputer? {
         if (candidates.isEmpty()) return null
         return candidates.minByOrNull { raw ->
-            val idMatch = raw.matchesHostExplicitId(host)
             val isPaired = raw.pairState == PairingManager.PairState.PAIRED
             when {
-                raw.state == ComputerDetails.State.ONLINE && idMatch && isPaired -> 0
-                raw.state == ComputerDetails.State.ONLINE && isPaired -> 1
-                raw.state == ComputerDetails.State.ONLINE && idMatch -> 2
-                raw.state == ComputerDetails.State.ONLINE -> 3
-                raw.state == ComputerDetails.State.UNKNOWN && idMatch -> 4
-                raw.state == ComputerDetails.State.OFFLINE && idMatch && isPaired -> 5
-                idMatch -> 6
-                else -> 7
+                raw.state == ComputerDetails.State.ONLINE && isPaired -> 0
+                raw.state == ComputerDetails.State.ONLINE -> 1
+                else -> 2
             }
         }
     }

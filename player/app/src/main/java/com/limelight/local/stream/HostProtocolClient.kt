@@ -3,11 +3,15 @@ package com.limelight.local.stream
 import android.content.Context
 import com.limelight.LimeLog
 import okhttp3.Call
+import okhttp3.ConnectionPool
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import java.net.InetAddress
+import java.net.Socket
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.PrivateKey
@@ -23,6 +27,7 @@ import javax.net.ssl.HostnameVerifier
 import javax.net.ssl.KeyManager
 import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSocketFactory
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
 
@@ -95,6 +100,9 @@ class InMemoryHostCertPinStore : HostCertPinStore {
 
     @Synchronized
     override fun savePairedTrust(hostId: String, trust: HostPairedTrust) {
+        require(trust.hostFingerprint.isNotBlank() && trust.computerUuid.isNotBlank() && trust.gsCertFingerprint.isNotBlank()) {
+            "HostPairedTrust requires non-blank hostFingerprint, computerUuid, and gsCertFingerprint"
+        }
         trusts[hostId] = trust
     }
 
@@ -140,6 +148,10 @@ class SharedPrefsHostCertPinStore(context: Context) : HostCertPinStore {
     }
 
     override fun savePairedTrust(hostId: String, trust: HostPairedTrust) {
+        if (trust.hostFingerprint.isBlank() || trust.computerUuid.isBlank() || trust.gsCertFingerprint.isBlank()) {
+            LimeLog.warning("depth3d: refusing to persist incomplete HostPairedTrust for $hostId")
+            return
+        }
         val cleanName = trust.savedName.orEmpty().replace('\n', ' ').trim()
         prefs.edit()
             .putString(hostId, trust.hostFingerprint)
@@ -211,7 +223,7 @@ sealed interface AutoPairResult {
     data class Approved(val next: PairNextStep, val ticket: String) : AutoPairResult
     data object Rejected : AutoPairResult
     data object TimedOut : AutoPairResult
-    data object Busy : AutoPairResult
+    data class Busy(val retryAfterSec: Int? = null) : AutoPairResult
     data class Cooldown(val retryAfterSec: Int?) : AutoPairResult
     data object UpgradeRequired : AutoPairResult
     data class StreamServiceUnavailable(val reason: String? = null) : AutoPairResult
@@ -453,10 +465,10 @@ class HttpHostProtocolClient(
             val root = MiniJson.parseObject(raw)
             val err = root?.string("error")?.lowercase(Locale.ROOT)
             val retryAfter = root?.int("retryAfterSec")?.takeIf { it > 0 }
-            return if (err == "cooldown" || (err != "busy" && retryAfter != null)) {
-                AutoPairResult.Cooldown(retryAfterSec = retryAfter)
-            } else {
-                AutoPairResult.Busy
+            return when (err) {
+                "cooldown" -> AutoPairResult.Cooldown(retryAfterSec = retryAfter)
+                "busy" -> AutoPairResult.Busy(retryAfterSec = retryAfter)
+                else -> if (retryAfter != null) AutoPairResult.Cooldown(retryAfter) else AutoPairResult.Busy(null)
             }
         }
 
@@ -483,15 +495,18 @@ class HttpHostProtocolClient(
             approvedNewFingerprint = approvedNewFingerprint,
         )
         return try {
+            val trackedSockets = CopyOnWriteArrayList<Socket>()
             val client = buildClient(
                 hostId = hostId,
                 policy = policy,
                 presentClientCert = false,
                 readTimeoutMs = infoReadTimeoutMs,
                 observedFingerprintOut = observed,
+                trackedSockets = trackedSockets,
+                cancelToken = cancelToken,
             )
             val call = client.newCall(Request.Builder().url(url).get().build())
-            val unregister = cancelToken?.registerCall(call)
+            val unregister = cancelToken?.register { closeCallAndSockets(call, client, trackedSockets) }
             try {
                 call.execute().use { resp ->
                     when (resp.code) {
@@ -516,6 +531,8 @@ class HttpHostProtocolClient(
                 }
             } finally {
                 unregister?.invoke()
+                closeSocketsQuietly(trackedSockets)
+                client.connectionPool.evictAll()
             }
         } catch (e: Throwable) {
             if (cancelToken?.isCancelled == true) return HostInfoResult.Cancelled
@@ -576,19 +593,25 @@ class HttpHostProtocolClient(
             reportedExpectedForError = savedPin ?: expected,
         )
         return try {
+            val trackedSockets = CopyOnWriteArrayList<Socket>()
             val client = buildClient(
                 hostId = hostId,
                 policy = policy,
                 presentClientCert = allowClientCert,
                 readTimeoutMs = pairReadTimeoutMs,
                 observedFingerprintOut = observed,
+                trackedSockets = trackedSockets,
+                cancelToken = cancelToken,
             )
             val request = Request.Builder()
                 .url(url)
+                .header("Connection", "close")
                 .post(payload.toRequestBody(JSON_MEDIA))
                 .build()
             val call = client.newCall(request)
-            val unregister = cancelToken?.registerCall(call)
+            // S5: Truly tear down the underlying TCP/TLS socket on cancel so the Mac Host closes its
+            // confirmation dialog immediately rather than keeping the connection open and returning busy!
+            val unregister = cancelToken?.register { closeCallAndSockets(call, client, trackedSockets) }
             try {
                 call.execute().use { resp ->
                     val body = resp.body.string()
@@ -609,6 +632,8 @@ class HttpHostProtocolClient(
                 }
             } finally {
                 unregister?.invoke()
+                closeSocketsQuietly(trackedSockets)
+                client.connectionPool.evictAll()
             }
         } catch (e: Throwable) {
             if (cancelToken?.isCancelled == true) return AutoPairResult.Cancelled
@@ -662,6 +687,7 @@ class HttpHostProtocolClient(
             reportedExpectedForError = savedPin ?: expected,
         )
         return try {
+            val trackedSockets = CopyOnWriteArrayList<Socket>()
             val client = buildClient(
                 hostId = hostId,
                 policy = policy,
@@ -669,13 +695,16 @@ class HttpHostProtocolClient(
                 readTimeoutMs = infoReadTimeoutMs,
                 observedFingerprintOut = observed,
                 precomputedKeyManagers = keyManagers,
+                trackedSockets = trackedSockets,
+                cancelToken = cancelToken,
             )
             val request = Request.Builder()
                 .url(url)
+                .header("Connection", "close")
                 .post(payload.toRequestBody(JSON_MEDIA))
                 .build()
             val call = client.newCall(request)
-            val unregister = cancelToken?.registerCall(call)
+            val unregister = cancelToken?.register { closeCallAndSockets(call, client, trackedSockets) }
             try {
                 call.execute().use { resp ->
                     val body = resp.body.string()
@@ -695,6 +724,8 @@ class HttpHostProtocolClient(
                 }
             } finally {
                 unregister?.invoke()
+                closeSocketsQuietly(trackedSockets)
+                client.connectionPool.evictAll()
             }
         } catch (e: Throwable) {
             if (cancelToken?.isCancelled == true) return PairCompleteResult.Cancelled
@@ -750,6 +781,7 @@ class HttpHostProtocolClient(
             reportedExpectedForError = savedPin,
         )
         return try {
+            val trackedSockets = CopyOnWriteArrayList<Socket>()
             val client = buildClient(
                 hostId = hostId,
                 policy = policy,
@@ -757,6 +789,8 @@ class HttpHostProtocolClient(
                 readTimeoutMs = infoReadTimeoutMs,
                 observedFingerprintOut = observed,
                 precomputedKeyManagers = keyManagers,
+                trackedSockets = trackedSockets,
+                cancelToken = cancelToken,
             )
             val request = Request.Builder()
                 .url(url)
@@ -764,7 +798,7 @@ class HttpHostProtocolClient(
                 .get()
                 .build()
             val call = client.newCall(request)
-            val unregister = cancelToken?.registerCall(call)
+            val unregister = cancelToken?.register { closeCallAndSockets(call, client, trackedSockets) }
             try {
                 call.execute().use { resp ->
                     if (!savedPin.equals(observed.get(), ignoreCase = true)) {
@@ -783,6 +817,8 @@ class HttpHostProtocolClient(
                 }
             } finally {
                 unregister?.invoke()
+                closeSocketsQuietly(trackedSockets)
+                client.connectionPool.evictAll()
             }
         } catch (e: Throwable) {
             if (cancelToken?.isCancelled == true) return MediaCredsResult.Cancelled
@@ -818,6 +854,8 @@ class HttpHostProtocolClient(
         readTimeoutMs: Long,
         observedFingerprintOut: AtomicReference<String?>,
         precomputedKeyManagers: Array<KeyManager>? = null,
+        trackedSockets: CopyOnWriteArrayList<Socket>? = null,
+        cancelToken: CallCancelToken? = null,
     ): OkHttpClient {
         val trustManager = PinningTrustManager(hostId, policy, observedFingerprintOut)
         val keyManagers = when {
@@ -827,14 +865,80 @@ class HttpHostProtocolClient(
         }
         val sslContext = SSLContext.getInstance("TLS")
         sslContext.init(keyManagers, arrayOf<TrustManager>(trustManager), SecureRandom())
+        val socketFactory: SSLSocketFactory = if (trackedSockets != null) {
+            TrackingSslSocketFactory(sslContext.socketFactory, trackedSockets, cancelToken)
+        } else {
+            sslContext.socketFactory
+        }
         return OkHttpClient.Builder()
+            .connectionPool(ConnectionPool(0, 1, TimeUnit.MILLISECONDS))
+            .protocols(listOf(Protocol.HTTP_1_1))
             .connectTimeout(connectTimeoutMs, TimeUnit.MILLISECONDS)
             .readTimeout(readTimeoutMs, TimeUnit.MILLISECONDS)
             .writeTimeout(connectTimeoutMs, TimeUnit.MILLISECONDS)
-            .sslSocketFactory(sslContext.socketFactory, trustManager)
+            .sslSocketFactory(socketFactory, trustManager)
             // Self-signed LAN host certificates are pinned by SHA-256 fingerprint via PinningTrustManager.
             .hostnameVerifier(HostnameVerifier { _, _ -> true })
             .build()
+    }
+
+    private fun closeCallAndSockets(
+        call: Call,
+        client: OkHttpClient,
+        trackedSockets: CopyOnWriteArrayList<Socket>,
+    ) {
+        try {
+            call.cancel()
+        } catch (_: Throwable) {
+        }
+        closeSocketsQuietly(trackedSockets)
+        try {
+            client.connectionPool.evictAll()
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun closeSocketsQuietly(trackedSockets: CopyOnWriteArrayList<Socket>) {
+        val snapshot = trackedSockets.toList()
+        trackedSockets.clear()
+        for (sock in snapshot) {
+            try {
+                sock.close()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    /** Wraps an [SSLSocketFactory] so every created TLS socket can be closed immediately on cancel (S5). */
+    private class TrackingSslSocketFactory(
+        private val delegate: SSLSocketFactory,
+        private val tracked: CopyOnWriteArrayList<Socket>,
+        private val cancelToken: CallCancelToken?,
+    ) : SSLSocketFactory() {
+        private fun register(sock: Socket): Socket {
+            tracked.add(sock)
+            if (cancelToken?.isCancelled == true) {
+                tracked.remove(sock)
+                try {
+                    sock.close()
+                } catch (_: Throwable) {
+                }
+                throw IOException("Cancelled")
+            }
+            return sock
+        }
+
+        override fun getDefaultCipherSuites(): Array<String> = delegate.defaultCipherSuites
+        override fun getSupportedCipherSuites(): Array<String> = delegate.supportedCipherSuites
+        override fun createSocket(): Socket = register(delegate.createSocket())
+        override fun createSocket(s: Socket, host: String, port: Int, autoClose: Boolean): Socket =
+            register(delegate.createSocket(s, host, port, autoClose))
+        override fun createSocket(host: String, port: Int): Socket = register(delegate.createSocket(host, port))
+        override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket =
+            register(delegate.createSocket(host, port, localHost, localPort))
+        override fun createSocket(host: InetAddress, port: Int): Socket = register(delegate.createSocket(host, port))
+        override fun createSocket(address: InetAddress, port: Int, localAddress: InetAddress, localPort: Int): Socket =
+            register(delegate.createSocket(address, port, localAddress, localPort))
     }
 
     private fun buildClientKeyManagers(): Array<KeyManager>? {

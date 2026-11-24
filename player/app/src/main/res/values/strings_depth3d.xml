@@ -193,16 +193,20 @@
     <string name="err_autopair_cooldown_title">配对请求过于频繁</string>
     <string name="err_autopair_cooldown_detail_sec">请等待 %1$d 秒后再点重试。</string>
     <string name="err_autopair_cooldown_detail">请稍等片刻后再点重试。</string>
-    <string name="err_pair_complete_not_paired_title">电脑还没完成配对记录</string>
-    <string name="err_pair_complete_not_paired_detail">电脑端串流服务暂时没有确认这台头显，请稍候点重试。</string>
-    <string name="err_pair_complete_expired_title">这次配对已过期</string>
-    <string name="err_pair_complete_expired_detail">配对凭证已超时失效，请重新发起配对并在电脑上点「允许」。</string>
-    <string name="err_pair_complete_unauth_title">未能验证头显凭据</string>
-    <string name="err_pair_complete_unauth_detail">电脑没有收到有效的设备凭据，请点重试重新配对。</string>
-    <string name="err_pair_complete_forbidden_title">配对来源校验未通过</string>
-    <string name="err_pair_complete_forbidden_detail">请确认头显和电脑连在同一个 Wi-Fi，再点重试。</string>
-    <string name="err_pair_complete_failed_title">未能完成电脑端配对确认</string>
-    <string name="err_pair_complete_failed_detail">请确认电脑保持唤醒且在同一个 Wi-Fi，再点重试。</string>
+    <string name="err_pair_complete_not_paired_title">电脑还没记录下这台头显</string>
+    <string name="err_pair_complete_not_paired_detail">请稍等几秒再点重试，或回到电脑上检查是否已点「允许」。</string>
+    <string name="err_pair_complete_expired_title">这次配对等太久了</string>
+    <string name="err_pair_complete_expired_detail">这次配对等太久了，请重新配对并在电脑上点「允许」。</string>
+    <string name="err_pair_complete_unauth_title">这台头显暂时无法证明身份</string>
+    <string name="err_pair_complete_unauth_detail">头显里的配对信息不完整，请退出并重新打开 depth3d 后再配对。</string>
+    <string name="err_pair_complete_forbidden_title">头显和电脑的网络地址变了</string>
+    <string name="err_pair_complete_forbidden_detail">请确认头显和电脑连在同一个 Wi-Fi，再重新配对。</string>
+    <string name="err_pair_complete_failed_title">没能和电脑完成最后一步确认</string>
+    <string name="err_pair_complete_failed_detail">请确认电脑醒着且和头显在同一个 Wi-Fi，再点重试。</string>
+    <string name="err_pair_gs_timeout_title">配对等太久了</string>
+    <string name="err_pair_gs_timeout_detail">电脑长时间没有完成配对，请确认电脑醒着并打开了 depth3d Host，再点重试。</string>
+    <string name="err_pair_unexpected_done_title">电脑配对状态不一致</string>
+    <string name="err_pair_unexpected_done_detail">这台头显还没和电脑完成串流配对，请点重试重新走完整配对。</string>
     <string name="err_host_upgrade_title">请更新电脑上的 depth3d Host</string>
     <string name="err_host_upgrade_detail">电脑端版本和当前头显不兼容，更新电脑端后再试。</string>
     <string name="err_host_service_down_title">电脑上的串流服务没有运行</string>
@@ -448,7 +452,7 @@
     <string name="settings_tp_depth_role">头显端实时 2D 转 3D 深度估计模型</string>
     <string name="settings_tp_media3_role">本地与局域网视频解码播放</string>
     <string name="settings_tp_openxr_role">OpenXR 运行时加载器与端侧推理引擎</string>
-    <string name="settings_tp_net_role">HTTPS 传输、证书加密与局域网服务发现</string>
+    <string name="settings_tp_net_role">局域网加密通信与设备发现</string>
 
     <!-- VR in-session streaming bar & quick menu -->
     <string name="vr_stream_default_pc">电脑</string>
@@ -487,6 +491,10 @@
     <string name="pc_action_complete_host_setup">完成设置（同步电脑影片）</string>
     <string name="pair_stage_preparing">正在准备连接…</string>
     <string name="pair_auto_finalizing">正在确认配对结果…</string>
+    <string name="action_retry_countdown">%1$d 秒后重试</string>
+    <string name="pc_action_retry_connect">重试连接</string>
+    <string name="pair_gs_cert_title">「%1$s」的身份变了</string>
+    <string name="pair_gs_cert_body">这台电脑的串流安全标识和以前不一样。如果电脑重装过系统或串流服务，点「信任并继续」；否则请取消。</string>
 
     <string name="dlna_body">在同一个 Wi-Fi 里，从手机上的视频 App 选择这个名字。</string>
     <string name="dlna_casting_title">正在播放手机投屏 · %1$s</string>

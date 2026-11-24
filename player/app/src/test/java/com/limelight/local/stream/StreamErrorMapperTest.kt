@@ -31,6 +31,10 @@ class StreamErrorMapperTest {
         "OpenXR",
         "HTTP",
         "RTSP",
+        "凭证",
+        "凭据",
+        "来源校验",
+        "配对记录",
     )
 
     private fun assertCleanChineseError(err: UserFacingError) {
@@ -58,7 +62,8 @@ class StreamErrorMapperTest {
             StreamErrorMapper.forPairState(strings, PairState.NOT_PAIRED, false),
             StreamErrorMapper.forAutoPair(strings, AutoPairResult.Rejected),
             StreamErrorMapper.forAutoPair(strings, AutoPairResult.TimedOut),
-            StreamErrorMapper.forAutoPair(strings, AutoPairResult.Busy),
+            StreamErrorMapper.forAutoPair(strings, AutoPairResult.Busy()),
+            StreamErrorMapper.forAutoPair(strings, AutoPairResult.Busy(4)),
             StreamErrorMapper.forAutoPair(strings, AutoPairResult.Cooldown(23)),
             StreamErrorMapper.forAutoPair(strings, AutoPairResult.Cooldown(null)),
             StreamErrorMapper.forAutoPair(strings, AutoPairResult.UpgradeRequired),
@@ -74,6 +79,8 @@ class StreamErrorMapperTest {
             StreamErrorMapper.forPairComplete(strings, PairCompleteResult.UpgradeRequired),
             StreamErrorMapper.forPairComplete(strings, PairCompleteResult.CertificateChanged("id", "aaa", "bbb")),
             StreamErrorMapper.forPairComplete(strings, PairCompleteResult.Failed("socket reset")),
+            StreamErrorMapper.forGameStreamPairTimeout(strings),
+            StreamErrorMapper.forUnexpectedDoneWithoutVerifiedStream(strings),
             StreamErrorMapper.forHostNotReady(strings, null),
             StreamErrorMapper.forHostNotReady(strings, "请在系统设置中授予屏幕录制权限"),
             StreamErrorMapper.forHostUpgradeRequired(strings),
@@ -119,13 +126,29 @@ class StreamErrorMapperTest {
         assertTrue("Cooldown detail should mention 25 seconds: ${errCooldown.detail}", errCooldown.detail.contains("25"))
         assertTrue(errCooldown.retryable)
 
-        // 429 busy, 409 not_paired, 410 ticket expired are retryable; 426 upgrade is not
-        assertTrue(StreamErrorMapper.forAutoPair(strings, AutoPairResult.Busy).retryable)
+        // 429 busy, 409 not_paired, 410 ticket expired are retryable; 401 local missing cert (M3) & 426 upgrade are NOT
+        assertTrue(StreamErrorMapper.forAutoPair(strings, AutoPairResult.Busy()).retryable)
         assertTrue(StreamErrorMapper.forPairComplete(strings, PairCompleteResult.NotPaired).retryable)
         assertTrue(StreamErrorMapper.forPairComplete(strings, PairCompleteResult.TicketExpired).retryable)
+        assertFalse(
+            "M3: Missing local client certificate (401) must NOT be retryable",
+            StreamErrorMapper.forPairComplete(strings, PairCompleteResult.Unauthorized).retryable,
+        )
         val err426Complete = StreamErrorMapper.forPairComplete(strings, PairCompleteResult.UpgradeRequired)
         assertEquals("请更新电脑上的 depth3d Host", err426Complete.title)
         assertFalse(err426Complete.retryable)
+
+        // M2: Cooldown/busy retry countdown seconds
+        assertEquals(25, RetryCooldown.initialSeconds(AutoPairResult.Cooldown(25)))
+        assertEquals(RetryCooldown.DEFAULT_COOLDOWN_SEC, RetryCooldown.initialSeconds(AutoPairResult.Cooldown(null)))
+        assertEquals(4, RetryCooldown.initialSeconds(AutoPairResult.Busy(4)))
+        assertEquals(RetryCooldown.DEFAULT_BUSY_SEC, RetryCooldown.initialSeconds(AutoPairResult.Busy(null)))
+        assertEquals(0, RetryCooldown.initialSeconds(AutoPairResult.Rejected))
+
+        // M5: Third-party networking description has no raw HTTPS / 证书加密 jargon
+        val netRole = strings.get(com.limelight.R.string.settings_tp_net_role)
+        assertFalse("M5: settings_tp_net_role should not contain HTTPS: $netRole", netRole.contains("HTTPS", ignoreCase = true))
+        assertFalse("M5: settings_tp_net_role should not contain 证书加密: $netRole", netRole.contains("证书加密"))
     }
 
     @Test

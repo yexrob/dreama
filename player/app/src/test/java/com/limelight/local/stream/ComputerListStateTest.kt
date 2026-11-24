@@ -522,4 +522,109 @@ class ComputerListStateTest {
         assertTrue(tracker.onAvailable(300L))
         assertEquals(300L, tracker.currentNetworkId())
     }
+
+    @Test
+    fun r5_s2_coldStartTrustedHostWithoutObservedFingerprintAndInfoFailureNeverSpawnsDuplicateCard() {
+        val realHost = DiscoveredHost(
+            id = "host-mac-1",
+            name = "书房 Mac",
+            address = "192.168.1.50",
+            controlPort = 47990,
+            gsPort = 47989,
+            pairMode = "auto",
+        )
+        val realRaw = rawComputer(
+            uuid = "gs-real-uuid",
+            name = "Mac-GS",
+            state = ComputerDetails.State.ONLINE,
+            pairState = PairingManager.PairState.PAIRED,
+            activeAddress = "192.168.1.50",
+            activePort = 47989,
+        ).copy(serverCertFingerprint = "gs-fp-real")
+        val trusts = mapOf(
+            "host-mac-1" to HostPairedTrust("fp-real", "gs-real-uuid", "gs-fp-real", savedName = "书房 Mac"),
+        )
+
+        // Case 1: Cold start — mDNS resolved host-mac-1, trust exists, /info has NOT returned yet (observedFp == null)
+        val coldStart = ComputerListMerger.merge(
+            computers = listOf(realRaw),
+            discoveredHosts = listOf(realHost),
+            observedFingerprintsByEndpoint = emptyMap(),
+            pairedTrusts = trusts,
+            failedInfoEndpoints = emptySet(),
+        )
+        assertEquals("S2: Cold start must NOT spawn a duplicate ONLINE_UNPAIRED card", 1, coldStart.size)
+        val coldCard = coldStart.single()
+        assertEquals("gs-real-uuid", coldCard.id)
+        assertEquals("书房 Mac", coldCard.name)
+        assertEquals("S2: Cold start before /info should show DISCOVERING (正在连接)", ComputerStatus.DISCOVERING, coldCard.status)
+        assertFalse(coldCard.isPairedOffline)
+
+        // Case 2: /info probe FAILED (observedFp still null, endpoint marked failed)
+        val infoFailed = ComputerListMerger.merge(
+            computers = listOf(realRaw),
+            discoveredHosts = listOf(realHost),
+            observedFingerprintsByEndpoint = emptyMap(),
+            pairedTrusts = trusts,
+            failedInfoEndpoints = setOf(realHost.endpointKey),
+        )
+        assertEquals("S2: /info failure must NOT spawn a duplicate ONLINE_UNPAIRED card", 1, infoFailed.size)
+        val failedCard = infoFailed.single()
+        assertEquals("gs-real-uuid", failedCard.id)
+        assertEquals("书房 Mac", failedCard.name)
+        assertEquals(ComputerStatus.OFFLINE, failedCard.status)
+        assertTrue("S2: /info failure should show paired-offline (已配对 · 暂时连不上)", failedCard.isPairedOffline)
+
+        // Case 3: Once /info actually observes a DIFFERENT fingerprint, isolate it without touching real Mac
+        val imposter = realHost.copy(address = "192.168.1.99", name = "冒充者")
+        val mismatch = ComputerListMerger.merge(
+            computers = listOf(realRaw),
+            discoveredHosts = listOf(realHost, imposter),
+            observedFingerprintsByEndpoint = mapOf(
+                realHost.endpointKey to "fp-real",
+                imposter.endpointKey to "fp-imposter",
+            ),
+            pairedTrusts = trusts,
+        )
+        assertEquals(2, mismatch.size)
+        assertEquals(ComputerStatus.ONLINE_PAIRED, mismatch.first { it.id == "gs-real-uuid" }.status)
+        assertEquals(ComputerStatus.ONLINE_UNPAIRED, mismatch.first { it.address == "192.168.1.99" }.status)
+    }
+
+    @Test
+    fun r5_s3_imposterAnnouncingRealStreamingUuidOrGsidCannotMergeOntoRealComputer() {
+        // S3: Imposter at 192.168.1.99 announces id == real Mac's GameStream uuid AND non-spec TXT gsid!
+        val imposter = DiscoveredHost.fromTxt(
+            serviceName = "EvilMac",
+            address = "192.168.1.99",
+            controlPort = 47990,
+            txt = mapOf(
+                "v" to "1",
+                "id" to "gs-real-uuid",
+                "gsid" to "gs-real-uuid",
+                "name" to "伪装 Mac",
+                "pair" to "auto",
+                "gs" to "47989",
+            ),
+        )!!
+        val realRaw = rawComputer(
+            uuid = "gs-real-uuid",
+            name = "真实 Mac",
+            state = ComputerDetails.State.ONLINE,
+            pairState = PairingManager.PairState.PAIRED,
+            activeAddress = "192.168.1.50",
+            activePort = 47989,
+        ).copy(serverCertFingerprint = "gs-fp-real")
+
+        val merged = ComputerListMerger.merge(
+            computers = listOf(realRaw),
+            discoveredHosts = listOf(imposter),
+        )
+        assertEquals("S3: Imposter at another IP announcing real uuid/gsid must NOT merge onto real Mac", 2, merged.size)
+        val realCard = merged.first { it.id == "gs-real-uuid" }
+        val imposterCard = merged.first { it.address == "192.168.1.99" }
+        assertNull("Real Mac must NOT attach to imposter Host", realCard.host)
+        assertNull("Imposter must NOT inherit real Mac's RawComputer", imposterCard.raw)
+        assertEquals(ComputerStatus.ONLINE_UNPAIRED, imposterCard.status)
+    }
 }

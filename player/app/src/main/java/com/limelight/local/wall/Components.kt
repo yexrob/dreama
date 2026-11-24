@@ -122,29 +122,35 @@ fun WallButton(
     kind: ButtonKind = ButtonKind.Plain,
     small: Boolean = false,
     trailing: ImageVector? = null,
+    enabled: Boolean = true,
 ) {
     val source = remember { MutableInteractionSource() }
     val hovered by rememberRayHover(source)
+    val effectiveHover = hovered && enabled
     val bg by animateColorAsState(
         when (kind) {
-            ButtonKind.Primary -> if (hovered) Color.White else Wall.Text
-            ButtonKind.Plain -> if (hovered) Wall.FillHi else Wall.Fill
-            ButtonKind.Ghost -> if (hovered) Wall.Fill else Color.Transparent
+            ButtonKind.Primary -> if (effectiveHover) Color.White else Wall.Text
+            ButtonKind.Plain -> if (effectiveHover) Wall.FillHi else Wall.Fill
+            ButtonKind.Ghost -> if (effectiveHover) Wall.Fill else Color.Transparent
         }, tween(120), label = "btn")
     val fg = when (kind) {
         ButtonKind.Primary -> Wall.Bg
         ButtonKind.Plain -> Wall.Text
-        ButtonKind.Ghost -> if (hovered) Wall.Text else Wall.Text2
+        ButtonKind.Ghost -> if (effectiveHover) Wall.Text else Wall.Text2
     }
-    val scale = hoverScale(hovered, 1.04f, 120)
+    val scale = hoverScale(effectiveHover, 1.04f, 120)
     val iconSize = if (small) 24.dp else 28.dp
     Row(
         modifier
-            .graphicsLayer { scaleX = scale; scaleY = scale }
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+                alpha = if (enabled) 1f else 0.45f
+            }
             .height(if (small) 60.dp else 64.dp)
             .clip(RoundedCornerShape(Wall.Radius))
             .background(bg)
-            .ray(source, onClick)
+            .then(if (enabled) Modifier.ray(source, onClick) else Modifier)
             .padding(horizontal = if (small) 24.dp else 32.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),

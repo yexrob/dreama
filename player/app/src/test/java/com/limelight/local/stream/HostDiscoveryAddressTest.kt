@@ -56,6 +56,25 @@ class HostDiscoveryAddressTest {
     }
 
     @Test
+    fun r5_m1_registryDistinguishesSameServiceNameByAddressAndPort() {
+        val registry = DiscoveredHostRegistry()
+        val hostA = DiscoveredHost(id = "host-a", name = "Mac A", address = "192.168.1.50", controlPort = 47990)
+        val hostB = DiscoveredHost(id = "host-b", name = "Mac B", address = "192.168.1.60", controlPort = 47990)
+        val keyA = registry.put("depth3d-host", hostA)
+        registry.put("depth3d-host", hostB)
+
+        val both = registry.snapshot()
+        assertEquals("M1: Same serviceName at different addresses must NOT overwrite", 2, both.size)
+        assertEquals(setOf("192.168.1.50", "192.168.1.60"), both.map { it.address }.toSet())
+
+        // Removing keyA keeps hostB intact
+        registry.removeKey(keyA)
+        val remaining = registry.snapshot()
+        assertEquals(1, remaining.size)
+        assertEquals("192.168.1.60", remaining.single().address)
+    }
+
+    @Test
     fun deduplicateEndpointsRetainsImposterAndRealHostWithSameIdAtDifferentAddresses() {
         // #7: An imposter copying a real Host's mDNS id at another IP must NOT evict the real Host.
         val real = DiscoveredHost(id = "host-same", name = "Real Mac", address = "192.168.1.50", controlPort = 47990)

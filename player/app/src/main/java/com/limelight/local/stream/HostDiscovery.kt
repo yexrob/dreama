@@ -27,7 +27,6 @@ data class DiscoveredHost(
     val mediaPort: Int? = null,
     val mediaRevision: Int? = null,
     val protocolVersion: Int = HttpHostProtocolClient.PROTOCOL_VERSION,
-    val gsId: String? = null,
 ) {
     val autoPairSupported: Boolean
         get() = pairMode.equals("auto", ignoreCase = true)
@@ -42,6 +41,8 @@ data class DiscoveredHost(
 
         /**
          * Parses mDNS TXT key-value pairs into a [DiscoveredHost]. Pure function for unit tests.
+         * Strictly adheres to `docs/specs/host-protocol.md` TXT keys (`v`, `name`, `id`, `pair`,
+         * `media`, `mrev`, `gs`) — no non-spec keys (S3).
          */
         fun fromTxt(
             serviceName: String,
@@ -57,7 +58,6 @@ data class DiscoveredHost(
             val pairMode = txt["pair"]?.trim()?.takeIf { it.isNotEmpty() }
             val mediaPort = txt["media"]?.trim()?.toIntOrNull()?.takeIf { it in 1..65535 }
             val mediaRevision = txt["mrev"]?.trim()?.toIntOrNull()?.takeIf { it > 0 }
-            val gsId = txt["gsid"]?.trim()?.takeIf { it.isNotEmpty() }
             return DiscoveredHost(
                 id = id,
                 name = name,
@@ -68,10 +68,39 @@ data class DiscoveredHost(
                 mediaPort = mediaPort,
                 mediaRevision = mediaRevision,
                 protocolVersion = version,
-                gsId = gsId,
             )
         }
     }
+}
+
+/**
+ * Pure-JVM registry storing discovered mDNS records keyed by `(serviceName, address, controlPort)`
+ * so two hosts sharing the same mDNS service name at different addresses/ports never overwrite each
+ * other (M1), while still deduplicating exact duplicate endpoints (#7).
+ */
+internal class DiscoveredHostRegistry {
+    data class EntryKey(val serviceName: String, val address: String, val controlPort: Int)
+
+    private val entries = LinkedHashMap<EntryKey, DiscoveredHost>()
+
+    fun put(serviceName: String, host: DiscoveredHost): EntryKey {
+        val key = EntryKey(serviceName, RawComputer.normalizeAddress(host.address), host.controlPort)
+        entries[key] = host
+        return key
+    }
+
+    fun removeKey(key: EntryKey): Boolean = entries.remove(key) != null
+
+    fun removeByServiceName(serviceName: String): Boolean {
+        val toRemove = entries.keys.filter { it.serviceName == serviceName }
+        if (toRemove.isEmpty()) return false
+        toRemove.forEach { entries.remove(it) }
+        return true
+    }
+
+    fun snapshot(): List<DiscoveredHost> = HostDiscovery.deduplicateEndpoints(entries.values)
+
+    fun clear() = entries.clear()
 }
 
 /**
@@ -82,7 +111,7 @@ class HostDiscovery(context: Context) {
     private val appContext = context.applicationContext
     private val nsd = appContext.getSystemService(Context.NSD_SERVICE) as? NsdManager
     private val lock = Any()
-    private val byServiceName = LinkedHashMap<String, DiscoveredHost>()
+    private val registry = DiscoveredHostRegistry()
     private val pendingResolves = ArrayDeque<NsdServiceInfo>()
     private val activeCallbacks = LinkedHashMap<String, Any>()
     private val executor = Executors.newSingleThreadExecutor { r ->
@@ -113,9 +142,18 @@ class HostDiscovery(context: Context) {
 
                 override fun onServiceLost(serviceInfo: NsdServiceInfo) {
                     val key = serviceInfo.serviceName ?: return
+                    val lostAddr = pickAddress(serviceInfo)
+                    val lostPort = serviceInfo.port
                     synchronized(lock) {
                         removeCallbackLocked(key)
-                        if (byServiceName.remove(key) != null) {
+                        val removed = if (lostAddr != null && lostPort in 1..65535) {
+                            registry.removeKey(
+                                DiscoveredHostRegistry.EntryKey(key, RawComputer.normalizeAddress(lostAddr), lostPort),
+                            )
+                        } else {
+                            registry.removeByServiceName(key)
+                        }
+                        if (removed) {
                             publishLocked()
                         }
                     }
@@ -177,17 +215,24 @@ class HostDiscovery(context: Context) {
                 if (!started) return
                 removeCallbackLocked(key)
                 val cb = object : NsdManager.ServiceInfoCallback {
+                    @Volatile var lastEntryKey: DiscoveredHostRegistry.EntryKey? = null
+
                     override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {
                         LimeLog.warning("depth3d: host mDNS callback failed for $key: $errorCode")
                     }
 
                     override fun onServiceUpdated(updated: NsdServiceInfo) {
-                        handleResolved(updated)
+                        val newKey = handleResolved(updated, previousKey = lastEntryKey)
+                        if (newKey != null) {
+                            lastEntryKey = newKey
+                        }
                     }
 
                     override fun onServiceLost() {
                         synchronized(lock) {
-                            if (byServiceName.remove(key) != null) {
+                            val removed = lastEntryKey?.let { registry.removeKey(it) }
+                                ?: registry.removeByServiceName(key)
+                            if (removed) {
                                 publishLocked()
                             }
                         }
@@ -240,19 +285,30 @@ class HostDiscovery(context: Context) {
         }
     }
 
-    private fun handleResolved(info: NsdServiceInfo) {
-        val addr = pickAddress(info) ?: return
+    private fun handleResolved(
+        info: NsdServiceInfo,
+        previousKey: DiscoveredHostRegistry.EntryKey? = null,
+    ): DiscoveredHostRegistry.EntryKey? {
+        val addr = pickAddress(info) ?: return null
         val txt = LinkedHashMap<String, String?>()
         info.attributes?.forEach { (k, v) ->
             txt[k] = v?.let { String(it, StandardCharsets.UTF_8) }
         }
-        val host = DiscoveredHost.fromTxt(info.serviceName.orEmpty(), addr, info.port, txt) ?: return
+        val serviceName = info.serviceName.orEmpty()
+        val host = DiscoveredHost.fromTxt(serviceName, addr, info.port, txt) ?: return null
+        val newKey: DiscoveredHostRegistry.EntryKey
         synchronized(lock) {
-            if (!started) return
-            byServiceName[info.serviceName.orEmpty()] = host
+            if (!started) return null
+            if (previousKey != null &&
+                (previousKey.address != RawComputer.normalizeAddress(host.address) || previousKey.controlPort != host.controlPort)
+            ) {
+                registry.removeKey(previousKey)
+            }
+            newKey = registry.put(serviceName, host)
             publishLocked()
         }
         LimeLog.info("depth3d: host mDNS resolved ${host.name} at ${host.address}:${host.controlPort} (gs=${host.gsPort}, pair=${host.pairMode})")
+        return newKey
     }
 
     private fun pickAddress(info: NsdServiceInfo): String? {
@@ -300,6 +356,6 @@ class HostDiscovery(context: Context) {
     }
 
     private fun publishLocked() {
-        _hosts.value = deduplicateEndpoints(byServiceName.values)
+        _hosts.value = registry.snapshot()
     }
 }

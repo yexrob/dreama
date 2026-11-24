@@ -32,6 +32,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -58,6 +59,7 @@ import com.limelight.R
 import com.limelight.local.airplay.AirPlayNotice
 import com.limelight.local.airplay.AirPlayState
 import com.limelight.local.airplay.AirPlayTakeover
+import com.limelight.local.stream.CertConfirmKind
 import com.limelight.local.airplay.takesPage
 import com.limelight.local.dlna.CastReceiver
 import com.limelight.local.dlna.ReceiverStatus
@@ -531,13 +533,20 @@ private fun StreamFlowTakeover(flow: StreamFlowState, streaming: StreamingContro
                     Icon(WallIcons.Shield, null, Modifier.size(36.dp), tint = Wall.Accent)
                 }
                 Text(
-                    stringResource(R.string.pair_cert_title, flow.computer.name),
+                    stringResource(
+                        if (flow.kind == CertConfirmKind.STREAM_SERVER_CERT) R.string.pair_gs_cert_title
+                        else R.string.pair_cert_title,
+                        flow.computer.name,
+                    ),
                     style = WallType.Title,
                     textAlign = TextAlign.Center,
                     modifier = Modifier.padding(top = 20.dp),
                 )
                 Text(
-                    stringResource(R.string.pair_cert_body),
+                    stringResource(
+                        if (flow.kind == CertConfirmKind.STREAM_SERVER_CERT) R.string.pair_gs_cert_body
+                        else R.string.pair_cert_body,
+                    ),
                     style = WallType.Body,
                     color = Wall.Text2,
                     textAlign = TextAlign.Center,
@@ -609,6 +618,13 @@ private fun StreamFlowTakeover(flow: StreamFlowState, streaming: StreamingContro
             }
         }
         is StreamFlowState.Failed -> {
+            var remainingSec by remember(flow) { mutableStateOf(flow.retryCooldownSec) }
+            LaunchedEffect(flow) {
+                while (remainingSec > 0) {
+                    kotlinx.coroutines.delay(1_000L)
+                    remainingSec--
+                }
+            }
             CenteredTakeover(
                 icon = { Icon(WallIcons.Alert, null, Modifier.size(40.dp), tint = Wall.Danger) },
                 title = flow.error.title,
@@ -617,10 +633,15 @@ private fun StreamFlowTakeover(flow: StreamFlowState, streaming: StreamingContro
                 Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                     flow.retryAction?.let { retry ->
                         WallButton(
-                            stringResource(R.string.action_retry),
-                            { nav.retryStream(retry) },
+                            text = if (remainingSec > 0) {
+                                stringResource(R.string.action_retry_countdown, remainingSec)
+                            } else {
+                                stringResource(R.string.action_retry)
+                            },
+                            onClick = { nav.retryStream(retry) },
                             icon = WallIcons.Refresh,
                             kind = ButtonKind.Primary,
+                            enabled = remainingSec == 0,
                         )
                     }
                     flow.fallbackPinComputer?.let { pc ->
@@ -757,6 +778,9 @@ private fun PcActionSheet(
                         ListRow(stringResource(R.string.pc_action_pair), lead = WallIcons.Computer, onClick = onPair)
                     }
                     ComputerStatus.OFFLINE, ComputerStatus.DISCOVERING -> {
+                        if (computer.isPairedOffline || (computer.isSaved && computer.raw?.pairState == com.limelight.nvstream.http.PairingManager.PairState.PAIRED)) {
+                            ListRow(stringResource(R.string.pc_action_retry_connect), lead = WallIcons.Refresh, onClick = onConnect)
+                        }
                         if (computer.canWake) {
                             ListRow(stringResource(R.string.pc_action_wake), lead = WallIcons.Power, onClick = onWake)
                         }
