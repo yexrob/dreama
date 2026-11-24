@@ -1906,7 +1906,7 @@ class StreamingController(
                     is MediaCredsResult.Available -> {
                         mediaRetry.markCompleted(key)
                         val base = HttpHostProtocolClient.formatWebDavUrl(host.address, res.creds.port)
-                        WebDav.save(app, WebDav.Server(base, res.creds.user, res.creds.pass))
+                        WebDav.save(app, WebDav.Server(base, res.creds.user, res.creds.pass, host.name))
                         LimeLog.info("depth3d: auto-configured WebDAV media source from host ${host.name}")
                         onAutoWebDavConfigured()
                     }
