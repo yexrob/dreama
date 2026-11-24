@@ -491,6 +491,14 @@ typedef struct {
     XrSwapchainImageOpenGLESKHR* overlayImages;
     int overlayHasContent;
     int overlayVisible;
+    // depth3d: the transport strip over the bottom of the picture, and
+    // whether this session plays a local file (no host keyboard or pad)
+    XrSwapchain transportSwapchain;
+    uint32_t transportImageCount;
+    XrSwapchainImageOpenGLESKHR* transportImages;
+    int transportHasContent;
+    int transportVisible;
+    int localMedia;
 
     // 0 off, 1 normal, 2 quality, compositor sharpening on the screen layers
     int sharpenMode;

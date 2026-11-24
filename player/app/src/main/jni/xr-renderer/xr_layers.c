@@ -84,6 +84,7 @@ typedef struct {
     XrCompositionLayerQuad video[2];
     XrCompositionLayerCylinderKHR cylinder[2];
     XrCompositionLayerQuad overlay;
+    XrCompositionLayerQuad transport;
     XrCompositionLayerQuad handle;
     XrCompositionLayerQuad envButton;
     XrCompositionLayerQuad cogButton;
@@ -526,6 +527,26 @@ static void addOverlayLayer(XrCtx* ctx, const FrameView* view, FrameLayers* laye
     }
 }
 
+// depth3d: the transport strip along the bottom of the picture, in front of
+// it like the stats. Java decides when it shows and hit tests it off the
+// pointer's place on the picture, so its geometry here has to match
+// TRANSPORT_* in LocalPlayerXR: full width less a margin, flush to the bottom.
+static void addTransportLayer(XrCtx* ctx, const FrameView* view, FrameLayers* layers) {
+    if (!ctx->transportHasContent || !ctx->transportVisible
+            || ctx->transportSwapchain == XR_NULL_HANDLE) {
+        return;
+    }
+    float margin = view->screenWidth * 0.02f;
+    float w = view->screenWidth - 2.0f * margin;
+    float h = w * (float)TRANSPORT_HEIGHT / (float)TRANSPORT_WIDTH;
+    Vec3 local = { 0.0f, -view->screenHeight * 0.5f + h * 0.5f + margin, 0.012f };
+    quadLayer(&layers->transport, layers->settingsChain,
+              XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT, ctx->transportSwapchain,
+              TRANSPORT_WIDTH, TRANSPORT_HEIGHT, view->space,
+              poseOffset(view->screenPose, local), w, h);
+    pushLayer(ctx, layers, &layers->transport);
+}
+
 // The move bar or the resize corner, whichever the ray is over
 static void addHandleLayer(XrCtx* ctx, const FrameView* view, FrameLayers* layers) {
     // Move bar and resize corner, shown only while the ray is over them.
@@ -683,7 +704,7 @@ static void addBarButtonLayers(XrCtx* ctx, const FrameView* view, FrameLayers* l
     // The keyboard button, one place further out. Unlike the cog it goes
     // away while its panel is up, since the panel covers the bar anyway and
     // the hide key is what puts it away.
-    if (ctx->kbButtonReady && view->barArea) {
+    if (ctx->kbButtonReady && view->barArea && !ctx->localMedia) {
         addBarButton(ctx, view, layers, &layers->kbButton, BTN_CELL_KB,
                      BAR_SLOT_KB, ctx->kbButtonHot, NULL);
     }
@@ -699,7 +720,7 @@ static void addBarButtonLayers(XrCtx* ctx, const FrameView* view, FrameLayers* l
 
     // Gamepad mode's switch, past the exit button, lit while the controllers
     // are the pad
-    if (ctx->padButtonReady && view->barArea) {
+    if (ctx->padButtonReady && view->barArea && !ctx->localMedia) {
         addBarButton(ctx, view, layers, &layers->padButton,
                      BTN_CELL_PAD + (ctx->padMode ? 1 : 0),
                      BAR_SLOT_PAD, ctx->padButtonHot, NULL);
@@ -1561,6 +1582,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
     if (!splashUp && ctx->everRendered && ctx->shouldRender) {
         addVideoLayers(ctx, &view, &layers);
         addOverlayLayer(ctx, &view, &layers);
+        addTransportLayer(ctx, &view, &layers);
         addHandleLayer(ctx, &view, &layers);
         addBarButtonLayers(ctx, &view, &layers);
         addExitPromptLayer(ctx, &view, &layers);

@@ -1009,3 +1009,44 @@ Java_com_limelight_binding_video_XrRenderer_nativeUploadOverlay(JNIEnv* env, job
         ctx->overlayHasContent = 1;
     }
 }
+
+// depth3d: the transport strip, drawn on the Java side like the stats. Frame
+// loop thread, so the GL context is current.
+JNIEXPORT void JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeUploadTransport(JNIEnv* env, jobject thiz,
+                                                                  jlong handle, jobject buffer) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx == NULL || ctx->transportSwapchain == XR_NULL_HANDLE || buffer == NULL) {
+        return;
+    }
+    void* pixels = (*env)->GetDirectBufferAddress(env, buffer);
+    if (!artBufferFits(env, buffer, pixels, TRANSPORT_WIDTH, TRANSPORT_HEIGHT)) {
+        return;
+    }
+    if (uploadArt(ctx, ctx->transportSwapchain, ctx->transportImages, pixels,
+                  TRANSPORT_WIDTH, TRANSPORT_HEIGHT)) {
+        ctx->transportHasContent = 1;
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeSetTransport(JNIEnv* env, jobject thiz,
+                                                               jlong handle, jboolean visible) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx != NULL) {
+        ctx->transportVisible = visible ? 1 : 0;
+    }
+}
+
+// A local file has no host to type to or play a pad on, so those two buttons
+// stay off the bar, which leaves room in the layer budget for the strip
+JNIEXPORT void JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeSetLocalMedia(JNIEnv* env, jobject thiz,
+                                                                jlong handle, jboolean on) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx != NULL) {
+        ctx->localMedia = on ? 1 : 0;
+        LOGI("local media %s: keyboard and gamepad buttons %s", on ? "on" : "off",
+             on ? "hidden" : "shown");
+    }
+}

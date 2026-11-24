@@ -55,7 +55,9 @@ BarFrame barFrame(XrCtx* ctx) {
 static int barSlotShown(XrCtx* ctx, int slot) {
     switch (slot) {
         case BAR_SLOT_PAD:
-            return ctx->padButtonReady;
+            return ctx->padButtonReady && !ctx->localMedia;
+        case BAR_SLOT_KB:
+            return !ctx->localMedia;
         case BAR_SLOT_AIM:
             return ctx->aimButtonReady && headAimCanAct(ctx);
         case BAR_SLOT_RAY:

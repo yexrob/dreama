@@ -68,6 +68,11 @@
 #define OVERLAY_WIDTH 768
 #define OVERLAY_HEIGHT 512
 
+// depth3d's transport strip for local playback: play button, times, the
+// track. Drawn in Java, laid along the bottom of the picture.
+#define TRANSPORT_WIDTH 1536
+#define TRANSPORT_HEIGHT 112
+
 // The sheet the launch splash shows: the logo over the app's name, drawn once
 // per number of the logo's wedges open, none to all six, one under the other,
 // so ticking the wedges is a different rectangle of the same image rather than

@@ -564,6 +564,35 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     private native void nativeDepthGaveUp(long ctx);
     private native void nativeSetEnvironment(long ctx, int choice);
     private native void nativeUploadOverlay(long ctx, ByteBuffer pixels, int width, int height);
+    // depth3d: the local player's transport strip, its visibility, and the
+    // switch that takes the host-only buttons off the bar
+    private native void nativeUploadTransport(long ctx, ByteBuffer pixels);
+    private native void nativeSetTransport(long ctx, boolean visible);
+    private native void nativeSetLocalMedia(long ctx, boolean on);
+
+    private final AtomicReference<ByteBuffer> pendingTransport = new AtomicReference<>();
+    private volatile boolean localMedia;
+
+    /** Before start(): this session plays a local file rather than a stream. */
+    public void setLocalMedia(boolean on) {
+        localMedia = on;
+    }
+
+    /**
+     * A new transport strip, TRANSPORT_WIDTH x TRANSPORT_HEIGHT RGBA with rows
+     * bottom up, uploaded on the next frame. Returns false while the last one
+     * has not been picked up, so the caller must not reuse that buffer yet.
+     */
+    public boolean postTransport(ByteBuffer pixels) {
+        return pendingTransport.compareAndSet(null, pixels);
+    }
+
+    public void setTransportVisible(boolean visible) {
+        long c = nativeCtx;
+        if (c != 0) {
+            nativeSetTransport(c, visible);
+        }
+    }
     private native float nativeGetWarpGpuMs(long ctx);
     // The rate the display is on, and the one the session last asked for, 0
     // when it has not asked
@@ -628,6 +657,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                     return;
                 }
 
+                nativeSetLocalMedia(nativeCtx, localMedia);
                 prefsContext = activity.getApplicationContext();
                 gazeAllowed = EyeTrackingPermission.gazeAllowed(prefsContext);
                 // Kept for a report, which can be made long after this session,
@@ -1205,6 +1235,10 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
             ByteBuffer overlay = pendingOverlay.getAndSet(null);
             if (overlay != null) {
                 nativeUploadOverlay(nativeCtx, overlay, OVERLAY_WIDTH, OVERLAY_HEIGHT);
+            }
+            ByteBuffer transport = pendingTransport.getAndSet(null);
+            if (transport != null) {
+                nativeUploadTransport(nativeCtx, transport);
             }
 
             ByteBuffer grid = pendingPickerArt.getAndSet(null);

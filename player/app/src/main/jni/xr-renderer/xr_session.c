@@ -609,6 +609,9 @@ static int initSwapchain(XrCtx* ctx) {
     // The stream is worth more than the stats, so carry on without it
     createArtSwapchain(ctx, OVERLAY_WIDTH, OVERLAY_HEIGHT, "create overlay swapchain",
                        &ctx->overlaySwapchain, &ctx->overlayImages, &ctx->overlayImageCount);
+    createArtSwapchain(ctx, TRANSPORT_WIDTH, TRANSPORT_HEIGHT, "create transport swapchain",
+                       &ctx->transportSwapchain, &ctx->transportImages,
+                       &ctx->transportImageCount);
     // Or the splash, which is left out without it, ground and all
     createArtSwapchain(ctx, SPLASH_TEX_W, SPLASH_TEX_H, "create splash swapchain",
                        &ctx->splashSwapchain, &ctx->splashImages, &ctx->splashImageCount);
@@ -802,6 +805,7 @@ static void destroyCtx(JNIEnv* env, XrCtx* ctx) {
 
     destroyArtSwapchain(ctx, &ctx->swapchain, &ctx->swapchainImages);
     destroyArtSwapchain(ctx, &ctx->overlaySwapchain, &ctx->overlayImages);
+    destroyArtSwapchain(ctx, &ctx->transportSwapchain, &ctx->transportImages);
     destroyArtSwapchain(ctx, &ctx->pointerSwapchain, &ctx->pointerImages);
     destroyArtSwapchain(ctx, &ctx->barSwapchain, &ctx->barImages);
     destroyArtSwapchain(ctx, &ctx->cornerSwapchain, &ctx->cornerImages);

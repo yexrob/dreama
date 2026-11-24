@@ -46,6 +46,16 @@ public class LocalPlayerXR extends Activity
     private MediaPlayer player;
     private boolean finishing;
 
+    // The transport strip and where the pointer is on the picture. The
+    // pointer fields are written on the frame loop thread.
+    private TransportBar bar;
+    private volatile float pointerU = -1f, pointerV = -1f;
+    private volatile long pointerMovedMs;
+    private float lastU, lastV;
+    private static final long BAR_LINGER_MS = 3000;
+    private static final long BAR_TICK_MS = 200;
+    private final Runnable barTick = this::tickBar;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -80,6 +90,7 @@ public class LocalPlayerXR extends Activity
         LimeLog.info(String.format(Locale.US, "depth3d: %s %dx%d @ %.2f", uri, size[0], size[1], fps));
 
         XrRenderer r = new XrRenderer();
+        r.setLocalMedia(true);
         r.setInputListener(this);
         r.setSessionListener(this);
         if (!r.start(this, size[0], size[1], prefs)) {
@@ -88,6 +99,7 @@ public class LocalPlayerXR extends Activity
             return;
         }
         renderer = r;
+        bar = new TransportBar(size[0], size[1]);
         main.post(() -> startPlayback(uri));
     }
 
@@ -123,6 +135,7 @@ public class LocalPlayerXR extends Activity
             return;
         }
         player = mp;
+        main.post(barTick);
     }
 
     private int[] videoSize(Uri uri) {
@@ -190,22 +203,56 @@ public class LocalPlayerXR extends Activity
         if (button != 0 || down) {
             return;
         }
+        final float u = pointerU, v = pointerV;
         main.post(() -> {
             MediaPlayer mp = player;
-            XrRenderer r = renderer;
-            if (mp == null || r == null) {
+            TransportBar b = bar;
+            if (mp == null || b == null) {
                 return;
             }
+            pointerMovedMs = System.currentTimeMillis();
             try {
-                if (mp.isPlaying()) {
+                float x = b.texX(u, v);
+                float f = Float.isNaN(x) || TransportBar.onButton(x)
+                        ? Float.NaN : TransportBar.trackFraction(x);
+                if (!Float.isNaN(f)) {
+                    mp.seekTo((int) (f * mp.getDuration()));
+                } else if (mp.isPlaying()) {
                     mp.pause();
-                    r.showNotice("已暂停", clock(mp.getCurrentPosition()) + " / " + clock(mp.getDuration()));
                 } else {
                     mp.start();
                 }
             } catch (IllegalStateException ignored) {
             }
+            tickBar();
         });
+    }
+
+    // Shown while paused, or for a while after the pointer moves; redrawn a
+    // few times a second while it shows
+    private void tickBar() {
+        main.removeCallbacks(barTick);
+        MediaPlayer mp = player;
+        XrRenderer r = renderer;
+        TransportBar b = bar;
+        if (mp == null || r == null || b == null) {
+            return;
+        }
+        try {
+            boolean playing = mp.isPlaying();
+            long since = System.currentTimeMillis() - pointerMovedMs;
+            boolean show = !playing || since < BAR_LINGER_MS;
+            r.setTransportVisible(show);
+            if (show) {
+                float x = since < BAR_LINGER_MS ? b.texX(pointerU, pointerV) : Float.NaN;
+                boolean onBtn = !Float.isNaN(x) && TransportBar.onButton(x);
+                float hover = Float.isNaN(x) || onBtn ? Float.NaN : TransportBar.trackFraction(x);
+                r.postTransport(b.draw(playing, mp.getCurrentPosition(), mp.getDuration(),
+                        hover, onBtn, getIntent().getStringExtra(EXTRA_TITLE)));
+            }
+        } catch (IllegalStateException ignored) {
+        }
+        main.postDelayed(barTick, BAR_TICK_MS);
     }
 
     @Override
@@ -220,7 +267,8 @@ public class LocalPlayerXR extends Activity
                 int to = Math.max(0, Math.min(mp.getDuration() - 1000,
                         mp.getCurrentPosition() - clicks * SEEK_STEP_MS));
                 mp.seekTo(to);
-                r.showNotice(clock(to) + " / " + clock(mp.getDuration()), null);
+                pointerMovedMs = System.currentTimeMillis();
+                tickBar();
             } catch (IllegalStateException ignored) {
             }
         });
@@ -231,7 +279,19 @@ public class LocalPlayerXR extends Activity
         main.post(this::finish);
     }
 
-    @Override public void onVrPointerMove(float u, float v) { }
+    @Override
+    public void onVrPointerMove(float u, float v) {
+        // Every frame while the ray is on the picture; only a real move
+        // brings the strip up, not the hand's own tremor
+        if (Math.abs(u - lastU) > 0.004f || Math.abs(v - lastV) > 0.004f) {
+            lastU = u;
+            lastV = v;
+            pointerMovedMs = System.currentTimeMillis();
+        }
+        pointerU = u;
+        pointerV = v;
+    }
+
     @Override public void onVrMouseMove(int dx, int dy) { }
     @Override public void onVrGamepadPlugged(boolean plugged) { }
     @Override public void onVrGamepadState(int buttons, int lt, int rt, int lx, int ly, int rx, int ry) { }
@@ -284,6 +344,7 @@ public class LocalPlayerXR extends Activity
             return;
         }
         finishing = true;
+        main.removeCallbacks(barTick);
         if (player != null) {
             player.release();
             player = null;

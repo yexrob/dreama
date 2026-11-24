@@ -101,3 +101,16 @@ uv run python -m depth3d_proto.convert 输入.mp4 --debug   # 右半边换成深
 - `--depth-rate`：每秒深度图张数，默认 12，模拟头显的算力预算
 
 M 系列 Mac 上用 MPS，256 输入大约 32–38 ms 一张。warp 目前是 numpy 实现，大约 50 ms 一帧，只用于离线出片，到头显上会改成 GPU shader。
+
+### Mac 作为串流主机
+
+Mac 端跑 Sunshine（`brew tap lizardbyte/homebrew && brew install lizardbyte/homebrew/sunshine`，
+`brew services start lizardbyte/homebrew/sunshine`，需在系统设置里给它「屏幕录制」权限）。
+编码走 VideoToolbox（H.264/HEVC）。管理页 https://localhost:47990，用户 depth3d，
+密码在 `~/.config/depth3d/sunshine-pass`。头显里点「Mac 串流」，选这台 Mac，把显示的 PIN
+填进管理页的 PIN 栏完成配对。macOS 上没有虚拟手柄；要声音需另装虚拟声卡（如 BlackHole）。
+
+### 本地播放控制条
+
+指向画面时底部出现控制条（暂停时常驻）：播放/暂停键、已播时间、进度条（悬停显示目标时间，
+扳机跳转）、总时长。画面其他位置按扳机为暂停/继续，摇杆每格 ±10 秒。
