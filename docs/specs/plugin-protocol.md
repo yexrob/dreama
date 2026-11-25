@@ -39,7 +39,7 @@ locales/zh-CN.json  可选，manifest 和表单里 `$t:key` 文案的翻译
     "lan": true
   },
   "config": [
-    { "key": "server", "type": "url",      "label": "服务器地址", "required": true, "discover": "_jellyfin._tcp" },
+    { "key": "server", "type": "url",      "label": "服务器地址", "required": true, "discover": "udp:jellyfin" },
     { "key": "user",   "type": "text",     "label": "用户名" },
     { "key": "pass",   "type": "password", "label": "密码" },
     { "key": "quality","type": "select",   "label": "默认清晰度", "options": [{"value":"auto","label":"自动"},{"value":"1080","label":"1080P"}], "default": "auto" }
@@ -58,7 +58,7 @@ locales/zh-CN.json  可选，manifest 和表单里 `$t:key` 文案的翻译
 | `permissions.hosts` | 插件可以访问的域名白名单，支持前缀通配 `*.`；只允许 https，除非域名在 `lan` 范围 |
 | `permissions.userHosts` | `true` 表示还可以访问用户在配置表单里填的 `url` 类型字段的主机（自建服务器用） |
 | `permissions.lan` | 是否允许访问局域网地址和 http；默认 `false` |
-| `config` | 配置表单，App 自动渲染。类型：`text`、`password`、`url`、`number`、`select`、`toggle`。`discover` 给出 mDNS 服务类型时，App 先在局域网找候选让用户点选。头显里填表优先走「手机扫码填写」 |
+| `config` | 配置表单，App 自动渲染。类型：`text`、`password`、`url`、`number`、`select`、`toggle`。`discover` 支持两种写法：mDNS 服务类型（如 `_service._tcp` / `_service._udp`），或宿主内置的局域网 UDP 探测（`udp:jellyfin`、`udp:emby`，由宿主代发 7359 端口广播探测并校验回复地址为私网地址，不向插件开放任意 UDP）。App 先在局域网找候选让用户点选。头显里填表优先走「手机扫码填写」 |
 | `auth` | `none` / `form`（用 config 里的账号密码登录）/ `qr`（插件给一个二维码，用户用手机 App 扫，见 §4.3）/ `device`（设备码：显示网址和短码） |
 
 ## 3. 数据模型

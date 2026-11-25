@@ -66,6 +66,8 @@ import com.limelight.local.stream.AndroidStringLookup
 import com.limelight.local.stream.DiscoveredLanService
 import com.limelight.local.stream.NsdServiceBrowser
 import com.limelight.local.stream.PhoneInputServer
+import com.limelight.local.stream.UdpDiscoveryProtocol
+import com.limelight.local.stream.UdpLanServerDiscovery
 import com.limelight.local.stream.UserFacingError
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -115,7 +117,7 @@ fun SourcesScreen(model: WallModel, nav: WallNav, initialTab: SourcesTab = Sourc
             try {
                 val prepared = withContext(Dispatchers.IO) {
                     PluginInstallGuard.prepareRepoInstall(
-                        packageManager = model.pluginHost.packageManager,
+                        packageManager = model.pluginHost.packageManager(),
                         repoClient = model.pluginHost.repoClient,
                         repoUrl = update.repoUrl,
                         entry = update.entry,
@@ -402,15 +404,28 @@ fun AddSourceScreen(model: WallModel, nav: WallNav) {
         pluginInstances.groupingBy { it.pluginId }.eachCount()
     }
 
-    // Collect every unique mDNS service type declared by enabled plugins' config[].discover
-    val serviceTypeToPlugin = remember(enabledManifests) {
+    // Collect every unique mDNS service type and built-in UDP probe declared by enabled plugins
+    val mdnsTypeToPlugin = remember(enabledManifests) {
         val map = LinkedHashMap<String, Pair<InstalledPluginEntity, PluginManifest>>()
         for ((pkg, manifest) in enabledManifests) {
             for (field in manifest.config) {
                 val rawType = field.discover?.trim()?.takeIf { it.isNotEmpty() } ?: continue
+                if (UdpDiscoveryProtocol.fromWire(rawType) != null) continue
                 val norm = NsdServiceBrowser.normalizeServiceType(rawType)
                 if (norm !in map) {
                     map[norm] = pkg to manifest
+                }
+            }
+        }
+        map
+    }
+    val udpProtocolToPlugin = remember(enabledManifests) {
+        val map = LinkedHashMap<UdpDiscoveryProtocol, Pair<InstalledPluginEntity, PluginManifest>>()
+        for ((pkg, manifest) in enabledManifests) {
+            for (field in manifest.config) {
+                val proto = UdpDiscoveryProtocol.fromWire(field.discover) ?: continue
+                if (proto !in map) {
+                    map[proto] = pkg to manifest
                 }
             }
         }
@@ -421,9 +436,10 @@ fun AddSourceScreen(model: WallModel, nav: WallNav) {
     val configuredUrls = remember { mutableStateMapOf<String, Boolean>() }
     LaunchedEffect(pluginInstances) {
         val urls = withContext(Dispatchers.IO) {
+            val pm = model.pluginHost.packageManager()
             val out = HashSet<String>()
             for (inst in pluginInstances) {
-                val cfg = runCatching { model.pluginHost.packageManager.getInstanceConfig(inst.instanceId) }.getOrNull()
+                val cfg = runCatching { pm.getInstanceConfig(inst.instanceId) }.getOrNull()
                     ?: continue
                 for (v in cfg.values) {
                     val s = (v as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim()?.trimEnd('/')
@@ -438,9 +454,11 @@ fun AddSourceScreen(model: WallModel, nav: WallNav) {
         urls.forEach { configuredUrls[it] = true }
     }
 
-    val discoveredServices = remember { mutableStateMapOf<String, List<DiscoveredLanService>>() }
-    val browsers = remember(serviceTypeToPlugin.keys.toList()) {
-        serviceTypeToPlugin.keys.map { svcType -> NsdServiceBrowser(context, svcType) }
+    val discoveredMdnsServices = remember { mutableStateMapOf<String, List<DiscoveredLanService>>() }
+    val discoveredUdpServices = remember { mutableStateMapOf<UdpDiscoveryProtocol, List<DiscoveredLanService>>() }
+
+    val browsers = remember(mdnsTypeToPlugin.keys.toList()) {
+        mdnsTypeToPlugin.keys.map { svcType -> NsdServiceBrowser(context, svcType) }
     }
     DisposableEffect(browsers) {
         browsers.forEach { it.start() }
@@ -449,13 +467,47 @@ fun AddSourceScreen(model: WallModel, nav: WallNav) {
     for (browser in browsers) {
         val list by browser.services.collectAsState()
         LaunchedEffect(browser.serviceType, list) {
-            discoveredServices[browser.serviceType] = list
+            discoveredMdnsServices[browser.serviceType] = list
         }
     }
 
-    val allLanItems = discoveredServices.entries.flatMap { (svcType, list) ->
-        val pair = serviceTypeToPlugin[svcType] ?: return@flatMap emptyList()
-        list.map { svc -> Triple(svc, pair.first, pair.second) }
+    // Host-side UDP 7359 broadcast probe for Jellyfin/Emby (#10): cancels & closes socket on exit
+    val udpProtocolsKey = remember(udpProtocolToPlugin) { udpProtocolToPlugin.keys.toList() }
+    LaunchedEffect(udpProtocolsKey) {
+        discoveredUdpServices.clear()
+        for (proto in udpProtocolsKey) {
+            launch {
+                val found = UdpLanServerDiscovery.discover(
+                    protocol = proto,
+                    onFound = { partial ->
+                        launch(Dispatchers.Main.immediate) {
+                            discoveredUdpServices[proto] = partial
+                        }
+                    },
+                )
+                discoveredUdpServices[proto] = found
+            }
+        }
+    }
+
+    val allLanItems = buildList {
+        val seenKeys = HashSet<String>()
+        for ((proto, list) in discoveredUdpServices) {
+            val pair = udpProtocolToPlugin[proto] ?: continue
+            for (svc in list) {
+                if (seenKeys.add(svc.endpointKey)) {
+                    add(Triple(svc, pair.first, pair.second))
+                }
+            }
+        }
+        for ((svcType, list) in discoveredMdnsServices) {
+            val pair = mdnsTypeToPlugin[svcType] ?: continue
+            for (svc in list) {
+                if (seenKeys.add(svc.endpointKey)) {
+                    add(Triple(svc, pair.first, pair.second))
+                }
+            }
+        }
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -958,7 +1010,7 @@ fun RepoBrowseScreen(model: WallModel, nav: WallNav, page: Page.RepoBrowse) {
             try {
                 val prepared = withContext(Dispatchers.IO) {
                     PluginInstallGuard.prepareRepoInstall(
-                        packageManager = model.pluginHost.packageManager,
+                        packageManager = model.pluginHost.packageManager(),
                         repoClient = model.pluginHost.repoClient,
                         repoUrl = page.repoUrl,
                         entry = entry,
@@ -1177,7 +1229,7 @@ fun PluginInstallConfirmSheet(
                             try {
                                 withContext(Dispatchers.IO) {
                                     PluginInstallGuard.confirmInstall(
-                                        packageManager = model.pluginHost.packageManager,
+                                        packageManager = model.pluginHost.packageManager(),
                                         pending = pending,
                                         userConfirmedReplacement = requireExplicitReplace,
                                     )
