@@ -548,6 +548,8 @@ void freeArtSheets(XrCtx* ctx) {
     }
     free(ctx->buttonAtlas);
     ctx->buttonAtlas = NULL;
+    free(ctx->readoutFlipBuf);
+    ctx->readoutFlipBuf = NULL;
 }
 
 // The thumbnail grid and the button that opens it, both drawn as Bitmaps in
@@ -829,12 +831,40 @@ Java_com_limelight_binding_video_XrRenderer_nativeUploadSplash(JNIEnv* env, jobj
 
 // The toast's words for the notice up now, drawn in Java the frame it went up.
 // The layer only shows while the notice it was drawn for is the one up.
+// Screen-adjust readout reuses the same swapchain but uploads only its spec
+// 960x112 sub-region using a persistent flip buffer (zero malloc per update).
 JNIEXPORT void JNICALL
 Java_com_limelight_binding_video_XrRenderer_nativeUploadToast(JNIEnv* env, jobject thiz,
                                                               jlong handle, jobject sheet,
                                                               jint kind, jint arg) {
     XrCtx* ctx = (XrCtx*)(intptr_t)handle;
-    if (ctx == NULL) {
+    if (ctx == NULL || sheet == NULL) {
+        return;
+    }
+    int prevKind = ctx->toastDrawnKind;
+    if (kind == TOAST_SCREEN_READOUT) {
+        const unsigned char* px = (*env)->GetDirectBufferAddress(env, sheet);
+        if (!artBufferFits(env, sheet, px, READOUT_TEX_W, READOUT_TEX_H)) {
+            return;
+        }
+        size_t stride = (size_t)READOUT_TEX_W * 4;
+        if (ctx->readoutFlipBuf == NULL) {
+            ctx->readoutFlipBuf = malloc(stride * READOUT_TEX_H);
+            if (ctx->readoutFlipBuf == NULL) {
+                return;
+            }
+        }
+        for (int y = 0; y < READOUT_TEX_H; y++) {
+            memcpy(ctx->readoutFlipBuf + stride * y,
+                   px + stride * (READOUT_TEX_H - 1 - y), stride);
+        }
+        ctx->toastArtReady = uploadArt(ctx, ctx->toastSwapchain, ctx->toastImages,
+                                       ctx->readoutFlipBuf, READOUT_TEX_W, READOUT_TEX_H);
+        ctx->toastDrawnKind = kind;
+        ctx->toastDrawnArg = arg;
+        if (prevKind != TOAST_SCREEN_READOUT) {
+            LOGEV("depth3d: screen readout toast up");
+        }
         return;
     }
     uploadSheet(env, ctx, sheet, ctx->toastSwapchain, ctx->toastImages, TOAST_TEX_W,

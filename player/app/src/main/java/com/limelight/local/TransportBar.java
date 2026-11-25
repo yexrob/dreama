@@ -9,6 +9,8 @@ import android.graphics.PorterDuff;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 
+import com.limelight.binding.video.XrShared;
+
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Locale;
@@ -22,10 +24,10 @@ import java.util.Locale;
  * margin under it, and TEX_H / TEX_W as tall as it is wide.
  */
 final class TransportBar {
-    // TRANSPORT_WIDTH and TRANSPORT_HEIGHT in xr_shared.h
-    static final int TEX_W = 1536;
-    static final int TEX_H = 112;
-    private static final float MARGIN = 0.02f;
+    // Shared with xr_shared.h so C hit-testing, curved cylinder rendering, and Java drawing agree
+    static final int TEX_W = XrShared.TRANSPORT_WIDTH;
+    static final int TEX_H = XrShared.TRANSPORT_HEIGHT;
+    private static final float MARGIN = XrShared.TRANSPORT_MARGIN_FRAC;
 
     // Texture x of each part
     private static final float BTN_END = 120f;

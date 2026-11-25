@@ -542,4 +542,23 @@
     <string name="webdav_err_auth">用户名或密码不对，请检查后重试。</string>
     <string name="webdav_err_server">媒体服务响应异常，请确认服务正在运行。</string>
     <string name="webdav_err_parse">无法读取目录内容，请检查共享地址设置。</string>
+
+    <!-- VR screen manipulation, continuous curvature & local playback prompts (G1) -->
+    <string name="vr_toast_screen_hint">推摇杆：前后调远近 · 左右调大小</string>
+    <string name="vr_toast_exit_again">再按一次退出播放</string>
+    <string name="vr_screen_preset_small">小</string>
+    <string name="vr_screen_preset_medium">中</string>
+    <string name="vr_screen_preset_large">大</string>
+    <string name="vr_screen_preset_giant">巨幕</string>
+    <string name="vr_screen_unit_inch">寸</string>
+    <string name="vr_curve_disabled_in_room">影院房间里屏幕是平的</string>
+    <string name="vr_curve_unsupported_headset">这台头显不支持曲面</string>
+    <string name="vr_seek_forward">快进 %1$d 秒</string>
+    <string name="vr_seek_backward">快退 %1$d 秒</string>
+    <string name="settings_trigger_screen_adjust_title">按住扳机调整屏幕</string>
+    <string name="settings_trigger_screen_adjust_sub">看片时按住扳机推摇杆调远近和大小；关闭后改用握键</string>
+    <string name="settings_screen_size_current_sub">当前 %1$d°（约 %2$d 寸）· 进入沉浸模式时的初始视角宽度</string>
+    <string name="settings_screen_dist_current_sub">当前 %1$s · 仅调整纵深，保持视角大小不变</string>
+    <string name="settings_curved_flat_label">平面</string>
+    <string name="settings_curved_percent">%1$d%%</string>
 </resources>

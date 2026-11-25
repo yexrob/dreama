@@ -45,6 +45,7 @@ import com.limelight.R
 import com.limelight.local.dlna.CastReceiver
 import com.limelight.local.stream.AndroidPrefsStore
 import com.limelight.local.stream.BitratePreset
+import com.limelight.local.stream.CurvatureDisabledReason
 import com.limelight.local.stream.DepthQualityMode
 import com.limelight.local.stream.DepthStrength
 import com.limelight.local.stream.FileLogMode
@@ -416,7 +417,11 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
                     item("screen-size") {
                         SettingRow(
                             title = stringResource(R.string.settings_screen_size_title),
-                            sub = stringResource(R.string.settings_screen_size_sub),
+                            sub = stringResource(
+                                R.string.settings_screen_size_current_sub,
+                                Math.round(snapshot.screenFovDeg),
+                                snapshot.screenDiagonalInches,
+                            ),
                         ) {
                             SegmentedControl(
                                 options = listOf(
@@ -425,15 +430,18 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
                                     ScreenSizePreset.LARGE to stringResource(R.string.settings_size_large),
                                     ScreenSizePreset.GIANT to stringResource(R.string.settings_size_giant),
                                 ),
-                                selected = snapshot.screenSize,
-                                onSelect = { update { StreamSettingsMapper.setScreenSize(store, it) } },
+                                selected = ScreenSizePreset.fromFovDegOrNull(snapshot.screenFovDeg),
+                                onSelect = { update { StreamSettingsMapper.setScreenFovDeg(store, it.fovDeg) } },
                             )
                         }
                     }
                     item("screen-dist") {
                         SettingRow(
                             title = stringResource(R.string.settings_screen_dist_title),
-                            sub = stringResource(R.string.settings_screen_dist_sub),
+                            sub = stringResource(
+                                R.string.settings_screen_dist_current_sub,
+                                String.format(java.util.Locale.US, "%.1f m", snapshot.actualScreenDistanceDm / 10f),
+                            ),
                         ) {
                             SegmentedControl(
                                 options = listOf(
@@ -441,18 +449,65 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
                                     ScreenDistancePreset.MEDIUM to stringResource(R.string.settings_dist_medium),
                                     ScreenDistancePreset.FAR to stringResource(R.string.settings_dist_far),
                                 ),
-                                selected = snapshot.screenDistance,
-                                onSelect = { update { StreamSettingsMapper.setScreenDistance(store, it) } },
+                                selected = ScreenDistancePreset.fromDistanceDmOrNull(snapshot.actualScreenDistanceDm),
+                                onSelect = { update { StreamSettingsMapper.setScreenDistanceMeters(store, it.meters) } },
                             )
                         }
                     }
                     item("curved") {
+                        val disabledReason = snapshot.curvatureDisabledReason
+                        val curveEnabled = disabledReason == null
+                        val curveSub = when (disabledReason) {
+                            CurvatureDisabledReason.IN_ROOM -> stringResource(R.string.vr_curve_disabled_in_room)
+                            CurvatureDisabledReason.UNSUPPORTED_HEADSET -> stringResource(R.string.vr_curve_unsupported_headset)
+                            null -> stringResource(R.string.settings_curved_sub)
+                        }
+                        val curveLabel = if (snapshot.actualCurvature <= 0) {
+                            stringResource(R.string.settings_curved_flat_label)
+                        } else {
+                            stringResource(R.string.settings_curved_percent, snapshot.actualCurvature)
+                        }
                         SettingRow(
                             title = stringResource(R.string.settings_curved_title),
-                            sub = stringResource(R.string.settings_curved_sub),
+                            sub = curveSub,
                         ) {
-                            WallSwitch(snapshot.curvedScreen) {
-                                update { StreamSettingsMapper.setCurvedScreen(store, it) }
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            ) {
+                                RoundButton(
+                                    WallIcons.Minus,
+                                    onClick = {
+                                        update {
+                                            StreamSettingsMapper.setCurvaturePercent(
+                                                store,
+                                                snapshot.actualCurvature - com.limelight.binding.video.ScreenReadout.CURVATURE_STEP,
+                                            )
+                                        }
+                                    },
+                                    filled = true,
+                                    enabled = curveEnabled && snapshot.actualCurvature > 0,
+                                )
+                                Text(
+                                    curveLabel,
+                                    style = WallType.Label.copy(fontFeatureSettings = "tnum"),
+                                    color = if (curveEnabled) Wall.Text else Wall.Text3,
+                                    modifier = Modifier.width(104.dp),
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                                )
+                                RoundButton(
+                                    WallIcons.Plus,
+                                    onClick = {
+                                        update {
+                                            StreamSettingsMapper.setCurvaturePercent(
+                                                store,
+                                                snapshot.actualCurvature + com.limelight.binding.video.ScreenReadout.CURVATURE_STEP,
+                                            )
+                                        }
+                                    },
+                                    filled = true,
+                                    enabled = curveEnabled && snapshot.actualCurvature < 100,
+                                )
                             }
                         }
                     }
@@ -535,6 +590,16 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
                 }
 
                 SettingsCategory.INPUT -> {
+                    item("trigger-screen-adjust") {
+                        SettingRow(
+                            title = stringResource(R.string.settings_trigger_screen_adjust_title),
+                            sub = stringResource(R.string.settings_trigger_screen_adjust_sub),
+                        ) {
+                            WallSwitch(snapshot.triggerScreenAdjust) {
+                                update { StreamSettingsMapper.setTriggerScreenAdjust(store, it) }
+                            }
+                        }
+                    }
                     item("hand-tracking") {
                         SettingRow(
                             title = stringResource(R.string.settings_hand_tracking_title),

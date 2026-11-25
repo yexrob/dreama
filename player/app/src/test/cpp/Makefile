@@ -13,7 +13,8 @@ OUT := build
 TESTS := $(OUT)/test_math $(OUT)/test_depthmap $(OUT)/test_atlas $(OUT)/test_roommesh \
          $(OUT)/test_layout $(OUT)/test_audio $(OUT)/test_rate $(OUT)/test_gate \
          $(OUT)/test_pinch $(OUT)/test_notice $(OUT)/test_glow $(OUT)/test_grade \
-         $(OUT)/test_keys $(OUT)/test_controller $(OUT)/test_headaim $(OUT)/test_gamepad
+         $(OUT)/test_keys $(OUT)/test_controller $(OUT)/test_headaim $(OUT)/test_gamepad \
+         $(OUT)/test_screen_ctrl
 
 .PHONY: test clean
 
@@ -104,6 +105,13 @@ $(OUT)/test_headaim: test_headaim.c check.h $(SRC)/xr_headaim.c $(SRC)/xr_headai
 $(OUT)/test_gamepad: test_gamepad.c check.h $(SRC)/xr_gamepad.c $(SRC)/xr_gamepad.h $(SRC)/xr_shared.h
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ test_gamepad.c $(SRC)/xr_gamepad.c -lm
+
+# Local-playback screen control state machine (§6.4), continuous curvature,
+# coaxial curved strip geometry, and §6.5 layer budget checks
+$(OUT)/test_screen_ctrl: test_screen_ctrl.c check.h $(SRC)/xr_screen_ctrl.c $(SRC)/xr_screen_ctrl.h \
+                         $(SRC)/xr_math.c $(SRC)/xr_math.h $(SRC)/xr_shared.h
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ test_screen_ctrl.c $(SRC)/xr_screen_ctrl.c $(SRC)/xr_math.c -lm
 
 # The audio module ships at -O2 and this test prints what its kernels cost, so
 # it is built the way the app builds it

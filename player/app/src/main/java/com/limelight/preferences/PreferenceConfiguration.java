@@ -60,9 +60,13 @@ public class PreferenceConfiguration {
     private static final String ENABLE_GL_RENDER_PATH_PREF_STRING = "checkbox_enable_gl_render_path";
     private static final String ENABLE_VR_MODE_PREF_STRING = "checkbox_enable_vr_mode";
     public static final String VR_HEAD_LOCKED_PREF_STRING = "checkbox_vr_head_locked";
-    private static final String VR_DISTANCE_PREF_STRING = "seekbar_vr_distance";
-    private static final String VR_SCREEN_SIZE_PREF_STRING = "seekbar_vr_screen_size";
-    private static final String VR_CURVATURE_PREF_STRING = "seekbar_vr_curvature";
+    public static final String VR_DISTANCE_PREF_STRING = "seekbar_vr_distance";
+    public static final String VR_SCREEN_SIZE_PREF_STRING = "seekbar_vr_screen_size";
+    public static final String VR_CURVATURE_PREF_STRING = "seekbar_vr_curvature";
+    public static final String VR_TRIGGER_SCREEN_ADJUST_PREF_STRING = "checkbox_vr_trigger_screen_adjust";
+    // Cached runtime support for XR_KHR_composition_layer_cylinder so 2D settings
+    // can grey out curvature with the spec reason when the headset lacks support.
+    public static final String VR_CYLINDER_SUPPORTED_PREF_STRING = "vr_cylinder_supported";
     public static final String VR_DEPTH_SOURCE_PREF_STRING = "list_vr_depth_source";
     // The two values of that list that name a depth model rather than a test
     // pattern. MiDaS keeps the plain "model" it has always been stored as.
@@ -213,6 +217,7 @@ public class PreferenceConfiguration {
     private static final int DEFAULT_VR_DISTANCE = 30;
     private static final int DEFAULT_VR_SCREEN_SIZE = 30;
     private static final int DEFAULT_VR_CURVATURE = 0;
+    public static final boolean DEFAULT_VR_TRIGGER_SCREEN_ADJUST = true;
     // ZipDepth, the newer model and the only one a Gen 1 headset can run
     static final String DEFAULT_VR_DEPTH_SOURCE = VR_DEPTH_SOURCE_ZIPDEPTH;
     // Standard everywhere, which caps the room at a size every headset here can
@@ -341,6 +346,8 @@ public class PreferenceConfiguration {
     public int vrScreenSize;
     // 0 to 100
     public int vrCurvature;
+    // Whether holding trigger + stick adjusts screen distance/size in local playback (§3.8)
+    public boolean vrTriggerScreenAdjust;
     // 0 off, 1 flat, 2 ramp, 3 blob, 4 eye test, 5 shift test, 6 depth model
     public int vrDepthMode;
     // Which model a depth model session runs, zipdepth or model (MiDaS). The
@@ -667,6 +674,42 @@ public class PreferenceConfiguration {
 
     static boolean headAimOn(SharedPreferences prefs) {
         return prefs.getBoolean(VR_HEAD_AIM_PREF_STRING, DEFAULT_VR_HEAD_AIM);
+    }
+
+    public static boolean triggerScreenAdjustOn(SharedPreferences prefs) {
+        return prefs.getBoolean(VR_TRIGGER_SCREEN_ADJUST_PREF_STRING,
+                DEFAULT_VR_TRIGGER_SCREEN_ADJUST);
+    }
+
+    public static int clampCurvature(int percent) {
+        return Math.max(0, Math.min(100, percent));
+    }
+
+    public static void saveCylinderSupported(SharedPreferences prefs, boolean supported) {
+        prefs.edit().putBoolean(VR_CYLINDER_SUPPORTED_PREF_STRING, supported).apply();
+    }
+
+    public static boolean isCylinderSupported(SharedPreferences prefs) {
+        return prefs.getBoolean(VR_CYLINDER_SUPPORTED_PREF_STRING, true);
+    }
+
+    /**
+     * Persists global screen distance and flat-equivalent width (decimetres) when
+     * in-VR screen adjustment saves, keeping 2D Settings and VR playback in sync.
+     */
+    public static void saveGlobalScreenDimensions(SharedPreferences prefs,
+                                                  float fovDeg, float distM) {
+        int distDm = Math.max(com.limelight.binding.video.ScreenReadout.MIN_SCREEN_DIST_DM,
+                Math.min(com.limelight.binding.video.ScreenReadout.MAX_SCREEN_DIST_DM,
+                        Math.round(distM * 10.0f)));
+        float flatW = com.limelight.binding.video.ScreenReadout.flatWidthMeters(fovDeg, distM);
+        int sizeDm = Math.max(com.limelight.binding.video.ScreenReadout.MIN_SCREEN_SIZE_DM,
+                Math.min(com.limelight.binding.video.ScreenReadout.MAX_SCREEN_SIZE_DM,
+                        Math.round(flatW * 10.0f)));
+        prefs.edit()
+                .putInt(VR_DISTANCE_PREF_STRING, distDm)
+                .putInt(VR_SCREEN_SIZE_PREF_STRING, sizeDm)
+                .apply();
     }
 
     /** Head aim's pixels a degree as stored, held to its lane. */
@@ -1428,7 +1471,9 @@ public class PreferenceConfiguration {
         config.vrHeadLocked = prefs.getBoolean(VR_HEAD_LOCKED_PREF_STRING, DEFAULT_VR_HEAD_LOCKED);
         config.vrDistance = prefs.getInt(VR_DISTANCE_PREF_STRING, DEFAULT_VR_DISTANCE);
         config.vrScreenSize = prefs.getInt(VR_SCREEN_SIZE_PREF_STRING, DEFAULT_VR_SCREEN_SIZE);
-        config.vrCurvature = prefs.getInt(VR_CURVATURE_PREF_STRING, DEFAULT_VR_CURVATURE);
+        config.vrCurvature = clampCurvature(
+                prefs.getInt(VR_CURVATURE_PREF_STRING, DEFAULT_VR_CURVATURE));
+        config.vrTriggerScreenAdjust = triggerScreenAdjustOn(prefs);
         // A Gen 1 headset runs ZipDepth for a stored MiDaS it does not offer
         String depthSource = depthSourceForHeadset(
                 prefs.getString(VR_DEPTH_SOURCE_PREF_STRING, DEFAULT_VR_DEPTH_SOURCE),

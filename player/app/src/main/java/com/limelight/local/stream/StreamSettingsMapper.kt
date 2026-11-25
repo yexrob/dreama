@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import android.preference.PreferenceManager
 import com.limelight.binding.video.DepthPresets
 import com.limelight.binding.video.EnvironmentIds
+import com.limelight.binding.video.ScreenReadout
 import com.limelight.binding.video.XrShared
 import com.limelight.preferences.PreferenceConfiguration
 import kotlin.math.roundToInt
@@ -171,11 +172,11 @@ enum class DepthQualityMode {
     QUALITY,
 }
 
-enum class ScreenSizePreset(val decimeters: Int) {
-    SMALL(22),
-    MEDIUM(30),
-    LARGE(40),
-    GIANT(54);
+enum class ScreenSizePreset(val decimeters: Int, val fovDeg: Float) {
+    SMALL(22, 40f),
+    MEDIUM(30, 50f),
+    LARGE(40, 62f),
+    GIANT(54, 80f);
 
     companion object {
         fun fromDecimeters(value: Int): ScreenSizePreset = when {
@@ -184,19 +185,31 @@ enum class ScreenSizePreset(val decimeters: Int) {
             value <= 47 -> LARGE
             else -> GIANT
         }
+
+        /** Matches a §6.12 angular preset within ±1.5°, or null for custom FOV. */
+        fun fromFovDegOrNull(fovDeg: Float): ScreenSizePreset? =
+            entries.firstOrNull { kotlin.math.abs(fovDeg - it.fovDeg) <= 1.5f }
     }
 }
 
-enum class ScreenDistancePreset(val decimeters: Int) {
-    NEAR(20),
-    MEDIUM(30),
-    FAR(45);
+enum class ScreenDistancePreset(val decimeters: Int, val meters: Float) {
+    NEAR(20, 2.0f),
+    MEDIUM(30, 3.0f),
+    FAR(45, 5.0f);
 
     companion object {
         fun fromDecimeters(value: Int): ScreenDistancePreset = when {
             value <= 24 -> NEAR
             value <= 37 -> MEDIUM
             else -> FAR
+        }
+
+        /** Matches a §6.12 distance preset (2 / 3 / 5 m, plus legacy 4.5 m FAR), or null for custom. */
+        fun fromDistanceDmOrNull(dm: Int): ScreenDistancePreset? = when {
+            dm in 19..21 -> NEAR
+            dm in 29..31 -> MEDIUM
+            dm in 45..51 -> FAR
+            else -> null
         }
     }
 }
@@ -223,6 +236,12 @@ enum class FileLogMode(val prefValue: String) {
         fun fromPref(value: String?): FileLogMode =
             entries.firstOrNull { it.prefValue == value } ?: BASIC
     }
+}
+
+/** Why continuous screen curvature cannot be adjusted right now (§6.12). */
+enum class CurvatureDisabledReason {
+    IN_ROOM,
+    UNSUPPORTED_HEADSET,
 }
 
 data class Depth3dSettingsSnapshot(
@@ -261,6 +280,18 @@ data class Depth3dSettingsSnapshot(
     val clickSound: Boolean,
     val fileLog: FileLogMode,
     val isGen1Headset: Boolean,
+    val screenFovDeg: Float = ScreenReadout.clampFov(
+        ScreenReadout.fovDegFromFlatWidth(actualScreenSizeDm / 10f, actualScreenDistanceDm / 10f),
+    ),
+    val screenDiagonalInches: Int = ScreenReadout.diagonalInches(
+        ScreenReadout.clampFov(
+            ScreenReadout.fovDegFromFlatWidth(actualScreenSizeDm / 10f, actualScreenDistanceDm / 10f),
+        ),
+        ScreenReadout.clampDist(actualScreenDistanceDm / 10f),
+    ),
+    val triggerScreenAdjust: Boolean = PreferenceConfiguration.DEFAULT_VR_TRIGGER_SCREEN_ADJUST,
+    val cylinderSupported: Boolean = true,
+    val curvatureDisabledReason: CurvatureDisabledReason? = null,
 ) {
     val warn3dLag: Boolean
         get() = StreamSettingsMapper.shouldWarn3dLag(actualWidth, actualHeight, actualFps)
@@ -301,9 +332,11 @@ object StreamSettingsMapper {
     const val KEY_SHARPENING = PreferenceConfiguration.VR_SHARPENING_PREF_STRING
     const val KEY_SUPERSAMPLING = PreferenceConfiguration.VR_SUPERSAMPLING_PREF_STRING
 
-    const val KEY_SCREEN_SIZE = "seekbar_vr_screen_size"
-    const val KEY_SCREEN_DISTANCE = "seekbar_vr_distance"
-    const val KEY_CURVATURE = "seekbar_vr_curvature"
+    const val KEY_SCREEN_SIZE = PreferenceConfiguration.VR_SCREEN_SIZE_PREF_STRING
+    const val KEY_SCREEN_DISTANCE = PreferenceConfiguration.VR_DISTANCE_PREF_STRING
+    const val KEY_CURVATURE = PreferenceConfiguration.VR_CURVATURE_PREF_STRING
+    const val KEY_TRIGGER_SCREEN_ADJUST = PreferenceConfiguration.VR_TRIGGER_SCREEN_ADJUST_PREF_STRING
+    const val KEY_CYLINDER_SUPPORTED = PreferenceConfiguration.VR_CYLINDER_SUPPORTED_PREF_STRING
     const val KEY_ENV_ID = PreferenceConfiguration.VR_ENVIRONMENT_ID_PREF_STRING
     const val KEY_PASSTHROUGH = PreferenceConfiguration.VR_PASSTHROUGH_PREF_STRING
     const val KEY_AMBILIGHT = PreferenceConfiguration.VR_AMBILIGHT_PREF_STRING
@@ -397,6 +430,18 @@ object StreamSettingsMapper {
 
         val envId = EnvironmentIds.listValue(prefs).toIntOrNull() ?: PreferenceConfiguration.VR_ENV_VOID
         val environment = VrEnvironmentPreset.fromEnvId(envId)
+        val cylinderSupported = PreferenceConfiguration.isCylinderSupported(prefs)
+        val inRoom = PreferenceConfiguration.isRoomEnvironment(envId)
+        val curvatureDisabledReason = when {
+            !cylinderSupported -> CurvatureDisabledReason.UNSUPPORTED_HEADSET
+            inRoom -> CurvatureDisabledReason.IN_ROOM
+            else -> null
+        }
+        val distM = ScreenReadout.clampDist(cfg.vrDistance / 10f)
+        val fovDeg = ScreenReadout.clampFov(
+            ScreenReadout.fovDegFromFlatWidth(cfg.vrScreenSize / 10f, cfg.vrDistance / 10f),
+        )
+        val diagInches = ScreenReadout.diagonalInches(fovDeg, distM)
 
         return Depth3dSettingsSnapshot(
             actualWidth = cfg.width,
@@ -434,6 +479,11 @@ object StreamSettingsMapper {
             clickSound = cfg.vrClickSound,
             fileLog = FileLogMode.fromPref(cfg.fileLogLevel),
             isGen1Headset = isGen1Headset,
+            screenFovDeg = fovDeg,
+            screenDiagonalInches = diagInches,
+            triggerScreenAdjust = cfg.vrTriggerScreenAdjust,
+            cylinderSupported = cylinderSupported,
+            curvatureDisabledReason = curvatureDisabledReason,
         )
     }
 
@@ -570,6 +620,45 @@ object StreamSettingsMapper {
 
     fun setCurvedScreen(store: PrefsStore, curved: Boolean) {
         store.putInt(KEY_CURVATURE, if (curved) CURVED_DEFAULT else 0)
+    }
+
+    /** Continuous curvature 0..100% quantized in 5% steps (§3.8, §6.12). */
+    fun setCurvaturePercent(store: PrefsStore, percent: Int) {
+        store.putInt(KEY_CURVATURE, ScreenReadout.quantizeCurvature(percent))
+    }
+
+    /** Sets horizontal screen FOV (30°..90°) keeping current distance unchanged (§6.12). */
+    fun setScreenFovDeg(store: PrefsStore, fovDeg: Float) {
+        val distDm = store.getInt(KEY_SCREEN_DISTANCE, 30)
+            .coerceIn(ScreenReadout.MIN_SCREEN_DIST_DM, ScreenReadout.MAX_SCREEN_DIST_DM)
+        val distM = distDm / 10f
+        val clampedFov = ScreenReadout.clampFov(fovDeg)
+        val flatWidthDm = (ScreenReadout.flatWidthMeters(clampedFov, distM) * 10f).roundToInt()
+            .coerceIn(ScreenReadout.MIN_SCREEN_SIZE_DM, ScreenReadout.MAX_SCREEN_SIZE_DM)
+        store.putInt(KEY_SCREEN_SIZE, flatWidthDm)
+    }
+
+    /** Sets viewing distance (2.0..8.0 m) while keeping angular FOV constant (§6.12). */
+    fun setScreenDistanceMeters(store: PrefsStore, meters: Float) {
+        val prevDistDm = store.getInt(KEY_SCREEN_DISTANCE, 30)
+            .coerceIn(10, ScreenReadout.MAX_SCREEN_DIST_DM)
+        val prevSizeDm = store.getInt(KEY_SCREEN_SIZE, 30)
+            .coerceIn(ScreenReadout.MIN_SCREEN_SIZE_DM, ScreenReadout.MAX_SCREEN_SIZE_DM)
+        val fovDeg = ScreenReadout.clampFov(
+            ScreenReadout.fovDegFromFlatWidth(prevSizeDm / 10f, prevDistDm / 10f),
+        )
+        val newDistM = ScreenReadout.clampDist(meters)
+        val newDistDm = (newDistM * 10f).roundToInt()
+            .coerceIn(ScreenReadout.MIN_SCREEN_DIST_DM, ScreenReadout.MAX_SCREEN_DIST_DM)
+        val newSizeDm = (ScreenReadout.flatWidthMeters(fovDeg, newDistM) * 10f).roundToInt()
+            .coerceIn(ScreenReadout.MIN_SCREEN_SIZE_DM, ScreenReadout.MAX_SCREEN_SIZE_DM)
+        store.putInt(KEY_SCREEN_DISTANCE, newDistDm)
+        store.putInt(KEY_SCREEN_SIZE, newSizeDm)
+    }
+
+    /** Setting: "按住扳机调整屏幕" (§3.8, §6.4 Rule 12). */
+    fun setTriggerScreenAdjust(store: PrefsStore, enabled: Boolean) {
+        store.putBoolean(KEY_TRIGGER_SCREEN_ADJUST, enabled)
     }
 
     fun setEnvironment(store: PrefsStore, preset: VrEnvironmentPreset) {
