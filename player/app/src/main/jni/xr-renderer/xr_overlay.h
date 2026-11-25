@@ -126,4 +126,53 @@ int overlayComputeSurface(XrPosef screenPose, float screenWidth, float screenHei
 // Returns total composition layers for a local playback frame per §6.5.
 int overlayCountLocalLayers(const OverlayLayerFlags* f);
 
+// ============================================================================
+// Pure-C production helpers for danmaku slot generations, anchor-based monotonic
+// snapshot clock, and §6.5/16-layer real drop ladder (shared & host-tested).
+// ============================================================================
+
+// Tracks the latest GPU-landed generation per atlas slot so an instance can NEVER
+// render stale text or un-uploaded pixels when a slot is reused or queued behind
+// the per-frame upload limit.
+typedef struct {
+    uint32_t uploadedGen[DANMAKU_MAX_SLOTS];
+} DanmakuSlotTable;
+
+void danmakuSlotTableClear(DanmakuSlotTable* t);
+void danmakuSlotTableMarkUploaded(DanmakuSlotTable* t, int slotIndex, uint32_t gen);
+int danmakuSlotTableIsReady(const DanmakuSlotTable* t, int slotIndex, uint32_t gen);
+
+// Anchor-based monotonic clock for 72/90 Hz danmaku scrolling:
+// Worker publishes (anchorTimelineMs, anchorMonoNs, paused); render thread extrapolates
+// continuously from CLOCK_MONOTONIC without stepping backward or jumping +/-14 ms on
+// every 20 Hz snapshot arrival.
+typedef struct {
+    int initialized;
+    int paused;
+    double anchorTimelineSec;
+    int64_t anchorMonoNs;
+    double currentSec;
+} DanmakuClockTracker;
+
+void danmakuClockReset(DanmakuClockTracker* c);
+void danmakuClockSetAnchor(DanmakuClockTracker* c, int64_t timelineMs,
+                           int64_t anchorMonoNs, int paused, int hardReset);
+float danmakuClockSample(DanmakuClockTracker* c, int64_t nowMonoNs, float dtSec);
+
+// Real composition-layer categories used by xr_layers.c and its §6.5 drop ladder.
+typedef enum {
+    OVERLAY_SLOT_OTHER = 0,
+    OVERLAY_SLOT_TOAST = 1,
+    OVERLAY_SLOT_MODELS = 2,
+    OVERLAY_SLOT_COG_HOVER = 3,
+    OVERLAY_SLOT_COG_BUTTON = 4,
+    OVERLAY_SLOT_COG_CLOCK = 5,
+    OVERLAY_SLOT_DANMAKU = 6
+} OverlayLayerSlotKind;
+
+// Evaluates the real production drop ladder against min(maxLayers, OVERLAY_HARD_MAX_LAYERS).
+// Writes keepOut[i] = 1 (keep) or 0 (drop) for i in [0, count) and returns kept layer count.
+// Drop priority order: toast -> models -> cogHover -> cogButton -> cogClock -> danmaku.
+int overlayApplyLayerBudget(const int* slotKinds, int count, int maxLayers, int* keepOut);
+
 #endif

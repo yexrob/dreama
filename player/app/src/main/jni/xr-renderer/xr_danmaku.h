@@ -1,6 +1,6 @@
-// GPU-accelerated instanced danmaku compositor with 2048x2048 2-channel (RG8)
-// glyph/stroke atlas, bounded incremental glTexSubImage2D uploads, smooth
-// 72/90 Hz native timeline interpolation, and per-eye stereoscopic rendering.
+// GPU-accelerated instanced danmaku compositor with 2048x2048 premultiplied RGBA8
+// glyph/emoji/stroke atlas, slot-generation gating, anchor-based monotonic 72/90 Hz
+// clock, bounded incremental glTexSubImage2D uploads, and per-eye stereoscopic rendering.
 // Strictly gated on ctx->localMedia so PC streaming allocates zero resources.
 
 #ifndef XR_DANMAKU_H
@@ -16,13 +16,15 @@
 
 // Bounded ring buffer for partial atlas uploads from the danmaku worker thread
 #define DANMAKU_UPLOAD_QUEUE_CAP 32
-// Max bytes for a single rasterized danmaku patch (e.g., 1024 x 96 x 2 B = 196 KB)
-#define DANMAKU_PATCH_MAX_BYTES  204800
+// Max bytes for a single rasterized RGBA8 danmaku patch (1024 x 96 x 4 B = 393,216 B)
+#define DANMAKU_PATCH_MAX_BYTES  409600
 
 typedef struct {
     int used;
     int x, y, w, h;
     int byteCount;
+    int slotIndex;
+    uint32_t slotGen;
     unsigned char* data; // lazily allocated up to DANMAKU_PATCH_MAX_BYTES, reused forever
 } DanmakuAtlasPatch;
 
@@ -32,9 +34,9 @@ typedef struct {
     float w;            // normalized width relative to screen width
     float h;            // normalized height relative to active overlay area height
     float velXPerSec;   // normalized screen-width units/sec (negative for scroll left)
-    float u0, v0;       // atlas top-left UV [0..1]
-    float du, dv;       // atlas UV span
-    float r, g, b;      // linear/sRGB text color [0..1]
+    float u0, v0;       // atlas top-left UV [0..1] (half-texel inset)
+    float du, dv;       // atlas UV span (half-texel inset)
+    float r, g, b;      // linear/sRGB text color [0..1] (baked in RGBA8 atlas; alpha in baseAlpha)
     float baseAlpha;    // 0..1 base opacity
     float spawnTimeSec; // item spawn time on native danmaku timeline
     float durationSec;  // item lifetime in real seconds
@@ -44,6 +46,8 @@ typedef struct {
     float fixedPhiDeg;  // item's disparity at spawn (frozen unless user drags Float/Layer)
     float animFromPhi;  // start disparity for 200 ms user-drag transition
     float animToPhi;    // target disparity for 200 ms user-drag transition
+    int slotIndex;      // atlas slot index in [0, DANMAKU_MAX_SLOTS)
+    uint32_t slotGen;   // expected generation; skipped until GPU upload of this gen lands
 } DanmakuNativeItem;
 
 // Packed per-instance GPU vertex buffer struct (13 floats = 52 bytes)
@@ -69,7 +73,9 @@ typedef struct {
     int snapshotDirty;
     int pendingEnabled;
     int pendingPaused;
-    float pendingClockSec;
+    int64_t pendingAnchorTimelineMs;
+    int64_t pendingAnchorMonoNs;
+    int pendingClockReset;
     float pendingAreaBotFrac;
     float pendingGlobalOpacity;
     int pendingCurveMode;
@@ -85,7 +91,8 @@ typedef struct {
     // Render-thread-only active playback state
     int enabled;
     int paused;
-    float clockSec;
+    DanmakuClockTracker clockTracker;
+    DanmakuSlotTable slotTable;
     float areaBotFrac;
     float globalOpacity;
     int curveMode;
@@ -101,7 +108,7 @@ typedef struct {
     int depthAnimActive;
     float depthAnimElapsedS;
 
-    // Render-thread GL & OpenXR resources (lazily created on first active danmaku)
+    // Render-thread GL & OpenXR resources (pre-warmed behind startup splash for localMedia)
     int glReady;
     int glFailed;
     GLuint program;
@@ -134,8 +141,9 @@ typedef struct {
 struct XrCtx;
 
 void danmakuInit(struct XrCtx* ctx);
+int danmakuPrewarmGl(struct XrCtx* ctx);
 void danmakuDestroy(struct XrCtx* ctx);
 void danmakuRenderEyes(struct XrCtx* ctx, float screenFovDeg, float screenDistM,
-                       float dt, int stereoActive);
+                       float dt, int64_t frameMonoNs, int stereoActive);
 
 #endif

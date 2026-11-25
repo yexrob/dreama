@@ -1446,8 +1446,12 @@ typedef struct XrCtx {
     int depthModelGlReady;
     int depthModelGlFailed;
     int depthReadyRendered;
-    // Whether ctx->swapchain is double-wide (videoWidth * 2) for stereo rendering
+    // Whether ctx->swapchain is double-wide (videoWidth * 2) for stereo rendering,
+    // whether a mid-session stereo upgrade failed (latched once so we never spam retries),
+    // and whether the active swapchain has had at least one image released.
     int swapchainStereo;
+    int swapchainUpgradeFailed;
+    int swapchainHasFrame;
 
     // depth3d G2: mutex-guarded pending commands from non-render threads, applied
     // exclusively on the render thread at the start of nativeUpdateInput / nativeEndFrame.

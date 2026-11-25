@@ -327,6 +327,9 @@ int initGl(XrCtx* ctx) {
             ctx->depthModelGlFailed = 1;
             atomic_store_explicit(&ctx->depthGaveUp, 1, memory_order_relaxed);
         }
+        // Pre-warm danmaku RGBA8 atlas + 2x eye swapchains behind startup splash so
+        // the first danmaku causes zero mid-playback hitch (PC streaming skips this).
+        danmakuPrewarmGl(ctx);
     }
     else if (ctx->stereoMode == DEPTH_MODE_MODEL && ctx->stereoLive) {
         if (!ensureDepthModelGl(ctx)) {
@@ -670,7 +673,8 @@ void renderVideoFrame(XrCtx* ctx, const float* texMatrix, float separation) {
 
     XrSwapchainImageReleaseInfo releaseInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
     xrReleaseSwapchainImage(ctx->swapchain, &releaseInfo);
-    // What the layers show from here on
+    // What the layers show from here on (guarantees swapchain has at least one released image)
+    ctx->swapchainHasFrame = 1;
     ctx->drawnEyes = eyes;
 
     // Close this frame's query and collect whichever earlier one has landed.

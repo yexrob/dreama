@@ -3674,8 +3674,14 @@ static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, XrPosef gripPose, i
     screenInputStep(&ctx->screenCtrl, &in, &res);
     applyUiHaptic(ctx, res.hapticEvent, opH, f->now);
     if (ctx->palettePendingHaptic != PALETTE_HAPTIC_NONE) {
-        // Avoid clobbering a stronger screen-adjust haptic fired on the same hand this frame
-        if (res.hapticEvent == SCREEN_HAPTIC_NONE || ctx->palettePendingHaptic > res.hapticEvent) {
+        // Map distinct SCREEN_HAPTIC_* and PALETTE_HAPTIC_* enums onto one unified priority scale
+        int screenPrio = res.hapticEvent == SCREEN_HAPTIC_LIMIT ? 3
+                : (res.hapticEvent == SCREEN_HAPTIC_DETENT ? 2
+                   : (res.hapticEvent == SCREEN_HAPTIC_HINT ? 1 : 0));
+        int palettePrio = ctx->palettePendingHaptic == PALETTE_HAPTIC_LIMIT ? 3
+                : (ctx->palettePendingHaptic == PALETTE_HAPTIC_DETENT ? 2
+                   : (ctx->palettePendingHaptic == PALETTE_HAPTIC_TICK ? 1 : 0));
+        if (palettePrio > screenPrio) {
             applyPaletteHaptic(ctx, ctx->palettePendingHaptic, opH, f->now);
         }
         ctx->palettePendingHaptic = PALETTE_HAPTIC_NONE;
@@ -4047,6 +4053,15 @@ static void handBack(JNIEnv* env, XrCtx* ctx, float* out, jfloatArray outArr) {
         out[IN_PALETTE_PAGE_STEP] = (float)ctx->palettePageStepOut;
         out[IN_PALETTE_DIM_FALLBACK] = ctx->palettePose.dimFallback ? 1.0f : 0.0f;
         out[IN_CONTENT_PHI_CENTI] = roundf(ctx->danmakuContentPhiSmoothed * 100.0f);
+        int unavailMask = 0;
+        if (ctx->depthModelGlFailed
+                || atomic_load_explicit(&ctx->depthGaveUp, memory_order_relaxed)) {
+            unavailMask |= STEREO_UNAVAIL_DEPTH;
+        }
+        if (ctx->swapchainUpgradeFailed) {
+            unavailMask |= STEREO_UNAVAIL_SWAPCHAIN;
+        }
+        out[IN_STEREO_UNAVAILABLE] = (float)unavailMask;
         ctx->paletteClickState = 0;
         ctx->paletteRowStepOut = 0;
         ctx->paletteRowResetOut = 0;

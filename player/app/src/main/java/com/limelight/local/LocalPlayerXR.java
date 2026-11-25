@@ -40,6 +40,7 @@ import com.limelight.binding.video.XrStartFailure;
 import com.limelight.local.danmaku.DanmakuPreviewStrings;
 import com.limelight.local.danmaku.DanmakuSessionManager;
 import com.limelight.local.danmaku.DanmakuXmlParser;
+import com.limelight.local.danmaku.LocalDanmakuPlaybackBridge;
 import com.limelight.local.dlna.CastReceiver;
 import com.limelight.local.dlna.PlayerLink;
 import com.limelight.local.dlna.PlayerState;
@@ -158,6 +159,9 @@ public class LocalPlayerXR extends Activity
     private volatile boolean danmakuOnUi = true;
     private volatile boolean danmakuMergeDuplicatesUi = true;
     private DanmakuSessionManager danmakuManager;
+    private LocalDanmakuPlaybackBridge danmakuBridge;
+    private boolean barScrubbing;
+    private float barScrubFraction = Float.NaN;
     private int lastPaletteRowMask = -1;
     private int lastPaletteTabOnWorker = -1;
     private Tracks latestTracks = Tracks.EMPTY;
@@ -261,6 +265,7 @@ public class LocalPlayerXR extends Activity
                     });
                     return kotlin.Unit.INSTANCE;
                 });
+        danmakuBridge = new LocalDanmakuPlaybackBridge(danmakuManager);
         initPaletteForIntent(getIntent(), false);
 
         trackSelector = createTrackSelector(this);
@@ -350,6 +355,9 @@ public class LocalPlayerXR extends Activity
         refreshInFlight = false;
         wantPlay = true;
         resetTrackSelectorForNewItem();
+        if (danmakuBridge != null) {
+            danmakuBridge.onNewItemLoading();
+        }
         player.setRepeatMode(Player.REPEAT_MODE_OFF);
         player.setWakeMode(C.WAKE_MODE_NETWORK);
         player.setPlayWhenReady(false);
@@ -452,6 +460,9 @@ public class LocalPlayerXR extends Activity
         errorCanRetry = true;
         wantPlay = true;
         resetTrackSelectorForNewItem();
+        if (danmakuBridge != null) {
+            danmakuBridge.onNewItemLoading();
+        }
         // A film of its own loops as it always did; a cast ends, for the phone to send the next
         player.setRepeatMode(castId != 0 ? Player.REPEAT_MODE_OFF : Player.REPEAT_MODE_ONE);
         player.setWakeMode(isHttp(uri) ? C.WAKE_MODE_NETWORK : C.WAKE_MODE_NONE);
@@ -628,6 +639,11 @@ public class LocalPlayerXR extends Activity
             if (wantPlay && PluginHostGuards.isPluginSource(sourceKind) && pluginSession != null) {
                 pluginSession.reportStartAsync(position(), duration());
             }
+            if (danmakuBridge != null) {
+                danmakuBridge.onPlaybackUpdate(
+                        position(), p.getPlaybackState(), p.getPlayWhenReady(), errored,
+                        p.getPlaybackParameters().speed);
+            }
         }
         tickBar();
     }
@@ -646,7 +662,9 @@ public class LocalPlayerXR extends Activity
         if (!PaletteStore.isScreenGestureHintSeen(store)) {
             String[] lines = PaletteTrackManager.splitGestureHintForToast(
                     getString(R.string.vr_hint_screen_gesture));
-            r.showNotice(lines[0], lines[1], () -> PaletteStore.markScreenGestureHintSeen(store));
+            // Write SharedPreferences off the XR render thread on the palette worker (G2 residual)
+            r.showNotice(lines[0], lines[1],
+                    () -> postToPaletteWorker(() -> PaletteStore.markScreenGestureHintSeen(store)));
         }
     }
 
@@ -671,6 +689,9 @@ public class LocalPlayerXR extends Activity
             return;
         }
         refreshInFlight = true;
+        if (danmakuBridge != null) {
+            danmakuBridge.onPluginRefreshStarted();
+        }
         notice(getString(com.limelight.R.string.plugin_player_refreshing), null);
         pluginSession.refreshAsync(resumePos, httpCode, new PluginPlayerSession.RefreshCallback() {
             @Override
@@ -752,6 +773,7 @@ public class LocalPlayerXR extends Activity
                 long d = duration();
                 // A resume point in the last seconds would only loop round to the start
                 boolean nearEnd = castId == 0 && d > 0 && startMs >= d - 5000;
+                long resolvedStartMs = (startMs > 0 && !nearEnd) ? startMs : position();
                 if (startMs > 0 && !nearEnd) {
                     p.seekTo(startMs);
                 }
@@ -761,6 +783,11 @@ public class LocalPlayerXR extends Activity
                     if (wantPlay && PluginHostGuards.isPluginSource(sourceKind) && pluginSession != null) {
                         pluginSession.reportStartAsync(position(), duration());
                     }
+                }
+                if (danmakuBridge != null) {
+                    float spd = p.getPlaybackParameters().speed;
+                    boolean actuallyPlaying = surfaceSet && wantPlay && !errored;
+                    danmakuBridge.onPlayerReady(resolvedStartMs, actuallyPlaying, spd);
                 }
             } else if (state == Player.STATE_BUFFERING && ready
                     && (PluginHostGuards.isPluginSource(sourceKind) || isHttp(getIntent().getData()))) {
@@ -772,19 +799,24 @@ public class LocalPlayerXR extends Activity
                     pluginSession.reportFinishAsync(d > 0 ? d : position(), d);
                 }
             }
+            if (danmakuBridge != null && ready) {
+                danmakuBridge.onPlaybackUpdate(
+                        position(), state, p.getPlayWhenReady(), errored, p.getPlaybackParameters().speed);
+            }
             tickBar();
         }
 
         @Override
         public void onIsPlayingChanged(boolean isPlaying) {
-            DanmakuSessionManager dm = danmakuManager;
-            if (dm != null) {
-                dm.updatePlaybackPosition(position(), isPlaying && ready && !errored && !refreshInFlight);
+            ExoPlayer p = player;
+            if (danmakuBridge != null && p != null) {
+                danmakuBridge.onPlaybackUpdate(
+                        position(), p.getPlaybackState(), p.getPlayWhenReady(), errored,
+                        p.getPlaybackParameters().speed);
             }
             if (!PluginHostGuards.isPluginSource(sourceKind) || pluginSession == null || !ready) {
                 return;
             }
-            ExoPlayer p = player;
             if (p == null) {
                 return;
             }
@@ -1048,9 +1080,8 @@ public class LocalPlayerXR extends Activity
         }
         if (on && p.getPlaybackState() == Player.STATE_ENDED) {
             p.seekTo(0);
-            DanmakuSessionManager dm = danmakuManager;
-            if (dm != null) {
-                dm.onSeek(0L);
+            if (danmakuBridge != null) {
+                danmakuBridge.onUserSeek(0L);
             }
         }
         if (ready && surfaceSet) {
@@ -1107,9 +1138,8 @@ public class LocalPlayerXR extends Activity
         } else {
             p.seekTo(clamped);
         }
-        DanmakuSessionManager dm = danmakuManager;
-        if (dm != null) {
-            dm.onSeek(clamped);
+        if (danmakuBridge != null) {
+            danmakuBridge.onUserSeek(clamped);
         }
         tickBar();
     }
@@ -1123,18 +1153,71 @@ public class LocalPlayerXR extends Activity
 
     @Override
     public void onVrButton(int button, boolean down) {
-        if (button != 0 || down) {
+        if (button != 0) {
             return;
         }
         final float u = pointerU, v = pointerV;
+        if (down) {
+            main.post(() -> {
+                ExoPlayer p = player;
+                TransportBar b = bar;
+                if (p == null || b == null || errored || !p.isCurrentMediaItemSeekable()) {
+                    return;
+                }
+                float x = b.texX(u, v);
+                if (!Float.isNaN(x)
+                        && !TransportBar.onButton(x)
+                        && !TransportBar.onAdjustButton(x)
+                        && !TransportBar.onDanmakuButton(x, danmakuSupportedUi)) {
+                    float f = TransportBar.trackFraction(x, danmakuSupportedUi);
+                    if (!Float.isNaN(f)) {
+                        barScrubbing = true;
+                        barScrubFraction = f;
+                        if (danmakuBridge != null) {
+                            danmakuBridge.onScrubStart();
+                        }
+                        tickBar();
+                    }
+                }
+            });
+            return;
+        }
         main.post(() -> {
             ExoPlayer p = player;
             TransportBar b = bar;
             if (p == null || b == null) {
+                if (barScrubbing) {
+                    barScrubbing = false;
+                    barScrubFraction = Float.NaN;
+                    if (danmakuBridge != null) {
+                        danmakuBridge.onScrubEnd(null);
+                    }
+                }
                 return;
             }
             pointerMovedMs = System.currentTimeMillis();
             float x = b.texX(u, v);
+            if (barScrubbing) {
+                float f = !Float.isNaN(x) ? TransportBar.trackFraction(x, danmakuSupportedUi) : barScrubFraction;
+                if (Float.isNaN(f)) {
+                    f = barScrubFraction;
+                }
+                barScrubbing = false;
+                barScrubFraction = Float.NaN;
+                long d = duration();
+                if (!Float.isNaN(f) && d > 0 && p.isCurrentMediaItemSeekable()) {
+                    long targetMs = (long) (f * d);
+                    lastKnownPositionMs = targetMs;
+                    p.seekTo(targetMs);
+                    if (danmakuBridge != null) {
+                        danmakuBridge.onScrubEnd(targetMs);
+                    }
+                } else if (danmakuBridge != null) {
+                    danmakuBridge.onScrubEnd(null);
+                }
+                tickBar();
+                return;
+            }
             if (errored) {
                 if (errorCanRetry && TransportBar.onErrorRetry(x)) {
                     retryCurrentPlayback();
@@ -1170,10 +1253,10 @@ public class LocalPlayerXR extends Activity
                 long d = duration();
                 if (d > 0 && p.isCurrentMediaItemSeekable()) {
                     long targetMs = (long) (f * d);
+                    lastKnownPositionMs = targetMs;
                     p.seekTo(targetMs);
-                    DanmakuSessionManager dm = danmakuManager;
-                    if (dm != null) {
-                        dm.onSeek(targetMs);
+                    if (danmakuBridge != null) {
+                        danmakuBridge.onUserSeek(targetMs);
                     }
                 }
             } else {
@@ -1200,9 +1283,10 @@ public class LocalPlayerXR extends Activity
                 lastKnownPositionMs = curPos;
             }
         }
-        DanmakuSessionManager dm = danmakuManager;
-        if (dm != null) {
-            dm.updatePlaybackPosition(position(), on && ready && !errored && !refreshInFlight);
+        if (danmakuBridge != null) {
+            danmakuBridge.onPlaybackUpdate(
+                    position(), p.getPlaybackState(), p.getPlayWhenReady(), errored,
+                    p.getPlaybackParameters().speed);
         }
         if (PluginHostGuards.isPluginSource(sourceKind) && pluginSession != null && ready && !errored) {
             if (!refreshInFlight && pluginSession.shouldProactiveRefresh()) {
@@ -1218,6 +1302,15 @@ public class LocalPlayerXR extends Activity
         TransportBar b = bar;
         if (r != null && b != null) {
             long since = System.currentTimeMillis() - pointerMovedMs;
+            if (barScrubbing) {
+                float sx = b.texX(pointerU, pointerV);
+                if (!Float.isNaN(sx)) {
+                    float sf = TransportBar.trackFraction(sx, danmakuSupportedUi);
+                    if (!Float.isNaN(sf)) {
+                        barScrubFraction = sf;
+                    }
+                }
+            }
             if (errored) {
                 r.setTransportVisible(true);
                 float x = since < BAR_LINGER_MS ? b.texX(pointerU, pointerV) : Float.NaN;
@@ -1272,9 +1365,8 @@ public class LocalPlayerXR extends Activity
             long clamped = Math.max(0, to);
             lastKnownPositionMs = clamped;
             p.seekTo(clamped);
-            DanmakuSessionManager dm = danmakuManager;
-            if (dm != null) {
-                dm.onSeek(clamped);
+            if (danmakuBridge != null) {
+                danmakuBridge.onUserSeek(clamped);
             }
             pointerMovedMs = System.currentTimeMillis();
             tickBar();
@@ -1318,9 +1410,8 @@ public class LocalPlayerXR extends Activity
             long clamped = Math.max(0, to);
             lastKnownPositionMs = clamped;
             p.seekTo(clamped);
-            DanmakuSessionManager dm = danmakuManager;
-            if (dm != null) {
-                dm.onSeek(clamped);
+            if (danmakuBridge != null) {
+                danmakuBridge.onUserSeek(clamped);
             }
             pointerMovedMs = System.currentTimeMillis();
             tickBar();

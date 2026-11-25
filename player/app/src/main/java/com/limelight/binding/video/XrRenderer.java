@@ -620,16 +620,20 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                                                        float curvature);
     private native void nativeTriggerPaletteHaptic(long ctx, int kind);
     private native boolean nativeEnsureDepthModel(long ctx);
-    // depth3d G4: GPU-accelerated instanced danmaku atlas & snapshot bridge (localMedia only)
+    // depth3d G4: GPU-accelerated instanced danmaku RGBA8 atlas, slot-generation & anchor-clock bridge
+    private native int nativeGetDanmakuUploadQueueFree(long ctx);
     private native boolean nativeUploadDanmakuAtlasPatch(long ctx, int x, int y, int w, int h,
-                                                         ByteBuffer rgPixels);
+                                                         int slotIndex, int slotGen,
+                                                         ByteBuffer rgbaPixels);
     private native void nativeClearDanmakuAtlas(long ctx);
     private native void nativeSetDanmakuSnapshot(long ctx, boolean enabled, boolean paused,
-                                                 float clockSec, float areaBotFrac,
-                                                 float globalOpacity, int curveMode,
-                                                 float customCurvePct, boolean floatAuto,
-                                                 int floatAutoOffset, int floatFixedSteps,
-                                                 float layerSpreadDeg, boolean animateDepth,
+                                                 long anchorTimelineMs, long anchorMonoNs,
+                                                 boolean clockReset,
+                                                 float areaBotFrac, float globalOpacity,
+                                                 int curveMode, float customCurvePct,
+                                                 boolean floatAuto, int floatAutoOffset,
+                                                 int floatFixedSteps, float layerSpreadDeg,
+                                                 boolean animateDepth,
                                                  float[] instances, int count);
 
     private final TransportBufferQueue transportQueue =
@@ -649,6 +653,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     private volatile int initialSourceFormat = STEREO_SRC_AUTO;
     private final java.util.concurrent.atomic.AtomicBoolean depthUnavailableNotified =
             new java.util.concurrent.atomic.AtomicBoolean(false);
+    private volatile boolean stereoRequestedThisSession;
 
     /** Before start(): this session plays a local file rather than a stream. */
     public void setLocalMedia(boolean on) {
@@ -738,6 +743,9 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     }
 
     public void setStereoStrength(boolean on, float separation, float convergence, float depthLocal) {
+        if (on) {
+            stereoRequestedThisSession = true;
+        }
         synchronized (nativeLock) {
             if (nativeCtx != 0) {
                 nativeSetStereoStrength(nativeCtx, on, separation, convergence, depthLocal);
@@ -786,14 +794,25 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         }
     }
 
-    /** Enqueues one 2-channel RG8 glyph patch into the native danmaku atlas ring (off render thread). */
-    public boolean uploadDanmakuAtlasPatch(int x, int y, int w, int h, ByteBuffer rgPixels) {
-        if (!localMedia || rgPixels == null) {
+    /** Returns remaining free slots in the native danmaku atlas upload ring (0 when full or inactive). */
+    public int getDanmakuUploadQueueFree() {
+        if (!localMedia) {
+            return 0;
+        }
+        synchronized (nativeLock) {
+            return nativeCtx != 0 ? nativeGetDanmakuUploadQueueFree(nativeCtx) : 0;
+        }
+    }
+
+    /** Enqueues one premultiplied RGBA8 glyph/emoji patch tagged with (slotIndex, slotGen). */
+    public boolean uploadDanmakuAtlasPatch(int x, int y, int w, int h,
+                                           int slotIndex, int slotGen, ByteBuffer rgbaPixels) {
+        if (!localMedia || rgbaPixels == null) {
             return false;
         }
         synchronized (nativeLock) {
             return nativeCtx != 0
-                    && nativeUploadDanmakuAtlasPatch(nativeCtx, x, y, w, h, rgPixels);
+                    && nativeUploadDanmakuAtlasPatch(nativeCtx, x, y, w, h, slotIndex, slotGen, rgbaPixels);
         }
     }
 
@@ -809,8 +828,9 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         }
     }
 
-    /** Publishes the latest active danmaku instance snapshot to the native GL compositor. */
-    public void setDanmakuSnapshot(boolean enabled, boolean paused, float clockSec,
+    /** Publishes the latest active danmaku instance snapshot with monotonic clock anchor to native GL. */
+    public void setDanmakuSnapshot(boolean enabled, boolean paused,
+                                   long anchorTimelineMs, long anchorMonoNs, boolean clockReset,
                                    float areaBotFrac, float globalOpacity,
                                    int curveMode, float customCurvePct,
                                    boolean floatAuto, int floatAutoOffset, int floatFixedSteps,
@@ -821,8 +841,10 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         }
         synchronized (nativeLock) {
             if (nativeCtx != 0) {
-                nativeSetDanmakuSnapshot(nativeCtx, enabled, paused, clockSec, areaBotFrac,
-                        globalOpacity, curveMode, customCurvePct, floatAuto, floatAutoOffset,
+                nativeSetDanmakuSnapshot(nativeCtx, enabled, paused,
+                        anchorTimelineMs, anchorMonoNs, clockReset,
+                        areaBotFrac, globalOpacity,
+                        curveMode, customCurvePct, floatAuto, floatAutoOffset,
                         floatFixedSteps, layerSpreadDeg, animateDepth, instances, count);
             }
         }
@@ -918,6 +940,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 depthThreadStarted = false;
                 firstDepthCapturePending = false;
                 depthUnavailableNotified.set(false);
+                stereoRequestedThisSession = initialStereoLive;
                 nativeCtx = nativeInit(activity, videoWidth, videoHeight, prefs.fps,
                         prefs.vrDepthMode, mapSize.width, mapSize.height,
                         prefs.vrDepthDebug, prefs.vrConvergence, prefs.vrDepthScale,
@@ -2048,6 +2071,11 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 if (Math.abs(contentPhi - lastReportedContentPhi) >= 0.01f) {
                     lastReportedContentPhi = contentPhi;
                     inputListener.onVrContentDepthPhi(contentPhi);
+                }
+                int stereoUnavail = (int)inputState[IN_STEREO_UNAVAILABLE];
+                if ((stereoUnavail & STEREO_UNAVAIL_SWAPCHAIN) != 0
+                        || ((stereoUnavail & STEREO_UNAVAIL_DEPTH) != 0 && stereoRequestedThisSession)) {
+                    markDepthModelUnavailable();
                 }
             }
         }

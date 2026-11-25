@@ -366,3 +366,140 @@ int overlayCountLocalLayers(const OverlayLayerFlags* f) {
     if (f->controllerModel) total += 1;
     return total;
 }
+
+void danmakuSlotTableClear(DanmakuSlotTable* t) {
+    if (t == NULL) {
+        return;
+    }
+    memset(t->uploadedGen, 0, sizeof(t->uploadedGen));
+}
+
+void danmakuSlotTableMarkUploaded(DanmakuSlotTable* t, int slotIndex, uint32_t gen) {
+    if (t == NULL || slotIndex < 0 || slotIndex >= DANMAKU_MAX_SLOTS || gen == 0) {
+        return;
+    }
+    t->uploadedGen[slotIndex] = gen;
+}
+
+int danmakuSlotTableIsReady(const DanmakuSlotTable* t, int slotIndex, uint32_t gen) {
+    if (t == NULL || slotIndex < 0 || slotIndex >= DANMAKU_MAX_SLOTS || gen == 0) {
+        return 0;
+    }
+    return t->uploadedGen[slotIndex] == gen ? 1 : 0;
+}
+
+void danmakuClockReset(DanmakuClockTracker* c) {
+    if (c == NULL) {
+        return;
+    }
+    memset(c, 0, sizeof(*c));
+}
+
+void danmakuClockSetAnchor(DanmakuClockTracker* c, int64_t timelineMs,
+                           int64_t anchorMonoNs, int paused, int hardReset) {
+    if (c == NULL) {
+        return;
+    }
+    double anchorSec = timelineMs > 0 ? ((double)timelineMs / 1000.0) : 0.0;
+    c->anchorTimelineSec = anchorSec;
+    c->anchorMonoNs = anchorMonoNs;
+    c->paused = paused ? 1 : 0;
+    if (!c->initialized || hardReset) {
+        c->currentSec = anchorSec;
+        c->initialized = 1;
+    }
+    else if (c->paused) {
+        // Never step backward when transitioning to pause; freeze at max(current, anchor)
+        if (anchorSec > c->currentSec) {
+            c->currentSec = anchorSec;
+        }
+    }
+}
+
+float danmakuClockSample(DanmakuClockTracker* c, int64_t nowMonoNs, float dtSec) {
+    if (c == NULL || !c->initialized) {
+        return 0.0f;
+    }
+    if (c->paused) {
+        return (float)c->currentSec;
+    }
+    double dt = dtSec > 0.0f ? (double)dtSec : 0.0;
+    if (dt > 0.10) {
+        dt = 0.10;
+    }
+    double elapsedSinceAnchor = 0.0;
+    if (c->anchorMonoNs > 0 && nowMonoNs > c->anchorMonoNs) {
+        elapsedSinceAnchor = (double)(nowMonoNs - c->anchorMonoNs) / 1e9;
+    }
+    double targetSec = c->anchorTimelineSec + elapsedSinceAnchor;
+    double err = targetSec - c->currentSec;
+
+    // Large discontinuity (> 0.5 s, e.g. long pause resume or missed reset): snap forward only
+    if (err > 0.50) {
+        c->currentSec = targetSec;
+        return (float)c->currentSec;
+    }
+    if (err < -0.50) {
+        // Still never regress backward without explicit hardReset (seek/new item)
+        return (float)c->currentSec;
+    }
+
+    // Smooth monotonic catch-up: rate in [0.85, 1.25] eliminates +/-14 ms snapshot jitter
+    // while strictly guaranteeing currentSec never steps backward.
+    double rate = 1.0 + err * 4.0;
+    if (rate < 0.85) rate = 0.85;
+    if (rate > 1.25) rate = 1.25;
+    double nextSec = c->currentSec + dt * rate;
+    if (nextSec < c->currentSec) {
+        nextSec = c->currentSec;
+    }
+    c->currentSec = nextSec;
+    return (float)c->currentSec;
+}
+
+int overlayApplyLayerBudget(const int* slotKinds, int count, int maxLayers, int* keepOut) {
+    if (slotKinds == NULL || keepOut == NULL || count <= 0) {
+        return 0;
+    }
+    int limit = maxLayers;
+    if (limit <= 0 || limit > OVERLAY_HARD_MAX_LAYERS) {
+        limit = OVERLAY_HARD_MAX_LAYERS;
+    }
+    for (int i = 0; i < count; i++) {
+        keepOut[i] = 1;
+    }
+    int kept = count;
+    if (kept <= limit) {
+        return kept;
+    }
+    static const int DROP_ORDER[] = {
+        OVERLAY_SLOT_TOAST,
+        OVERLAY_SLOT_MODELS,
+        OVERLAY_SLOT_COG_HOVER,
+        OVERLAY_SLOT_COG_BUTTON,
+        OVERLAY_SLOT_COG_CLOCK,
+        OVERLAY_SLOT_DANMAKU
+    };
+    const int numStages = (int)(sizeof(DROP_ORDER) / sizeof(DROP_ORDER[0]));
+    for (int s = 0; s < numStages && kept > limit; s++) {
+        int kind = DROP_ORDER[s];
+        // For danmaku, shed all active danmaku eyes together so stereo never splits half-blind
+        if (kind == OVERLAY_SLOT_DANMAKU) {
+            for (int i = count - 1; i >= 0; i--) {
+                if (keepOut[i] && slotKinds[i] == kind) {
+                    keepOut[i] = 0;
+                    kept--;
+                }
+            }
+        }
+        else {
+            for (int i = count - 1; i >= 0 && kept > limit; i--) {
+                if (keepOut[i] && slotKinds[i] == kind) {
+                    keepOut[i] = 0;
+                    kept--;
+                }
+            }
+        }
+    }
+    return kept;
+}

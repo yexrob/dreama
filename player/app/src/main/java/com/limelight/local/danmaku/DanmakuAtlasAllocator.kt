@@ -3,20 +3,20 @@ package com.limelight.local.danmaku
 import com.limelight.binding.video.XrShared
 
 /**
- * Pure-Kotlin shelf allocator for the 2048x2048 2-channel GL_RG8 danmaku glyph atlas
+ * Pure-Kotlin shelf allocator for the 2048x2048 premultiplied GL_RGBA8 danmaku atlas
  * (ux-spec.md §6.10, §7).
  *
- * - Partitions the atlas into horizontal shelves sized to the 3 font tiers (56 / 72 / 92 px)
- *   plus generous extra medium shelves (the default 1.4° tier).
- * - Each shelf maintains a coalescing free-span list so exited danmaku immediately return
- *   space with zero fragmentation blow-up and zero full-atlas re-uploads.
- * - Returns `null` when full, which [DanmakuEngine] treats identically to "no free track"
- *   (wait up to 1 s, then drop).
+ * - Partitions the atlas into horizontal shelves sized to the 3 font tiers (56 / 72 / 92 px).
+ * - Assigns each live allocation a bounded [DanmakuAtlasSlot.slotIndex] in `[0, DANMAKU_MAX_SLOTS)`
+ *   plus a strictly monotonic [DanmakuAtlasSlot.generation] (`>= 1`) so native GPU rendering skips
+ *   any instance until that exact `(slotIndex, generation)` upload has landed.
+ * - Coalesces freed spans immediately on release; returns `null` when shelves or slot pool are full.
  */
 class DanmakuAtlasAllocator(
     val atlasWidth: Int = XrShared.DANMAKU_ATLAS_W,
     val atlasHeight: Int = XrShared.DANMAKU_ATLAS_H,
     private val gutterPx: Int = 2,
+    private val maxSlots: Int = XrShared.DANMAKU_MAX_SLOTS,
 ) {
     private data class Span(var x: Int, var width: Int)
 
@@ -31,21 +31,33 @@ class DanmakuAtlasAllocator(
 
     private val shelves = ArrayList<Shelf>()
     private val activeSlots = HashMap<Int, DanmakuAtlasSlot>()
+    private val freeSlotIndices = ArrayDeque<Int>(maxSlots)
     private var nextSlotId = 1
+    private var nextGeneration = 1
 
     init {
         buildShelves()
+        resetSlotPool()
     }
 
     val activeSlotCount: Int
         get() = activeSlots.size
 
+    private fun resetSlotPool() {
+        freeSlotIndices.clear()
+        for (i in 0 until maxSlots) {
+            freeSlotIndices.addLast(i)
+        }
+    }
+
+    private fun nextGen(): Int {
+        val g = nextGeneration
+        nextGeneration = if (g == Int.MAX_VALUE) 1 else g + 1
+        return g
+    }
+
     private fun buildShelves() {
         shelves.clear()
-        // Partition 2048 px height across font tiers:
-        // - 8 shelves x 56 px  = 448 px  (Small 1.2°)
-        // - 14 shelves x 72 px = 1008 px (Medium 1.4° default)
-        // - 6 shelves x 92 px  = 552 px  (Large 1.7°; total 2008 <= 2048)
         val tierHeights = intArrayOf(56, 72, 92)
         val tierCounts = intArrayOf(8, 14, 6)
         var y = 0
@@ -62,14 +74,13 @@ class DanmakuAtlasAllocator(
         }
     }
 
-    /** Allocates a `[width x height]` rectangle inside the smallest fitting shelf, or `null` if full. */
+    /** Allocates a `[width x height]` rectangle with a fresh `(slotIndex, generation)`, or `null` if full. */
     fun allocate(width: Int, height: Int): DanmakuAtlasSlot? {
-        if (width <= 0 || height <= 0) return null
+        if (width <= 0 || height <= 0 || freeSlotIndices.isEmpty()) return null
         val needW = width + gutterPx
         val needH = height + gutterPx
         if (needW > atlasWidth || needH > 92) return null
 
-        // First-fit in exact-tier shelves, then fall back to taller shelves if exact tier is full
         for (pass in 0..1) {
             for (shelf in shelves) {
                 if (shelf.height < needH) continue
@@ -91,8 +102,11 @@ class DanmakuAtlasAllocator(
                         if (sp.width == 0) {
                             spans.removeAt(i)
                         }
+                        val slotIdx = freeSlotIndices.removeFirst()
                         val slot = DanmakuAtlasSlot(
                             slotId = nextSlotId++,
+                            slotIndex = slotIdx,
+                            generation = nextGen(),
                             x = allocX,
                             y = shelf.y,
                             width = width,
@@ -108,9 +122,10 @@ class DanmakuAtlasAllocator(
         return null
     }
 
-    /** Releases a previously allocated slot back into its shelf and coalesces adjacent free spans. */
+    /** Releases a previously allocated slot back into its shelf and free slot-index pool. */
     fun release(slot: DanmakuAtlasSlot) {
         val removed = activeSlots.remove(slot.slotId) ?: return
+        freeSlotIndices.addLast(removed.slotIndex)
         val shelf = shelves.getOrNull(removed.shelfIndex) ?: return
         val freedX = removed.x
         val freedW = removed.width + gutterPx
@@ -122,7 +137,6 @@ class DanmakuAtlasAllocator(
         }
         spans.add(insertAt, Span(freedX, freedW))
 
-        // Coalesce with right neighbor
         if (insertAt + 1 < spans.size) {
             val cur = spans[insertAt]
             val next = spans[insertAt + 1]
@@ -131,7 +145,6 @@ class DanmakuAtlasAllocator(
                 spans.removeAt(insertAt + 1)
             }
         }
-        // Coalesce with left neighbor
         if (insertAt > 0) {
             val prev = spans[insertAt - 1]
             val cur = spans[insertAt]
@@ -142,9 +155,10 @@ class DanmakuAtlasAllocator(
         }
     }
 
-    /** Resets all shelves to empty (called on seek/episode reset alongside native atlas clear). */
+    /** Resets shelves & free slot pool while keeping [nextGeneration] monotonically advancing. */
     fun clear() {
         activeSlots.clear()
+        resetSlotPool()
         for (shelf in shelves) {
             shelf.freeSpans.clear()
             shelf.freeSpans.add(Span(0, atlasWidth))

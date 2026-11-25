@@ -227,10 +227,144 @@ static void testSection65LayerBudgetAllStates(void) {
     CHECK(overlayCountLocalLayers(&f) == 11);
 }
 
+static void testSlotGenerationTableGating(void) {
+    DanmakuSlotTable t;
+    danmakuSlotTableClear(&t);
+
+    // Un-uploaded slot must NEVER be considered ready
+    CHECK(danmakuSlotTableIsReady(&t, 0, 1) == 0);
+    CHECK(danmakuSlotTableIsReady(&t, 5, 1) == 0);
+    // Out-of-bounds & generation 0 safely return 0
+    CHECK(danmakuSlotTableIsReady(&t, -1, 1) == 0);
+    CHECK(danmakuSlotTableIsReady(&t, DANMAKU_MAX_SLOTS, 1) == 0);
+    CHECK(danmakuSlotTableIsReady(&t, 0, 0) == 0);
+
+    // Upload generation 1 into slot 5 -> ready ONLY for generation 1
+    danmakuSlotTableMarkUploaded(&t, 5, 1);
+    CHECK(danmakuSlotTableIsReady(&t, 5, 1) == 1);
+    // Slot reuse with generation 2 BEFORE upload lands -> MUST be skipped (no stale text!)
+    CHECK(danmakuSlotTableIsReady(&t, 5, 2) == 0);
+
+    // Once generation 2 upload lands -> gen 2 ready, old gen 1 no longer matches
+    danmakuSlotTableMarkUploaded(&t, 5, 2);
+    CHECK(danmakuSlotTableIsReady(&t, 5, 2) == 1);
+    CHECK(danmakuSlotTableIsReady(&t, 5, 1) == 0);
+
+    // Atlas clear invalidates all landed generations immediately
+    danmakuSlotTableClear(&t);
+    CHECK(danmakuSlotTableIsReady(&t, 5, 2) == 0);
+}
+
+static void testAnchorMonotonicSnapshotClock(void) {
+    DanmakuClockTracker c;
+    danmakuClockReset(&c);
+
+    // First anchor at t=10.000 s, mono=100.000 s, playing
+    int64_t t0Ns = 100000000000LL;
+    danmakuClockSetAnchor(&c, 10000, t0Ns, 0, 1);
+    float prev = danmakuClockSample(&c, t0Ns, 0.0111f);
+    CHECK_NEAR(prev, 10.0f, 0.02f);
+
+    // Simulate 90 Hz frames (11.11 ms) while 20 Hz snapshots arrive with +/-14 ms jitter:
+    // clock MUST stay strictly monotonic (never step backward) and never jump +/-14 ms!
+    int64_t nowNs = t0Ns;
+    for (int frame = 1; frame <= 90; frame++) {
+        nowNs += 11111111LL;
+        if (frame % 4 == 0) {
+            int64_t jitterMs = (frame % 8 == 0) ? -14 : 14;
+            int64_t anchorMs = 10000 + (int64_t)((nowNs - t0Ns) / 1000000LL) + jitterMs;
+            danmakuClockSetAnchor(&c, anchorMs, nowNs, 0, 0);
+        }
+        float cur = danmakuClockSample(&c, nowNs, 0.011111f);
+        CHECK(cur >= prev); // strictly monotonic: zero backward step
+        float step = cur - prev;
+        CHECK(step <= 0.011111f * 1.26f + 1e-4f); // bounded smooth slew: zero +/-14 ms jump
+        prev = cur;
+    }
+    // After 1.0 s of 90 Hz frames, total clock should be right around 11.0 s
+    CHECK_NEAR(prev, 11.0f, 0.04f);
+
+    // Pause freezes clock even if wall time advances and jittery pause anchor arrives slightly earlier
+    danmakuClockSetAnchor(&c, (int64_t)(prev * 1000.0f) - 10, nowNs, 1, 0);
+    float frozen1 = danmakuClockSample(&c, nowNs + 500000000LL, 0.0111f);
+    float frozen2 = danmakuClockSample(&c, nowNs + 2000000000LL, 0.0111f);
+    CHECK(frozen1 >= prev);
+    CHECK_NEAR(frozen2, frozen1, 1e-5f);
+
+    // Explicit hardReset (seek / new item) snaps cleanly backward to 0.0 s
+    danmakuClockSetAnchor(&c, 0, nowNs + 2000000000LL, 0, 1);
+    float afterReset = danmakuClockSample(&c, nowNs + 2000000000LL, 0.0111f);
+    CHECK_NEAR(afterReset, 0.0f, 0.02f);
+}
+
+static void testRealProductionLayerBudgetAndDropLadder(void) {
+    // Case 1: Local playback worst-case steady frame (13 layers: room+glow+2 video+2 danmaku+
+    // transport+palette+popup+2 ray+models+toast) against 16-layer hardware cap -> all 13 kept!
+    int local13[13] = {
+        OVERLAY_SLOT_OTHER, // room/dimmer
+        OVERLAY_SLOT_OTHER, // glow
+        OVERLAY_SLOT_OTHER, // video L
+        OVERLAY_SLOT_OTHER, // video R
+        OVERLAY_SLOT_DANMAKU, // danmaku L
+        OVERLAY_SLOT_DANMAKU, // danmaku R
+        OVERLAY_SLOT_OTHER, // transport
+        OVERLAY_SLOT_OTHER, // palette
+        OVERLAY_SLOT_OTHER, // popup
+        OVERLAY_SLOT_MODELS,
+        OVERLAY_SLOT_OTHER, // beam
+        OVERLAY_SLOT_OTHER, // dot
+        OVERLAY_SLOT_TOAST
+    };
+    int keep[24];
+    int kept = overlayApplyLayerBudget(local13, 13, 32 /* Quest reports 32 -> clamped to 16 */, keep);
+    CHECK(kept == 13);
+
+    // Case 2: Over-limit 19-layer frame (12 OTHER + 2 DANMAKU + toast + models + cogHover +
+    // cogButton + cogClock = 19) -> drops toast, models, cogHover (3 dropped -> 16 kept),
+    // keeping danmaku & video intact!
+    int frame19[19];
+    for (int i = 0; i < 12; i++) frame19[i] = OVERLAY_SLOT_OTHER;
+    frame19[12] = OVERLAY_SLOT_DANMAKU;
+    frame19[13] = OVERLAY_SLOT_DANMAKU;
+    frame19[14] = OVERLAY_SLOT_COG_BUTTON;
+    frame19[15] = OVERLAY_SLOT_COG_CLOCK;
+    frame19[16] = OVERLAY_SLOT_COG_HOVER;
+    frame19[17] = OVERLAY_SLOT_MODELS;
+    frame19[18] = OVERLAY_SLOT_TOAST;
+    kept = overlayApplyLayerBudget(frame19, 19, 32, keep);
+    CHECK(kept == 16);
+    CHECK(keep[18] == 0); // toast dropped 1st
+    CHECK(keep[17] == 0); // models dropped 2nd
+    CHECK(keep[16] == 0); // cogHover dropped 3rd
+    CHECK(keep[14] == 1); // cogButton kept
+    CHECK(keep[15] == 1); // cogClock kept
+    CHECK(keep[12] == 1 && keep[13] == 1); // danmaku kept
+
+    // Case 3: Extreme 22-layer frame (15 OTHER + 2 DANMAKU + 5 droppable UI) -> drops all 5 UI
+    // AND both danmaku eyes together so frame lands at 15 <= 16 (never rejected whole by xrEndFrame!)
+    int frame22[22];
+    for (int i = 0; i < 15; i++) frame22[i] = OVERLAY_SLOT_OTHER;
+    frame22[15] = OVERLAY_SLOT_DANMAKU;
+    frame22[16] = OVERLAY_SLOT_DANMAKU;
+    frame22[17] = OVERLAY_SLOT_COG_BUTTON;
+    frame22[18] = OVERLAY_SLOT_COG_CLOCK;
+    frame22[19] = OVERLAY_SLOT_COG_HOVER;
+    frame22[20] = OVERLAY_SLOT_MODELS;
+    frame22[21] = OVERLAY_SLOT_TOAST;
+    kept = overlayApplyLayerBudget(frame22, 22, 32, keep);
+    CHECK(kept == 15);
+    CHECK(kept <= OVERLAY_HARD_MAX_LAYERS);
+    CHECK(keep[15] == 0 && keep[16] == 0); // both danmaku eyes dropped cleanly together
+    for (int i = 0; i < 15; i++) CHECK(keep[i] == 1); // core video/UI intact
+}
+
 int main(void) {
     testDisparityDistanceTableAndCeilings();
     testContentDepthSmoothingAndHistogram98();
     testSharedCurvedAndChordOverlaySurfaces();
     testSection65LayerBudgetAllStates();
+    testSlotGenerationTableGating();
+    testAnchorMonotonicSnapshotClock();
+    testRealProductionLayerBudgetAndDropLadder();
     return checksDone("xr_overlay");
 }

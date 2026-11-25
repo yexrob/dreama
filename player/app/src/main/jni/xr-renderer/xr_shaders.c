@@ -688,9 +688,9 @@ const char* const DANMAKU_VERTEX_SRC =
     "    v_screenU = u;\n"
     "}\n";
 
-// 2-channel GL_RG8 atlas: R = crisp glyph fill alpha, G = 0.08em #0E0F12 stroke
-// + 1-texel soft shadow alpha. Multiplies per-item RGB color, per-item fade,
-// global opacity, and 1.5 deg horizontal edge feathering in one pass.
+// Premultiplied GL_RGBA8 danmaku atlas: baked text color, full-color Android emoji,
+// 0.08em #0E0F12 stroke, and 1-texel soft drop shadow. Multiplies per-item fade,
+// live global opacity, and 1.5 deg horizontal edge feathering in one pass.
 const char* const DANMAKU_FRAGMENT_SRC =
     "#version 300 es\n"
     "precision mediump float;\n"
@@ -702,20 +702,15 @@ const char* const DANMAKU_FRAGMENT_SRC =
     "uniform float u_featherU;\n"
     "out vec4 fragColor;\n"
     "void main() {\n"
-    "    vec2 rg = texture(u_atlas, v_uv).rg;\n"
-    "    float fillA = rg.r;\n"
-    "    float strokeA = rg.g;\n"
-    "    float outA = clamp(fillA + strokeA * (1.0 - fillA), 0.0, 1.0);\n"
-    "    if (outA < 0.004) {\n"
+    "    vec4 tex = texture(u_atlas, v_uv);\n"
+    "    if (tex.a < 0.004) {\n"
     "        discard;\n"
     "    }\n"
-    "    vec3 strokeCol = vec3(0.0549, 0.0588, 0.0706);\n"
-    "    vec3 rgb = v_colorAlpha.rgb * fillA + strokeCol * (strokeA * (1.0 - fillA));\n"
     "    float edge = 1.0;\n"
     "    if (u_featherU > 0.0001) {\n"
     "        edge = smoothstep(0.0, u_featherU, v_screenU)\n"
     "             * smoothstep(0.0, u_featherU, 1.0 - v_screenU);\n"
     "    }\n"
     "    float mask = v_colorAlpha.a * u_globalOpacity * edge;\n"
-    "    fragColor = vec4(rgb * mask, outA * mask);\n"
+    "    fragColor = tex * mask;\n"
     "}\n";

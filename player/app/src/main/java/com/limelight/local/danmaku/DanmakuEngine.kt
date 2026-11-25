@@ -4,6 +4,7 @@ import com.limelight.binding.video.XrShared
 import com.limelight.local.DanmakuArea
 import com.limelight.local.StereoSourceFormat
 import com.limelight.local.plugin.DanmakuMode
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -19,6 +20,7 @@ data class DanmakuStepResult(
     val snapshotChanged: Boolean,
     val newlySpawned: List<ActiveDanmakuItem>,
     val animateDepthTransition: Boolean,
+    val clockReset: Boolean,
     val activeCount: Int,
     val areaBotFrac: Float,
 )
@@ -27,23 +29,21 @@ data class DanmakuStepResult(
  * Pure-Kotlin, 100% deterministic danmaku track allocator, collision avoider, timeline engine,
  * and stereoscopic layered-float controller (ux-spec.md §6.10, §6.3, §6.12).
  *
- * Guarantees:
- * - Same input items, settings, screen geometry, and virtual [clock] always produce identical
- *   tracks, depth bands, spawn times, and positions.
- * - Scroll danmaku share one angular velocity (Slow 10s / Normal 8s / Fast 6s, capped at 12°/s)
- *   so same-track collisions are mathematically impossible once tail clearance >= gapChars * fontDeg.
- * - Top/Bottom stay 4 s in real time on the NEAR band with 150 ms fade; Bottom stays above the
- *   6.5° subtitle zone with max 3 rows.
- * - Tracks never rise above +18° above eye level; scroll tracks never enter the subtitle zone.
- * - Overflow items wait up to 1,000 ms real time, then drop cleanly (no backfill).
- * - Pause freezes real timeline; playback speed spawns by mediaTimeMs while scrolling in real time;
- *   scrubbing hides and seek resets cleanly with zero backfill.
+ * Hard invariants:
+ * - Forward media jumps exceeding `expectedAdvance + 1.5 s` AND backward jumps exceeding `1.5 s`
+ *   are treated as clean seeks with ZERO backfill.
+ * - Scheduled items are bounded to `[currentWindow - 1, currentWindow + 1]` and capped at
+ *   [MAX_ITEMS_PER_WINDOW] per window, merged in O(N + M) without full re-sorting.
+ * - Per-tick spawn count respects [maxNewSpawns] so bursts never overflow the native atlas queue.
+ * - [packInstances] emits ONLY items whose atlas patch has already been rasterized & accepted,
+ *   tagging each instance with `(slotIndex, generation)` for GPU-side landing verification.
  */
 class DanmakuEngine(
     private val clock: DanmakuClock,
     private val measurer: DanmakuTextMeasurer = HeuristicDanmakuMeasurer,
     val atlas: DanmakuAtlasAllocator = DanmakuAtlasAllocator(),
     private val previewStrings: DanmakuPreviewStrings = DanmakuPreviewStrings(),
+    private val windowMs: Long = DanmakuWindowFetcher.WINDOW_MS,
 ) {
     private data class WaitingItem(
         val raw: DanmakuRawItem,
@@ -62,21 +62,23 @@ class DanmakuEngine(
     private var scrubbing: Boolean = false
     private var previewRequested: Boolean = false
     private var previewActive: Boolean = false
+    private var playbackSpeed: Float = 1.0f
 
-    // Real-time timeline that freezes while paused so paused items stay frozen at exact X
+    // Real-time timeline that freezes while paused/buffering so active items stay frozen at exact X
     private var lastWallRealMs: Long = clock.nowRealMs()
     private var timelineRealMs: Long = 0L
 
-    // Last processed video media timestamp (ms)
+    // Last processed video media timestamp (ms) and bounded window anchor
     private var lastMediaMs: Long = 0L
     private var mediaCursorReady: Boolean = false
+    private var lastPrunedWindow: Int = Int.MIN_VALUE
 
-    // Pending timeline items from fetched windows, sorted by (timeMs, id)
-    private val scheduled = ArrayList<DanmakuRawItem>()
+    // Pending timeline items from active windows [cur-1 .. cur+1], strictly sorted by (timeMs, id)
+    private var scheduled = ArrayList<DanmakuRawItem>()
     private val scheduledIds = HashSet<Long>()
     private var scheduledCursor: Int = 0
 
-    // Bounded 1 s wait queue when tracks, density cap, or atlas are temporarily full
+    // Bounded 1 s wait queue when tracks, density cap, atlas, or upload queue are temporarily full
     private val waitQueue = ArrayDeque<WaitingItem>()
 
     // Currently live items on screen (or 3 stationary previews)
@@ -84,11 +86,15 @@ class DanmakuEngine(
     private var nextRuntimeId: Long = 1L
 
     private var pendingDepthAnim: Boolean = false
+    private var pendingClockReset: Boolean = true
     private var dirtySnapshot: Boolean = true
     private var droppedCount: Int = 0
 
     val activeItems: List<ActiveDanmakuItem>
         get() = active
+
+    val scheduledItemCount: Int
+        get() = scheduled.size
 
     val currentTimelineRealMs: Long
         get() = timelineRealMs
@@ -110,7 +116,6 @@ class DanmakuEngine(
         val fontDeg = settings.fontAngularDeg()
         val pitchDeg = fontDeg * TRACK_PITCH_RATIO
 
-        // Top ceiling: never above +18 deg above eye level (for giant screen where vFov/2 > 18 deg)
         val topSkipDeg = max(0.0f, vFov * 0.5f - MAX_ELEVATION_DEG)
         val maxNonSubDeg = max(pitchDeg, vFov - SUBTITLE_ZONE_DEG)
 
@@ -122,14 +127,7 @@ class DanmakuEngine(
         val usableDeg = max(0.0f, areaBottomDeg - topSkipDeg)
         val scrollTracks = DanmakuDepthMath.computeTrackCount(usableDeg, fontDeg)
         val areaBotFrac = (areaBottomDeg / vFov).coerceIn(0.15f, 1.0f)
-        // Bottom fixed danmaku sit above subtitle zone (within full non-sub height, max 3 rows)
-        val bottomAreaBotFrac = if (settings.area == DanmakuArea.FULL) {
-            areaBotFrac
-        } else {
-            areaBotFrac
-        }
 
-        // Scroll angular speed: screenFovDeg / transitSec, capped at 12 deg/s on giant screens (§6.10)
         val rawSpeedDegPerSec = fovW / settings.transitDurationSec()
         val speedDegPerSec = min(rawSpeedDegPerSec, MAX_SCROLL_DEG_PER_SEC)
 
@@ -140,7 +138,7 @@ class DanmakuEngine(
             pitchDeg = pitchDeg,
             topSkipDeg = topSkipDeg,
             areaBottomDeg = areaBottomDeg,
-            areaBotFrac = bottomAreaBotFrac,
+            areaBotFrac = areaBotFrac,
             scrollTrackCount = scrollTracks,
             bottomTrackCount = min(MAX_BOTTOM_ROWS, scrollTracks),
             speedDegPerSec = speedDegPerSec,
@@ -150,39 +148,57 @@ class DanmakuEngine(
     }
 
     /**
-     * Ingests newly fetched window items. When [windowIndex] >= 0, replaces any earlier items from
-     * that same window so LRU eviction + seek-back or toggling duplicate-merge never duplicates items.
+     * Ingests newly fetched window items in O(N + M) sorted merge order.
+     * - Replaces any earlier items from the same [windowIndex] so LRU re-fetch or toggling
+     *   duplicate-merge never creates duplicates.
+     * - Enforces [MAX_ITEMS_PER_WINDOW] cap and prunes windows outside `[cur - 1, cur + 1]`.
      */
     fun ingestWindowItems(items: List<DanmakuRawItem>, windowIndex: Int = -1) {
-        var changed = false
+        if (windowIndex >= 0 && mediaCursorReady) {
+            val curWin = windowIndexFor(lastMediaMs)
+            if (abs(windowIndex - curWin) > 1) {
+                return
+            }
+        }
         if (windowIndex >= 0) {
-            val iter = scheduled.iterator()
-            while (iter.hasNext()) {
-                val existing = iter.next()
-                if (existing.windowIndex == windowIndex) {
-                    scheduledIds.remove(existing.id)
-                    iter.remove()
-                    changed = true
-                }
-            }
+            removeWindowFromScheduled(windowIndex)
         }
-        for (it in items) {
-            val tagged = if (windowIndex >= 0 && it.windowIndex != windowIndex) {
-                it.copy(windowIndex = windowIndex)
-            } else {
-                it
-            }
-            if (scheduledIds.add(tagged.id)) {
-                scheduled.add(tagged)
-                changed = true
-            }
-        }
-        if (changed) {
-            scheduled.sortWith(compareBy<DanmakuRawItem> { it.timeMs }.thenBy { it.id })
-            // Re-sync cursor to current media position without backfilling already-passed items
+        if (items.isEmpty()) {
             if (mediaCursorReady) {
                 scheduledCursor = lowerBoundTime(lastMediaMs)
             }
+            return
+        }
+
+        val cappedCount = min(items.size, MAX_ITEMS_PER_WINDOW)
+        val incoming = ArrayList<DanmakuRawItem>(cappedCount)
+        var alreadySorted = true
+        var prevTime = Long.MIN_VALUE
+        var prevId = Long.MIN_VALUE
+        for (i in 0 until cappedCount) {
+            val raw = items[i]
+            val tagged = if (windowIndex >= 0 && raw.windowIndex != windowIndex) {
+                raw.copy(windowIndex = windowIndex)
+            } else {
+                raw
+            }
+            if (scheduledIds.add(tagged.id)) {
+                if (tagged.timeMs < prevTime || (tagged.timeMs == prevTime && tagged.id < prevId)) {
+                    alreadySorted = false
+                }
+                prevTime = tagged.timeMs
+                prevId = tagged.id
+                incoming.add(tagged)
+            }
+        }
+        if (incoming.isEmpty()) return
+        if (!alreadySorted) {
+            incoming.sortWith(ITEM_COMPARATOR)
+        }
+        mergeSortedIntoScheduled(incoming)
+        if (mediaCursorReady) {
+            pruneScheduledAround(lastMediaMs)
+            scheduledCursor = lowerBoundTime(lastMediaMs)
         }
     }
 
@@ -211,9 +227,13 @@ class DanmakuEngine(
         this.contentPhiDeg = contentPhiDeg.coerceIn(0.0f, DanmakuDepthMath.MAX_NEAR_PHI_DEG)
     }
 
-    /** Updates ONLY the latest smoothed 98th-percentile foreground disparity without altering screen/stereo state. */
+    /** Updates ONLY the latest smoothed 98th-percentile foreground disparity. */
     fun updateContentPhi(contentPhiDeg: Float) {
         this.contentPhiDeg = contentPhiDeg.coerceIn(0.0f, DanmakuDepthMath.MAX_NEAR_PHI_DEG)
+    }
+
+    fun setPlaybackSpeed(speed: Float) {
+        playbackSpeed = if (speed.isFinite()) speed.coerceIn(0.25f, 4.0f) else 1.0f
     }
 
     /** Updates settings live per §6.10 rules (block immediately removes, float/layer animates 200 ms). */
@@ -223,7 +243,6 @@ class DanmakuEngine(
         this.settings = next
         dirtySnapshot = true
 
-        // Turning OFF clears screen immediately
         if (!next.on) {
             clearActiveItems()
             waitQueue.clear()
@@ -231,18 +250,15 @@ class DanmakuEngine(
             return
         }
 
-        // Changing block mask removes matching active items immediately (no fade-out per §6.10)
         if (next.blockMask != prev.blockMask) {
             removeActiveMatching { !it.isPreview && next.isBlocked(it.mode, it.colorRgb) }
         }
 
-        // Changing area or font size resets preview so it re-lays out at new size/area
         if (next.area != prev.area || next.sizeTier != prev.sizeTier) {
             if (previewActive) {
                 clearActiveItems()
                 previewActive = false
             }
-            // Remove any active items whose track is now outside the shrunken area
             val metrics = computeLayoutMetrics()
             removeActiveMatching {
                 !it.isPreview && (
@@ -252,7 +268,6 @@ class DanmakuEngine(
             }
         }
 
-        // §6.10: ONLY when the user drags Float or Layer do existing on-screen items animate (200 ms)
         val depthChanged = next.floatAuto != prev.floatAuto
             || next.floatAutoOffsetSteps != prev.floatAutoOffsetSteps
             || next.floatFixedSteps != prev.floatFixedSteps
@@ -268,7 +283,6 @@ class DanmakuEngine(
 
     fun setPaused(isPaused: Boolean) {
         if (this.paused == isPaused) return
-        // Advance timeline right up to pause boundary before freezing
         advanceTimelineClock()
         this.paused = isPaused
         dirtySnapshot = true
@@ -305,7 +319,9 @@ class DanmakuEngine(
         previewActive = false
         lastMediaMs = pos
         mediaCursorReady = true
+        pruneScheduledAround(pos)
         scheduledCursor = lowerBoundTime(pos)
+        pendingClockReset = true
         dirtySnapshot = true
     }
 
@@ -316,6 +332,7 @@ class DanmakuEngine(
         scheduled.clear()
         scheduledIds.clear()
         scheduledCursor = 0
+        lastPrunedWindow = Int.MIN_VALUE
         atlas.clear()
         lastMediaMs = startMediaMs.coerceAtLeast(0L)
         mediaCursorReady = false
@@ -324,19 +341,22 @@ class DanmakuEngine(
         droppedCount = 0
         lastWallRealMs = clock.nowRealMs()
         timelineRealMs = 0L
+        pendingClockReset = true
         dirtySnapshot = true
     }
 
     /**
-     * Advances the danmaku engine for the current video `mediaTimeMs` and virtual/monotonic clock.
-     * Call at ~20 Hz (or on state changes) on the dedicated danmaku worker thread.
+     * Advances the danmaku engine for the current video [mediaTimeMs] and virtual/monotonic clock.
+     * [maxNewSpawns] caps newly spawned items in this tick so bursts never overflow the native
+     * atlas upload queue.
      */
-    fun step(mediaTimeMs: Long): DanmakuStepResult {
+    fun step(mediaTimeMs: Long, maxNewSpawns: Int = Int.MAX_VALUE): DanmakuStepResult {
         val newlySpawned = ArrayList<ActiveDanmakuItem>()
         val nowWall = clock.nowRealMs()
-        if (!paused) {
-            val dt = (nowWall - lastWallRealMs).coerceIn(0L, 250L)
-            timelineRealMs += dt
+        val dt = if (!paused) {
+            (nowWall - lastWallRealMs).coerceIn(0L, MAX_STEP_DT_MS).also { timelineRealMs += it }
+        } else {
+            0L
         }
         lastWallRealMs = nowWall
 
@@ -348,21 +368,32 @@ class DanmakuEngine(
                 dirtySnapshot = true
             }
             val changed = dirtySnapshot
-            dirtySnapshot = false
             val anim = pendingDepthAnim
+            val reset = pendingClockReset
+            dirtySnapshot = false
             pendingDepthAnim = false
-            return DanmakuStepResult(changed, newlySpawned, anim, 0, metrics.areaBotFrac)
+            pendingClockReset = false
+            return DanmakuStepResult(changed, newlySpawned, anim, reset, 0, metrics.areaBotFrac)
         }
 
         val mediaPos = mediaTimeMs.coerceAtLeast(0L)
         if (!mediaCursorReady) {
             mediaCursorReady = true
             lastMediaMs = mediaPos
+            pruneScheduledAround(mediaPos)
             scheduledCursor = lowerBoundTime(mediaPos)
-        } else if (mediaPos + SEEK_BACKWARD_GUARD_MS < lastMediaMs) {
-            // Unexpected backward jump (e.g. loop repeat or external seek): treat as clean seek
-            onSeek(mediaPos)
+        } else if (!paused) {
+            val expectedAdvanceMs = (dt * max(1.0f, playbackSpeed)).toLong()
+            val jumpedBackward = mediaPos + SEEK_BACKWARD_GUARD_MS < lastMediaMs
+            val jumpedForward = mediaPos > lastMediaMs + expectedAdvanceMs + SEEK_FORWARD_GUARD_MS
+            if (jumpedBackward || jumpedForward) {
+                // Any unexpected backward OR forward jump > (expected + 1.5 s) is treated as a clean
+                // seek so resume/refresh/external jumps NEVER backfill skipped danmaku.
+                onSeek(mediaPos)
+            }
         }
+
+        pruneScheduledAround(mediaPos)
 
         // 1. Reap expired active items and immediately recycle their atlas slots
         if (!previewActive && !paused) {
@@ -384,7 +415,8 @@ class DanmakuEngine(
             dirtySnapshot = true
         }
 
-        // 3. Collect newly due items in [lastMediaMs, mediaPos] when playing (supports any playback speed!)
+        // 3. Collect newly due items in [lastMediaMs, mediaPos] when playing (supports any playback speed)
+        val spawnBudget = maxNewSpawns.coerceAtLeast(0)
         if (!paused) {
             if (scheduledCursor < scheduled.size && scheduled[scheduledCursor].timeMs < lastMediaMs - 50L) {
                 scheduledCursor = lowerBoundTime(lastMediaMs)
@@ -397,7 +429,7 @@ class DanmakuEngine(
             }
             lastMediaMs = mediaPos
 
-            // 4. Drain wait queue (drop items waiting > 1,000 ms real time per §6.10)
+            // 4. Drain wait queue (drop items waiting > 1,000 ms real time; throttle to spawnBudget)
             val depthBands = computeCurrentDepthBands()
             val retryQueue = ArrayList<WaitingItem>()
             while (waitQueue.isNotEmpty()) {
@@ -407,6 +439,10 @@ class DanmakuEngine(
                     continue
                 }
                 if (settings.isBlocked(w.raw.mode, w.raw.colorRgb)) {
+                    continue
+                }
+                if (newlySpawned.size >= spawnBudget) {
+                    retryQueue.add(w)
                     continue
                 }
                 val placed = tryPlaceItem(w.raw, metrics, depthBands)
@@ -427,9 +463,9 @@ class DanmakuEngine(
             }
         }
 
-        // 5. §6.3 Preview mode: 3 stationary layered items when Danmaku tab open & (paused or screen empty)
+        // 5. §6.3 Preview mode: 3 stationary layered items when Danmaku tab open & (paused or empty)
         val wantPreview = previewRequested && (paused || active.none { !it.isPreview })
-        if (wantPreview && !previewActive && active.none { !it.isPreview }) {
+        if (wantPreview && !previewActive && active.none { !it.isPreview } && spawnBudget >= 3) {
             spawnPreviewItems(metrics, computeCurrentDepthBands(), newlySpawned)
         } else if (!wantPreview && previewActive) {
             clearActiveItems()
@@ -439,17 +475,25 @@ class DanmakuEngine(
 
         val changed = dirtySnapshot || newlySpawned.isNotEmpty()
         val anim = pendingDepthAnim
+        val reset = pendingClockReset
         dirtySnapshot = false
         pendingDepthAnim = false
-        return DanmakuStepResult(changed, newlySpawned, anim, active.size, metrics.areaBotFrac)
+        pendingClockReset = false
+        return DanmakuStepResult(changed, newlySpawned, anim, reset, active.size, metrics.areaBotFrac)
     }
 
-    /** Packs all rasterized active items into `out` (zero heap allocation) for JNI upload. */
+    /**
+     * Packs ONLY rasterized & upload-accepted active items into [out] (zero heap allocation).
+     * Each instance carries 20 floats including `(slotIndex, generation)` so the native render
+     * thread skips any item whose GPU atlas patch has not yet finished uploading.
+     */
     fun packInstances(out: FloatArray): Int {
         val maxItems = min(active.size, min(XrShared.DANMAKU_MAX_ITEMS, out.size / XrShared.DANMAKU_INSTANCE_FLOATS))
         var count = 0
-        for (i in 0 until maxItems) {
+        for (i in 0 until active.size) {
+            if (count >= maxItems) break
             val it = active[i]
+            if (!it.rasterized) continue
             val slot = it.atlasSlot ?: continue
             val base = count * XrShared.DANMAKU_INSTANCE_FLOATS
             out[base + 0] = it.xStartNorm
@@ -475,6 +519,8 @@ class DanmakuEngine(
             }
             out[base + 16] = (modeCode or (it.layerBand.nativeCode shl 8)).toFloat()
             out[base + 17] = it.fixedPhiDeg
+            out[base + 18] = slot.slotIndex.toFloat()
+            out[base + 19] = slot.generation.toFloat()
             count++
         }
         return count
@@ -490,7 +536,6 @@ class DanmakuEngine(
         m: TrackLayoutMetrics,
         depthBands: DanmakuDepthBands,
     ): ActiveDanmakuItem? {
-        // Density cap (§6.10: Sparse 20 / Medium 40 / Dense 80)
         val liveRealCount = active.count { !it.isPreview }
         if (liveRealCount >= m.maxOnScreen) return null
 
@@ -507,7 +552,6 @@ class DanmakuEngine(
         }
         if (trackIdx < 0) return null
 
-        // Allocate atlas space BEFORE committing track (full atlas behaves like no free track per §6.10)
         val (patchW, patchH) = estimateAtlasPatchPx(widthDeg, m)
         val slot = atlas.allocate(patchW, patchH) ?: return null
 
@@ -520,7 +564,6 @@ class DanmakuEngine(
         val hNormInArea = (m.pitchDeg / m.areaBottomDeg).coerceIn(0.02f, 0.5f)
         val yNormInArea = when (raw.mode) {
             DanmakuMode.BOTTOM -> {
-                // Bottom danmaku stack upward from bottom of non-subtitle area (max 3 rows)
                 val rowFromBottom = trackIdx + 1
                 val yDeg = m.areaBottomDeg - rowFromBottom * m.pitchDeg
                 (yDeg / m.areaBottomDeg).coerceIn(0.0f, 1.0f - hNormInArea)
@@ -532,7 +575,6 @@ class DanmakuEngine(
         }
 
         return if (raw.mode == DanmakuMode.SCROLL) {
-            // Constant angular speed across all scroll danmaku -> zero mid-flight overtaking!
             val velNormPerSec = -(m.speedDegPerSec / m.screenFovDeg)
             val totalTravelNorm = 1.0f + wNorm + 0.04f
             val durationMs = ((totalTravelNorm / (-velNormPerSec)) * 1000.0f).toLong().coerceAtLeast(1000L)
@@ -582,10 +624,6 @@ class DanmakuEngine(
         }
     }
 
-    /**
-     * Top-down scroll track search (§6.10): track `k` is free iff every active scroll item on `k`
-     * has its trailing edge at least `gapDeg` inside the right edge (`tailNorm <= 1.0 - gapNorm`).
-     */
     private fun findFreeScrollTrack(m: TrackLayoutMetrics): Int {
         val gapNorm = m.gapDeg / m.screenFovDeg
         val maxAllowedTail = 1.0f - gapNorm
@@ -655,7 +693,7 @@ class DanmakuEngine(
                 layerBand = bands[i],
                 fixedPhiDeg = depthBands.phiFor(bands[i]),
                 spawnRealMs = timelineRealMs,
-                durationRealMs = 0L, // stays up while preview active
+                durationRealMs = 0L,
                 fadeMs = 0L,
                 xStartNorm = xNorm,
                 velNormPerSec = 0.0f,
@@ -691,7 +729,7 @@ class DanmakuEngine(
     private fun advanceTimelineClock() {
         val nowWall = clock.nowRealMs()
         if (!paused) {
-            val dt = (nowWall - lastWallRealMs).coerceIn(0L, 250L)
+            val dt = (nowWall - lastWallRealMs).coerceIn(0L, MAX_STEP_DT_MS)
             timelineRealMs += dt
         }
         lastWallRealMs = nowWall
@@ -716,6 +754,75 @@ class DanmakuEngine(
         }
     }
 
+    private fun windowIndexFor(mediaMs: Long): Int =
+        (mediaMs.coerceAtLeast(0L) / windowMs).toInt()
+
+    private fun removeWindowFromScheduled(windowIndex: Int) {
+        if (scheduled.isEmpty()) return
+        val kept = ArrayList<DanmakuRawItem>(scheduled.size)
+        for (it in scheduled) {
+            if (it.windowIndex == windowIndex) {
+                scheduledIds.remove(it.id)
+            } else {
+                kept.add(it)
+            }
+        }
+        scheduled = kept
+    }
+
+    /** Keeps strictly `[curWindow - 1, curWindow + 1]` in memory so long dense videos stay O(1) RAM. */
+    private fun pruneScheduledAround(mediaMs: Long) {
+        val curWin = windowIndexFor(mediaMs)
+        if (curWin == lastPrunedWindow) return
+        lastPrunedWindow = curWin
+        if (scheduled.isEmpty()) return
+        val minKeep = curWin - 1
+        val maxKeep = curWin + 1
+        var anyDropped = false
+        for (it in scheduled) {
+            if (it.windowIndex >= 0 && (it.windowIndex < minKeep || it.windowIndex > maxKeep)) {
+                anyDropped = true
+                break
+            }
+        }
+        if (!anyDropped) return
+        val kept = ArrayList<DanmakuRawItem>(scheduled.size)
+        for (it in scheduled) {
+            if (it.windowIndex >= 0 && (it.windowIndex < minKeep || it.windowIndex > maxKeep)) {
+                scheduledIds.remove(it.id)
+            } else {
+                kept.add(it)
+            }
+        }
+        scheduled = kept
+        scheduledCursor = lowerBoundTime(mediaMs)
+    }
+
+    /** O(N + M) merge of two already-sorted lists into [scheduled]. */
+    private fun mergeSortedIntoScheduled(incoming: List<DanmakuRawItem>) {
+        if (scheduled.isEmpty()) {
+            scheduled.addAll(incoming)
+            return
+        }
+        val merged = ArrayList<DanmakuRawItem>(scheduled.size + incoming.size)
+        var i = 0
+        var j = 0
+        while (i < scheduled.size && j < incoming.size) {
+            val a = scheduled[i]
+            val b = incoming[j]
+            if (ITEM_COMPARATOR.compare(a, b) <= 0) {
+                merged.add(a)
+                i++
+            } else {
+                merged.add(b)
+                j++
+            }
+        }
+        while (i < scheduled.size) merged.add(scheduled[i++])
+        while (j < incoming.size) merged.add(incoming[j++])
+        scheduled = merged
+    }
+
     private fun lowerBoundTime(targetMs: Long): Int {
         var lo = 0
         var hi = scheduled.size
@@ -736,7 +843,11 @@ class DanmakuEngine(
         const val FIXED_STAY_REAL_MS = 4_000L
         const val FIXED_FADE_REAL_MS = 150L
         const val MAX_BOTTOM_ROWS = 3
-        private const val SEEK_BACKWARD_GUARD_MS = 1_500L
+        const val MAX_ITEMS_PER_WINDOW = DanmakuWindowFetcher.MAX_ITEMS_PER_WINDOW
+        const val SEEK_BACKWARD_GUARD_MS = 1_500L
+        const val SEEK_FORWARD_GUARD_MS = 1_500L
+        private const val MAX_STEP_DT_MS = 250L
+        private val ITEM_COMPARATOR = compareBy<DanmakuRawItem> { it.timeMs }.thenBy { it.id }
     }
 }
 

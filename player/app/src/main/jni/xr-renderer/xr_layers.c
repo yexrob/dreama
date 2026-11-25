@@ -132,6 +132,7 @@ typedef struct {
     // on its own on the rest
     XrCompositionLayerColorScaleBiasKHR fades[FADE_SLOTS][2];
     const XrCompositionLayerBaseHeader* order[FRAME_MAX_LAYERS];
+    int slotKind[FRAME_MAX_LAYERS];
     uint32_t count;
 } FrameLayers;
 
@@ -179,16 +180,18 @@ typedef struct {
     BarFrame bar;
 } FrameView;
 
-// Takes a layer back out of the frame, keeping the order of the rest
-static void dropLayer(FrameLayers* layers, const void* layer) {
-    for (uint32_t i = 0; i < layers->count; i++) {
-        if (layers->order[i] == (const XrCompositionLayerBaseHeader*)layer) {
-            memmove(&layers->order[i], &layers->order[i + 1],
-                    (layers->count - i - 1) * sizeof(layers->order[0]));
-            layers->count--;
-            return;
-        }
+// Maps a pushed FrameLayers pointer to its production drop-ladder slot kind.
+static int classifyLayerSlot(const FrameLayers* layers, const void* layer) {
+    if (layer == &layers->toast) return OVERLAY_SLOT_TOAST;
+    if (layer == &layers->models) return OVERLAY_SLOT_MODELS;
+    if (layer == &layers->cogMark[COG_OPTION_COUNT]) return OVERLAY_SLOT_COG_HOVER;
+    if (layer == &layers->cogButton) return OVERLAY_SLOT_COG_BUTTON;
+    if (layer == &layers->cogClock) return OVERLAY_SLOT_COG_CLOCK;
+    if (layer == &layers->danmakuQuad[0] || layer == &layers->danmakuQuad[1]
+            || layer == &layers->danmakuCyl[0] || layer == &layers->danmakuCyl[1]) {
+        return OVERLAY_SLOT_DANMAKU;
     }
+    return OVERLAY_SLOT_OTHER;
 }
 
 // Adds a layer to the frame. One past the array would be a smashed stack, so a
@@ -203,7 +206,9 @@ static void pushLayer(XrCtx* ctx, FrameLayers* layers, const void* layer) {
         }
         return;
     }
-    layers->order[layers->count++] = (const XrCompositionLayerBaseHeader*)layer;
+    uint32_t idx = layers->count++;
+    layers->order[idx] = (const XrCompositionLayerBaseHeader*)layer;
+    layers->slotKind[idx] = classifyLayerSlot(layers, layer);
 }
 
 // A quad in the given space showing a texW x texH rect of one swapchain
@@ -464,6 +469,10 @@ static void addGlowLayer(XrCtx* ctx, const FrameView* view, FrameLayers* layers)
 // one layer. What was last drawn decides, not the switch, so a press that
 // lands between two frames never shows an eye the draw has not caught up with.
 static void addVideoLayers(XrCtx* ctx, const FrameView* view, FrameLayers* layers) {
+    // Guard against submitting a freshly upgraded swapchain whose first acquire failed
+    if (!ctx->swapchainHasFrame) {
+        return;
+    }
     int viewCount = view->stereo && ctx->drawnEyes == 2 ? 2 : 1;
     for (int eye = 0; eye < viewCount; eye++) {
         XrSwapchainSubImage subImage;
@@ -1669,7 +1678,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
             if (dmDt > 0.10f) dmDt = 0.10f;
         }
         ctx->lastDanmakuFrameNs = frameNs;
-        danmakuRenderEyes(ctx, curFov, curDist, dmDt, view.stereo);
+        danmakuRenderEyes(ctx, curFov, curDist, dmDt, frameNs, view.stereo);
     }
     else if (ctx->localMedia) {
         ctx->danmaku.drawnEyes = 0;
@@ -1747,41 +1756,34 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
     // Last, so it is in front of everything
     addSplashLayers(ctx, &layers, frameNs);
 
-    // The Room tab at its fullest, with a room, the glow, the stats and the
-    // ray all up, is a layer past the Pico's sixteen, two with the toast, and
-    // the controller models put three more of the tabs past it. A frame over
-    // the limit is refused whole (the count is in the comment at the top).
-    // The toast goes first: it is only ever a few seconds of words, and what
-    // it says is still true without it. Then the controller models: a hand
-    // that goes unseen while a full tab is up still points, and the beam and
-    // the dot are still there to show where. Then the hover ring, which
-    // every tab and the step buttons share: the cursor already shows where the
-    // ray is. Then the cog button, which only says which panel is open while
-    // it is: a press off the panel closes it the way pressing the button
-    // would. Then the clock over the panel, which the stats can show as well.
-    if (layers.count > (uint32_t)ctx->maxLayerCount) {
-        dropLayer(&layers, &layers.toast);
+    // Enforce hard <= 16 composition layer limit (OVERLAY_HARD_MAX_LAYERS) using
+    // the shared host-tested production drop ladder: toast -> models -> cogHover ->
+    // cogButton -> cogClock -> danmaku. Never let xrEndFrame receive > 16 layers.
+    int effectiveLimit = ctx->maxLayerCount;
+    if (effectiveLimit <= 0 || effectiveLimit > OVERLAY_HARD_MAX_LAYERS) {
+        effectiveLimit = OVERLAY_HARD_MAX_LAYERS;
     }
-    if (layers.count > (uint32_t)ctx->maxLayerCount) {
-        dropLayer(&layers, &layers.models);
-    }
-    if (layers.count > (uint32_t)ctx->maxLayerCount) {
-        dropLayer(&layers, &layers.cogMark[COG_OPTION_COUNT]);
-    }
-    if (layers.count > (uint32_t)ctx->maxLayerCount) {
-        dropLayer(&layers, &layers.cogButton);
-    }
-    if (layers.count > (uint32_t)ctx->maxLayerCount) {
-        dropLayer(&layers, &layers.cogClock);
+    int keep[FRAME_MAX_LAYERS];
+    int keptCount = overlayApplyLayerBudget(layers.slotKind, (int)layers.count,
+                                            effectiveLimit, keep);
+    if (keptCount < (int)layers.count) {
+        uint32_t dst = 0;
+        for (uint32_t i = 0; i < layers.count; i++) {
+            if (keep[i]) {
+                layers.order[dst] = layers.order[i];
+                layers.slotKind[dst] = layers.slotKind[i];
+                dst++;
+            }
+        }
+        layers.count = dst;
     }
 
     // Said once and only once, since a frame that crowds the limit is usually
-    // every frame after it. Nothing else is dropped: a missing layer is a
-    // silent bug, where the count in the log points straight at the culprit.
-    if (layers.count >= (uint32_t)ctx->maxLayerCount && !ctx->layerLimitWarned) {
+    // every frame after it.
+    if (layers.count >= (uint32_t)effectiveLimit && !ctx->layerLimitWarned) {
         ctx->layerLimitWarned = 1;
         LOGW("submitted %u composition layers against a limit of %d",
-             layers.count, ctx->maxLayerCount);
+             layers.count, effectiveLimit);
     }
 
     endInfo.layerCount = layers.count;

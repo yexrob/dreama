@@ -353,6 +353,32 @@ class PluginRuntime(
         }
     }
 
+    /** Result of [invokeIfIdle]: distinguishes runtime-busy contention from an actual invocation. */
+    sealed class IdleInvokeResult {
+        data object Busy : IdleInvokeResult()
+        data class Done(val value: JsonElement) : IdleInvokeResult()
+    }
+
+    /**
+     * Non-blocking best-effort invocation for low-priority background work such as danmaku windows:
+     * uses `tryLock()` so it NEVER queues behind `playback`, stream refresh, or user navigation.
+     * When busy, returns [IdleInvokeResult.Busy] immediately so the caller can reschedule cleanly.
+     */
+    suspend fun invokeIfIdle(
+        method: String,
+        arg: JsonElement? = null,
+        itemIdForErrors: String? = null,
+        timeoutMsOverride: Long? = null,
+    ): IdleInvokeResult {
+        if (!callMutex.tryLock()) return IdleInvokeResult.Busy
+        return try {
+            val res = invokeLocked(method, arg, itemIdForErrors, timeoutMsOverride, optional = false) ?: JsonNull
+            IdleInvokeResult.Done(res)
+        } finally {
+            callMutex.unlock()
+        }
+    }
+
     /**
      * Best-effort invocation used by `reportProgress` (§11.1): if this instance
      * is currently busy with another call, immediately drops the call and

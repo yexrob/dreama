@@ -9,6 +9,8 @@ import com.limelight.local.GlobalPaletteSettings
 import com.limelight.local.StereoSourceFormat
 import com.limelight.local.TextSizeTier
 import com.limelight.local.plugin.DanmakuMode
+import java.text.BreakIterator
+import java.util.Locale
 import kotlin.math.PI
 import kotlin.math.floor
 import kotlin.math.max
@@ -162,19 +164,27 @@ object HeuristicDanmakuMeasurer : DanmakuTextMeasurer {
     }
 }
 
-/** Allocated rectangle inside the 2048x2048 2-channel GL_RG8 danmaku atlas. */
+/**
+ * Allocated rectangle inside the 2048x2048 premultiplied GL_RGBA8 danmaku atlas.
+ * - [slotIndex] in `[0, DANMAKU_MAX_SLOTS)` and monotonic [generation] (`>= 1`) gate GPU rendering
+ *   so an instance NEVER renders stale text or un-uploaded pixels when regions are reused.
+ * - UV coordinates inset by 0.5 texel on all four sides so bilinear filtering never bleeds from
+ *   neighboring slots or residual pixels below shorter patches.
+ */
 data class DanmakuAtlasSlot(
     val slotId: Int,
+    val slotIndex: Int,
+    val generation: Int,
     val x: Int,
     val y: Int,
     val width: Int,
     val height: Int,
     val shelfIndex: Int,
 ) {
-    val u0: Float get() = x.toFloat() / XrShared.DANMAKU_ATLAS_W.toFloat()
-    val v0: Float get() = y.toFloat() / XrShared.DANMAKU_ATLAS_H.toFloat()
-    val du: Float get() = width.toFloat() / XrShared.DANMAKU_ATLAS_W.toFloat()
-    val dv: Float get() = height.toFloat() / XrShared.DANMAKU_ATLAS_H.toFloat()
+    val u0: Float get() = (x + 0.5f) / XrShared.DANMAKU_ATLAS_W.toFloat()
+    val v0: Float get() = (y + 0.5f) / XrShared.DANMAKU_ATLAS_H.toFloat()
+    val du: Float get() = max(1.0f, width - 1.0f) / XrShared.DANMAKU_ATLAS_W.toFloat()
+    val dv: Float get() = max(1.0f, height - 1.0f) / XrShared.DANMAKU_ATLAS_H.toFloat()
 }
 
 /** Live placed danmaku item currently visible on screen (or stationary preview). */
@@ -309,29 +319,78 @@ object DanmakuDepthMath {
         return clean.toIntOrNull(16) ?: 0xFFFFFF
     }
 
-    /** Sanitizes text per §6.10: collapses newlines to spaces, trims, caps at 40 chars + `…`. */
+    /**
+     * Sanitizes danmaku text per §6.10:
+     * - Maps `\n`, `\r`, `\t` to spaces and collapses runs of spaces.
+     * - Strips C0/DEL/C1 control characters, BiDi overrides/isolates/marks (U+202A–202E,
+     *   U+2066–2069, U+200E, U+200F, U+061C), zero-width chars (U+200B, U+200C, U+FEFF),
+     *   and Object Replacement Character (U+FFFC).
+     * - Truncates strictly on Unicode grapheme-cluster boundaries (`maxGraphemes = 40` + `…`)
+     *   so surrogate pairs and ZWJ emoji sequences are NEVER split mid-sequence.
+     */
     @JvmStatic
-    fun sanitizeText(raw: String, maxChars: Int = 40): String {
-        val sb = StringBuilder(min(raw.length, maxChars + 2))
+    fun sanitizeText(raw: String, maxGraphemes: Int = 40): String {
+        val sb = StringBuilder(raw.length)
         var lastWasSpace = true
         for (ch in raw) {
-            val mapped = if (ch == '\n' || ch == '\r' || ch == '\t') ' ' else ch
-            if (mapped == ' ') {
+            val code = ch.code
+            if (ch == '\n' || ch == '\r' || ch == '\t' || ch == ' ') {
                 if (!lastWasSpace) {
                     sb.append(' ')
                     lastWasSpace = true
                 }
-            } else {
-                sb.append(mapped)
-                lastWasSpace = false
+                continue
             }
+            if (isDisallowedControlOrBidi(code)) {
+                continue
+            }
+            sb.append(ch)
+            lastWasSpace = false
         }
-        val trimmed = sb.toString().trim()
-        if (trimmed.isEmpty()) return ""
-        return if (trimmed.length > maxChars) trimmed.substring(0, maxChars) + "…" else trimmed
+        // Strip leading/trailing spaces and stray leading/trailing ZWJ
+        var start = 0
+        var end = sb.length
+        while (start < end && (sb[start] == ' ' || sb[start] == '\u200D')) start++
+        while (end > start && (sb[end - 1] == ' ' || sb[end - 1] == '\u200D')) end--
+        if (start >= end) return ""
+        val cleaned = sb.substring(start, end)
+        return truncateByGraphemes(cleaned, maxGraphemes)
     }
 
-    /** Truncates sanitized text to fit within `maxWidthDeg` (60% of screen width per §6.10). */
+    private fun isDisallowedControlOrBidi(code: Int): Boolean =
+        code in 0x0000..0x001F ||
+            code == 0x007F ||
+            code in 0x0080..0x009F ||
+            code in 0x202A..0x202E ||
+            code in 0x2066..0x2069 ||
+            code == 0x200E || code == 0x200F || code == 0x061C ||
+            code == 0x200B || code == 0x200C || code == 0xFEFF ||
+            code == 0xFFFC
+
+    /** Returns grapheme-cluster end indices in [text] via [BreakIterator]. */
+    @JvmStatic
+    fun graphemeEndOffsets(text: String): IntArray {
+        if (text.isEmpty()) return IntArray(0)
+        val it = BreakIterator.getCharacterInstance(Locale.ROOT)
+        it.setText(text)
+        val ends = ArrayList<Int>(text.length)
+        var pos = it.next()
+        while (pos != BreakIterator.DONE) {
+            ends.add(pos)
+            pos = it.next()
+        }
+        return IntArray(ends.size) { ends[it] }
+    }
+
+    @JvmStatic
+    fun truncateByGraphemes(text: String, maxGraphemes: Int): String {
+        if (maxGraphemes <= 0 || text.isEmpty()) return ""
+        val ends = graphemeEndOffsets(text)
+        if (ends.size <= maxGraphemes) return text
+        return text.substring(0, ends[maxGraphemes - 1]) + "…"
+    }
+
+    /** Truncates sanitized text on grapheme boundaries to fit within `maxWidthDeg` (60% width per §6.10). */
     @JvmStatic
     fun fitToMaxWidthDeg(
         text: String,
@@ -340,16 +399,17 @@ object DanmakuDepthMath {
         measurer: DanmakuTextMeasurer,
     ): Pair<String, Float> {
         val fullW = measurer.measureWidthDeg(text, fontDeg)
-        if (fullW <= maxWidthDeg || text.length <= 2) {
+        val ends = graphemeEndOffsets(text)
+        if (fullW <= maxWidthDeg || ends.size <= 1) {
             return text to min(fullW, maxWidthDeg)
         }
         var lo = 1
-        var hi = text.length
-        var best = text.substring(0, 1) + "…"
+        var hi = ends.size
+        var best = text.substring(0, ends[0]) + "…"
         var bestW = measurer.measureWidthDeg(best, fontDeg)
         while (lo <= hi) {
             val mid = (lo + hi) ushr 1
-            val cand = text.substring(0, mid) + "…"
+            val cand = text.substring(0, ends[mid - 1]) + "…"
             val w = measurer.measureWidthDeg(cand, fontDeg)
             if (w <= maxWidthDeg) {
                 best = cand

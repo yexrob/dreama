@@ -14,7 +14,9 @@ import com.limelight.local.StereoSourceFormat
 import com.limelight.local.plugin.DanmakuItem
 import java.io.Closeable
 import java.io.InputStream
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /** Opens a non-plugin local or WebDAV sidecar `.xml` stream (implemented in audited host layer). */
 fun interface SidecarXmlStreamOpener {
@@ -25,11 +27,17 @@ fun interface SidecarXmlStreamOpener {
  * Dedicated off-render-thread coordinator owning [DanmakuWindowFetcher], [DanmakuEngine], and
  * [DanmakuRasterizer] for [com.limelight.local.LocalPlayerXR].
  *
- * - Runs all track allocation, collision checks, and 2-channel RG8 glyph rasterization on a single
- *   dedicated `HandlerThread("depth3d-danmaku")` at ~20 Hz (50 ms tick) while playing, while the
- *   native XR render thread smoothly advances `x(t)` at 72/90 Hz with zero allocations or waits.
- * - Supports both plugin `danmaku(ctx, { itemId, fromMs, toMs })` via [PluginPlayerSession] and
- *   local / WebDAV sidecar `.xml` files via [DanmakuXmlParser].
+ * Key guarantees:
+ * - Runs track allocation, collision checks, and premultiplied RGBA8 rasterization on
+ *   `HandlerThread("depth3d-danmaku")` at ~20 Hz while native GL interpolates smoothly at 72/90 Hz
+ *   using monotonic `(anchorTimelineMs, System.nanoTime())` anchors (zero snapshot jitter).
+ * - Sidecar `.xml` network/file I/O runs on a SEPARATE `depth3d-danmaku-io` thread with generation
+ *   cancellation and per-60s-window bucketing so slow WebDAV I/O NEVER blocks seek or settings.
+ * - Plugin fetches use `fetchDanmakuIfIdle` (`tryLock`, ~5 s timeout, max concurrency 1) and pause
+ *   while `refreshInFlight` or `!ready` so danmaku NEVER blocks `playback` or stream refresh.
+ * - Throttles per-tick spawns to remaining native upload queue space, retries rejected uploads on
+ *   subsequent ticks, and tags every instance with `(slotIndex, generation)` so un-uploaded or
+ *   reused slots NEVER render stale/corrupt text.
  */
 class DanmakuSessionManager(
     context: Context,
@@ -37,11 +45,15 @@ class DanmakuSessionManager(
     private val sidecarOpener: SidecarXmlStreamOpener,
     private val onSupportChanged: (supported: Boolean) -> Unit,
     private val onLoadFailedChanged: (failed: Boolean) -> Unit,
-) : Closeable {
+) : DanmakuPlaybackSink, Closeable {
     private val appContext = context.applicationContext
     private val thread = HandlerThread("depth3d-danmaku").apply { start() }
     private val handler = Handler(thread.looper)
+    private val ioExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "depth3d-danmaku-io").apply { isDaemon = true }
+    }
     private val closed = AtomicBoolean(false)
+    private val sidecarLoadGen = AtomicLong(0L)
 
     private val rasterizer = DanmakuRasterizer()
     private val engine = DanmakuEngine(
@@ -85,20 +97,21 @@ class DanmakuSessionManager(
             if (renderer != null) {
                 renderer.clearDanmakuAtlas()
                 engine.atlas.clear()
-                // Force re-rasterization of any active preview/items onto fresh GL atlas
                 engine.onSeek(latestMediaMs)
                 tickOnWorker(forcePush = true)
+                scheduleNextTickIfNeeded()
             }
         }
     }
 
-    /** Configures a plugin item's danmaku source through [PluginPlayerSession]. */
+    /** Configures a plugin item's danmaku source through non-blocking [PluginPlayerSession.fetchDanmakuIfIdle]. */
     fun bindPluginSource(
         session: PluginPlayerSession?,
         supported: Boolean,
         startMediaMs: Long,
         mergeDuplicates: Boolean,
     ) {
+        sidecarLoadGen.incrementAndGet()
         hasActiveSource = supported && session != null
         latestMediaMs = startMediaMs.coerceAtLeast(0L)
         onSupportChanged(hasActiveSource)
@@ -108,9 +121,14 @@ class DanmakuSessionManager(
             rendererRef?.clearDanmakuAtlas()
             if (supported && session != null) {
                 val src = DanmakuDataSource { fromMs, toMs ->
-                    session.fetchDanmaku(fromMs, toMs)
+                    val list = session.fetchDanmakuIfIdle(fromMs, toMs)
+                    if (list == null) DanmakuFetchResult.Busy else DanmakuFetchResult.Loaded(list)
                 }
-                fetcher.setDataSource(src, mergeDuplicates)
+                fetcher.setDataSource(
+                    source = src,
+                    mergeDuplicates = mergeDuplicates,
+                    maxConcurrency = DanmakuWindowFetcher.MAX_CONCURRENT_PLUGIN_FETCHES,
+                )
                 fetcher.ensureWindowsFor(startMediaMs)
             } else {
                 fetcher.setDataSource(null, mergeDuplicates)
@@ -120,13 +138,18 @@ class DanmakuSessionManager(
         }
     }
 
-    /** Probes and binds a local or WebDAV sidecar `.xml` file matching the video path/URL. */
+    /**
+     * Probes and binds a local or WebDAV sidecar `.xml` file on the dedicated [ioExecutor]
+     * (never blocking seek or settings updates on `depth3d-danmaku`), indexing parsed items by
+     * 60-second window bucket so [DanmakuWindowFetcher] serves only active windows.
+     */
     fun bindSidecarXmlSource(
         videoUri: Uri?,
         httpHeaders: Map<String, String>,
         startMediaMs: Long,
         mergeDuplicates: Boolean,
     ) {
+        val loadGen = sidecarLoadGen.incrementAndGet()
         hasActiveSource = false
         latestMediaMs = startMediaMs.coerceAtLeast(0L)
         onSupportChanged(false)
@@ -135,25 +158,41 @@ class DanmakuSessionManager(
             engine.resetForNewItem(startMediaMs)
             rendererRef?.clearDanmakuAtlas()
             fetcher.setDataSource(null, mergeDuplicates)
-            val xmlUrl = DanmakuXmlParser.sidecarXmlUrlFor(videoUri?.toString())
-            if (xmlUrl == null) {
-                tickOnWorker(forcePush = true)
-                return@post
+            tickOnWorker(forcePush = true)
+        }
+        val xmlUrl = DanmakuXmlParser.sidecarXmlUrlFor(videoUri?.toString()) ?: return
+        val headersCopy = HashMap(httpHeaders)
+        ioExecutor.execute {
+            if (closed.get() || sidecarLoadGen.get() != loadGen) return@execute
+            val parsed = loadSidecarXmlBlocking(videoUri, xmlUrl, headersCopy)
+            if (closed.get() || sidecarLoadGen.get() != loadGen) return@execute
+            if (parsed == null || parsed.isEmpty()) return@execute
+
+            // Bucket once by 60-second window so playback only slices active windows in O(1)
+            val buckets = HashMap<Int, ArrayList<DanmakuItem>>()
+            for (item in parsed) {
+                val w = (item.timeMs / DanmakuWindowFetcher.WINDOW_MS).toInt()
+                buckets.getOrPut(w) { ArrayList() }.add(item)
             }
-            val parsed: List<DanmakuItem>? = loadSidecarXmlBlocking(videoUri, xmlUrl, httpHeaders)
-            if (closed.get()) return@post
-            if (parsed != null && parsed.isNotEmpty()) {
+            val totalCount = parsed.size
+            post {
+                if (closed.get() || sidecarLoadGen.get() != loadGen) return@post
                 hasActiveSource = true
                 onSupportChanged(true)
-                val src = DanmakuDataSource { fromMs, toMs ->
-                    parsed.filter { it.timeMs in fromMs until toMs }
+                val src = DanmakuDataSource { fromMs, _ ->
+                    val w = (fromMs / DanmakuWindowFetcher.WINDOW_MS).toInt()
+                    DanmakuFetchResult.Loaded(buckets[w] ?: emptyList())
                 }
-                fetcher.setDataSource(src, mergeDuplicates)
-                fetcher.ensureWindowsFor(startMediaMs)
-                LimeLog.info("depth3d: loaded sidecar danmaku XML (" + parsed.size + " items)")
+                fetcher.setDataSource(
+                    source = src,
+                    mergeDuplicates = mergeDuplicates,
+                    maxConcurrency = DanmakuWindowFetcher.MAX_CONCURRENT_LOCAL_FETCHES,
+                )
+                fetcher.ensureWindowsFor(latestMediaMs)
+                LimeLog.info("depth3d: loaded sidecar danmaku XML ($totalCount items in ${buckets.size} windows)")
+                tickOnWorker(forcePush = true)
+                scheduleNextTickIfNeeded()
             }
-            tickOnWorker(forcePush = true)
-            scheduleNextTickIfNeeded()
         }
     }
 
@@ -196,9 +235,23 @@ class DanmakuSessionManager(
         latestContentPhiDeg = contentPhiDeg
     }
 
-    fun updatePlaybackPosition(mediaTimeMs: Long, playing: Boolean) {
+    override fun setFetchPaused(paused: Boolean) {
+        post {
+            fetcher.setFetchPaused(paused)
+        }
+    }
+
+    override fun setPausedWithoutPosition() {
+        post {
+            engine.setPaused(true)
+            tickOnWorker(forcePush = false)
+        }
+    }
+
+    override fun updatePlaybackPosition(mediaTimeMs: Long, playing: Boolean, playbackSpeed: Float) {
         latestMediaMs = mediaTimeMs.coerceAtLeast(0L)
         post {
+            engine.setPlaybackSpeed(playbackSpeed)
             engine.setPaused(!playing)
             if (hasActiveSource && engine.currentSettings.on) {
                 fetcher.ensureWindowsFor(latestMediaMs)
@@ -208,15 +261,15 @@ class DanmakuSessionManager(
         }
     }
 
-    fun setScrubbing(scrubbing: Boolean) {
+    override fun setScrubbing(scrubbing: Boolean) {
         post {
             engine.setScrubbing(scrubbing)
             tickOnWorker(forcePush = true)
         }
     }
 
-    fun onSeek(newMediaMs: Long) {
-        latestMediaMs = newMediaMs.coerceAtLeast(0L)
+    override fun onSeek(targetMs: Long) {
+        latestMediaMs = targetMs.coerceAtLeast(0L)
         post {
             rendererRef?.clearDanmakuAtlas()
             engine.atlas.clear()
@@ -245,29 +298,50 @@ class DanmakuSessionManager(
 
     private fun tickOnWorker(forcePush: Boolean) {
         val xr = rendererRef
-        // Sync latest measured content depth without clobbering real screen/stereo geometry
         engine.updateContentPhi(latestContentPhiDeg)
-        val res = engine.step(latestMediaMs)
+
+        // Throttle per-tick spawns against remaining native upload ring headroom so bursts
+        // never drop patches or exceed DANMAKU_UPLOAD_QUEUE_CAP.
+        val pendingUploads = engine.activeItems.count { !it.rasterized }
+        val maxNewSpawns = if (xr == null) {
+            0
+        } else {
+            val freeQueue = xr.getDanmakuUploadQueueFree()
+            (freeQueue - pendingUploads).coerceIn(0, MAX_SPAWNS_PER_TICK)
+        }
+
+        val res = engine.step(latestMediaMs, maxNewSpawns)
         if (xr == null) return
 
-        // Rasterize any newly spawned items on this worker thread and enqueue RG8 patches
-        for (item in res.newlySpawned) {
+        // Rasterize and upload ALL un-uploaded active items (retrying any rejected on earlier ticks)
+        var anyUploaded = false
+        for (item in engine.activeItems) {
+            if (item.rasterized) continue
             val slot = item.atlasSlot ?: continue
-            if (!item.rasterized) {
-                val buf = rasterizer.rasterizeToRgBuffer(item.displayText, slot)
-                if (xr.uploadDanmakuAtlasPatch(slot.x, slot.y, slot.width, slot.height, buf)) {
-                    item.rasterized = true
-                }
+            val buf = rasterizer.rasterizeToRgbaBuffer(item.displayText, item.colorRgb, slot)
+            if (xr.uploadDanmakuAtlasPatch(
+                    slot.x, slot.y, slot.width, slot.height,
+                    slot.slotIndex, slot.generation, buf,
+                )
+            ) {
+                item.rasterized = true
+                anyUploaded = true
+            } else {
+                // Native queue temporarily full: retry remaining items on next 50 ms tick
+                break
             }
         }
 
-        if (res.snapshotChanged || forcePush) {
+        if (res.snapshotChanged || anyUploaded || forcePush) {
             val count = engine.packInstances(packedInstances)
             val s = engine.currentSettings
+            val anchorMonoNs = System.nanoTime()
             xr.setDanmakuSnapshot(
                 s.on && hasActiveSource,
                 engine.isPaused,
-                engine.currentTimelineRealMs / 1000.0f,
+                engine.currentTimelineRealMs,
+                anchorMonoNs,
+                res.clockReset,
                 res.areaBotFrac,
                 s.opacityPct / 100.0f,
                 s.curvatureMode.nativeCode,
@@ -285,7 +359,10 @@ class DanmakuSessionManager(
 
     private fun scheduleNextTickIfNeeded() {
         if (closed.get() || tickScheduled) return
-        if (hasActiveSource && engine.currentSettings.on && (!engine.isPaused || engine.activeItems.isNotEmpty())) {
+        val hasPendingUploads = engine.activeItems.any { !it.rasterized }
+        if (hasActiveSource && engine.currentSettings.on
+            && (!engine.isPaused || engine.activeItems.isNotEmpty() || hasPendingUploads)
+        ) {
             tickScheduled = true
             handler.postDelayed(tickTask, TICK_INTERVAL_MS)
         }
@@ -314,7 +391,9 @@ class DanmakuSessionManager(
 
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        sidecarLoadGen.incrementAndGet()
         fetcher.close()
+        ioExecutor.shutdownNow()
         handler.removeCallbacksAndMessages(null)
         handler.post { rasterizer.release() }
         thread.quitSafely()
@@ -322,5 +401,6 @@ class DanmakuSessionManager(
 
     companion object {
         private const val TICK_INTERVAL_MS = 50L // 20 Hz worker tick; native GL interpolates at 72/90 Hz
+        private const val MAX_SPAWNS_PER_TICK = 12
     }
 }

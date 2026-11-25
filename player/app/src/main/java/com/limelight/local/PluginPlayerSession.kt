@@ -244,6 +244,17 @@ class PluginPlayerSession(
         return src.danmaku(itemId = id, fromMs = fromMs, toMs = toMs)
     }
 
+    /**
+     * Idle-only non-blocking danmaku fetch (~5 s timeout) returning `null` if the plugin instance
+     * is busy (e.g. running `playback` or stream refresh), so danmaku never starves playback.
+     */
+    suspend fun fetchDanmakuIfIdle(fromMs: Long, toMs: Long): List<DanmakuItem>? {
+        val src = activeSource ?: return emptyList()
+        val id = activeItemId ?: return emptyList()
+        if (!src.capabilities.contains(PluginCapability.DANMAKU)) return emptyList()
+        return src.danmakuIfIdle(itemId = id, fromMs = fromMs, toMs = toMs)
+    }
+
     suspend fun load(
         instanceId: String,
         itemId: String,

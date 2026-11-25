@@ -315,7 +315,12 @@
 #define IN_PALETTE_DIM_FALLBACK (IN_PALETTE_PAGE_STEP + 1)
 // Smoothed foreground content depth 98th-percentile disparity x 100 (G4/G3 shared)
 #define IN_CONTENT_PHI_CENTI (IN_PALETTE_DIM_FALLBACK + 1)
-#define IN_SLOTS    (IN_CONTENT_PHI_CENTI + 1)
+// Bitmask of stereo unavailability reasons latched on native side (G2 residual)
+#define IN_STEREO_UNAVAILABLE (IN_CONTENT_PHI_CENTI + 1)
+#define IN_SLOTS    (IN_STEREO_UNAVAILABLE + 1)
+
+#define STEREO_UNAVAIL_DEPTH     1
+#define STEREO_UNAVAIL_SWAPCHAIN 2
 
 // Gamepad mode's buttons, in the bits Moonlight's controller packet carries
 // them in, which are ControllerPacket's flags: the four face buttons, the
@@ -783,16 +788,18 @@
 #define HINT_ZONE_OK    1
 #define HINT_ZONE_NEVER 2
 
-// depth3d G4 (+ G3 shared overlay): GPU danmaku atlas, eye render targets,
-// curvature modes, and per-instance buffer stride.
+// depth3d G4 (+ G3 shared overlay): GPU danmaku premultiplied RGBA8 atlas,
+// eye render targets, slot generations, curvature modes, and layer budget.
 #define DANMAKU_ATLAS_W              2048
 #define DANMAKU_ATLAS_H              2048
 #define DANMAKU_TEX_W                2048
 #define DANMAKU_TEX_H                1152
 #define DANMAKU_MAX_ITEMS            160
+#define DANMAKU_MAX_SLOTS            256
 #define DANMAKU_MAX_UPLOADS_PER_FRAME 6
-#define DANMAKU_UPLOAD_BYTES_PER_FRAME 196608
-#define DANMAKU_INSTANCE_FLOATS      18
+#define DANMAKU_UPLOAD_BYTES_PER_FRAME 393216
+#define DANMAKU_INSTANCE_FLOATS      20
+#define OVERLAY_HARD_MAX_LAYERS      16
 
 #define OVERLAY_CURVE_FOLLOW         0
 #define OVERLAY_CURVE_FLAT           1

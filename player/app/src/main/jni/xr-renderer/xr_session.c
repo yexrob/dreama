@@ -598,6 +598,8 @@ static int initSwapchain(XrCtx* ctx) {
     // lazily via ensureVideoSwapchainStereo() if 3D or SBS/OU is enabled later.
     ctx->swapchainStereo = paletteNeedStereoSwapchain(
             ctx->localMedia, ctx->stereoMode, ctx->stereoLive, ctx->stereoSourceFormat, 0);
+    ctx->swapchainUpgradeFailed = 0;
+    ctx->swapchainHasFrame = 0;
     int chainWidth = ctx->swapchainStereo ? ctx->videoWidth * 2 : ctx->videoWidth;
     if (!createArtSwapchain(ctx, chainWidth, ctx->videoHeight, "xrCreateSwapchain",
                             &ctx->swapchain, &ctx->swapchainImages, &ctx->swapchainImageCount)) {
@@ -894,13 +896,18 @@ int ensureVideoSwapchainStereo(XrCtx* ctx) {
     if (ctx == NULL || ctx->swapchainStereo) {
         return 1;
     }
+    if (ctx->swapchainUpgradeFailed) {
+        return 0;
+    }
     XrSwapchain newChain = XR_NULL_HANDLE;
     XrSwapchainImageOpenGLESKHR* newImages = NULL;
     uint32_t newCount = 0;
     int chainWidth = ctx->videoWidth * 2;
     if (!createArtSwapchain(ctx, chainWidth, ctx->videoHeight, "upgrade stereo swapchain",
                             &newChain, &newImages, &newCount)) {
-        LOGW("depth3d: could not upgrade video swapchain to %dx%d, keeping 2D",
+        // Latch failure once so we never hammer xrCreateSwapchain every frame or hit runtime limits
+        ctx->swapchainUpgradeFailed = 1;
+        LOGW("depth3d: could not upgrade video swapchain to %dx%d, latching 2D fallback",
              chainWidth, ctx->videoHeight);
         return 0;
     }
@@ -909,6 +916,8 @@ int ensureVideoSwapchainStereo(XrCtx* ctx) {
     ctx->swapchainImages = newImages;
     ctx->swapchainImageCount = newCount;
     ctx->swapchainStereo = 1;
+    // Newly created swapchain has no released frame yet; addVideoLayers waits until renderVideoFrame releases
+    ctx->swapchainHasFrame = 0;
     ctx->warpRedraw = 1;
     LOGEV("depth3d: upgraded video swapchain to double-wide %dx%d (%u images)",
           chainWidth, ctx->videoHeight, newCount);

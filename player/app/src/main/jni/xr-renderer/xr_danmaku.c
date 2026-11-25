@@ -1,8 +1,10 @@
 // GPU-accelerated instanced danmaku compositor & JNI bridge (ux-spec.md §6.10, §7).
-// Render thread never allocates heap memory, never blocks on Java rasterization,
-// uploads bounded partial RG8 atlas patches (<= 6 patches & <= 192 KB / frame),
-// and renders all active danmaku in 1 instanced draw per eye (0 draws & 0 layers
-// when no danmaku are visible).
+// - Pre-warmed behind startup splash for localMedia (zero first-danmaku hitch; PC streaming skips).
+// - Premultiplied GL_RGBA8 2048x2048 atlas preserves full-color Android emoji + crisp CJK bold
+//   fill + 0.08 em #0E0F12 stroke + 1 px soft drop shadow in one pass.
+// - Drains bounded partial atlas uploads FIRST, updates per-slot uploaded generation table,
+//   THEN absorbs snapshot and skips any instance whose slot generation has not yet landed.
+// - Uses anchor-based monotonic clock (CLOCK_MONOTONIC) for jitter-free 72/90 Hz scrolling.
 
 #include "xr_renderer.h"
 #include "xr_shaders.h"
@@ -61,17 +63,17 @@ static int initDanmakuGl(XrCtx* ctx) {
     dm->featherUUniform = glGetUniformLocation(prog, "u_featherU");
     dm->atlasUniform = glGetUniformLocation(prog, "u_atlas");
 
-    // 2048x2048 2-channel GL_RG8 atlas (8 MB VRAM): R = fill alpha, G = stroke+shadow alpha
+    // 2048x2048 premultiplied GL_RGBA8 atlas (16 MB VRAM): supports colored text,
+    // full-color Android NotoColorEmoji, 0.08 em #0E0F12 stroke, and soft shadow.
     glGenTextures(1, &dm->atlasTex);
     glBindTexture(GL_TEXTURE_2D, dm->atlasTex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, DANMAKU_ATLAS_W, DANMAKU_ATLAS_H, 0,
-                 GL_RG, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, DANMAKU_ATLAS_W, DANMAKU_ATLAS_H, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 
-    // Static unit-quad VBO + dynamic instanced VBO inside one VAO
     static const float QUAD_CORNERS[8] = {
         0.0f, 0.0f,
         1.0f, 0.0f,
@@ -118,6 +120,15 @@ static int initDanmakuGl(XrCtx* ctx) {
 
     glGenFramebuffers(1, &dm->fbo);
 
+    // Clear initial atlas contents to transparent zero on GPU so unused pixels are clean
+    glBindFramebuffer(GL_FRAMEBUFFER, dm->fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                           dm->atlasTex, 0);
+    glViewport(0, 0, DANMAKU_ATLAS_W, DANMAKU_ATLAS_H);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
     for (int eye = 0; eye < 2; eye++) {
         if (!createArtSwapchain(ctx, DANMAKU_TEX_W, DANMAKU_TEX_H,
                                 eye == 0 ? "danmaku left swapchain" : "danmaku right swapchain",
@@ -135,8 +146,9 @@ static int initDanmakuGl(XrCtx* ctx) {
         return 0;
     }
 
+    danmakuSlotTableClear(&dm->slotTable);
     dm->glReady = 1;
-    LOGEV("depth3d: danmaku GPU atlas (%dx%d RG8) and eye swapchains (%dx%d x2) ready",
+    LOGEV("depth3d: danmaku GPU atlas (%dx%d RGBA8) and eye swapchains (%dx%d x2) ready",
           DANMAKU_ATLAS_W, DANMAKU_ATLAS_H, DANMAKU_TEX_W, DANMAKU_TEX_H);
     return 1;
 }
@@ -149,12 +161,21 @@ void danmakuInit(XrCtx* ctx) {
     memset(dm, 0, sizeof(*dm));
     pthread_mutex_init(&dm->lock, NULL);
     dm->lockReady = 1;
+    danmakuSlotTableClear(&dm->slotTable);
+    danmakuClockReset(&dm->clockTracker);
     dm->areaBotFrac = 0.5f;
     dm->globalOpacity = 0.8f;
     dm->floatAuto = 1;
     dm->layerSpreadDeg = 0.30f;
     dm->drawnTexH = DANMAKU_TEX_H / 2;
     dm->drawnAreaBotFrac = 0.5f;
+}
+
+int danmakuPrewarmGl(XrCtx* ctx) {
+    if (ctx == NULL || !ctx->localMedia) {
+        return 0;
+    }
+    return initDanmakuGl(ctx);
 }
 
 void danmakuDestroy(XrCtx* ctx) {
@@ -211,10 +232,11 @@ static void drainAtlasUploads(DanmakuState* dm) {
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, dm->atlasTex);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 
     for (;;) {
-        int px = 0, py = 0, pw = 0, ph = 0, pbytes = 0;
+        int px = 0, py = 0, pw = 0, ph = 0, pbytes = 0, pSlotIndex = -1;
+        uint32_t pSlotGen = 0;
         int havePatch = 0;
         int wantClear = 0;
 
@@ -238,6 +260,8 @@ static void drainAtlasUploads(DanmakuState* dm) {
                 pw = slot->w;
                 ph = slot->h;
                 pbytes = slot->byteCount;
+                pSlotIndex = slot->slotIndex;
+                pSlotGen = slot->slotGen;
                 havePatch = 1;
             }
             slot->used = 0;
@@ -248,7 +272,7 @@ static void drainAtlasUploads(DanmakuState* dm) {
 
         if (wantClear) {
             didClear = 1;
-            // Clear atlas texture to zero via FBO clear (instant GPU clear, zero CPU buffer!)
+            danmakuSlotTableClear(&dm->slotTable);
             glBindFramebuffer(GL_FRAMEBUFFER, dm->fbo);
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                                    dm->atlasTex, 0);
@@ -264,12 +288,12 @@ static void drainAtlasUploads(DanmakuState* dm) {
         if (pw > 0 && ph > 0 && px >= 0 && py >= 0
                 && px + pw <= DANMAKU_ATLAS_W && py + ph <= DANMAKU_ATLAS_H) {
             glTexSubImage2D(GL_TEXTURE_2D, 0, px, py, pw, ph,
-                            GL_RG, GL_UNSIGNED_BYTE, dm->uploadScratch);
+                            GL_RGBA, GL_UNSIGNED_BYTE, dm->uploadScratch);
+            danmakuSlotTableMarkUploaded(&dm->slotTable, pSlotIndex, pSlotGen);
             uploadedBytes += pbytes;
         }
         uploadedPatches++;
     }
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 }
 
 static void absorbSnapshot(DanmakuState* dm, float smoothedContentPhi, float screenDistM,
@@ -285,7 +309,10 @@ static void absorbSnapshot(DanmakuState* dm, float smoothedContentPhi, float scr
     dm->snapshotDirty = 0;
     dm->enabled = dm->pendingEnabled;
     dm->paused = dm->pendingPaused;
-    dm->clockSec = dm->pendingClockSec;
+    int64_t anchorTimelineMs = dm->pendingAnchorTimelineMs;
+    int64_t anchorMonoNs = dm->pendingAnchorMonoNs;
+    int clockReset = dm->pendingClockReset;
+    dm->pendingClockReset = 0;
     dm->areaBotFrac = clampf(dm->pendingAreaBotFrac, 0.10f, 1.0f);
     dm->globalOpacity = clampf(dm->pendingGlobalOpacity, 0.0f, 1.0f);
     dm->curveMode = dm->pendingCurveMode;
@@ -299,7 +326,6 @@ static void absorbSnapshot(DanmakuState* dm, float smoothedContentPhi, float scr
     if (count < 0) count = 0;
     if (count > DANMAKU_MAX_ITEMS) count = DANMAKU_MAX_ITEMS;
 
-    // Preserve previous item disparities for smooth 200 ms animation if requested
     float prevFar = dm->currentDepth.farPhiDeg;
     float prevMid = dm->currentDepth.midPhiDeg;
     float prevNear = dm->currentDepth.nearPhiDeg;
@@ -310,7 +336,9 @@ static void absorbSnapshot(DanmakuState* dm, float smoothedContentPhi, float scr
     }
     pthread_mutex_unlock(&dm->lock);
 
-    // Recompute target depth layers using the NEWLY absorbed float/layer settings
+    danmakuClockSetAnchor(&dm->clockTracker, anchorTimelineMs, anchorMonoNs,
+                          dm->paused, clockReset);
+
     overlayComputeDepthLayers(smoothedContentPhi, dm->floatAuto,
                               dm->floatAutoOffset, dm->floatFixedSteps,
                               dm->layerSpreadDeg, screenDistM, outDepthNow);
@@ -332,14 +360,18 @@ static void absorbSnapshot(DanmakuState* dm, float smoothedContentPhi, float scr
 }
 
 void danmakuRenderEyes(XrCtx* ctx, float screenFovDeg, float screenDistM,
-                       float dt, int stereoActive) {
+                       float dt, int64_t frameMonoNs, int stereoActive) {
     if (ctx == NULL || !ctx->localMedia) {
         return;
     }
     DanmakuState* dm = &ctx->danmaku;
 
-    // Step smoothed foreground content depth (0 in 2D, 0.25 deg in native SBS/OU,
-    // 64-bin 98th-percentile histogram in AI 2D-to-3D)
+    // 1. Drain atlas uploads FIRST so newly uploaded slot generations land before snapshot absorption
+    if (dm->glReady) {
+        drainAtlasUploads(dm);
+    }
+
+    // 2. Step smoothed foreground content depth & absorb latest snapshot anchor
     uint32_t rawBits = atomic_load_explicit(&ctx->depthContentPhiBits, memory_order_relaxed);
     float measuredPhi = 0.0f;
     memcpy(&measuredPhi, &rawBits, sizeof(measuredPhi));
@@ -356,25 +388,20 @@ void danmakuRenderEyes(XrCtx* ctx, float screenFovDeg, float screenDistM,
     dm->currentDepth = depthNow;
 
     if (!dm->enabled || dm->itemCount <= 0) {
-        // Still drain pending uploads lazily if GL is already initialized so queue stays fresh
-        if (dm->glReady) {
-            drainAtlasUploads(dm);
+        dm->drawnEyes = 0;
+        return;
+    }
+
+    if (!dm->glReady) {
+        if (!initDanmakuGl(ctx)) {
+            dm->drawnEyes = 0;
+            return;
         }
-        dm->drawnEyes = 0;
-        return;
+        drainAtlasUploads(dm);
     }
 
-    if (!initDanmakuGl(ctx)) {
-        dm->drawnEyes = 0;
-        return;
-    }
-
-    drainAtlasUploads(dm);
-
-    // Advance smooth real-time display clock when playing (§6.10: transit is real-time)
-    if (!dm->paused && dt > 0.0f && dt < 0.25f) {
-        dm->clockSec += dt;
-    }
+    // 3. Sample monotonic anchor-driven clock (zero +/-14 ms snapshot jitter)
+    float clockSec = danmakuClockSample(&dm->clockTracker, frameMonoNs, dt);
 
     float animT = 1.0f;
     if (dm->depthAnimActive) {
@@ -386,16 +413,19 @@ void danmakuRenderEyes(XrCtx* ctx, float screenFovDeg, float screenDistM,
         else {
             float t = dm->depthAnimElapsedS / OVERLAY_DEPTH_ANIM_S;
             float u = 1.0f - t;
-            animT = 1.0f - u * u * u; // cubic ease-out (§5.6)
+            animT = 1.0f - u * u * u;
         }
     }
 
-    // Build GPU instance array on render thread (zero allocations)
+    // 4. Build GPU instance array — strictly skip any item whose slot generation has not landed
     int visible = 0;
     int anyParallax = 0;
     for (int i = 0; i < dm->itemCount && visible < DANMAKU_MAX_ITEMS; i++) {
         DanmakuNativeItem* it = &dm->items[i];
-        float elapsed = dm->clockSec - it->spawnTimeSec;
+        if (!danmakuSlotTableIsReady(&dm->slotTable, it->slotIndex, it->slotGen)) {
+            continue;
+        }
+        float elapsed = clockSec - it->spawnTimeSec;
         if (elapsed < -0.05f || (it->durationSec > 0.0f && elapsed > it->durationSec)) {
             continue;
         }
@@ -404,7 +434,6 @@ void danmakuRenderEyes(XrCtx* ctx, float screenFovDeg, float screenDistM,
         }
 
         float x = it->x0 + it->velXPerSec * elapsed;
-        // Cull scrolled items completely off either side (allow 0.05 margin for disparity shift)
         if (x + it->w < -0.05f || x > 1.05f) {
             continue;
         }
@@ -423,7 +452,6 @@ void danmakuRenderEyes(XrCtx* ctx, float screenFovDeg, float screenDistM,
         if (dm->depthAnimActive) {
             phi = it->animFromPhi + (it->animToPhi - it->animFromPhi) * animT;
         }
-        // Always enforce comfort ceiling at current distance
         if (phi > depthNow.maxPhiDeg) {
             phi = depthNow.maxPhiDeg;
         }
@@ -494,7 +522,12 @@ void danmakuRenderEyes(XrCtx* ctx, float screenFovDeg, float screenDistM,
         }
         XrSwapchainImageWaitInfo wait = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
         wait.timeout = XR_INFINITE_DURATION;
-        xrWaitSwapchainImage(dm->eyeSwapchain[eye], &wait);
+        if (!checkXr(xrWaitSwapchainImage(dm->eyeSwapchain[eye], &wait),
+                     "wait danmaku image")) {
+            XrSwapchainImageReleaseInfo rel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+            xrReleaseSwapchainImage(dm->eyeSwapchain[eye], &rel);
+            break;
+        }
 
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                                dm->eyeImages[eye][imgIdx].image, 0);
@@ -522,21 +555,38 @@ void danmakuRenderEyes(XrCtx* ctx, float screenFovDeg, float screenDistM,
 
 // ---- JNI bridge called strictly off render thread (from dedicated danmaku worker) ----
 
+JNIEXPORT jint JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeGetDanmakuUploadQueueFree(
+        JNIEnv* env, jobject thiz, jlong handle) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx == NULL || !ctx->localMedia || !ctx->danmaku.lockReady) {
+        return 0;
+    }
+    DanmakuState* dm = &ctx->danmaku;
+    pthread_mutex_lock(&dm->lock);
+    int freeSlots = DANMAKU_UPLOAD_QUEUE_CAP - dm->uploadCount;
+    pthread_mutex_unlock(&dm->lock);
+    return freeSlots > 0 ? freeSlots : 0;
+}
+
 JNIEXPORT jboolean JNICALL
 Java_com_limelight_binding_video_XrRenderer_nativeUploadDanmakuAtlasPatch(
         JNIEnv* env, jobject thiz, jlong handle, jint x, jint y, jint w, jint h,
-        jobject rgPixels) {
+        jint slotIndex, jint slotGen, jobject rgbaPixels) {
     XrCtx* ctx = (XrCtx*)(intptr_t)handle;
-    if (ctx == NULL || !ctx->localMedia || !ctx->danmaku.lockReady || rgPixels == NULL) {
+    if (ctx == NULL || !ctx->localMedia || !ctx->danmaku.lockReady || rgbaPixels == NULL) {
         return JNI_FALSE;
     }
-    int bytes = w * h * 2;
+    if (slotIndex < 0 || slotIndex >= DANMAKU_MAX_SLOTS || slotGen <= 0) {
+        return JNI_FALSE;
+    }
+    int bytes = w * h * 4;
     if (w <= 0 || h <= 0 || bytes <= 0 || bytes > DANMAKU_PATCH_MAX_BYTES
             || x < 0 || y < 0 || x + w > DANMAKU_ATLAS_W || y + h > DANMAKU_ATLAS_H) {
         return JNI_FALSE;
     }
-    void* src = (*env)->GetDirectBufferAddress(env, rgPixels);
-    jlong cap = (*env)->GetDirectBufferCapacity(env, rgPixels);
+    void* src = (*env)->GetDirectBufferAddress(env, rgbaPixels);
+    jlong cap = (*env)->GetDirectBufferCapacity(env, rgbaPixels);
     if (src == NULL || cap < bytes) {
         return JNI_FALSE;
     }
@@ -562,6 +612,8 @@ Java_com_limelight_binding_video_XrRenderer_nativeUploadDanmakuAtlasPatch(
     slot->w = w;
     slot->h = h;
     slot->byteCount = bytes;
+    slot->slotIndex = slotIndex;
+    slot->slotGen = (uint32_t)slotGen;
     dm->uploadTail = (dm->uploadTail + 1) % DANMAKU_UPLOAD_QUEUE_CAP;
     dm->uploadCount++;
     pthread_mutex_unlock(&dm->lock);
@@ -587,7 +639,8 @@ Java_com_limelight_binding_video_XrRenderer_nativeClearDanmakuAtlas(
 JNIEXPORT void JNICALL
 Java_com_limelight_binding_video_XrRenderer_nativeSetDanmakuSnapshot(
         JNIEnv* env, jobject thiz, jlong handle, jboolean enabled, jboolean paused,
-        jfloat clockSec, jfloat areaBotFrac, jfloat globalOpacity,
+        jlong anchorTimelineMs, jlong anchorMonoNs, jboolean clockReset,
+        jfloat areaBotFrac, jfloat globalOpacity,
         jint curveMode, jfloat customCurvePct, jboolean floatAuto,
         jint floatAutoOffset, jint floatFixedSteps, jfloat layerSpreadDeg,
         jboolean animateDepth, jfloatArray instancesArr, jint count) {
@@ -617,7 +670,11 @@ Java_com_limelight_binding_video_XrRenderer_nativeSetDanmakuSnapshot(
     pthread_mutex_lock(&dm->lock);
     dm->pendingEnabled = enabled ? 1 : 0;
     dm->pendingPaused = paused ? 1 : 0;
-    dm->pendingClockSec = clockSec;
+    dm->pendingAnchorTimelineMs = (int64_t)anchorTimelineMs;
+    dm->pendingAnchorMonoNs = (int64_t)anchorMonoNs;
+    if (clockReset) {
+        dm->pendingClockReset = 1;
+    }
     dm->pendingAreaBotFrac = areaBotFrac;
     dm->pendingGlobalOpacity = globalOpacity;
     dm->pendingCurveMode = curveMode;
@@ -653,6 +710,8 @@ Java_com_limelight_binding_video_XrRenderer_nativeSetDanmakuSnapshot(
         dst->fixedPhiDeg = f[17];
         dst->animFromPhi = dst->fixedPhiDeg;
         dst->animToPhi = dst->fixedPhiDeg;
+        dst->slotIndex = (int)f[18];
+        dst->slotGen = f[19] > 0.0f ? (uint32_t)f[19] : 0u;
     }
     dm->snapshotDirty = 1;
     pthread_mutex_unlock(&dm->lock);

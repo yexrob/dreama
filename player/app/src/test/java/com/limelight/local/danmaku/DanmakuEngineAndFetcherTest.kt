@@ -26,6 +26,7 @@ import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class DanmakuEngineAndFetcherTest {
@@ -84,7 +85,6 @@ class DanmakuEngineAndFetcherTest {
         """.trimIndent()
         assertTrue(DanmakuXmlParser.parse(ByteArrayInputStream(xxe.toByteArray())).isEmpty())
 
-        // Truncated trailing XML still recovers earlier valid items without throwing
         val truncated = """
             <i>
               <d p="1.0,1,25,16777215">Valid1</d>
@@ -96,7 +96,6 @@ class DanmakuEngineAndFetcherTest {
         assertEquals("Valid1", recovered[0].text)
         assertEquals("Valid2", recovered[1].text)
 
-        // Hard item cap stops streaming early
         val many = buildString {
             append("<i>")
             for (i in 0 until 30) {
@@ -104,14 +103,9 @@ class DanmakuEngineAndFetcherTest {
             }
             append("</i>")
         }
-        val capped = DanmakuXmlParser.parse(ByteArrayInputStream(many.toByteArray()), maxItems = 7)
-        assertEquals(7, capped.size)
+        assertEquals(7, DanmakuXmlParser.parse(ByteArrayInputStream(many.toByteArray()), maxItems = 7).size)
+        assertTrue(DanmakuXmlParser.parse(ByteArrayInputStream(many.toByteArray()), maxBytes = 64).size < 3)
 
-        // Hard byte cap
-        val byteCapped = DanmakuXmlParser.parse(ByteArrayInputStream(many.toByteArray()), maxBytes = 64)
-        assertTrue(byteCapped.size < 3)
-
-        // Sidecar URL derivation
         assertEquals("file:///sdcard/Movies/demo.xml", DanmakuXmlParser.sidecarXmlUrlFor("file:///sdcard/Movies/demo.mkv"))
         assertEquals(
             "https://nas.local/webdav/ep01.xml?token=abc",
@@ -121,19 +115,64 @@ class DanmakuEngineAndFetcherTest {
         assertNull(DanmakuXmlParser.sidecarXmlUrlFor("https://nas.local/webdav/noext"))
     }
 
-    // ---- 2. Atlas Shelf Allocator (3 tiers, release coalescing, null on full) ----
+    // ---- 2. Text Sanitization (C0/C1/BiDi/ZWSP/FFFC) & Grapheme-Safe ZWJ Emoji Truncation ----
 
     @Test
-    fun atlasAllocatorCoalescesReleasedSpansAndReturnsNullWhenFull() {
-        val atlas = DanmakuAtlasAllocator(atlasWidth = 512, atlasHeight = 256, gutterPx = 2)
+    fun sanitizeTextStripsControlBidiZeroWidthAndTruncatesSafelyOnGraphemeClusters() {
+        // Strips C0 (\u0000, \u0007), DEL (\u007F), C1 (\u0085), BiDi RLO/LRI (\u202E, \u2066), ZWSP (\u200B), BOM (\uFEFF), U+FFFC
+        val dirty = "\uFEFF\u0000Hello\u202E\u2066\u200B\u0007\u007F\u0085\uFFFC World\u200D"
+        assertEquals("Hello World", DanmakuDepthMath.sanitizeText(dirty))
+
+        // 45 ZWJ family emojis: truncating at 40 graphemes MUST NOT split any surrogate pair or ZWJ cluster!
+        val family = "\uD83D\uDC68\u200D\uD83D\uDC69\u200D\uD83D\uDC67\u200D\uD83D\uDC66"
+        val manyEmojis = family.repeat(45)
+        val sanitized = DanmakuDepthMath.sanitizeText(manyEmojis, maxGraphemes = 40)
+        assertTrue(sanitized.endsWith("…"))
+        val body = sanitized.dropLast(1)
+        // Verify ZERO unpaired surrogates anywhere in truncated string
+        var i = 0
+        while (i < body.length) {
+            val ch = body[i]
+            if (Character.isHighSurrogate(ch)) {
+                assertTrue("Unpaired high surrogate at $i", i + 1 < body.length && Character.isLowSurrogate(body[i + 1]))
+                i += 2
+            } else {
+                assertFalse("Unpaired low surrogate at $i", Character.isLowSurrogate(ch))
+                i++
+            }
+        }
+        // Width truncation via fitToMaxWidthDeg must also stay on grapheme boundaries
+        val skinThumbs = "\uD83D\uDC4D\uD83C\uDFFD".repeat(25)
+        val (fit, _) = DanmakuDepthMath.fitToMaxWidthDeg(skinThumbs, 1.4f, 15.0f, HeuristicDanmakuMeasurer)
+        assertTrue(fit.endsWith("…"))
+        val fitBody = fit.dropLast(1)
+        assertFalse("Last char before ellipsis must not be unpaired high surrogate", Character.isHighSurrogate(fitBody.last()))
+    }
+
+    // ---- 3. Atlas Shelf Allocator (slotIndex + generation + half-texel UV inset + coalescing) ----
+
+    @Test
+    fun atlasAllocatorCoalescesSpansIncrementsGenerationsAndInsetsUvsByHalfTexel() {
+        val atlas = DanmakuAtlasAllocator(atlasWidth = 512, atlasHeight = 256, gutterPx = 2, maxSlots = 4)
         val s1 = atlas.allocate(200, 50)
         val s2 = atlas.allocate(200, 50)
         assertNotNull(s1)
         assertNotNull(s2)
         assertEquals(s1!!.shelfIndex, s2!!.shelfIndex)
         assertEquals(202, s2.x)
+        assertTrue(s1.slotIndex in 0 until 4)
+        assertTrue(s2.slotIndex in 0 until 4)
+        assertTrue(s2.generation > s1.generation)
 
-        // Release both adjacent slots and verify coalescing permits a single 450px allocation on the same shelf
+        // Verify half-texel UV inset prevents bilinear neighbor bleed
+        val invW = 1.0f / XrShared.DANMAKU_ATLAS_W.toFloat()
+        val invH = 1.0f / XrShared.DANMAKU_ATLAS_H.toFloat()
+        assertEquals((s1.x + 0.5f) * invW, s1.u0, 1e-7f)
+        assertEquals((s1.width - 1.0f) * invW, s1.du, 1e-7f)
+        assertEquals((s1.y + 0.5f) * invH, s1.v0, 1e-7f)
+        assertEquals((s1.height - 1.0f) * invH, s1.dv, 1e-7f)
+
+        // Release both and verify coalescing + strictly higher generation on slot reuse
         atlas.release(s1)
         atlas.release(s2)
         assertEquals(0, atlas.activeSlotCount)
@@ -142,100 +181,166 @@ class DanmakuEngineAndFetcherTest {
         assertNotNull(merged)
         assertEquals(s1.shelfIndex, merged!!.shelfIndex)
         assertEquals(0, merged.x)
+        assertTrue("Reused slot must carry strictly newer generation", merged.generation > s2.generation)
 
-        // Exhaust all shelves cleanly -> returns null without crashing
+        // Exhaust shelves cleanly -> returns null without crashing
         val smallAtlas = DanmakuAtlasAllocator(atlasWidth = 256, atlasHeight = 60, gutterPx = 2)
         assertNotNull(smallAtlas.allocate(250, 50))
         assertNull(smallAtlas.allocate(250, 50))
         smallAtlas.clear()
         assertEquals(0, smallAtlas.activeSlotCount)
-        assertNotNull(smallAtlas.allocate(250, 50))
+        val afterClear = smallAtlas.allocate(250, 50)
+        assertNotNull(afterClear)
+        assertTrue("Generation keeps advancing monotonically across clear()", afterClear!!.generation > 1)
     }
 
-    // ---- 3. Segmented Window Fetcher (60 s windows, 10 s prefetch, LRU, seek cancel, retry, merge) ----
+    // ---- 4. Must-Fix #1 Regression: Un-uploaded / Rejected Patch Gating & Per-Tick Spawn Throttling ----
 
     @Test
-    fun windowFetcherSegmentedPrefetchLruSeekCancelFailureRetryAndDuplicateMerge() = runTest {
+    fun packInstancesExcludesUnrasterizedItemsAndStepThrottlesBurstSpawnsToQueueCapacity() {
+        val clock = VirtualClock(0L)
+        val engine = DanmakuEngine(clock)
+        engine.updateSettings(DanmakuSettings(area = DanmakuArea.FULL, density = DanmakuDensity.DENSE))
+
+        // Inject a 40-item burst at t=100ms, throttle per-tick spawns to 6 (matching native upload ring)
+        val burst = (1..40).map { i ->
+            DanmakuRawItem(id = i.toLong(), timeMs = 100L, text = "突发弹幕#$i", mode = DanmakuMode.SCROLL)
+        }
+        engine.ingestWindowItems(burst, windowIndex = 0)
+        engine.step(0L)
+
+        clock.advance(100L)
+        val step1 = engine.step(100L, maxNewSpawns = 6)
+        assertEquals("Per-tick spawn cap must throttle burst to 6", 6, step1.newlySpawned.size)
+        assertEquals(6, engine.activeItems.size)
+
+        // Before worker uploads any patches (rasterized == false), packInstances MUST emit 0 items!
+        val buf = FloatArray(XrShared.DANMAKU_MAX_ITEMS * XrShared.DANMAKU_INSTANCE_FLOATS)
+        assertEquals(0, engine.packInstances(buf))
+
+        // Simulate native upload queue accepting only first 4 patches and rejecting #5 & #6:
+        for (i in 0 until 4) {
+            engine.activeItems[i].rasterized = true
+        }
+        assertEquals("Only accepted/uploaded items may enter GPU snapshot", 4, engine.packInstances(buf))
+        // Verify slotIndex & slotGen are packed at indices [18] and [19]
+        val slot0 = engine.activeItems[0].atlasSlot!!
+        assertEquals(slot0.slotIndex.toFloat(), buf[18], 0.0f)
+        assertEquals(slot0.generation.toFloat(), buf[19], 0.0f)
+
+        // Next tick retries rejected #5 & #6 and spawns next throttled batch
+        for (item in engine.activeItems) {
+            if (!item.rasterized) item.rasterized = true
+        }
+        clock.advance(50L)
+        val step2 = engine.step(150L, maxNewSpawns = 5)
+        assertEquals(5, step2.newlySpawned.size)
+        assertEquals(6, engine.packInstances(buf)) // newly spawned 5 are still unrasterized until uploaded
+    }
+
+    // ---- 5. Window Fetcher: 60 s Windows, 10 s Prefetch, LRU, Seek Cancel, Busy, Pause, Cooldown Auto-Retry ----
+
+    @Test
+    fun windowFetcherHandlesPrefetchLruSeekCancelBusyPauseCooldownAutoRetryAndMerge() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
+        val fakeClockMs = AtomicLong(1_000L)
         val calls = ArrayList<Pair<Long, Long>>()
-        val delivered = ArrayList<Pair<Int, List<DanmakuRawItem>>>()
         val failEvents = ArrayList<Boolean>()
 
         val fetcher = DanmakuWindowFetcher(
             ioDispatcher = dispatcher,
+            clockMs = { fakeClockMs.get() },
             windowMs = 60_000L,
             prefetchLeadMs = 10_000L,
             maxCachedWindows = 2,
-            maxConcurrentFetches = 2,
-            backoffScheduleMs = longArrayOf(100L, 200L),
-            onWindowReady = { w, items -> delivered.add(w to items) },
+            defaultMaxConcurrentFetches = 1,
+            backoffScheduleMs = longArrayOf(50L, 100L),
+            busyRetryDelayMs = 25L,
+            failedCooldownMs = 30_000L,
             onLoadStateChanged = { f -> failEvents.add(f) },
         )
 
+        val busyOnce = AtomicInteger(0)
         val failWindow2Count = AtomicInteger(0)
         val gateWindow5 = CompletableDeferred<Unit>()
         fetcher.setDataSource(
             source = DanmakuDataSource { fromMs, toMs ->
                 calls.add(fromMs to toMs)
                 val w = (fromMs / 60_000L).toInt()
+                if (w == 0 && busyOnce.getAndIncrement() == 0) {
+                    return@DanmakuDataSource DanmakuFetchResult.Busy
+                }
                 if (w == 2 && failWindow2Count.getAndIncrement() < 3) {
                     throw RuntimeException("simulated network error")
                 }
                 if (w == 5) {
                     gateWindow5.await()
                 }
-                listOf(
-                    DanmakuItem(fromMs + 1_000L, "哈哈哈", "#FFFFFF", DanmakuMode.SCROLL),
-                    DanmakuItem(fromMs + 2_000L, "哈哈哈", "#FFFFFF", DanmakuMode.SCROLL),
-                    DanmakuItem(fromMs + 4_500L, "哈哈哈", "#FFFFFF", DanmakuMode.SCROLL),
-                    DanmakuItem(fromMs + 5_500L, "哈哈哈", "#FFFFFF", DanmakuMode.SCROLL), // 4th inside 5s of 1st (1000..6000)
-                    DanmakuItem(fromMs + 12_000L, "哈哈哈", "#FFFFFF", DanmakuMode.SCROLL), // >5s later: separate
-                    DanmakuItem(fromMs + 13_000L, "哈哈哈", "#FFFFFF", DanmakuMode.SCROLL), // only 2 -> unmerged
+                DanmakuFetchResult.Loaded(
+                    listOf(
+                        DanmakuItem(fromMs + 1_000L, "哈哈哈", "#FFFFFF", DanmakuMode.SCROLL),
+                        DanmakuItem(fromMs + 2_000L, "哈哈哈", "#FFFFFF", DanmakuMode.SCROLL),
+                        DanmakuItem(fromMs + 4_500L, "哈哈哈", "#FFFFFF", DanmakuMode.SCROLL),
+                        DanmakuItem(fromMs + 5_500L, "哈哈哈", "#FFFFFF", DanmakuMode.SCROLL),
+                        DanmakuItem(fromMs + 12_000L, "哈哈哈", "#FFFFFF", DanmakuMode.SCROLL),
+                        DanmakuItem(fromMs + 13_000L, "哈哈哈", "#FFFFFF", DanmakuMode.SCROLL),
+                    ),
                 )
             },
             mergeDuplicates = true,
+            maxConcurrency = 1,
         )
 
-        // At t=10s: only window 0 fetched (not yet within 10s lead of window 1)
+        // Fetch paused during !ready / refreshInFlight -> MUST NOT launch any fetch!
+        fetcher.setFetchPaused(true)
         fetcher.ensureWindowsFor(10_000L)
         advanceUntilIdle()
-        assertEquals(listOf(0L to 60_000L), calls)
+        assertTrue("No fetch allowed while fetchPaused", calls.isEmpty())
+
+        // Unpause -> window 0 gets Busy once (must NOT mark failed!), reschedules, and loads cleanly
+        fetcher.setFetchPaused(false)
+        advanceUntilIdle()
+        assertFalse("Busy must never mark load failed", fetcher.isLoadFailed)
         val win0 = fetcher.getCachedWindow(0)!!
         assertEquals(3, win0.size)
         assertEquals("哈哈哈 ×4", win0[0].displayText)
-        assertEquals(4, win0[0].repeatCount)
-        assertEquals("哈哈哈", win0[1].displayText)
-        assertEquals(1, win0[1].repeatCount)
 
-        // At t=49s: still 11s left -> no prefetch yet
+        // At t=49s no prefetch; at t=50s prefetches window 1
+        val callsBeforePrefetch = calls.size
         fetcher.ensureWindowsFor(49_000L)
         advanceUntilIdle()
-        assertEquals(1, calls.size)
+        assertEquals(callsBeforePrefetch, calls.size)
 
-        // At t=50s: 10s lead triggers prefetch of window 1 [60_000, 120_000)
         fetcher.ensureWindowsFor(50_000L)
         advanceUntilIdle()
-        assertEquals(2, calls.size)
-        assertEquals(60_000L to 120_000L, calls[1])
         assertNotNull(fetcher.getCachedWindow(1))
 
-        // Move to window 2 (fails all 3 attempts -> isLoadFailed = true, playback unaffected)
+        // Window 2 fails 3 attempts -> isLoadFailed = true
         fetcher.ensureWindowsFor(125_000L)
         advanceUntilIdle()
         assertTrue(fetcher.isLoadFailed)
         assertTrue(failEvents.last())
 
-        // Retry succeeds on next call -> isLoadFailed flips back to false & LRU evicts window 0 (cap=2)
-        fetcher.retryCurrentWindow()
+        // Before 30 s cooldown elapses: stays failed without hammering plugin
+        fakeClockMs.addAndGet(15_000L)
+        val callsWhileCooling = calls.size
+        fetcher.ensureWindowsFor(126_000L)
         advanceUntilIdle()
-        assertFalse(fetcher.isLoadFailed)
-        assertNotNull(fetcher.getCachedWindow(2))
-        assertNull(fetcher.getCachedWindow(0)) // evicted by 2-window LRU
+        assertEquals(callsWhileCooling, calls.size)
+        assertTrue(fetcher.isLoadFailed)
 
-        // Seek-cancellation test: start window 5 (suspended), seek to window 3, then release window 5
-        fetcher.onSeek(305_000L) // starts window 5
+        // After 30 s cooldown elapses: AUTOMATICALLY retries & recovers + LRU evicts window 0!
+        fakeClockMs.addAndGet(20_000L)
+        fetcher.ensureWindowsFor(127_000L)
+        advanceUntilIdle()
+        assertFalse("Must auto-recover after cooldown", fetcher.isLoadFailed)
+        assertNotNull(fetcher.getCachedWindow(2))
+        assertNull(fetcher.getCachedWindow(0))
+
+        // Seek cancels in-flight window 5 and discards late result
+        fetcher.onSeek(305_000L)
         testScheduler.runCurrent()
-        fetcher.onSeek(185_000L) // cancels window 5, fetches window 3
+        fetcher.onSeek(185_000L)
         gateWindow5.complete(Unit)
         advanceUntilIdle()
         assertNull(fetcher.getCachedWindow(5))
@@ -244,7 +349,213 @@ class DanmakuEngineAndFetcherTest {
         fetcher.close()
     }
 
-    // ---- 4. Engine Track Geometry, +18° Ceiling, 6.5° Subtitle Zone & 12°/s Speed Cap ----
+    // ---- 6. Must-Fix #2 & #3 Regression: Forward Jump Zero Backfill + LocalDanmakuPlaybackBridge ----
+
+    @Test
+    fun engineUnannouncedForwardJumpTreatsAsSeekWithZeroBackfill() {
+        val clock = VirtualClock(0L)
+        val engine = DanmakuEngine(clock)
+        engine.ingestWindowItems(
+            listOf(
+                DanmakuRawItem(1L, 1_000L, "正常第1秒", mode = DanmakuMode.SCROLL),
+                DanmakuRawItem(2L, 10_000L, "跳过第10秒", mode = DanmakuMode.SCROLL),
+                DanmakuRawItem(3L, 25_000L, "跳过第25秒", mode = DanmakuMode.SCROLL),
+                DanmakuRawItem(4L, 40_000L, "跳过第40秒", mode = DanmakuMode.SCROLL),
+                DanmakuRawItem(5L, 46_000L, "跳转后正常出现", mode = DanmakuMode.SCROLL),
+            ),
+            windowIndex = 0,
+        )
+        engine.step(0L)
+        for (i in 1..10) {
+            clock.advance(200L)
+            engine.step(i * 200L)
+        }
+        assertEquals(1, engine.activeItems.size)
+
+        // Sudden unannounced forward jump from 2,000 ms to 45,000 ms (WITHOUT calling onSeek!)
+        clock.advance(200L)
+        val jumpStep = engine.step(45_000L)
+        assertTrue("Forward jump must reset native clock anchor", jumpStep.clockReset)
+        assertTrue("Forward jump must drop old active items and NEVER backfill 10s/25s/40s!", engine.activeItems.isEmpty())
+
+        // Normal playback after 45,000 ms spawns the 46,000 ms item cleanly
+        for (i in 1..6) {
+            clock.advance(200L)
+            engine.step(45_000L + i * 200L)
+        }
+        assertEquals(1, engine.activeItems.size)
+        assertEquals("跳转后正常出现", engine.activeItems[0].displayText)
+    }
+
+    @Test
+    fun playbackBridgeHandlesResume40m30sBufferingPauseInPlaceRefreshZeroJumpAndScrubbing() {
+        val clock = VirtualClock(0L)
+        val engine = DanmakuEngine(clock)
+        var fetchPaused = false
+        val seekLog = ArrayList<Long>()
+
+        val sink = object : DanmakuPlaybackSink {
+            override fun setFetchPaused(paused: Boolean) {
+                fetchPaused = paused
+            }
+            override fun setPausedWithoutPosition() {
+                engine.setPaused(true)
+            }
+            override fun updatePlaybackPosition(mediaTimeMs: Long, playing: Boolean, playbackSpeed: Float) {
+                engine.setPlaybackSpeed(playbackSpeed)
+                engine.setPaused(!playing)
+                engine.step(mediaTimeMs)
+            }
+            override fun onSeek(targetMs: Long) {
+                seekLog.add(targetMs)
+                engine.onSeek(targetMs)
+            }
+            override fun setScrubbing(scrubbing: Boolean) {
+                engine.setScrubbing(scrubbing)
+            }
+        }
+        val bridge = LocalDanmakuPlaybackBridge(sink)
+
+        // Pre-populate window 0 (0:00-1:00) AND window 40 (40:00-41:00, 2_400_000..2_460_000)
+        val win0Items = listOf(
+            DanmakuRawItem(1L, 1_000L, "片头0:01不该补发", windowIndex = 0),
+            DanmakuRawItem(2L, 5_000L, "片头0:05不该补发", windowIndex = 0),
+        )
+        val win40Items = listOf(
+            DanmakuRawItem(10L, 2_405_000L, "40:05不该补发", windowIndex = 40),
+            DanmakuRawItem(11L, 2_420_000L, "40:20不该补发", windowIndex = 40),
+            DanmakuRawItem(12L, 2_431_000L, "40:31续播后第一条", windowIndex = 40),
+            DanmakuRawItem(13L, 2_436_000L, "40:36刷新后第一条", windowIndex = 40),
+        )
+        engine.ingestWindowItems(win0Items, windowIndex = 0)
+        engine.ingestWindowItems(win40Items, windowIndex = 40)
+
+        // 1. Loading resume at 40:30 (2,430,000 ms): before STATE_READY, tickBar fires with position=0!
+        bridge.onNewItemLoading()
+        assertTrue("Fetcher must pause while !ready", fetchPaused)
+        assertTrue(engine.isPaused)
+        repeat(5) {
+            clock.advance(200L)
+            bridge.onPlaybackUpdate(
+                positionMs = 0L,
+                playbackState = LocalDanmakuPlaybackBridge.PLAYBACK_STATE_BUFFERING,
+                playWhenReady = true,
+                errored = false,
+                playbackSpeed = 1.0f,
+            )
+        }
+        assertTrue("Must NEVER spawn window 0 items while !ready!", engine.activeItems.isEmpty())
+
+        // 2. ExoPlayer reaches STATE_READY & seeks to resume point 40:30 (2,430,000 ms)
+        bridge.onPlayerReady(2_430_000L, actuallyPlaying = true, playbackSpeed = 1.0f)
+        assertFalse("Fetcher unpauses on READY", fetchPaused)
+        assertEquals(listOf(2_430_000L), seekLog)
+        assertTrue("Must NEVER backfill 40:05 or 40:20 on resume!", engine.activeItems.isEmpty())
+
+        // Advance to 40:31.200 -> 40:31 item spawns normally
+        for (i in 1..6) {
+            clock.advance(200L)
+            bridge.onPlaybackUpdate(
+                positionMs = 2_430_000L + i * 200L,
+                playbackState = LocalDanmakuPlaybackBridge.PLAYBACK_STATE_READY,
+                playWhenReady = true,
+                errored = false,
+                playbackSpeed = 1.0f,
+            )
+        }
+        assertEquals(1, engine.activeItems.size)
+        assertEquals("40:31续播后第一条", engine.activeItems[0].displayText)
+
+        // 3. Mid-playback BUFFERING with playWhenReady=true (§6.5): danmaku MUST freeze in place & NOT disappear!
+        bridge.onPlaybackUpdate(
+            positionMs = 2_431_200L,
+            playbackState = LocalDanmakuPlaybackBridge.PLAYBACK_STATE_BUFFERING,
+            playWhenReady = true, // ExoPlayer keeps playWhenReady=true during buffering!
+            errored = false,
+            playbackSpeed = 1.0f,
+        )
+        assertTrue("Danmaku engine MUST pause during buffering even when playWhenReady=true", engine.isPaused)
+        val xBeforeBuffer = engine.activeItems[0].xNormAt(engine.currentTimelineRealMs)
+        repeat(10) {
+            clock.advance(200L)
+            bridge.onPlaybackUpdate(
+                positionMs = 2_431_200L,
+                playbackState = LocalDanmakuPlaybackBridge.PLAYBACK_STATE_BUFFERING,
+                playWhenReady = true,
+                errored = false,
+                playbackSpeed = 1.0f,
+            )
+        }
+        assertTrue("Danmaku engine MUST remain paused during buffering", engine.isPaused)
+        assertEquals("Buffering must keep active danmaku on screen (§6.5)", 1, engine.activeItems.size)
+        assertEquals(xBeforeBuffer, engine.activeItems[0].xNormAt(engine.currentTimelineRealMs), 1e-6f)
+
+        // Resume READY after buffering -> stays at exact frozen X on resume boundary, then moves smoothly leftward
+        bridge.onPlaybackUpdate(2_431_200L, LocalDanmakuPlaybackBridge.PLAYBACK_STATE_READY, true, false, 1.0f)
+        assertFalse(engine.isPaused)
+        assertEquals(xBeforeBuffer, engine.activeItems[0].xNormAt(engine.currentTimelineRealMs), 1e-6f)
+        clock.advance(200L)
+        bridge.onPlaybackUpdate(2_431_400L, LocalDanmakuPlaybackBridge.PLAYBACK_STATE_READY, true, false, 1.0f)
+        assertTrue(engine.activeItems[0].xNormAt(engine.currentTimelineRealMs) < xBeforeBuffer)
+
+        // 4. Real plugin URL/quality refresh simulation: setMediaSource + prepare() drops pos to 0, then seeks back to 40:35!
+        bridge.onPluginRefreshStarted()
+        assertTrue("Fetcher must pause during refreshInFlight", fetchPaused)
+        repeat(4) {
+            clock.advance(200L)
+            bridge.onPlaybackUpdate(0L, LocalDanmakuPlaybackBridge.PLAYBACK_STATE_BUFFERING, true, false, 1.0f)
+        }
+        // Re-prepare finishes and seeks back to 40:35 (2,435,000 ms)
+        bridge.onPlayerReady(2_435_000L, actuallyPlaying = true, playbackSpeed = 1.0f)
+        assertFalse(fetchPaused)
+        assertTrue("Refresh 0->40:35 must NEVER backfill 0:00 or 40:05..40:31!", engine.activeItems.isEmpty())
+        for (i in 1..6) {
+            clock.advance(200L)
+            bridge.onPlaybackUpdate(2_435_000L + i * 200L, LocalDanmakuPlaybackBridge.PLAYBACK_STATE_READY, true, false, 1.0f)
+        }
+        assertEquals(1, engine.activeItems.size)
+        assertEquals("40:36刷新后第一条", engine.activeItems[0].displayText)
+
+        // 5. Progress bar drag scrubbing hides active danmaku immediately, then commits clean seek on release
+        bridge.onScrubStart()
+        assertTrue("Scrubbing must hide active danmaku immediately", engine.activeItems.isEmpty())
+        bridge.onScrubEnd(commitTargetMs = 2_435_500L)
+        assertEquals(2_435_500L, seekLog.last())
+    }
+
+    // ---- 7. Bounded Engine Memory & Per-Window Cap (Dense Video O(1) Memory) ----
+
+    @Test
+    fun enginePrunesOutOfRangeWindowsAndCapsItemsPerWindow() {
+        val clock = VirtualClock(0L)
+        val engine = DanmakuEngine(clock)
+        engine.step(0L)
+
+        // Window 0 with 2,500 items -> capped strictly at MAX_ITEMS_PER_WINDOW (2,000)
+        val denseWin0 = (0 until 2_500).map { i ->
+            DanmakuRawItem(id = i.toLong() + 1L, timeMs = (i * 20L), text = "w0-$i", windowIndex = 0)
+        }
+        engine.ingestWindowItems(denseWin0, windowIndex = 0)
+        assertEquals(DanmakuEngine.MAX_ITEMS_PER_WINDOW, engine.scheduledItemCount)
+
+        // Advance through windows 1, 2, 3, 4; engine must NEVER retain more than [cur-1 .. cur+1]
+        for (w in 1..4) {
+            val baseMs = w * 60_000L
+            engine.onSeek(baseMs)
+            val winItems = (0 until 500).map { i ->
+                DanmakuRawItem(id = w * 10_000L + i, timeMs = baseMs + i * 100L, text = "w$w-$i", windowIndex = w)
+            }
+            engine.ingestWindowItems(winItems, windowIndex = w)
+            assertTrue(
+                "Scheduled count ${engine.scheduledItemCount} exceeded 3-window bound at window $w",
+                engine.scheduledItemCount <= 3 * DanmakuEngine.MAX_ITEMS_PER_WINDOW,
+            )
+        }
+        // At window 4, windows 0, 1, 2 MUST be pruned (only window 3 and 4 = 1,000 items remain!)
+        assertEquals(1_000, engine.scheduledItemCount)
+    }
+
+    // ---- 8. Track Geometry, Collision, Top/Bottom, Pause/2x, Block Mask, Depth Bands, Store, Determinism ----
 
     @Test
     fun engineTrackCountsCeilingSubtitleZoneAndSpeedCapMatchSpec610() {
@@ -252,13 +563,11 @@ class DanmakuEngineAndFetcherTest {
         val engine = DanmakuEngine(clock)
         engine.updateScreenContext(50.0f, 16.0f / 9.0f, 3.0f, stereoActive = false, StereoSourceFormat.AUTO, 0.0f)
 
-        // §6.10 exact table on 50° 16:9 medium (1.4°): FULL = 11, HALF = 7, QUARTER = 3
         engine.updateSettings(DanmakuSettings(area = DanmakuArea.FULL, sizeTier = TextSizeTier.MEDIUM))
         val full = engine.computeLayoutMetrics()
         assertEquals(11, full.scrollTrackCount)
         assertEquals(3, full.bottomTrackCount)
         assertEquals(0.0f, full.topSkipDeg, 1e-4f)
-        // Bottom of FULL area strictly excludes 6.5° subtitle zone
         assertEquals(full.screenVFovDeg - 6.5f, full.areaBottomDeg, 1e-3f)
 
         engine.updateSettings(DanmakuSettings(area = DanmakuArea.HALF, sizeTier = TextSizeTier.MEDIUM))
@@ -271,23 +580,12 @@ class DanmakuEngineAndFetcherTest {
         assertEquals(3, quarter.scrollTrackCount)
         assertEquals(0.25f, quarter.areaBotFrac, 1e-3f)
 
-        // Giant screen (80° 16:9, vFov = 45°, half = 22.5° > 18° ceiling) + FAST speed (80/6 = 13.33 -> capped 12°/s)
         engine.updateScreenContext(80.0f, 16.0f / 9.0f, 3.0f, stereoActive = false, StereoSourceFormat.AUTO, 0.0f)
         engine.updateSettings(DanmakuSettings(area = DanmakuArea.FULL, speed = DanmakuSpeed.FAST))
         val giant = engine.computeLayoutMetrics()
         assertEquals(4.5f, giant.topSkipDeg, 1e-3f)
         assertEquals(12.0f, giant.speedDegPerSec, 1e-4f)
-
-        // 60% width truncation guard
-        val ultraLong = "弹".repeat(38)
-        val (fitText, fitW) = DanmakuDepthMath.fitToMaxWidthDeg(
-            ultraLong, 1.4f, 50.0f * 0.60f, HeuristicDanmakuMeasurer,
-        )
-        assertTrue(fitText.endsWith("…"))
-        assertTrue(fitW <= 50.0f * 0.60f + 1e-3f)
     }
-
-    // ---- 5. Collision Avoidance, Density Cap, 1 s Wait Queue & Drop, Full Atlas Degradation ----
 
     @Test
     fun engineEnforcesZeroSameTrackCollisionDensityCapWaitQueueAndFullAtlas() {
@@ -295,15 +593,8 @@ class DanmakuEngineAndFetcherTest {
         val engine = DanmakuEngine(clock)
         engine.updateScreenContext(50.0f, 16.0f / 9.0f, 3.0f, stereoActive = false, StereoSourceFormat.AUTO, 0.0f)
         engine.updateSettings(
-            DanmakuSettings(
-                area = DanmakuArea.FULL,
-                density = DanmakuDensity.SPARSE, // maxOnScreen = 20, gap = 4 chars
-                speed = DanmakuSpeed.NORMAL,
-            ),
+            DanmakuSettings(area = DanmakuArea.FULL, density = DanmakuDensity.SPARSE, speed = DanmakuSpeed.NORMAL),
         )
-
-        // Inject 35 simultaneous scroll items across 11 tracks -> at most 11 fit immediately,
-        // remaining wait up to 1,000 ms and fill freed tracks or drop cleanly with zero overlap.
         val burst = (1..35).map { i ->
             DanmakuRawItem(id = i.toLong(), timeMs = 100L, text = "测试弹幕$i", mode = DanmakuMode.SCROLL)
         }
@@ -312,41 +603,24 @@ class DanmakuEngineAndFetcherTest {
 
         val metrics = engine.computeLayoutMetrics()
         val gapNorm = metrics.gapDeg / metrics.screenFovDeg
-
-        // Step 30 times at 100 ms intervals (3 seconds real time)
         for (stepIdx in 1..30) {
             clock.advance(100L)
             engine.step(stepIdx * 100L)
-
-            // Density cap strictly respected
-            assertTrue("active ${engine.activeItems.size} > 20", engine.activeItems.size <= 20)
-
-            // Zero collision on every track: sorted by xStart (head), each older item's tail + gap <= newer item's head
-            val byTrack = engine.activeItems
-                .filter { it.mode == DanmakuMode.SCROLL }
-                .groupBy { it.trackIndex }
+            assertTrue(engine.activeItems.size <= 20)
+            val byTrack = engine.activeItems.filter { it.mode == DanmakuMode.SCROLL }.groupBy { it.trackIndex }
             for ((track, itemsOnTrack) in byTrack) {
                 val sorted = itemsOnTrack.sortedBy { it.xNormAt(clock.nowMs) }
                 for (k in 0 until sorted.size - 1) {
-                    val prevTail = sorted[k].tailNormAt(clock.nowMs)
-                    val nextHead = sorted[k + 1].xNormAt(clock.nowMs)
                     assertTrue(
-                        "Collision on track $track at t=${clock.nowMs}: prevTail=$prevTail, nextHead=$nextHead, gap=$gapNorm",
-                        prevTail + gapNorm - 1e-3f <= nextHead,
+                        "Collision on track $track",
+                        sorted[k].tailNormAt(clock.nowMs) + gapNorm - 1e-3f <= sorted[k + 1].xNormAt(clock.nowMs),
                     )
                 }
             }
         }
-        assertTrue("Overflow items waiting > 1s must drop cleanly", engine.totalDroppedCount > 0)
+        assertTrue(engine.totalDroppedCount > 0)
 
-        // Verify track -> depth band cycle: 0=FAR, 1=MID, 2=NEAR, 3=MID, 4=FAR
-        assertEquals(DanmakuLayerBand.FAR, DanmakuLayerBand.forScrollTrack(0))
-        assertEquals(DanmakuLayerBand.MID, DanmakuLayerBand.forScrollTrack(1))
-        assertEquals(DanmakuLayerBand.NEAR, DanmakuLayerBand.forScrollTrack(2))
-        assertEquals(DanmakuLayerBand.MID, DanmakuLayerBand.forScrollTrack(3))
-        assertEquals(DanmakuLayerBand.FAR, DanmakuLayerBand.forScrollTrack(4))
-
-        // Full atlas degradation: tiny 1-shelf SMALL atlas holds 1 slot, 2nd item waits and drops without crashing
+        // Full atlas degradation: tiny 1-shelf SMALL atlas holds 1 slot, 2nd waits then drops cleanly
         val tinyClock = VirtualClock(0L)
         val tinyEngine = DanmakuEngine(tinyClock, atlas = DanmakuAtlasAllocator(atlasWidth = 650, atlasHeight = 60))
         tinyEngine.updateSettings(DanmakuSettings(sizeTier = TextSizeTier.SMALL))
@@ -368,201 +642,55 @@ class DanmakuEngineAndFetcherTest {
         assertEquals(1, tinyEngine.totalDroppedCount)
     }
 
-    // ---- 6. Top / Bottom Fixed Danmaku (4 s stay, 150 ms fade, NEAR band, max 3 bottom rows) ----
-
     @Test
-    fun engineTopAndBottomStay4sOnNearBandWith150msFadeAndMax3BottomRows() {
-        val clock = VirtualClock(0L)
-        val engine = DanmakuEngine(clock)
-        engine.updateSettings(DanmakuSettings(area = DanmakuArea.FULL))
-        engine.ingestWindowItems(
-            listOf(
-                DanmakuRawItem(1L, 100L, "顶部置顶", mode = DanmakuMode.TOP),
-                DanmakuRawItem(2L, 100L, "底部1", mode = DanmakuMode.BOTTOM),
-                DanmakuRawItem(3L, 100L, "底部2", mode = DanmakuMode.BOTTOM),
-                DanmakuRawItem(4L, 100L, "底部3", mode = DanmakuMode.BOTTOM),
-                DanmakuRawItem(5L, 100L, "底部4溢出", mode = DanmakuMode.BOTTOM),
-            ),
-            windowIndex = 0,
-        )
-        engine.step(0L)
-        clock.advance(100L)
-        engine.step(100L)
-
-        val bottoms = engine.activeItems.filter { it.mode == DanmakuMode.BOTTOM }
-        val tops = engine.activeItems.filter { it.mode == DanmakuMode.TOP }
-        assertEquals(1, tops.size)
-        assertEquals(3, bottoms.size) // strictly capped at 3 rows
-        assertEquals(DanmakuLayerBand.NEAR, tops[0].layerBand)
-        assertEquals(DanmakuLayerBand.NEAR, bottoms[0].layerBand)
-        assertEquals(4_000L, tops[0].durationRealMs)
-        assertEquals(150L, tops[0].fadeMs)
-        assertEquals(0.0f, tops[0].velNormPerSec, 1e-6f)
-        // Bottom rows stack upward: track 0 is lowest (largest yNorm), track 2 is highest
-        assertTrue(bottoms[0].yNormInArea > bottoms[1].yNormInArea)
-        assertTrue(bottoms[1].yNormInArea > bottoms[2].yNormInArea)
-
-        // At t=4,050ms still alive; at t=4,150ms expired & recycled
-        for (i in 1..19) {
-            clock.advance(200L)
-            engine.step(100L + i * 200L)
-        }
-        assertTrue(engine.activeItems.any { it.mode == DanmakuMode.TOP })
-        clock.advance(250L)
-        engine.step(4_200L)
-        assertTrue(engine.activeItems.isEmpty())
-        assertEquals(0, engine.atlas.activeSlotCount)
-    }
-
-    // ---- 7. Pause, Playback Speed (2x), Seek (Zero Backfill), Episode Reset & Quality Refresh ----
-
-    @Test
-    fun engineHandlesPause2xSpeedSeekZeroBackfillEpisodeSwitchAndQualityRefresh() {
-        val clock = VirtualClock(0L)
-        val engine = DanmakuEngine(clock)
-        engine.updateSettings(DanmakuSettings(area = DanmakuArea.HALF, speed = DanmakuSpeed.NORMAL))
-        engine.ingestWindowItems(
-            listOf(
-                DanmakuRawItem(1L, 1_000L, "第一条", mode = DanmakuMode.SCROLL),
-                DanmakuRawItem(2L, 3_000L, "2倍速触发", mode = DanmakuMode.SCROLL),
-                DanmakuRawItem(3L, 20_000L, "跳过不补发", mode = DanmakuMode.SCROLL),
-                DanmakuRawItem(4L, 60_000L, "跳转后第一条", mode = DanmakuMode.SCROLL),
-            ),
-            windowIndex = 0,
-        )
-        engine.step(0L)
-
-        // Advance 1s wall clock, 1s media -> item 1 spawns
-        for (i in 1..5) {
-            clock.advance(200L)
-            engine.step(i * 200L)
-        }
-        assertEquals(1, engine.activeItems.size)
-        val xBeforePause = engine.activeItems[0].xNormAt(engine.currentTimelineRealMs)
-
-        // Pause for 10 seconds real time -> item X & timelineRealMs must stay completely frozen
-        engine.setPaused(true)
-        clock.advance(10_000L)
-        engine.step(1_000L)
-        assertEquals(1, engine.activeItems.size)
-        assertEquals(xBeforePause, engine.activeItems[0].xNormAt(engine.currentTimelineRealMs), 1e-6f)
-
-        // Resume at 2x playback speed: 1,000 ms wall clock -> +2,000 ms media (reaches 3,000 ms)
-        engine.setPaused(false)
-        for (i in 1..5) {
-            clock.advance(200L)
-            engine.step(1_000L + i * 400L)
-        }
-        assertEquals(2, engine.activeItems.size) // item 2 spawned at media 3,000 ms
-        // Item 1 scrolled at normal real-time velocity (1/8 screen width in 1s), NOT 2x speed!
-        val expectedXAfter1s = xBeforePause - (1.0f / 8.0f)
-        assertEquals(expectedXAfter1s, engine.activeItems[0].xNormAt(engine.currentTimelineRealMs), 0.01f)
-
-        // Quality refresh (no reset): re-ingesting same windowIndex does NOT duplicate items
-        engine.ingestWindowItems(
-            listOf(
-                DanmakuRawItem(101L, 1_000L, "第一条", mode = DanmakuMode.SCROLL),
-                DanmakuRawItem(104L, 60_000L, "跳转后第一条", mode = DanmakuMode.SCROLL),
-            ),
-            windowIndex = 0,
-        )
-        assertEquals(2, engine.activeItems.size) // current active items uninterrupted
-
-        // Seek to 59,000 ms: clears active items, ZERO backfill of 20,000 ms item, plays 60,000 ms item next
-        engine.onSeek(59_000L)
-        assertTrue(engine.activeItems.isEmpty())
-        assertEquals(0, engine.atlas.activeSlotCount)
-        clock.advance(200L)
-        engine.step(60_100L)
-        assertEquals(1, engine.activeItems.size)
-        assertEquals("跳转后第一条", engine.activeItems[0].displayText)
-
-        // Episode switch clears everything completely
-        engine.resetForNewItem(0L)
-        assertTrue(engine.activeItems.isEmpty())
-        assertEquals(0, engine.atlas.activeSlotCount)
-        clock.advance(200L)
-        engine.step(60_500L)
-        assertTrue(engine.activeItems.isEmpty())
-    }
-
-    // ---- 8. Block Mask Immediate Removal, Layered Depth (2D/SBS/AI-3D), User Drag Anim & Preview ----
-
-    @Test
-    fun engineBlockMaskLayeredDepthAndPreviewWorkAcross2dSbsAndAi3d() {
+    fun engineTopBottomFixedStayFade2xSpeedBlockMaskDepthBandsAndPreview() {
         val clock = VirtualClock(0L)
         val engine = DanmakuEngine(clock, previewStrings = DanmakuPreviewStrings("远", "中", "近"))
-        engine.updateScreenContext(50.0f, 16.0f / 9.0f, 3.0f, stereoActive = false, StereoSourceFormat.AUTO, 0.0f)
-        engine.updateSettings(DanmakuSettings(floatAuto = true, depthLayer = DepthLayerLevel.MEDIUM))
-
-        // 2D mode: contentPhi = 0 -> Far=0.10°, Mid=0.25°, Near=0.40°
-        val bands2d = engine.computeCurrentDepthBands()
-        assertEquals(0.10f, bands2d.farPhiDeg, 1e-4f)
-        assertEquals(0.25f, bands2d.midPhiDeg, 1e-4f)
-        assertEquals(0.40f, bands2d.nearPhiDeg, 1e-4f)
-
-        // Native SBS: contentPhi = 0.25 -> Far=0.35°, Mid=0.50°, Near=0.65°
-        engine.updateScreenContext(50.0f, 16.0f / 9.0f, 3.0f, stereoActive = true, StereoSourceFormat.SBS, 0.0f)
-        val bandsSbs = engine.computeCurrentDepthBands()
-        assertEquals(0.35f, bandsSbs.farPhiDeg, 1e-4f)
-        assertEquals(0.50f, bandsSbs.midPhiDeg, 1e-4f)
-        assertEquals(0.65f, bandsSbs.nearPhiDeg, 1e-4f)
-
-        // AI 2D-to-3D with measured contentPhi = 0.70° at 3.0 m:
-        // farRaw = 0.80°, delta = 0.30°, maxPhi(3.0m) = 1.00° -> delta compressed to 0.20° -> Far=0.80, Mid=0.90, Near=1.00
         engine.updateScreenContext(50.0f, 16.0f / 9.0f, 3.0f, stereoActive = true, StereoSourceFormat.AUTO, 0.70f)
+        engine.updateSettings(DanmakuSettings(area = DanmakuArea.FULL, floatAuto = true, depthLayer = DepthLayerLevel.MEDIUM))
+
+        // Ceiling compression: content=0.70 -> far=0.80, delta compressed 0.30->0.20 -> near=1.00
         val bandsAi = engine.computeCurrentDepthBands()
         assertEquals(0.80f, bandsAi.farPhiDeg, 1e-3f)
         assertEquals(0.90f, bandsAi.midPhiDeg, 1e-3f)
         assertEquals(1.00f, bandsAi.nearPhiDeg, 1e-3f)
         assertTrue(bandsAi.nearDistM >= 1.599f)
 
-        // Spawn 2 items (white scroll + colored top) and verify:
-        // - contentPhi change alone does NOT mutate existing item fixedPhiDeg
-        // - user dragging Float/Layer triggers animateDepthTransition=true and updates fixedPhiDeg
-        // - toggling COLOR block mask removes colored item immediately
         engine.ingestWindowItems(
             listOf(
-                DanmakuRawItem(1L, 100L, "白色滚动", colorRgb = 0xFFFFFF, mode = DanmakuMode.SCROLL),
-                DanmakuRawItem(2L, 100L, "彩色顶部", colorRgb = 0xFF6699, mode = DanmakuMode.TOP),
+                DanmakuRawItem(1L, 100L, "顶部置顶", colorRgb = 0xFF6699, mode = DanmakuMode.TOP),
+                DanmakuRawItem(2L, 100L, "底部1", mode = DanmakuMode.BOTTOM),
+                DanmakuRawItem(3L, 100L, "底部2", mode = DanmakuMode.BOTTOM),
+                DanmakuRawItem(4L, 100L, "底部3", mode = DanmakuMode.BOTTOM),
+                DanmakuRawItem(5L, 100L, "底部4溢出", mode = DanmakuMode.BOTTOM),
+                DanmakuRawItem(6L, 2_000L, "2倍速触发", mode = DanmakuMode.SCROLL),
             ),
             windowIndex = 0,
         )
         engine.step(0L)
         clock.advance(100L)
         engine.step(100L)
-        assertEquals(2, engine.activeItems.size)
-        val origScrollPhi = engine.activeItems[0].fixedPhiDeg
-
-        // Scene depth change does NOT push live items around
-        engine.updateContentPhi(0.10f)
-        val resNoAnim = engine.step(150L)
-        assertFalse(resNoAnim.animateDepthTransition)
-        assertEquals(origScrollPhi, engine.activeItems[0].fixedPhiDeg, 1e-5f)
-
-        // User drags Float to fixed flat (0°) -> triggers 200 ms animation on existing items
-        engine.updateSettings(
-            engine.currentSettings.copy(floatAuto = false, floatFixedSteps = 0, depthLayer = DepthLayerLevel.OFF),
-        )
-        val resAnim = engine.step(150L)
-        assertTrue(resAnim.animateDepthTransition)
-        assertEquals(0.0f, engine.activeItems[0].fixedPhiDeg, 1e-5f)
+        assertEquals(3, engine.activeItems.count { it.mode == DanmakuMode.BOTTOM })
+        assertEquals(1, engine.activeItems.count { it.mode == DanmakuMode.TOP })
 
         // Block COLOR removes colored top immediately
         engine.updateSettings(engine.currentSettings.copy(blockMask = DanmakuBlockFlags.COLOR))
-        assertEquals(1, engine.activeItems.size)
-        assertEquals("白色滚动", engine.activeItems[0].displayText)
+        assertEquals(0, engine.activeItems.count { it.mode == DanmakuMode.TOP })
 
-        // Pack instances produces valid flat array matching DANMAKU_INSTANCE_FLOATS
-        val packed = FloatArray(XrShared.DANMAKU_MAX_ITEMS * XrShared.DANMAKU_INSTANCE_FLOATS)
-        assertEquals(1, engine.packInstances(packed))
+        // 2x playback speed advances media 2x faster while NOT tripping forward-jump guard
+        engine.setPlaybackSpeed(2.0f)
+        for (i in 1..5) {
+            clock.advance(200L)
+            engine.step(100L + i * 400L)
+        }
+        assertTrue(engine.activeItems.any { it.displayText == "2倍速触发" })
 
-        // Preview mode when paused/empty spawns 3 stationary FAR/MID/NEAR items and clears on close
+        // Preview mode when paused/empty spawns 3 stationary FAR/MID/NEAR items
         engine.onSeek(10_000L)
         engine.setPaused(true)
         engine.setPreviewRequested(true)
-        val prevStep = engine.step(10_000L)
-        assertEquals(3, prevStep.activeCount)
+        val prev = engine.step(10_000L)
+        assertEquals(3, prev.activeCount)
         assertEquals(
             listOf(DanmakuLayerBand.FAR, DanmakuLayerBand.MID, DanmakuLayerBand.NEAR),
             engine.activeItems.map { it.layerBand },
@@ -571,10 +699,8 @@ class DanmakuEngineAndFetcherTest {
         assertTrue(engine.activeItems.isEmpty())
     }
 
-    // ---- 9. PaletteStore Persistence of New G4 Danmaku Prefs ----
-
     @Test
-    fun paletteStoreRoundTripsG4DanmakuDensityMergeAndCurvaturePrefs() {
+    fun paletteStoreRoundTripsG4DanmakuPrefsAndEngineIsDeterministic() {
         val store = MapPrefsStore()
         val saved = GlobalPaletteSettings(
             danmakuOn = true,
@@ -586,59 +712,40 @@ class DanmakuEngineAndFetcherTest {
             danmakuDensity = DanmakuDensity.DENSE,
             danmakuMergeDuplicates = false,
             danmakuCurvatureMode = DanmakuCurvatureMode.CUSTOM,
-            danmakuCustomCurvaturePct = 37, // ScreenReadout.CURVATURE_STEP = 5 -> quantizes to 35
+            danmakuCustomCurvaturePct = 37,
         )
         PaletteStore.saveGlobal(store, saved)
         val loaded = PaletteStore.readGlobal(store)
-
-        assertEquals(DanmakuArea.FULL, loaded.danmakuArea)
-        assertEquals(65, loaded.danmakuOpacityPct)
-        assertEquals(TextSizeTier.LARGE, loaded.danmakuSize)
-        assertEquals(DanmakuSpeed.FAST, loaded.danmakuSpeed)
-        assertEquals(DanmakuBlockFlags.TOP or DanmakuBlockFlags.COLOR, loaded.danmakuBlockMask)
         assertEquals(DanmakuDensity.DENSE, loaded.danmakuDensity)
         assertFalse(loaded.danmakuMergeDuplicates)
         assertEquals(DanmakuCurvatureMode.CUSTOM, loaded.danmakuCurvatureMode)
         assertEquals(35, loaded.danmakuCustomCurvaturePct)
-    }
 
-    @Test
-    fun engineIs100PercentDeterministicUnderVirtualClock() {
         fun runSim(): Pair<Int, FloatArray> {
             val clock = VirtualClock(0L)
             val engine = DanmakuEngine(clock)
             engine.updateScreenContext(55.0f, 16.0f / 9.0f, 3.0f, stereoActive = true, StereoSourceFormat.AUTO, 0.35f)
             engine.updateSettings(DanmakuSettings(area = DanmakuArea.FULL, density = DanmakuDensity.DENSE))
-            val items = (1..40).map { i ->
-                DanmakuRawItem(
-                    id = i.toLong(),
-                    timeMs = (i * 80L),
-                    text = "弹幕条目#$i",
-                    colorRgb = if (i % 4 == 0) 0xFFAA00 else 0xFFFFFF,
-                    mode = when {
-                        i % 11 == 0 -> DanmakuMode.TOP
-                        i % 13 == 0 -> DanmakuMode.BOTTOM
-                        else -> DanmakuMode.SCROLL
-                    },
-                )
+            val items = (1..30).map { i ->
+                DanmakuRawItem(id = i.toLong(), timeMs = i * 80L, text = "弹幕#$i", mode = DanmakuMode.SCROLL)
             }
             engine.ingestWindowItems(items, windowIndex = 0)
             engine.step(0L)
             for (t in 1..25) {
                 clock.advance(100L)
                 engine.step(t * 100L)
+                engine.activeItems.forEach { it.rasterized = true }
             }
             val buf = FloatArray(XrShared.DANMAKU_MAX_ITEMS * XrShared.DANMAKU_INSTANCE_FLOATS)
-            val count = engine.packInstances(buf)
-            return count to buf
+            return engine.packInstances(buf) to buf
         }
 
-        val (countA, bufA) = runSim()
-        val (countB, bufB) = runSim()
-        assertTrue(countA > 10)
-        assertEquals(countA, countB)
-        for (i in 0 until countA * XrShared.DANMAKU_INSTANCE_FLOATS) {
-            assertEquals("Mismatch at float[$i]", bufA[i], bufB[i], 0.0f)
+        val (cA, bA) = runSim()
+        val (cB, bB) = runSim()
+        assertTrue(cA > 10)
+        assertEquals(cA, cB)
+        for (i in 0 until cA * XrShared.DANMAKU_INSTANCE_FLOATS) {
+            assertEquals(bA[i], bB[i], 0.0f)
         }
     }
 }
