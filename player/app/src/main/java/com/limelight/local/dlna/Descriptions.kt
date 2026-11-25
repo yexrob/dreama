@@ -39,9 +39,9 @@ object Descriptions {
 <device>
 <deviceType>$DEVICE_TYPE</deviceType>
 <friendlyName>${Xml.escape(name)}</friendlyName>
-<manufacturer>depth3d</manufacturer>
-<modelDescription>depth3d 2D to 3D media renderer</modelDescription>
-<modelName>depth3d</modelName>
+<manufacturer>Dreama</manufacturer>
+<modelDescription>Dreama 2D to 3D media renderer</modelDescription>
+<modelName>Dreama</modelName>
 <modelNumber>${Xml.escape(version)}</modelNumber>
 <serialNumber>${udn.takeLast(12)}</serialNumber>
 <UDN>uuid:$udn</UDN>

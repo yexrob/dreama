@@ -34,7 +34,7 @@ object CastReceiver {
     private const val PREFS = "dlna"
     private const val KEY_NAME = "name"
     private const val KEY_UDN = "udn"
-    const val DEFAULT_NAME = "depth3d"
+    const val DEFAULT_NAME = "Dreama"
 
     private val main = Handler(Looper.getMainLooper())
     private var holds = 0

@@ -62,7 +62,7 @@ import java.util.Set;
  * not exist), so anyone on the same Wi-Fi can mirror to the headset.
  */
 public class AirPlayService extends Service implements AirPlayNative.Listener {
-    public static final String DEFAULT_NAME = "depth3d";
+    public static final String DEFAULT_NAME = "Dreama";
     // UxPlay's default as well: H.265 is offered only when asked for. The
     // decoding side handles it; turning this on offers it to devices that
     // can send it, where the headset has a hardware decoder.

@@ -141,7 +141,7 @@ final class XrPanels {
             { R.string.vr_panel_brightness, R.string.vr_panel_contrast, R.string.vr_panel_gamma,
               R.string.vr_panel_saturation };
     // About / Streaming tab header name
-    private static final String COG_ABOUT_NAME = "depth3d";
+    private static final String COG_ABOUT_NAME = "Dreama";
 
     // The in world keyboard. Four sheets of the same layout, one per state,
     // handed over in state order, along with the geometry that goes with them:
@@ -1507,7 +1507,7 @@ final class XrPanels {
             canvas.drawText(Toast.fit(context.getString(R.string.vr_stream_next_connect_note),
                     notePaint, room), mid, 0.835f * COG_TEX_H, notePaint);
 
-            String version = "depth3d " + BuildConfig.VERSION_NAME;
+            String version = "Dreama " + BuildConfig.VERSION_NAME;
             canvas.drawText(Toast.fit(version, subPaint, room), mid, 0.915f * COG_TEX_H, subPaint);
         }
         else {

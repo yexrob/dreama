@@ -101,7 +101,7 @@ scripts/serve-gdrive.sh            # 默认 gdrive:，端口 8890，只读
 登录名 `depth3d`，密码在 `~/.config/depth3d/webdav-pass`（第一次运行时生成），头显里填一次即可。也可以用 adb 直接写进去：
 
 ```bash
-adb shell am start -n dev.depth3d.player.debug/com.limelight.local.wall.WallActivity \
+adb shell am start -n dev.dreama.player.debug/com.limelight.local.wall.WallActivity \
   --es base http://<Mac IP>:8890 --es user depth3d --es pass <密码>
 ```
 
@@ -109,10 +109,10 @@ Moonlight 原来的串流入口在「投屏」页的「电脑串流」里。
 
 ### 手机投屏（DLNA）
 
-头显是一个标准的 DLNA 接收端（UPnP MediaRenderer），名字默认叫 **depth3d**。
+头显是一个标准的 DLNA 接收端（UPnP MediaRenderer），名字默认叫 **Dreama**。
 
-1. 头显打开 depth3d，进「投屏」页，看到「正在等待投屏」。
-2. 手机和头显连同一个 Wi-Fi，在 B 站、爱奇艺、优酷、腾讯视频等 App 里播放视频，点「投屏」（电视图标），选「depth3d」。
+1. 头显打开 Dreama，进「投屏」页，看到「正在等待投屏」。
+2. 手机和头显连同一个 Wi-Fi，在 B 站、爱奇艺、优酷、腾讯视频等 App 里播放视频，点「投屏」（电视图标），选「Dreama」。
 3. 头显直接进入 3D 播放。手机上的暂停、继续、拖进度、调音量、退出投屏都对头显生效，手机上的进度条跟着头显走。
 
 接收端只在 App 打开时运行（播放墙在前台，或正在播放），是一个带常驻通知的前台服务，持有 Wi-Fi 组播锁；关掉 App 几秒后就停，手机列表里随之消失。正在播放时又投来新视频，会直接切过去。
@@ -139,7 +139,7 @@ Moonlight 原来的串流入口在「投屏」页的「电脑串流」里。
 App 打开期间，头显在 Wi-Fi 里是一台叫 **depth3d** 的 AirPlay 接收端（前台服务 `local/airplay/AirPlayService`，通知栏里能看到）。用法：
 
 1. 头显和 iPad / iPhone 连同一个 Wi-Fi，打开 depth3d，停在任意页面都行。
-2. iPad 上从右上角下拉出控制中心 → 「屏幕镜像」→ 选「depth3d」。
+2. iPad 上从右上角下拉出控制中心 → 「屏幕镜像」→ 选「Dreama」。
 3. 头显自动进入 VR，iPad 的画面出现在屏幕上并实时转成 3D；声音从头显出。
 4. 在 iPad 上点「停止镜像」，或在头显里退出播放，都会断开并回到首页。
 

@@ -79,7 +79,7 @@ class DlnaService : Service(), RendererHost {
         audio = getSystemService(AUDIO_SERVICE) as AudioManager
         name = CastReceiver.name(this)
         udn = CastReceiver.udn(this)
-        serverHeader = "Android/${Build.VERSION.RELEASE} UPnP/1.0 depth3d/1.0"
+        serverHeader = "Android/${Build.VERSION.RELEASE} UPnP/1.0 Dreama/1.0"
         // Cast ids from the clock, so a player left from an earlier run never matches a new cast
         renderer = MediaRenderer(this, System.currentTimeMillis())
         handler = DlnaHandler(renderer, subs) { Descriptions.device(name, udn, version()) }

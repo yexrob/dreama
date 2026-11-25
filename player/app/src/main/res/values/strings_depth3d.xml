@@ -285,18 +285,18 @@
     <string name="phone_input_addr_label">电脑局域网地址</string>
     <string name="phone_input_addr_placeholder">例如 192.168.1.20</string>
     <string name="phone_input_name_label">头显投屏名称</string>
-    <string name="phone_input_name_placeholder">例如 客厅的 depth3d</string>
+    <string name="phone_input_name_placeholder">例如 客厅的 Dreama</string>
     <string name="phone_input_connecting">正在处理…</string>
 
-    <string name="phone_html_add_pc_page_title">depth3d · 添加电脑</string>
+    <string name="phone_html_add_pc_page_title">Dreama · 添加电脑</string>
     <string name="phone_html_add_pc_heading">添加电脑到头显</string>
     <string name="phone_html_add_pc_hint">输入电脑在当前 Wi-Fi 里的局域网地址</string>
     <string name="phone_html_add_pc_placeholder">例如 192.168.1.20</string>
     <string name="phone_html_add_pc_submit">发送到头显</string>
-    <string name="phone_html_rename_page_title">depth3d · 设备名称</string>
+    <string name="phone_html_rename_page_title">Dreama · 设备名称</string>
     <string name="phone_html_rename_heading">修改头显投屏名称</string>
     <string name="phone_html_rename_hint">投屏列表和电脑配对提示里会显示这个名字</string>
-    <string name="phone_html_rename_placeholder">例如 客厅的 depth3d</string>
+    <string name="phone_html_rename_placeholder">例如 客厅的 Dreama</string>
     <string name="phone_html_rename_submit">保存名称</string>
     <string name="phone_html_code_label">头显上的 4 位数字</string>
     <string name="phone_html_code_placeholder">4 位验证码</string>
@@ -452,13 +452,13 @@
     <string name="settings_reset_pairing_failed">重置配对信息失败，请重启应用后再试</string>
 
     <!-- Settings: About & Licenses -->
-    <string name="settings_about_product">depth3d</string>
+    <string name="settings_about_product">Dreama</string>
     <string name="settings_about_tagline">头显端实时 3D 影院与电脑串流</string>
     <string name="settings_about_version_title">当前版本</string>
     <string name="settings_about_license_title">开源许可</string>
     <string name="settings_about_license_sub">GNU General Public License v3.0 (GPLv3)</string>
     <string name="settings_about_license_view">阅读 GPLv3 全文</string>
-    <string name="settings_about_license_summary">depth3d 遵循 GNU 通用公共许可证第 3 版（GPLv3）发布，以下为随包附带的完整许可证原文：</string>
+    <string name="settings_about_license_summary">Dreama 遵循 GNU 通用公共许可证第 3 版（GPLv3）发布，以下为随包附带的完整许可证原文：</string>
     <string name="settings_about_license_missing">完整 GPLv3 原文随源码仓库 LICENSE.txt 一并发布。</string>
     <string name="settings_about_third_party_title">第三方开源组件</string>
     <string name="settings_about_third_party_sub">本头显端应用包含以下开源项目，特此致谢</string>
@@ -484,11 +484,11 @@
     <string name="vr_stream_next_connect_note">修改后将在下次连接时生效</string>
 
     <!-- Services -->
-    <string name="service_airplay_label">depth3d 屏幕镜像接收</string>
-    <string name="service_dlna_label">depth3d 投屏接收</string>
-    <string name="service_discovery_label">depth3d 局域网发现服务</string>
-    <string name="service_computer_manager_label">depth3d 电脑连接管理服务</string>
-    <string name="service_usb_driver_label">depth3d USB 手柄服务</string>
+    <string name="service_airplay_label">Dreama 屏幕镜像接收</string>
+    <string name="service_dlna_label">Dreama 投屏接收</string>
+    <string name="service_discovery_label">Dreama 局域网发现服务</string>
+    <string name="service_computer_manager_label">Dreama 电脑连接管理服务</string>
+    <string name="service_usb_driver_label">Dreama USB 手柄服务</string>
 
     <!-- Additional localized copy for AirPlay, DLNA, Library, Detail, Local source, WebDAV, and formatting -->
     <string name="stream_default_desktop_name">桌面</string>
@@ -515,7 +515,7 @@
     <string name="dlna_casting_title">正在播放手机投屏 · %1$s</string>
     <string name="dlna_no_network_body">投屏需要头显和手机在同一个 Wi-Fi 里。</string>
     <string name="dlna_failed_title">投屏接收没能启动</string>
-    <string name="dlna_failed_body">关掉 depth3d 再打开试试；还不行就重启头显的 Wi-Fi。</string>
+    <string name="dlna_failed_body">关掉 Dreama 再打开试试；还不行就重启头显的 Wi-Fi。</string>
     <string name="dlna_starting">正在打开投屏接收…</string>
     <string name="dlna_untitled">手机投屏</string>
     <string name="dlna_notif_text">手机和头显连同一个 Wi-Fi，在视频 App 里点「投屏」</string>
@@ -527,7 +527,7 @@
     <string name="library_manage_sources">管理播放源</string>
     <string name="library_empty_videos">这里还没有视频。</string>
     <string name="library_source_unreachable">连不上「%1$s」</string>
-    <string name="library_storage_hint">头显里的视频要先允许 depth3d 读取。</string>
+    <string name="library_storage_hint">头显里的视频要先允许 Dreama 读取。</string>
     <string name="library_source_offline_hint">提供它的电脑可能关机了，或者不在这个 Wi-Fi 里。</string>
     <string name="library_check_settings">检查设置</string>
     <string name="library_source_missing">这个播放源已经不在了</string>
