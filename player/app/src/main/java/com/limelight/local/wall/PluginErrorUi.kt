@@ -108,8 +108,14 @@ object SourceErrorDispatcher {
         )
 
         is SourceNeedsSetupException -> {
-            val msg = safeUserMessage(error.message, strings.get(R.string.plugin_error_needs_setup))
             val isPermReconfirm = needsPermissionReconfirm && sourceKind == SourceKind.PLUGIN
+            val msg = safeUserMessage(
+                error.message,
+                strings.get(
+                    if (isPermReconfirm) R.string.plugin_error_permission_reconfirm
+                    else R.string.plugin_error_needs_setup,
+                ),
+            )
             val primary = when (sourceKind) {
                 SourceKind.LOCAL -> SourceErrorAction(
                     kind = SourceErrorActionKind.REQUEST_STORAGE,

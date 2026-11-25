@@ -81,14 +81,6 @@ private sealed interface InteractiveAuthStep {
     data class Device(val tempInstanceId: String, val start: DeviceLoginStart, val status: LoginPollStatus) : InteractiveAuthStep
 }
 
-private data class EditRollbackBackup(
-    val instanceId: String,
-    val prevDisplayName: String?,
-    val prevConfig: Map<String, JsonElement>,
-    val prevAuthState: String?,
-    val prevAuthUserJson: String?,
-)
-
 private sealed interface FormSubmitOutcome {
     data class Accepted(val onAfterFlushed: () -> Unit) : FormSubmitOutcome
     data class Rejected(val message: String) : FormSubmitOutcome
@@ -177,7 +169,7 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
     var authStep by remember(page) { mutableStateOf<InteractiveAuthStep?>(null) }
     var activeJob by remember { mutableStateOf<Job?>(null) }
     val tempInstanceToRollback = remember(page) { AtomicReference<String?>(null) }
-    val editBackupToRollback = remember(page) { AtomicReference<EditRollbackBackup?>(null) }
+    val editBackupToRollback = remember(page) { AtomicReference<PluginInstanceAuthenticator.EditRollbackSnapshot?>(null) }
 
     fun rollbackOrphanInBackground(orphanId: String) {
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
@@ -188,27 +180,14 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
         }
     }
 
-    fun rollbackEditBackupInBackground(backup: EditRollbackBackup) {
+    fun rollbackEditBackupInBackground(backup: PluginInstanceAuthenticator.EditRollbackSnapshot) {
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-            withContext(NonCancellable) {
-                runCatching {
-                    val pm = model.pluginHost.packageManager()
-                    pm.updateInstanceConfig(
-                        instanceId = backup.instanceId,
-                        displayName = backup.prevDisplayName,
-                        config = backup.prevConfig,
-                    )
-                    if (backup.prevAuthState != null) {
-                        model.pluginHost.store.updateInstanceAuth(
-                            instanceId = backup.instanceId,
-                            authState = backup.prevAuthState,
-                            authUserJson = backup.prevAuthUserJson,
-                            updatedAt = System.currentTimeMillis(),
-                        )
-                    }
-                    pm.openSource(backup.instanceId)
-                }
-            }
+            val pm = runCatching { model.pluginHost.packageManager() }.getOrNull() ?: return@launch
+            PluginInstanceAuthenticator.restoreEditSnapshot(
+                packageManager = pm,
+                store = model.pluginHost.store,
+                snapshot = backup,
+            )
         }
     }
 
@@ -275,7 +254,13 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                errorText = SourceErrorDispatcher.dispatch(e, SourceKind.PLUGIN, manifest.name, strings).message
+                errorText = SourceErrorDispatcher.dispatch(
+                    error = e,
+                    sourceKind = SourceKind.PLUGIN,
+                    sourceName = manifest.name,
+                    strings = strings,
+                    needsPermissionReconfirm = pkg.needsPermissionReconfirm,
+                ).message
             }
         }
     }
@@ -311,7 +296,7 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
                     }
                     if (prevCfg != null) {
                         editBackupToRollback.set(
-                            EditRollbackBackup(
+                            PluginInstanceAuthenticator.EditRollbackSnapshot(
                                 instanceId = targetId,
                                 prevDisplayName = prevInst?.displayName ?: existingInst?.displayName,
                                 prevConfig = prevCfg,
@@ -364,14 +349,11 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
                         } else {
                             val backup = editBackupToRollback.getAndSet(null)
                             if (backup != null) {
-                                runCatching {
-                                    pm.updateInstanceConfig(
-                                        instanceId = backup.instanceId,
-                                        displayName = backup.prevDisplayName,
-                                        config = backup.prevConfig,
-                                    )
-                                    pm.openSource(backup.instanceId)
-                                }
+                                PluginInstanceAuthenticator.restoreEditSnapshot(
+                                    packageManager = pm,
+                                    store = model.pluginHost.store,
+                                    snapshot = backup,
+                                )
                             }
                         }
                     }
@@ -427,7 +409,13 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
                 fieldValues.putAll(cleaned)
             }
             FormSubmitOutcome.Rejected(
-                SourceErrorDispatcher.dispatch(e, SourceKind.PLUGIN, manifest.name, strings).message,
+                SourceErrorDispatcher.dispatch(
+                    error = e,
+                    sourceKind = SourceKind.PLUGIN,
+                    sourceName = manifest.name,
+                    strings = strings,
+                    needsPermissionReconfirm = pkg.needsPermissionReconfirm,
+                ).message,
             )
         }
     }
@@ -578,7 +566,13 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
                                 authStep = nextStep
                                 startQrOrDevicePolling(instId, nextStep)
                             } catch (e: Exception) {
-                                errorText = SourceErrorDispatcher.dispatch(e, SourceKind.PLUGIN, manifest.name, strings).message
+                                errorText = SourceErrorDispatcher.dispatch(
+                                    error = e,
+                                    sourceKind = SourceKind.PLUGIN,
+                                    sourceName = manifest.name,
+                                    strings = strings,
+                                    needsPermissionReconfirm = pkg.needsPermissionReconfirm,
+                                ).message
                             }
                         }
                     },

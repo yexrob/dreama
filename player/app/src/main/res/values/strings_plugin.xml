@@ -48,6 +48,7 @@
     <string name="plugin_player_error_network">网络连接中断，无法继续播放。</string>
     <string name="plugin_player_error_format">视频格式或编码暂不支持播放。</string>
     <string name="plugin_player_error_generic">播放失败，请稍后重试。</string>
+    <string name="plugin_cast_unsupported">插件片源暂不支持投屏播放。</string>
 
     <!-- Detail screens (movie.html & series.html) -->
     <string name="detail_preparing">正在准备</string>
@@ -73,9 +74,12 @@
     <string name="series_kind_label">剧集</string>
     <string name="series_season_count">%1$d 季</string>
     <string name="series_season_tab">第 %1$d 季</string>
+    <string name="series_specials_tab">特别篇</string>
     <string name="series_parts_tab">分集</string>
     <string name="series_resume_season_ep">继续播放 · 第 %1$d 季第 %2$d 集</string>
     <string name="series_play_season_ep">播放 · 第 %1$d 季第 %2$d 集</string>
+    <string name="series_resume_specials_ep">继续播放 · 特别篇第 %1$d 集</string>
+    <string name="series_play_specials_ep">播放 · 特别篇第 %1$d 集</string>
     <string name="series_resume_ep">继续播放 · 第 %1$d 集</string>
     <string name="series_play_ep">播放 · 第 %1$d 集</string>
     <string name="series_episode_watched">已看完</string>
@@ -140,6 +144,7 @@
     <string name="add_source_title">添加播放源</string>
     <string name="add_source_lan_section">在局域网里找到</string>
     <string name="add_source_lan_searching">正在搜索局域网内的媒体服务器…</string>
+    <string name="add_source_lan_rescan">重新搜索</string>
     <string name="add_source_lan_empty">暂未在局域网发现新的服务器。</string>
     <string name="add_source_lan_added">已添加</string>
     <string name="add_source_manual_section">手动添加</string>

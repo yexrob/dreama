@@ -8,6 +8,8 @@ import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.Upsert
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import com.limelight.LimeLog
 import com.limelight.local.plugin.InstalledPluginEntity
 import com.limelight.local.plugin.PluginInstanceDao
@@ -35,6 +37,7 @@ data class WatchProgress(
     val positionMs: Long,
     val durationMs: Long,
     val updatedAt: Long,
+    val parentId: String? = null,
 ) {
     /** Far enough in to be worth resuming, and not so far that it is done. */
     val resumable: Boolean
@@ -74,7 +77,7 @@ interface WatchProgressDao {
         PluginInstanceEntity::class,
         PluginRepoEntity::class,
     ],
-    version = 2,
+    version = 3,
     exportSchema = true,
 )
 abstract class WallDatabase : RoomDatabase() {
@@ -86,12 +89,18 @@ abstract class WallDatabase : RoomDatabase() {
     companion object {
         val MIGRATION_1_2 = WALL_DATABASE_MIGRATION_1_2
 
+        val MIGRATION_2_3: Migration = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `watch_progress` ADD COLUMN `parentId` TEXT")
+            }
+        }
+
         @Volatile
         private var instance: WallDatabase? = null
 
         fun get(context: Context): WallDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(context.applicationContext, WallDatabase::class.java, "wall.db")
-                .addMigrations(MIGRATION_1_2)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                 .build().also { instance = it }
         }
     }
@@ -105,16 +114,34 @@ object WatchHistory {
     private val io = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @JvmStatic
-    fun save(context: Context, sourceId: String, itemId: String, title: String?,
-             positionMs: Long, durationMs: Long) {
+    @JvmOverloads
+    fun save(
+        context: Context,
+        sourceId: String,
+        itemId: String,
+        title: String?,
+        positionMs: Long,
+        durationMs: Long,
+        parentId: String? = null,
+    ) {
         if (durationMs <= 0) {
             return
         }
         val app = context.applicationContext
+        val cleanParentId = parentId?.trim()?.takeIf { it.isNotEmpty() }
         io.launch {
             try {
-                WallDatabase.get(app).progress().upsert(WatchProgress(
-                    sourceId, itemId, title ?: itemId, positionMs, durationMs, System.currentTimeMillis()))
+                WallDatabase.get(app).progress().upsert(
+                    WatchProgress(
+                        sourceId = sourceId,
+                        itemId = itemId,
+                        title = title ?: itemId,
+                        positionMs = positionMs,
+                        durationMs = durationMs,
+                        updatedAt = System.currentTimeMillis(),
+                        parentId = cleanParentId,
+                    ),
+                )
             } catch (e: Exception) {
                 LimeLog.warning("depth3d: saving progress for $sourceId/$itemId failed: $e")
             }

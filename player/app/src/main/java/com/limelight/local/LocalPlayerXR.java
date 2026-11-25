@@ -74,6 +74,7 @@ public class LocalPlayerXR extends Activity
     public static final String EXTRA_START_MS = "start_ms";
     public static final String EXTRA_SOURCE_ID = "source_id";
     public static final String EXTRA_ITEM_ID = "item_id";
+    public static final String EXTRA_PARENT_ID = "parent_id";
     // Plugin playback: opaque instance ID + optional known duration (never raw URL or headers)
     public static final String EXTRA_PLUGIN_INSTANCE_ID = "plugin_instance_id";
     public static final String EXTRA_DURATION_MS = "duration_ms";
@@ -144,7 +145,15 @@ public class LocalPlayerXR extends Activity
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        final PluginLaunchArgs pluginArgs = PluginPlayerLaunch.parseIntent(getIntent());
+        final PluginLaunchArgs pluginArgs;
+        try {
+            pluginArgs = resolvePluginIntentOrThrow(getIntent());
+        } catch (UnsupportedOperationException e) {
+            LimeLog.warning("depth3d: rejected cast attachment on plugin playback intent");
+            Toast.makeText(this, getString(com.limelight.R.string.plugin_cast_unsupported), Toast.LENGTH_LONG).show();
+            finish();
+            return;
+        }
         final Uri uri = getIntent().getData();
         sourceKind = pluginArgs != null
                 ? SourceKind.PLUGIN
@@ -208,6 +217,19 @@ public class LocalPlayerXR extends Activity
                 .setPreferredTextLanguage("zh")
                 .setSelectUndeterminedTextLanguage(true));
         return trackSelector;
+    }
+
+    /**
+     * Parses a plugin launch [Intent] and rejects any non-zero [EXTRA_CAST_ID] BEFORE [loadPlugin]
+     * clears `castId` (§1.4/§2.4), throwing [UnsupportedOperationException] via [PluginHostGuards].
+     */
+    static PluginLaunchArgs resolvePluginIntentOrThrow(Intent intent) {
+        PluginLaunchArgs args = PluginPlayerLaunch.parseIntent(intent);
+        if (args != null && intent != null) {
+            long incomingCastId = intent.getLongExtra(EXTRA_CAST_ID, 0L);
+            guardCastAttachment(SourceKind.PLUGIN, incomingCastId);
+        }
+        return args;
     }
 
     /** Enforces §1.4/§2.4: plugin playback may never attach to an active DLNA cast session. */
@@ -439,7 +461,9 @@ public class LocalPlayerXR extends Activity
 
     private void handlePlaybackFailure(Throwable error) {
         String srcName = pluginSession != null ? pluginSession.getSourceName() : "";
-        PlayerErrorUi ui = PluginPlayerSession.formatPlayerError(this, error, sourceKind, srcName);
+        boolean needsPermReconfirm = pluginSession != null && pluginSession.getNeedsPermissionReconfirm();
+        PlayerErrorUi ui = PluginPlayerSession.formatPlayerError(
+                this, error, sourceKind, srcName, needsPermReconfirm);
         errored = true;
         errorReason = ui.getReason();
         errorCanRetry = ui.getCanRetry();
@@ -678,7 +702,15 @@ public class LocalPlayerXR extends Activity
         if (p == null || relaunch != null) {
             return;
         }
-        PluginLaunchArgs incomingPlugin = PluginPlayerLaunch.parseIntent(intent);
+        final PluginLaunchArgs incomingPlugin;
+        try {
+            incomingPlugin = resolvePluginIntentOrThrow(intent);
+        } catch (UnsupportedOperationException e) {
+            LimeLog.warning("depth3d: rejected cast attachment on incoming plugin intent");
+            notice(getString(com.limelight.R.string.plugin_cast_unsupported), null);
+            Toast.makeText(this, getString(com.limelight.R.string.plugin_cast_unsupported), Toast.LENGTH_LONG).show();
+            return;
+        }
         boolean incomingIsPlugin = incomingPlugin != null;
         if (!incomingIsPlugin && intent.getData() == null) {
             return;
@@ -1052,7 +1084,14 @@ public class LocalPlayerXR extends Activity
         if (p == null || !ready || source == null || item == null) {
             return;
         }
-        WatchHistory.save(this, source, item, in.getStringExtra(EXTRA_TITLE), position(), duration());
+        WatchHistory.save(
+                this,
+                source,
+                item,
+                in.getStringExtra(EXTRA_TITLE),
+                position(),
+                duration(),
+                in.getStringExtra(EXTRA_PARENT_ID));
     }
 
     // ---- lifecycle ----

@@ -280,6 +280,46 @@ object PluginInstanceAuthenticator {
         }
     }
 
+    /** Snapshot of an existing plugin instance prior to edit, restored on any failure or cancellation. */
+    data class EditRollbackSnapshot(
+        val instanceId: String,
+        val prevDisplayName: String?,
+        val prevConfig: Map<String, JsonElement>,
+        val prevAuthState: String?,
+        val prevAuthUserJson: String?,
+    )
+
+    suspend fun restoreEditSnapshot(
+        packageManager: PluginPackageManager,
+        store: PluginStore?,
+        snapshot: EditRollbackSnapshot,
+        dnsResolver: ((String) -> List<java.net.InetAddress>)? = null,
+    ) {
+        withContext(NonCancellable) {
+            runCatching {
+                packageManager.updateInstanceConfig(
+                    instanceId = snapshot.instanceId,
+                    displayName = snapshot.prevDisplayName,
+                    config = snapshot.prevConfig,
+                )
+            }
+            if (snapshot.prevAuthState != null && store != null) {
+                runCatching {
+                    store.updateInstanceAuth(
+                        instanceId = snapshot.instanceId,
+                        authState = snapshot.prevAuthState,
+                        authUserJson = snapshot.prevAuthUserJson,
+                        updatedAt = System.currentTimeMillis(),
+                    )
+                }
+            }
+            // Restore runtime bound to the previous working config
+            runCatching {
+                packageManager.openSource(snapshot.instanceId, dnsResolver = dnsResolver)
+            }
+        }
+    }
+
     suspend fun updateAndAuthenticateFormOrNone(
         packageManager: PluginPackageManager,
         manifest: PluginManifest,
@@ -292,7 +332,15 @@ object PluginInstanceAuthenticator {
     ): PluginInstanceEntity {
         val prevInst = runCatching { store?.getInstance(instanceId) }.getOrNull()
         val prevConfig = runCatching { packageManager.getInstanceConfig(instanceId) }.getOrNull()
-        val restoreDisplayName = prevInst?.displayName ?: prevDisplayName
+        val snapshot = prevConfig?.let {
+            EditRollbackSnapshot(
+                instanceId = instanceId,
+                prevDisplayName = prevInst?.displayName ?: prevDisplayName,
+                prevConfig = it,
+                prevAuthState = prevInst?.authState,
+                prevAuthUserJson = prevInst?.authUserJson,
+            )
+        }
         val updated = packageManager.updateInstanceConfig(
             instanceId = instanceId,
             displayName = displayName,
@@ -307,30 +355,13 @@ object PluginInstanceAuthenticator {
             }
             return updated
         } catch (e: Throwable) {
-            withContext(NonCancellable) {
-                if (prevConfig != null) {
-                    runCatching {
-                        packageManager.updateInstanceConfig(
-                            instanceId = instanceId,
-                            displayName = restoreDisplayName,
-                            config = prevConfig,
-                        )
-                    }
-                    if (prevInst != null && store != null) {
-                        runCatching {
-                            store.updateInstanceAuth(
-                                instanceId = instanceId,
-                                authState = prevInst.authState,
-                                authUserJson = prevInst.authUserJson,
-                                updatedAt = System.currentTimeMillis(),
-                            )
-                        }
-                    }
-                    // Restore runtime bound to the previous working config
-                    runCatching {
-                        packageManager.openSource(instanceId, dnsResolver = dnsResolver)
-                    }
-                }
+            if (snapshot != null) {
+                restoreEditSnapshot(
+                    packageManager = packageManager,
+                    store = store,
+                    snapshot = snapshot,
+                    dnsResolver = dnsResolver,
+                )
             }
             throw e
         }

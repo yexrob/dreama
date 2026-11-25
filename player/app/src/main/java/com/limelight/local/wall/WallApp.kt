@@ -38,7 +38,7 @@ import kotlinx.coroutines.launch
 /** What the wall needs from the Activity: everything that leaves Compose. */
 interface WallActions {
     val hostActivity: Activity
-    fun launchPlayer(info: PlaybackInfo, sourceId: String, itemId: String)
+    fun launchPlayer(info: PlaybackInfo, sourceId: String, itemId: String, parentId: String? = null)
     fun launchPluginPlayer(
         instanceId: String,
         sourceId: String,
@@ -46,6 +46,7 @@ interface WallActions {
         title: String?,
         startMs: Long,
         durationMs: Long?,
+        parentId: String? = null,
     )
     fun requestStorage()
     fun toast(text: String)
@@ -279,12 +280,13 @@ fun WallApp(model: WallModel, actions: WallActions, pendingTab: StateFlow<Tab?>)
                     title = item.title,
                     startMs = startMs,
                     durationMs = item.durationMs,
+                    parentId = item.parentId,
                 )
             } else {
                 scope.launch {
                     try {
                         val info = source.playback(item.id).copy(startPositionMs = startMs)
-                        actions.launchPlayer(info, source.source.id, item.id)
+                        actions.launchPlayer(info, source.source.id, item.id, item.parentId)
                     } catch (e: Exception) {
                         actions.toast(actions.hostActivity.getString(R.string.wall_play_failed))
                     }

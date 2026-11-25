@@ -34,8 +34,11 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.ArrayDeque
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.logging.Handler
 import java.util.logging.LogRecord
@@ -120,34 +123,39 @@ object BuiltInPluginInstaller {
                         val oldVer = SemVer.parse(existing.version)
                         val newVer = SemVer.parse(manifest.version)
                         val actualSha = PluginRepositoryClient.sha256Hex(bytes)
+                        val existingDir = File(existing.packagePath)
+                        val filesIntact = existingDir.isDirectory &&
+                            File(existingDir, "manifest.json").isFile &&
+                            File(existingDir, "main.js").isFile
                         val isNewerVersion = oldVer != null && newVer != null && newVer > oldVer
-                        val isSameVersionDifferentContent =
-                            oldVer != null && newVer != null && newVer == oldVer &&
-                                !actualSha.equals(existing.sha256, ignoreCase = true)
+                        val needsRepairOrContentRefresh =
+                            oldVer == null ||
+                                !filesIntact ||
+                                (newVer != null && newVer == oldVer && !actualSha.equals(existing.sha256, ignoreCase = true))
                         if (isNewerVersion) {
                             val res = packageManager.installFromBytes(bytes, sourceUrl = srcUrl)
                             if (res.needsPermissionReconfirm) {
                                 packageManager.confirmPermissions(manifest.id)
                             }
                             upgraded += manifest.id
-                        } else if (isSameVersionDifferentContent) {
-                            // Built-in package content changed at the same SemVer (e.g. manifest/asset
-                            // update in an APK rebuild). Temporarily clear existing SemVer marker so
-                            // PluginPackageManager performs an in-place same-source update without
-                            // wiping user instances, and restore existing metadata on any error.
-                            store.upsertPackage(existing.copy(version = "refreshing"))
-                            try {
-                                val res = packageManager.installFromBytes(bytes, sourceUrl = srcUrl)
-                                if (res.needsPermissionReconfirm) {
-                                    packageManager.confirmPermissions(manifest.id)
-                                }
-                                upgraded += manifest.id
-                            } catch (t: Throwable) {
-                                withContext(NonCancellable) {
-                                    runCatching { store.upsertPackage(existing) }
-                                }
-                                throw t
-                            }
+                        } else if (needsRepairOrContentRefresh) {
+                            // Crash-safe in-place repair / same-version content refresh without writing
+                            // any fake version to Room and without deleting existingDir before swap (#4):
+                            // 1) Write unpacked archive to a sibling staging dir.
+                            // 2) Atomically rename staging dir to a fresh `<version>-<sha8>` sibling dir.
+                            // 3) Commit real SemVer + new packagePath + new sha256 in one atomic Room upsert.
+                            // 4) Shut down cached runtimes and best-effort prune superseded dirs.
+                            repairOrRefreshBuiltInInPlace(
+                                packageManager = packageManager,
+                                store = store,
+                                existing = existing,
+                                archive = archive,
+                                manifest = manifest,
+                                actualSha = actualSha,
+                                srcUrl = srcUrl,
+                                expectedOrigin = expectedOrigin,
+                            )
+                            upgraded += manifest.id
                         } else {
                             skipped += manifest.id
                         }
@@ -165,6 +173,95 @@ object BuiltInPluginInstaller {
             skippedDifferentSource = skippedDifferentSource,
             failed = failed,
         )
+    }
+
+    private suspend fun repairOrRefreshBuiltInInPlace(
+        packageManager: PluginPackageManager,
+        store: PluginStore,
+        existing: InstalledPluginEntity,
+        archive: PluginPackageArchive,
+        manifest: PluginManifest,
+        actualSha: String,
+        srcUrl: String,
+        expectedOrigin: String,
+    ) {
+        val oldDir = File(existing.packagePath)
+        val pluginRootDir = oldDir.parentFile ?: error("Built-in plugin packagePath has no parent directory")
+        pluginRootDir.mkdirs()
+
+        // Clean up any abandoned staging directories from prior interrupted launches
+        pluginRootDir.listFiles { f -> f.isDirectory && f.name.startsWith(".staging-") }
+            ?.forEach { runCatching { it.deleteRecursively() } }
+
+        val shaPrefix = actualSha.take(8).lowercase(Locale.ROOT)
+        val desiredDirName = "${manifest.version}-$shaPrefix"
+        val targetDir = if (oldDir.name == desiredDirName) {
+            File(pluginRootDir, "$desiredDirName-${UUID.randomUUID().toString().take(6)}")
+        } else {
+            File(pluginRootDir, desiredDirName)
+        }
+        val stagingDir = File(pluginRootDir, ".staging-${UUID.randomUUID()}")
+        try {
+            writeArchiveFiles(archive, stagingDir)
+            if (targetDir.exists() && targetDir.absolutePath != oldDir.absolutePath) {
+                targetDir.deleteRecursively()
+            }
+            moveDirAtomically(stagingDir, targetDir)
+        } catch (t: Throwable) {
+            runCatching { stagingDir.deleteRecursively() }
+            throw t
+        }
+
+        val now = System.currentTimeMillis()
+        val updatedEntity = InstalledPluginEntity(
+            pluginId = manifest.id,
+            name = manifest.name,
+            version = manifest.version,
+            author = manifest.author,
+            description = manifest.description,
+            manifestJson = archive.manifestJson,
+            packagePath = targetDir.absolutePath,
+            sourceUrl = srcUrl,
+            repoUrl = null,
+            sourceOrigin = expectedOrigin,
+            sha256 = actualSha,
+            enabled = existing.enabled,
+            needsPermissionReconfirm = false,
+            approvedPermissionsJson = manifest.permissions.toJsonString(),
+            installedAt = existing.installedAt,
+            updatedAt = now,
+        )
+        store.upsertPackage(updatedEntity)
+        runCatching { packageManager.shutdownAll() }
+
+        // Only remove superseded directory AFTER Room has atomically committed the new packagePath
+        if (oldDir.absolutePath != targetDir.absolutePath) {
+            runCatching { oldDir.deleteRecursively() }
+        }
+    }
+
+    private fun writeArchiveFiles(archive: PluginPackageArchive, dir: File) {
+        dir.mkdirs()
+        File(dir, "manifest.json").writeText(archive.manifestJson, Charsets.UTF_8)
+        File(dir, "main.js").writeText(archive.mainJs, Charsets.UTF_8)
+        archive.iconPng?.let { File(dir, "icon.png").writeBytes(it) }
+        if (archive.locales.isNotEmpty()) {
+            val locDir = File(dir, "locales").apply { mkdirs() }
+            archive.locales.forEach { (tag, text) ->
+                File(locDir, "$tag.json").writeText(text, Charsets.UTF_8)
+            }
+        }
+    }
+
+    private fun moveDirAtomically(src: File, dst: File) {
+        try {
+            Files.move(src.toPath(), dst.toPath(), StandardCopyOption.ATOMIC_MOVE)
+        } catch (_: Exception) {
+            if (!src.renameTo(dst)) {
+                src.copyRecursively(dst, overwrite = true)
+                src.deleteRecursively()
+            }
+        }
     }
 }
 

@@ -30,6 +30,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -72,6 +73,8 @@ import com.limelight.local.stream.UserFacingError
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -456,8 +459,9 @@ fun AddSourceScreen(model: WallModel, nav: WallNav) {
 
     val discoveredMdnsServices = remember { mutableStateMapOf<String, List<DiscoveredLanService>>() }
     val discoveredUdpServices = remember { mutableStateMapOf<UdpDiscoveryProtocol, List<DiscoveredLanService>>() }
+    var rescanToken by remember { mutableIntStateOf(0) }
 
-    val browsers = remember(mdnsTypeToPlugin.keys.toList()) {
+    val browsers = remember(mdnsTypeToPlugin.keys.toList(), rescanToken) {
         mdnsTypeToPlugin.keys.map { svcType -> NsdServiceBrowser(context, svcType) }
     }
     DisposableEffect(browsers) {
@@ -466,26 +470,48 @@ fun AddSourceScreen(model: WallModel, nav: WallNav) {
     }
     for (browser in browsers) {
         val list by browser.services.collectAsState()
-        LaunchedEffect(browser.serviceType, list) {
+        LaunchedEffect(browser.serviceType, list, rescanToken) {
             discoveredMdnsServices[browser.serviceType] = list
         }
     }
 
-    // Host-side UDP 7359 broadcast probe for Jellyfin/Emby (#10): cancels & closes socket on exit
+    // Host-side UDP 7359 broadcast probe for Jellyfin/Emby (#8/#10):
+    // Re-probes every 5s while on AddSourceScreen, cancels & closes socket immediately on exit,
+    // and catches any non-cancellation error so the discovery effect never crashes.
     val udpProtocolsKey = remember(udpProtocolToPlugin) { udpProtocolToPlugin.keys.toList() }
-    LaunchedEffect(udpProtocolsKey) {
+    LaunchedEffect(udpProtocolsKey, rescanToken) {
         discoveredUdpServices.clear()
         for (proto in udpProtocolsKey) {
             launch {
-                val found = UdpLanServerDiscovery.discover(
-                    protocol = proto,
-                    onFound = { partial ->
-                        launch(Dispatchers.Main.immediate) {
-                            discoveredUdpServices[proto] = partial
+                val merged = LinkedHashMap<String, DiscoveredLanService>()
+                while (isActive) {
+                    try {
+                        val found = UdpLanServerDiscovery.discover(
+                            protocol = proto,
+                            onFound = { partial ->
+                                launch(Dispatchers.Main.immediate) {
+                                    for (svc in partial) {
+                                        if (merged.size < UdpLanServerDiscovery.MAX_DISCOVERED_SERVERS || svc.endpointKey in merged) {
+                                            merged[svc.endpointKey] = svc
+                                        }
+                                    }
+                                    discoveredUdpServices[proto] = merged.values.toList()
+                                }
+                            },
+                        )
+                        for (svc in found) {
+                            if (merged.size < UdpLanServerDiscovery.MAX_DISCOVERED_SERVERS || svc.endpointKey in merged) {
+                                merged[svc.endpointKey] = svc
+                            }
                         }
-                    },
-                )
-                discoveredUdpServices[proto] = found
+                        discoveredUdpServices[proto] = merged.values.toList()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        // Keep previously discovered items and retry next cycle
+                    }
+                    delay(UdpLanServerDiscovery.REPROBE_INTERVAL_MS)
+                }
             }
         }
     }
@@ -521,7 +547,19 @@ fun AddSourceScreen(model: WallModel, nav: WallNav) {
         )
 
         // Section 1: LAN auto-discovered servers (top: 126dp)
-        SectionTitle(stringResource(R.string.add_source_lan_section), Modifier.offset(64.dp, 126.dp))
+        Row(
+            Modifier.offset(64.dp, 120.dp).width(1152.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SectionTitle(stringResource(R.string.add_source_lan_section), Modifier.weight(1f))
+            WallButton(
+                text = stringResource(R.string.add_source_lan_rescan),
+                onClick = { rescanToken++ },
+                icon = WallIcons.Refresh,
+                kind = ButtonKind.Ghost,
+                small = true,
+            )
+        }
         LazyColumn(
             Modifier.offset(40.dp, 180.dp).width(1200.dp).height(200.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -548,7 +586,8 @@ fun AddSourceScreen(model: WallModel, nav: WallNav) {
                 ManagementRow(
                     icon = WallIcons.Server,
                     title = svc.serviceName,
-                    sub = "${manifest.name} · ${svc.address}:${svc.port}",
+                    // Show the EXACT string that will be prefilled into the form (#2)
+                    sub = "${manifest.name} · $url",
                     trailingAction = {
                         if (alreadyAdded) {
                             Row(

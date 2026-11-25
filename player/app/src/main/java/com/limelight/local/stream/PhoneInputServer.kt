@@ -632,6 +632,9 @@ class PhoneFormServer(
 ) : Closeable {
     private val closed = AtomicBoolean(false)
     private val failedAttempts = AtomicInteger(0)
+    private val submissionInProgress = AtomicBoolean(false)
+    private val submissionAccepted = AtomicBoolean(false)
+    private val acceptedSummary = java.util.concurrent.atomic.AtomicReference("")
     private val concurrencyGate = Semaphore(PhoneInputServer.MAX_CONCURRENT_CONNECTIONS)
     private val activeReaders = ConcurrentLinkedDeque<Socket>()
     private val workers = Executors.newFixedThreadPool(8) { r ->
@@ -851,14 +854,54 @@ class PhoneFormServer(
                     return
                 }
 
-                when (val result = onSubmitted(values)) {
-                    PhoneSubmitResult.Accepted -> {
-                        // Never echo passwords or sensitive fields on done screen
+                // Single-use token semantics (#7): once a form submission has been accepted, any
+                // duplicate / retried POST with the same token/code returns the Done page without
+                // invoking onSubmitted a second time (preventing duplicate instances).
+                if (submissionAccepted.get()) {
+                    writeHtml(out, 200, "OK", renderDoneHtml(acceptedSummary.get()))
+                    return
+                }
+                if (!submissionInProgress.compareAndSet(false, true)) {
+                    if (submissionAccepted.get()) {
+                        writeHtml(out, 200, "OK", renderDoneHtml(acceptedSummary.get()))
+                    } else {
+                        writeHtml(out, 409, "Conflict", renderFormHtml(hiddenToken = keepToken, preserved = safeNonSecret, error = copy.hint))
+                    }
+                    return
+                }
+
+                var acceptedNowSummary: String? = null
+                val result = try {
+                    if (submissionAccepted.get()) {
+                        writeHtml(out, 200, "OK", renderDoneHtml(acceptedSummary.get()))
+                        return
+                    }
+                    val submitRes = onSubmitted(values)
+                    if (submitRes == PhoneSubmitResult.Accepted) {
+                        // Mark accepted BEFORE releasing submissionInProgress so no concurrent POST
+                        // can observe (inProgress=false, accepted=false) and double-submit (#7).
                         val summary = fields.firstOrNull {
                             it.kind != PhoneFormFieldKind.PASSWORD && !safeNonSecret[it.key].isNullOrBlank()
                         }?.let { safeNonSecret[it.key] }.orEmpty()
-                        writeHtml(out, 200, "OK", renderDoneHtml(summary))
-                        runCatching { onAcceptedFlushed() }
+                        acceptedSummary.set(summary)
+                        submissionAccepted.set(true)
+                        acceptedNowSummary = summary
+                    }
+                    submitRes
+                } finally {
+                    submissionInProgress.set(false)
+                }
+
+                when (result) {
+                    PhoneSubmitResult.Accepted -> {
+                        val summary = acceptedNowSummary.orEmpty()
+                        // Always execute onAcceptedFlushed in finally so headset navigation NEVER
+                        // stalls if the phone closes the socket before writeHtml completes (#7).
+                        try {
+                            writeHtml(out, 200, "OK", renderDoneHtml(summary))
+                        } finally {
+                            runCatching { onAcceptedFlushed() }
+                        }
                     }
                     is PhoneSubmitResult.Rejected -> {
                         // Re-render with ONLY non-password fields preserved; passwords are always blank

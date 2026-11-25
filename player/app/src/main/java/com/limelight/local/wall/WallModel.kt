@@ -33,6 +33,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.mapLatest
@@ -42,6 +43,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.ConcurrentHashMap
 
 sealed interface Load<out T> {
     data object Loading : Load<Nothing>
@@ -90,6 +92,29 @@ class WallModel(app: Application) : AndroidViewModel(app) {
     val pluginRepos: StateFlow<List<PluginRepoEntity>> get() = _pluginRepos
 
     val shelves = mutableStateMapOf<String, Load<List<Shelf>>>()
+    private val knownParentIds = ConcurrentHashMap<Pair<String, String>, String>()
+
+    fun recordParentId(sourceId: String, itemId: String, parentId: String?) {
+        knownParentIds[sourceId to itemId] = parentId.orEmpty()
+    }
+
+    fun knownParentIdsForSource(sourceId: String): Map<String, String?> {
+        val out = HashMap<String, String?>()
+        val load = shelves[sourceId] as? Load.Ready
+        load?.value?.forEach { shelf ->
+            shelf.items.forEach { item ->
+                if (!item.parentId.isNullOrBlank()) {
+                    out[item.id] = item.parentId
+                }
+            }
+        }
+        for ((key, parent) in knownParentIds) {
+            if (key.first == sourceId) {
+                out[key.second] = parent.ifEmpty { null }
+            }
+        }
+        return out
+    }
 
     /** A WebDAV server found on the network while none is set up yet. */
     val discovered = MutableStateFlow<String?>(null)
@@ -277,7 +302,7 @@ class WallModel(app: Application) : AndroidViewModel(app) {
     fun progressMapForSource(sourceId: String): Flow<Map<String, WatchProgress>> =
         WallDatabase.get(getApplication()).progress().recent(200).mapLatest { rows ->
             rows.asSequence().filter { it.sourceId == sourceId }.associateBy { it.itemId }
-        }
+        }.distinctUntilChanged()
 
     suspend fun clearProgress(sourceId: String, itemId: String) {
         withContext(Dispatchers.IO) {

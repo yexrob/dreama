@@ -496,7 +496,7 @@ private fun SeriesDetailContent(
     onDismissError: () -> Unit,
     strings: AndroidStringLookup,
 ) {
-    val seasons = item.seasons
+    val seasons = remember(item.seasons) { DetailStateLogic.orderSeasons(item.seasons) }
     val hasSeasons = seasons.isNotEmpty()
     val scope = rememberCoroutineScope()
     val localProgressNullable by remember(source?.source?.id) {
@@ -505,7 +505,7 @@ private fun SeriesDetailContent(
     val localProgress = localProgressNullable.orEmpty()
 
     var selectedSeasonId by remember(item.id) {
-        mutableStateOf(seasons.firstOrNull()?.id ?: SERIES_DIRECT_SEASON_ID)
+        mutableStateOf(DetailStateLogic.defaultSeason(seasons)?.id ?: SERIES_DIRECT_SEASON_ID)
     }
     var userSelectedSeason by remember(item.id) { mutableStateOf(false) }
     var initialResolution by remember(item.id) { mutableStateOf<SeriesInitialResolution?>(null) }
@@ -530,21 +530,31 @@ private fun SeriesDetailContent(
         pageStates[seasonId] = loader.state
         if (!loader.state.loadedOnce && loader.state.nextPage != null) {
             pageStates[seasonId] = loader.state.copy(loading = true, error = null)
-            pageStates[seasonId] = loader.loadNextPage()
+            try {
+                loader.ensureLoaded()
+            } finally {
+                // Always write back loader.state even on cancellation so loading never sticks at true (#3)
+                pageStates[seasonId] = loader.state
+            }
         }
         return loader.state.items
     }
 
     suspend fun loadMoreSeasonEpisodes(seasonId: String): List<Item> {
         val loader = coordinator?.existingLoader(seasonId) ?: return emptyList()
-        if (loader.state.nextPage == null || loader.state.loading) return loader.state.items
+        if (loader.state.nextPage == null) return loader.state.items
         pageStates[seasonId] = loader.state.copy(loading = true, error = null)
-        pageStates[seasonId] = loader.loadNextPage()
+        try {
+            loader.loadNextPage()
+        } finally {
+            pageStates[seasonId] = loader.state
+        }
         return loader.state.items
     }
 
-    // Cross-season initial default season & play target (#5): resolves across ALL seasons
-    // using local WatchProgress once detail() and Room progress have loaded.
+    // Cross-season initial default season & play target (#3, #5, #10):
+    // matches only parentId hitting this series within a 2s overall timeout, skips Specials by default,
+    // and shares mutex-serialized loader.ensureLoaded() so concurrent effects never observe empty items.
     LaunchedEffect(source?.source?.id, item.id, seasons, loadingDetail, localProgressNullable) {
         if (source == null || loadingDetail) return@LaunchedEffect
         if (!hasSeasons) {
@@ -553,8 +563,9 @@ private fun SeriesDetailContent(
             return@LaunchedEffect
         }
         val progressMap = localProgressNullable ?: return@LaunchedEffect
+        val fallbackSeasonId = DetailStateLogic.defaultSeason(seasons)?.id ?: seasons.first().id
         if (seasons.none { it.id == selectedSeasonId }) {
-            selectedSeasonId = seasons.first().id
+            selectedSeasonId = fallbackSeasonId
         }
         val resolved = DetailStateLogic.resolveInitialSeriesSeasonAndTarget(
             source = source,
@@ -562,6 +573,7 @@ private fun SeriesDetailContent(
             localProgress = progressMap,
             loadSeasonEpisodes = { sid -> ensureSeasonEpisodesLoaded(sid) },
             loadMoreInSeason = { sid -> loadMoreSeasonEpisodes(sid) },
+            knownParentIds = model.knownParentIdsForSource(source.source.id),
         )
         initialResolution = resolved
         if (resolved != null && !userSelectedSeason) {
@@ -573,9 +585,7 @@ private fun SeriesDetailContent(
         seasons.indexOfFirst { it.id == selectedSeasonId }.takeIf { it >= 0 }
     }
     val activeSeasonNumber = remember(seasons, activeSeasonIndex) {
-        activeSeasonIndex?.let { idx ->
-            seasons[idx].index?.takeIf { it > 0 } ?: (idx + 1)
-        }
+        activeSeasonIndex?.let { idx -> DetailStateLogic.seasonNumberFor(seasons, idx) }
     }
 
     val directEpisodeIds = remember(item.episodes) { item.episodes.map { it.id } }
@@ -592,7 +602,11 @@ private fun SeriesDetailContent(
         pageStates[key] = loader.state
         if (!loader.state.loadedOnce && loader.state.nextPage != null) {
             pageStates[key] = loader.state.copy(loading = true, error = null)
-            pageStates[key] = loader.loadNextPage()
+            try {
+                loader.ensureLoaded()
+            } finally {
+                pageStates[key] = loader.state
+            }
         }
     }
 
@@ -643,12 +657,16 @@ private fun SeriesDetailContent(
         }.filter { it >= 0 }.collect {
             val loader = coordinator?.existingLoader(activeKey) ?: return@collect
             pageStates[activeKey] = loader.state.copy(loading = true, error = null)
-            pageStates[activeKey] = loader.loadNextPage()
+            try {
+                loader.loadNextPage()
+            } finally {
+                pageStates[activeKey] = loader.state
+            }
         }
     }
 
-    val metaText = remember(item, seasons.size, source?.source?.name) {
-        DetailStateLogic.formatSeriesMeta(item, seasons.size, source?.source?.name, strings)
+    val metaText = remember(item, seasons, source?.source?.name) {
+        DetailStateLogic.formatSeriesMeta(item, DetailStateLogic.regularSeasonCount(seasons), source?.source?.name, strings)
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -730,7 +748,12 @@ private fun SeriesDetailContent(
                         text = primaryText,
                         onClick = {
                             val target = playTarget ?: return@WallButton
-                            nav.play(source, target.episode, target.resumePositionMs)
+                            val epWithParent = if (hasSeasons && target.episode.parentId.isNullOrBlank()) {
+                                target.episode.copy(parentId = selectedSeasonId)
+                            } else {
+                                target.episode
+                            }
+                            nav.play(source, epWithParent, target.resumePositionMs)
                         },
                         icon = WallIcons.Play,
                         kind = ButtonKind.Primary,
@@ -795,8 +818,7 @@ private fun SeriesDetailContent(
         ) {
             if (hasSeasons) {
                 itemsIndexed(seasons, key = { _, s -> s.id }) { idx, season ->
-                    val label = season.title.takeIf { it.isNotBlank() }
-                        ?: stringResource(R.string.series_season_tab, season.index ?: (idx + 1))
+                    val label = DetailStateLogic.formatSeasonTabLabel(seasons, idx, strings)
                     SeasonTabChip(
                         label = label,
                         selected = season.id == selectedSeasonId,
@@ -898,7 +920,12 @@ private fun SeriesDetailContent(
                                 progressFraction = (state as? WatchState.InProgress)?.fraction,
                                 onClick = {
                                     val startAt = (state as? WatchState.InProgress)?.positionMs ?: 0L
-                                    nav.play(source, ep, startAt)
+                                    val epWithParent = if (hasSeasons && ep.parentId.isNullOrBlank()) {
+                                        ep.copy(parentId = selectedSeasonId)
+                                    } else {
+                                        ep
+                                    }
+                                    nav.play(source, epWithParent, startAt)
                                 },
                             )
                         }
@@ -918,7 +945,11 @@ private fun SeriesDetailContent(
                                         val loader = coordinator?.existingLoader(activeKey) ?: return@EpisodePageRetryCard
                                         scope.launch {
                                             pageStates[activeKey] = loader.state.copy(loading = true, error = null)
-                                            pageStates[activeKey] = loader.loadNextPage()
+                                            try {
+                                                loader.loadNextPage()
+                                            } finally {
+                                                pageStates[activeKey] = loader.state
+                                            }
                                         }
                                     },
                                 )

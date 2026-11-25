@@ -179,18 +179,37 @@ data class DiscoveredLanService(
     val port: Int,
     val txt: Map<String, String?> = emptyMap(),
 ) {
+    val isUdpDiscovery: Boolean
+        get() = serviceType.startsWith("udp:", ignoreCase = true)
+
+    /**
+     * Deduplication key for plugin discovery services (both UDP and mDNS): uses `serviceType#id`
+     * when a server advertises an `id`, falling back to `serviceType@addr:port`.
+     * Host discovery (`HostDiscovery`) never uses this key — it passes its own `id@addr:port`
+     * `deduplicateKey` to [NsdServiceBrowser] to match `main` exactly (#1).
+     */
     val endpointKey: String
         get() {
             val id = txt["id"]?.trim()?.takeIf { it.isNotEmpty() }
-            return if (id != null) {
-                "${serviceType.lowercase()}#${id.lowercase()}"
-            } else {
-                "${serviceType.lowercase()}@${RawComputer.normalizeAddress(address)}:$port"
+            if (id != null) {
+                return "${serviceType.lowercase(Locale.ROOT)}#${id.lowercase(Locale.ROOT)}"
             }
+            return "${serviceType.lowercase(Locale.ROOT)}@${RawComputer.normalizeAddress(address)}:$port"
         }
 
+    /**
+     * Returns the exact URL displayed in the discovery list AND prefilled into the plugin form.
+     * - For built-in UDP probes (`udp:*`), uses the validated private-LAN `Address` returned by the probe.
+     * - For mDNS services, NEVER trusts untrusted TXT `address` fields; always constructs the URL
+     *   strictly from the resolved IPv4 [address] and [port].
+     */
     fun suggestedUrl(): String {
-        txt["address"]?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+        if (isUdpDiscovery) {
+            val raw = txt["address"]?.trim()?.takeIf { it.isNotEmpty() }
+            if (raw != null && UdpLanServerDiscovery.parsePrivateServerAddress(raw) != null) {
+                return raw.trimEnd('/')
+            }
+        }
         val scheme = if (port == 443 || txt["scheme"].equals("https", ignoreCase = true)) "https" else "http"
         val host = HttpHostProtocolClient.formatAuthorityHost(address)
         val omitPort = (scheme == "http" && port == 80) || (scheme == "https" && port == 443)
@@ -208,6 +227,9 @@ class NsdServiceBrowser(
     context: Context,
     rawServiceType: String,
     private val serviceTypeFilter: (String) -> Boolean = { true },
+    private val requirePrivateLanAddress: Boolean = true,
+    private val acceptResolved: (DiscoveredLanService) -> Boolean = { true },
+    private val deduplicateKey: (DiscoveredLanService) -> String = { it.endpointKey },
     private val logTag: String = "plugin mDNS",
     private val onServicesChanged: ((List<DiscoveredLanService>) -> Unit)? = null,
 ) {
@@ -410,13 +432,30 @@ class NsdServiceBrowser(
         previousKey: DiscoveredEndpointRegistry.EntryKey?,
     ): DiscoveredEndpointRegistry.EntryKey? {
         val addr = pickAddress(info) ?: return null
-        val port = info.port
-        if (port !in 1..65535) return null
         val txt = LinkedHashMap<String, String?>()
         info.attributes?.forEach { (k, v) ->
             txt[k] = v?.let { String(it, StandardCharsets.UTF_8) }
         }
-        val rawName = info.serviceName.orEmpty()
+        return ingestResolvedEndpoint(
+            rawName = info.serviceName.orEmpty(),
+            addr = addr,
+            port = info.port,
+            txt = txt,
+            previousKey = previousKey,
+            requireStarted = true,
+        )
+    }
+
+    internal fun ingestResolvedEndpoint(
+        rawName: String,
+        addr: String,
+        port: Int,
+        txt: Map<String, String?>,
+        previousKey: DiscoveredEndpointRegistry.EntryKey? = null,
+        requireStarted: Boolean = false,
+    ): DiscoveredEndpointRegistry.EntryKey? {
+        if (port !in 1..65535) return null
+        if (requirePrivateLanAddress && !UdpLanServerDiscovery.isPrivateLanIpLiteral(addr)) return null
         val svc = DiscoveredLanService(
             serviceType = serviceType,
             serviceName = rawName.ifBlank { addr },
@@ -424,9 +463,10 @@ class NsdServiceBrowser(
             port = port,
             txt = txt,
         )
+        if (!acceptResolved(svc)) return null
         val newKey: DiscoveredEndpointRegistry.EntryKey
         synchronized(lock) {
-            if (!started) return null
+            if (requireStarted && !started) return null
             val normAddr = RawComputer.normalizeAddress(addr)
             if (previousKey != null && (previousKey.address != normAddr || previousKey.port != port)) {
                 registry.removeKey(previousKey)
@@ -458,7 +498,7 @@ class NsdServiceBrowser(
     }
 
     private fun publishLocked() {
-        val list = registry.values().distinctBy { it.endpointKey }
+        val list = registry.values().distinctBy(deduplicateKey)
         _services.value = list
         onServicesChanged?.invoke(list)
     }
@@ -472,7 +512,8 @@ class NsdServiceBrowser(
 /**
  * Watches the local network for `_depth3d-host._tcp` mDNS announcements by delegating to the
  * single shared [NsdServiceBrowser] engine so Host and plugin mDNS discovery share one NSD
- * implementation while preserving every Host discovery invariant.
+ * implementation while preserving every Host discovery invariant (`id@addr:port` deduplication
+ * and dropping records without valid TXT `id` before they enter the registry).
  */
 class HostDiscovery(context: Context) {
     private val _hosts = MutableStateFlow<List<DiscoveredHost>>(emptyList())
@@ -482,6 +523,14 @@ class HostDiscovery(context: Context) {
         context = context,
         rawServiceType = DiscoveredHost.SERVICE_TYPE_NSD,
         serviceTypeFilter = { it.contains("_depth3d-host") },
+        requirePrivateLanAddress = false,
+        acceptResolved = { svc ->
+            DiscoveredHost.fromTxt(svc.serviceName, svc.address, svc.port, svc.txt) != null
+        },
+        deduplicateKey = { svc ->
+            val id = svc.txt["id"]?.trim()?.lowercase(Locale.ROOT).orEmpty()
+            "$id@${RawComputer.normalizeAddress(svc.address)}:${svc.port}"
+        },
         logTag = "host mDNS",
         onServicesChanged = { services ->
             val mapped = services.mapNotNull { svc ->
@@ -558,6 +607,8 @@ enum class UdpDiscoveryProtocol(
  */
 object UdpLanServerDiscovery {
     const val DEFAULT_TIMEOUT_MS = 2_000L
+    const val REPROBE_INTERVAL_MS = 5_000L
+    const val MAX_DISCOVERED_SERVERS = 32
     private const val MAX_PACKET_BYTES = 4096
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
@@ -580,59 +631,72 @@ object UdpLanServerDiscovery {
         if (destinations.isEmpty()) return@withContext emptyList()
 
         val foundById = LinkedHashMap<String, DiscoveredLanService>()
-        val socket = DatagramSocket()
-        coroutineScope {
-            // Unblock socket.receive() immediately when the caller coroutine is cancelled (e.g. page exit)
-            val closer = launch(start = CoroutineStart.UNDISPATCHED) {
+        var socket: DatagramSocket? = null
+        try {
+            socket = DatagramSocket()
+            val activeSocket = socket
+            coroutineScope {
+                // Unblock socket.receive() immediately when the caller coroutine is cancelled (e.g. page exit)
+                val closer = launch(start = CoroutineStart.UNDISPATCHED) {
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        runCatching { activeSocket.close() }
+                    }
+                }
                 try {
-                    awaitCancellation()
-                } finally {
-                    runCatching { socket.close() }
-                }
-            }
-            try {
-                socket.broadcast = true
-                val probeBytes = protocol.probeMessage.toByteArray(StandardCharsets.UTF_8)
-                for (dest in destinations) {
-                    try {
-                        socket.send(DatagramPacket(probeBytes, probeBytes.size, dest, targetPort))
-                    } catch (_: Exception) {
+                    activeSocket.broadcast = true
+                    val probeBytes = protocol.probeMessage.toByteArray(StandardCharsets.UTF_8)
+                    for (dest in destinations) {
+                        try {
+                            activeSocket.send(DatagramPacket(probeBytes, probeBytes.size, dest, targetPort))
+                        } catch (_: Exception) {
+                        }
                     }
-                }
 
-                val deadlineMs = System.currentTimeMillis() + timeoutMs.coerceAtLeast(100L)
-                val buffer = ByteArray(MAX_PACKET_BYTES)
-                while (coroutineContext.isActive && !socket.isClosed) {
-                    val remaining = (deadlineMs - System.currentTimeMillis()).toInt()
-                    if (remaining <= 0) break
-                    socket.soTimeout = remaining.coerceAtLeast(1)
-                    val packet = DatagramPacket(buffer, buffer.size)
-                    try {
-                        socket.receive(packet)
-                    } catch (_: SocketTimeoutException) {
-                        break
-                    } catch (_: SocketException) {
-                        // Socket closed on cancellation / page exit
-                        break
+                    val deadlineMs = System.currentTimeMillis() + timeoutMs.coerceAtLeast(100L)
+                    val buffer = ByteArray(MAX_PACKET_BYTES)
+                    while (coroutineContext.isActive && !activeSocket.isClosed) {
+                        val remaining = (deadlineMs - System.currentTimeMillis()).toInt()
+                        if (remaining <= 0) break
+                        val packet = DatagramPacket(buffer, buffer.size)
+                        try {
+                            activeSocket.soTimeout = remaining.coerceAtLeast(1)
+                            activeSocket.receive(packet)
+                        } catch (_: SocketTimeoutException) {
+                            break
+                        } catch (_: SocketException) {
+                            // Socket closed on cancellation / page exit
+                            break
+                        }
+                        val payload = String(packet.data, packet.offset, packet.length, StandardCharsets.UTF_8)
+                        val parsed = parseResponsePayload(
+                            protocol = protocol,
+                            payload = payload,
+                            allowLoopbackForTesting = allowLoopbackForTesting,
+                        ) ?: continue
+                        val idKey = parsed.txt["id"]?.lowercase(Locale.ROOT) ?: parsed.endpointKey
+                        if (idKey !in foundById) {
+                            if (foundById.size >= MAX_DISCOVERED_SERVERS) {
+                                continue
+                            }
+                            foundById[idKey] = parsed
+                            onFound?.invoke(foundById.values.toList())
+                        }
                     }
-                    val payload = String(packet.data, packet.offset, packet.length, StandardCharsets.UTF_8)
-                    val parsed = parseResponsePayload(
-                        protocol = protocol,
-                        payload = payload,
-                        allowLoopbackForTesting = allowLoopbackForTesting,
-                    ) ?: continue
-                    val idKey = parsed.txt["id"]?.lowercase(Locale.ROOT) ?: parsed.endpointKey
-                    if (idKey !in foundById) {
-                        foundById[idKey] = parsed
-                        onFound?.invoke(foundById.values.toList())
-                    }
+                } finally {
+                    closer.cancel()
+                    runCatching { activeSocket.close() }
                 }
-            } catch (e: CancellationException) {
-                throw e
-            } finally {
-                closer.cancel()
-                runCatching { socket.close() }
             }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: SocketException) {
+            LimeLog.warning("depth3d: UDP LAN discovery socket error (${protocol.wireValue}): ${e.message}")
+        } catch (e: Exception) {
+            LimeLog.warning("depth3d: UDP LAN discovery error (${protocol.wireValue}): ${e.javaClass.simpleName}")
+        } finally {
+            runCatching { socket?.close() }
         }
         foundById.values.toList()
     }

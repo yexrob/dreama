@@ -57,6 +57,7 @@ data class PluginLaunchArgs(
     val title: String?,
     val startMs: Long,
     val durationMs: Long?,
+    val parentId: String? = null,
 )
 
 /**
@@ -65,6 +66,7 @@ data class PluginLaunchArgs(
  */
 object PluginPlayerLaunch {
     @JvmStatic
+    @JvmOverloads
     fun createIntent(
         context: Context,
         instanceId: String,
@@ -73,6 +75,7 @@ object PluginPlayerLaunch {
         title: String?,
         startMs: Long = 0L,
         durationMs: Long? = null,
+        parentId: String? = null,
     ): Intent {
         val intent = Intent(context, LocalPlayerXR::class.java)
             .putExtra(LocalPlayerXR.EXTRA_PLUGIN_INSTANCE_ID, instanceId)
@@ -84,6 +87,9 @@ object PluginPlayerLaunch {
         }
         if (durationMs != null && durationMs > 0L) {
             intent.putExtra(LocalPlayerXR.EXTRA_DURATION_MS, durationMs)
+        }
+        if (!parentId.isNullOrBlank()) {
+            intent.putExtra(LocalPlayerXR.EXTRA_PARENT_ID, parentId)
         }
         return intent
     }
@@ -106,6 +112,7 @@ object PluginPlayerLaunch {
             title = intent.getStringExtra(LocalPlayerXR.EXTRA_TITLE),
             startMs = startMs,
             durationMs = rawDur.takeIf { it > 0L },
+            parentId = intent.getStringExtra(LocalPlayerXR.EXTRA_PARENT_ID)?.trim()?.takeIf { it.isNotEmpty() },
         )
     }
 
@@ -169,6 +176,7 @@ class PluginPlayerSession(
     private val progressIntervalMs: Long = PROGRESS_REPORT_INTERVAL_MS,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val callbackDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate,
+    private val checkNeedsPermissionReconfirm: suspend (instanceId: String) -> Boolean = { false },
 ) : Closeable {
 
     interface LoadCallback {
@@ -206,8 +214,17 @@ class PluginPlayerSession(
     @Volatile
     private var fallbackDurationMs: Long? = null
 
+    @Volatile
+    private var currentExpiresAtMs: Long? = null
+
+    @Volatile
+    private var permissionReconfirmNeeded: Boolean = false
+
     val sourceName: String
         get() = activeSource?.source?.name.orEmpty()
+
+    val needsPermissionReconfirm: Boolean
+        get() = permissionReconfirmNeeded
 
     val supportsProgress: Boolean
         get() = activeSource?.capabilities?.contains(PluginCapability.PROGRESS) == true
@@ -218,6 +235,7 @@ class PluginPlayerSession(
         resumePositionMs: Long,
         fallbackDurationMs: Long?,
     ): LoadedPluginMedia {
+        this.permissionReconfirmNeeded = runCatching { checkNeedsPermissionReconfirm(instanceId) }.getOrDefault(false)
         val pluginSource = openPluginSource(instanceId)
         val ctrl = PluginPlayback.createSessionController(pluginSource, clockMs = clockMs)
         val session = ctrl.load(
@@ -232,8 +250,14 @@ class PluginPlayerSession(
         this.activeItemId = itemId
         this.activeSessionId = session.info.sessionId
         this.fallbackDurationMs = session.info.durationMs ?: fallbackDurationMs
+        this.currentExpiresAtMs = session.info.expiresAtMs
         this.consecutiveRefreshes.set(0)
-        this.proactiveRefreshExhausted.set(false)
+        // If initial URL is valid right now but has <=60s TTL, avoid proactive refresh thrashing;
+        // real HTTP 401/403/410 playback errors will still trigger error-based refresh (#6).
+        val initExp = session.info.expiresAtMs
+        val now = clockMs()
+        val isShortTtlValidNow = initExp != null && initExp > now && (initExp - now) <= PROACTIVE_REFRESH_LEAD_MS
+        this.proactiveRefreshExhausted.set(isShortTtlValidNow)
         this.startReported.set(false)
         this.finishReported.set(false)
         this.stopReported.set(false)
@@ -275,13 +299,22 @@ class PluginPlayerSession(
         }
     }
 
+    private fun isLiterallyExpired(nowMs: Long = clockMs()): Boolean {
+        val exp = currentExpiresAtMs ?: return false
+        return exp <= nowMs
+    }
+
     fun markPlaybackReady() {
-        // Only reset the refresh counter if the newly ready stream is NOT already inside the
-        // expiry window; otherwise a short-TTL / already-expired URL would reset on every ready
-        // callback and loop indefinitely.
-        if (controller?.isExpired(clockMs()) != true) {
+        val now = clockMs()
+        // Reset error/refresh counter whenever the stream is valid right now (including short-TTL
+        // streams that disabled proactive polling so error-based 401/403/410 recovery keeps working).
+        if (!isLiterallyExpired(now)) {
             consecutiveRefreshes.set(0)
-            proactiveRefreshExhausted.set(false)
+            val exp = currentExpiresAtMs
+            val isShortTtl = exp != null && (exp - now) <= PROACTIVE_REFRESH_LEAD_MS
+            if (!isShortTtl && controller?.isExpired(now) != true) {
+                proactiveRefreshExhausted.set(false)
+            }
         }
     }
 
@@ -320,12 +353,21 @@ class PluginPlayerSession(
             httpStatusCode = httpStatusCode,
             fallbackDurationMs = fallbackDurationMs,
         ) ?: return null
-        // Guard against servers returning an already-expired or <=60s TTL URL on refresh:
-        // stop immediately and surface an error instead of re-entering a 200ms refresh loop.
-        if (ctrl.isExpired(clockMs())) {
+
+        val now = clockMs()
+        val exp = refreshed.info.expiresAtMs
+        currentExpiresAtMs = exp
+        // Only abort if the refreshed URL is LITERALLY already expired (expiresAt <= now).
+        // If it is valid right now but within the <=60s proactive lead window, stop proactive
+        // polling and continue playing normally; real HTTP errors still trigger error refresh (#6).
+        if (exp != null && exp <= now) {
             proactiveRefreshExhausted.set(true)
             throw SourceUnavailableException("播放地址刷新后仍已过期，请稍后重试。")
         }
+        if (exp != null && (exp - now) <= PROACTIVE_REFRESH_LEAD_MS) {
+            proactiveRefreshExhausted.set(true)
+        }
+
         val exoMediaSource = ctrl.createMediaSource(refreshed)
         activeSessionId = refreshed.info.sessionId
         fallbackDurationMs = refreshed.info.durationMs ?: fallbackDurationMs
@@ -489,6 +531,7 @@ class PluginPlayerSession(
     companion object {
         const val PROGRESS_REPORT_INTERVAL_MS = 10_000L
         const val MAX_CONSECUTIVE_ERROR_REFRESHES = 2
+        const val PROACTIVE_REFRESH_LEAD_MS = 60_000L
         private const val FINAL_STOP_TIMEOUT_MS = 5_000L
 
         private val finalReportScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -496,7 +539,14 @@ class PluginPlayerSession(
         @JvmStatic
         fun create(context: Context): PluginPlayerSession {
             val host = PluginHost.get(context.applicationContext)
-            return PluginPlayerSession(openPluginSource = { id -> host.openSource(id) })
+            return PluginPlayerSession(
+                openPluginSource = { id -> host.openSource(id) },
+                checkNeedsPermissionReconfirm = { instanceId ->
+                    val inst = host.store.getInstance(instanceId)
+                    val pkg = inst?.let { host.store.getPackage(it.pluginId) }
+                    pkg?.needsPermissionReconfirm == true
+                },
+            )
         }
 
         @JvmStatic
@@ -514,16 +564,19 @@ class PluginPlayerSession(
         }
 
         @JvmStatic
+        @JvmOverloads
         fun formatPlayerError(
             context: Context,
             error: Throwable,
             sourceKind: SourceKind,
             sourceName: String,
+            needsPermissionReconfirm: Boolean = false,
         ): PlayerErrorUi = formatPlayerError(
             error = error,
             sourceKind = sourceKind,
             sourceName = sourceName,
             strings = AndroidStringLookup(context),
+            needsPermissionReconfirm = needsPermissionReconfirm,
         )
 
         fun formatPlayerError(
@@ -531,6 +584,7 @@ class PluginPlayerSession(
             sourceKind: SourceKind,
             sourceName: String,
             strings: StringLookup,
+            needsPermissionReconfirm: Boolean = false,
         ): PlayerErrorUi {
             val domain = findDomainException(error)
             if (domain != null) {
@@ -540,10 +594,12 @@ class PluginPlayerSession(
                     sourceName = sourceName,
                     strings = strings,
                     inPlaybackContext = true,
+                    needsPermissionReconfirm = needsPermissionReconfirm,
                 )
                 return PlayerErrorUi(
                     reason = pres.message,
-                    canRetry = domain !is SourceUnsupportedException,
+                    canRetry = domain !is SourceUnsupportedException &&
+                        !(domain is SourceNeedsSetupException && needsPermissionReconfirm),
                 )
             }
 

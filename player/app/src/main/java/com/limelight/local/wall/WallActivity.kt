@@ -137,7 +137,7 @@ class WallActivity : ComponentActivity(), WallActions {
         return super.dispatchTouchEvent(ev)
     }
 
-    override fun launchPlayer(info: PlaybackInfo, sourceId: String, itemId: String) {
+    override fun launchPlayer(info: PlaybackInfo, sourceId: String, itemId: String, parentId: String?) {
         PluginHostGuards.requireNonPluginPlayback(info)
         val play = Intent(this, LocalPlayerXR::class.java)
             .setData(Uri.parse(info.url))
@@ -146,6 +146,7 @@ class WallActivity : ComponentActivity(), WallActions {
             .putExtra(LocalPlayerXR.EXTRA_START_MS, info.startPositionMs)
             .putExtra(LocalPlayerXR.EXTRA_SOURCE_ID, sourceId)
             .putExtra(LocalPlayerXR.EXTRA_ITEM_ID, itemId)
+        parentId?.takeIf { it.isNotBlank() }?.let { play.putExtra(LocalPlayerXR.EXTRA_PARENT_ID, it) }
         // The player takes one header, which is all WebDAV needs
         info.headers["Authorization"]?.let { play.putExtra(LocalPlayerXR.EXTRA_AUTH, it) }
         startActivity(play)
@@ -158,6 +159,7 @@ class WallActivity : ComponentActivity(), WallActions {
         title: String?,
         startMs: Long,
         durationMs: Long?,
+        parentId: String?,
     ) {
         startActivity(
             PluginPlayerLaunch.createIntent(
@@ -168,6 +170,7 @@ class WallActivity : ComponentActivity(), WallActions {
                 title = title,
                 startMs = startMs,
                 durationMs = durationMs,
+                parentId = parentId,
             ),
         )
     }
