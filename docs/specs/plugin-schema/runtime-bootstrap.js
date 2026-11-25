@@ -209,12 +209,15 @@
   let nextTimerId = 1;
   const activeTimerIds = new Set();
   const cancelledTimers = new Set();
-  let abortCurrentCall = null;
+  let callCancelled = false;
   let strictAwaitTracking = false;
   let trackedAsyncOps = [];
 
   globalThis.setTimeout = function (fn, delayMs, ...args) {
     if (typeof fn !== 'function') throw new TypeError('setTimeout requires a function');
+    if (callCancelled) {
+      throw new Error('Call cancelled by host');
+    }
     if (activeTimerIds.size >= MAX_ACTIVE_TIMERS) {
       throw new RangeError('同时活跃的定时器数量超过上限（最多 ' + MAX_ACTIVE_TIMERS + ' 个）');
     }
@@ -225,24 +228,29 @@
     host.sleep(BRIDGE_TOKEN, id, ms, gen).then((stillActive) => {
       activeTimerIds.delete(id);
       const wasCleared = cancelledTimers.delete(id);
-      if (stillActive && gen === currentGen && !wasCleared) {
-        fn(...args);
-      } else if (!stillActive && !wasCleared && gen === currentGen && abortCurrentCall) {
-        // Host cancelled this timer during cooperative call cancellation (not clearTimeout):
-        // reject the active call's abort race so `await new Promise(r => setTimeout(r, n))`
-        // unwinds cleanly without hanging or forcing a QuickJS VM rebuild.
-        const abort = abortCurrentCall;
-        abortCurrentCall = null;
-        abort(new Error('Timer cancelled by host'));
+      if (gen !== currentGen || wasCleared) {
+        return;
       }
-    }, (err) => {
+      if (!stillActive) {
+        // Host cooperatively cancelled this active call's timer (not clearTimeout, and call not
+        // yet finished): mark the call cancelled so any subsequent host call / new timer rejects
+        // immediately, then STILL invoke `fn(...args)` so `await new Promise(r => setTimeout(r, n))`
+        // settles and plugin `finally` blocks run to clean up module-level locks / single-flight state.
+        callCancelled = true;
+      }
+      try {
+        fn(...args);
+      } catch (_) {}
+    }, () => {
       activeTimerIds.delete(id);
       const wasCleared = cancelledTimers.delete(id);
-      if (!wasCleared && gen === currentGen && abortCurrentCall) {
-        const abort = abortCurrentCall;
-        abortCurrentCall = null;
-        abort(err instanceof Error ? err : new Error(String(err || 'Timer cancelled by host')));
+      if (gen !== currentGen || wasCleared) {
+        return;
       }
+      callCancelled = true;
+      try {
+        fn(...args);
+      } catch (_) {}
     });
     return id;
   };
@@ -355,6 +363,9 @@
       device: deepFreeze(JSON.parse(host.getDeviceJson(BRIDGE_TOKEN))),
 
       async fetch(url, opts) {
+        if (callCancelled) {
+          throw new Error('Call cancelled by host');
+        }
         const o = opts || {};
         const urlStr = String(url);
         if (utf8ByteLength(urlStr) > MAX_FETCH_URL_BYTES) {
@@ -469,22 +480,26 @@
       storage: Object.freeze({
         get(key) {
           return trackAwaitableOp('ctx.storage.get', (async () => {
+            if (callCancelled) throw new Error('Call cancelled by host');
             const raw = await host.storageGet(BRIDGE_TOKEN, String(key));
             return raw === null || raw === undefined ? null : JSON.parse(raw);
           })());
         },
         set(key, value) {
           return trackAwaitableOp('ctx.storage.set', (async () => {
+            if (callCancelled) throw new Error('Call cancelled by host');
             await host.storageSet(BRIDGE_TOKEN, String(key), JSON.stringify(value === undefined ? null : value));
           })());
         },
         remove(key) {
           return trackAwaitableOp('ctx.storage.remove', (async () => {
+            if (callCancelled) throw new Error('Call cancelled by host');
             await host.storageRemove(BRIDGE_TOKEN, String(key));
           })());
         },
         keys() {
           return trackAwaitableOp('ctx.storage.keys', (async () => {
+            if (callCancelled) throw new Error('Call cancelled by host');
             const raw = await host.storageKeys(BRIDGE_TOKEN);
             return JSON.parse(raw);
           })());
@@ -494,15 +509,20 @@
       // §11.1: ctx.cookies.* are async and MUST be awaited
       cookies: Object.freeze({
         get(url) {
-          return trackAwaitableOp('ctx.cookies.get', (async () => await host.cookiesGet(BRIDGE_TOKEN, String(url)))());
+          return trackAwaitableOp('ctx.cookies.get', (async () => {
+            if (callCancelled) throw new Error('Call cancelled by host');
+            return await host.cookiesGet(BRIDGE_TOKEN, String(url));
+          })());
         },
         set(url, cookie) {
           return trackAwaitableOp('ctx.cookies.set', (async () => {
+            if (callCancelled) throw new Error('Call cancelled by host');
             await host.cookiesSet(BRIDGE_TOKEN, String(url), String(cookie));
           })());
         },
         clear() {
           return trackAwaitableOp('ctx.cookies.clear', (async () => {
+            if (callCancelled) throw new Error('Call cancelled by host');
             await host.cookiesClear(BRIDGE_TOKEN);
           })());
         },
@@ -641,6 +661,7 @@
 
   async function callPlugin(method, argJson, hasArg, gen, optional) {
     currentGen = gen;
+    callCancelled = false;
     activeTimerIds.clear();
     cancelledTimers.clear();
     trackedAsyncOps = [];
@@ -651,18 +672,13 @@
       throw new Error('Plugin does not implement method: ' + method);
     }
     let succeeded = false;
-    const callAbortPromise = new Promise((_, reject) => {
-      abortCurrentCall = reject;
-    });
-    callAbortPromise.then(() => {}, () => {});
     try {
-      const invokePromise = Promise.resolve().then(() => (
-        hasArg
-          ? fn.call(pluginExport, ctx, JSON.parse(argJson))
-          : fn.call(pluginExport, ctx)
-      ));
-      invokePromise.then(() => {}, () => {});
-      const res = await Promise.race([invokePromise, callAbortPromise]);
+      const res = hasArg
+        ? await fn.call(pluginExport, ctx, JSON.parse(argJson))
+        : await fn.call(pluginExport, ctx);
+      if (callCancelled) {
+        throw new Error('Call cancelled by host');
+      }
       if (res === undefined) {
         succeeded = true;
         return 'undefined';
@@ -684,7 +700,7 @@
       }
       throw err;
     } finally {
-      abortCurrentCall = null;
+      callCancelled = false;
       if (strictAwaitTracking && succeeded && trackedAsyncOps.length > 0) {
         const unawaited = trackedAsyncOps.filter((op) => !op.awaited);
         if (unawaited.length > 0 && typeof host.reportUnawaitedOps === 'function') {
@@ -710,18 +726,16 @@
   });
   defineReadOnlyGlobal('__d3_eval_probe', async function (fnCode, gen) {
     currentGen = gen;
+    callCancelled = false;
     activeTimerIds.clear();
     cancelledTimers.clear();
     trackedAsyncOps = [];
-    const callAbortPromise = new Promise((_, reject) => {
-      abortCurrentCall = reject;
-    });
-    callAbortPromise.then(() => {}, () => {});
     try {
       const fn = new Function('ctx', 'return (async () => { ' + fnCode + ' })();');
-      const invokePromise = Promise.resolve().then(() => fn(ctx));
-      invokePromise.then(() => {}, () => {});
-      const res = await Promise.race([invokePromise, callAbortPromise]);
+      const res = await fn(ctx);
+      if (callCancelled) {
+        throw new Error('Call cancelled by host');
+      }
       if (res === undefined) return 'undefined';
       const serialized = JSON.stringify(res);
       if (serialized && serialized.length > MAX_RETURN_BYTES) {
@@ -729,7 +743,7 @@
       }
       return serialized;
     } finally {
-      abortCurrentCall = null;
+      callCancelled = false;
       currentGen = -1;
       activeTimerIds.clear();
       cancelledTimers.clear();

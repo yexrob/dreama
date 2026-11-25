@@ -8,6 +8,7 @@ import com.limelight.local.search.SearchAggregator
 import com.limelight.local.search.SearchKindFilter
 import com.limelight.local.search.SearchLogSanitizer
 import com.limelight.local.search.SearchRowStatus
+import com.limelight.local.search.SearchWarmUpCoordinator
 import com.limelight.local.wall.DetailStateLogic
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -64,6 +65,7 @@ class PluginRuntimeSearchCancellationAndLoggingTest {
         mainJs: String,
         hostPort: Int? = null,
         sinkLines: MutableList<String>? = null,
+        clockMs: () -> Long = System::currentTimeMillis,
     ): Pair<PluginRuntime, PluginMediaSource> {
         val manifest = PluginManifest(
             api = 1,
@@ -116,6 +118,7 @@ class PluginRuntimeSearchCancellationAndLoggingTest {
             storage = storage,
             cookieJar = cookies,
             logger = logger,
+            clockMs = clockMs,
         )
         val mapper = PluginProtocolMapper(policy)
         val source = PluginMediaSource(
@@ -489,25 +492,42 @@ class PluginRuntimeSearchCancellationAndLoggingTest {
     }
 
     @Test
-    fun timerPromiseCancellationUnwindsCleanlyWithoutRebuildingVm() = runBlocking {
+    fun timerPromiseCancellationUnwindsCleanlyRunsFinallyWithoutRebuildingVm() = runBlocking {
         val tmpDir = Files.createTempDirectory("d3-rt-cancel-timer").toFile()
         val mainJs = """
             let initCount = 0;
-            let postSleepRuns = 0;
+            let finallyCount = 0;
+            let clearedTimerFired = 0;
+            let staleFetchRejected = 0;
             export default {
               async init() { initCount += 1; },
-              home() { return [{ id: 's1', title: 'init=' + initCount + ',post=' + postSleepRuns, style: 'poster', items: [] }]; },
+              home() {
+                return [{
+                  id: 's1',
+                  title: 'init=' + initCount + ',fin=' + finallyCount + ',cleared=' + clearedTimerFired + ',rej=' + staleFetchRejected,
+                  style: 'poster',
+                  items: []
+                }];
+              },
               browse() { return { items: [], next: null }; },
               detail(ctx, { itemId }) { return { id: itemId, kind: 'movie', title: '详情-' + itemId }; },
               playback() { return { url: 'https://cdn.example.com/v.mp4' }; },
               async search(ctx, { query }) {
                 if (query === 'sleep') {
-                  await new Promise((r) => setTimeout(r, 5000));
-                  postSleepRuns += 1;
-                  return { items: [{ id: 'late', kind: 'movie', title: '不应到达' }], next: null };
+                  try {
+                    await new Promise((r) => setTimeout(r, 5000));
+                    try {
+                      await ctx.fetch('https://cdn.example.com/should-not-run');
+                    } catch (_) {
+                      staleFetchRejected += 1;
+                    }
+                    return { items: [{ id: 'late', kind: 'movie', title: '不应到达' }], next: null };
+                  } finally {
+                    finallyCount += 1;
+                  }
                 }
                 if (query === 'cleared') {
-                  const id = setTimeout(() => { postSleepRuns += 99; }, 5000);
+                  const id = setTimeout(() => { clearedTimerFired += 1; }, 5000);
                   clearTimeout(id);
                   await new Promise((r) => setTimeout(r, 20));
                   return { items: [{ id: 'ok-cleared', kind: 'movie', title: '正常清除' }], next: null };
@@ -521,15 +541,15 @@ class PluginRuntimeSearchCancellationAndLoggingTest {
         val (runtime, source) = buildRuntimeAndSource(tmpDir, mainJs)
         try {
             // Warm up VM -> creationCount == 1
-            assertEquals("init=1,post=0", source.home().single().category.title)
+            assertEquals("init=1,fin=0,cleared=0,rej=0", source.home().single().category.title)
             assertEquals(1, runtime.creationCount)
 
-            // 1. User clearTimeout() must NOT abort the active call
+            // 1. User clearTimeout() must NOT trigger callback or abort the active call
             assertEquals(listOf("ok-cleared"), source.search("cleared").items.map { it.id })
             assertEquals(1, runtime.creationCount)
 
-            // 2. Host cancellation during `await new Promise(r => setTimeout(r, 5000))` MUST
-            //    unwind cleanly WITHOUT triggering the 250 ms interrupt/rebuild path!
+            // 2. Host cancellation during `await new Promise(r => setTimeout(r, 5000))` settles the
+            //    timer, rejects subsequent host calls, executes plugin `finally`, and keeps VM alive!
             var caughtCancel = false
             val startedMs = System.currentTimeMillis()
             val job = launch(Dispatchers.IO) {
@@ -540,7 +560,6 @@ class PluginRuntimeSearchCancellationAndLoggingTest {
                     throw ce
                 }
             }
-            // Wait until the JS timer is registered with the host
             val waitDeadline = System.currentTimeMillis() + 3_000L
             while (runtime.currentActiveTimerCount() == 0 && System.currentTimeMillis() < waitDeadline) {
                 delay(10)
@@ -558,8 +577,9 @@ class PluginRuntimeSearchCancellationAndLoggingTest {
             assertEquals(0, runtime.currentActiveTimerCount())
             assertTrue("Cooperative timer cancel should settle fast (was ${cancelElapsedMs}ms)", cancelElapsedMs < 240L)
 
-            // 3. Post-sleep code never ran, and subsequent calls continue on the exact same VM
-            assertEquals("init=1,post=0", source.home().single().category.title)
+            // 3. Plugin `finally` ran, post-cancel fetch was rejected by expired generation,
+            //    clearTimeout callback never fired, and subsequent calls reuse the exact same VM.
+            assertEquals("init=1,fin=1,cleared=0,rej=1", source.home().single().category.title)
             assertEquals(listOf("hit-潮"), source.search("潮").items.map { it.id })
             assertEquals(listOf("潮 推荐"), source.suggest("潮"))
             assertEquals(1, runtime.creationCount)
@@ -575,8 +595,125 @@ class PluginRuntimeSearchCancellationAndLoggingTest {
     }
 
     @Test
-    fun backgroundWarmUpEnablesSuggestOnColdVmAndSilentlyIgnoresInitFailure() = runBlocking {
+    fun singleFlightTokenRefreshCancelledDuringBackoffSleepCleansUpAndNextCallSucceeds() = runBlocking {
+        val tmpDir = Files.createTempDirectory("d3-rt-singleflight-backoff").toFile()
+        val server = MockWebServer()
+        val refreshAttempts = AtomicInteger(0)
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                return when (request.path) {
+                    "/refresh" -> {
+                        val n = refreshAttempts.incrementAndGet()
+                        if (n == 1) {
+                            MockResponse().setResponseCode(500).setBody("temporary error")
+                        } else {
+                            MockResponse().setResponseCode(200).setBody("""{"token":"tok-$n"}""")
+                        }
+                    }
+                    else -> MockResponse().setResponseCode(200).setBody("""{"ok":true}""")
+                }
+            }
+        }
+        server.start()
+        val baseUrl = "http://192.168.1.50:${server.port}"
+        val mainJs = """
+            let refreshInFlight = null;
+            let cachedToken = null;
+            let finallyRan = 0;
+
+            async function ensureToken(ctx) {
+              if (cachedToken) return cachedToken;
+              if (!refreshInFlight) {
+                refreshInFlight = (async () => {
+                  try {
+                    for (let attempt = 0; attempt < 3; attempt++) {
+                      const resp = await ctx.fetch('$baseUrl/refresh');
+                      if (resp.ok) {
+                        cachedToken = resp.json().token;
+                        return cachedToken;
+                      }
+                      await new Promise((r) => setTimeout(r, 5000));
+                    }
+                    throw new Error('refresh failed');
+                  } finally {
+                    refreshInFlight = null;
+                    finallyRan += 1;
+                  }
+                })();
+              }
+              return refreshInFlight;
+            }
+
+            export default {
+              home() { return []; },
+              browse() { return { items: [], next: null }; },
+              detail(ctx, { itemId }) { return { id: itemId, kind: 'movie', title: itemId }; },
+              playback() { return { url: '$baseUrl/v.mp4' }; },
+              async search(ctx, { query }) {
+                const tok = await ensureToken(ctx);
+                return {
+                  items: [{ id: tok + ':' + finallyRan, kind: 'movie', title: query + ' ' + tok }],
+                  next: null
+                };
+              }
+            };
+        """.trimIndent()
+
+        val (runtime, source) = buildRuntimeAndSource(tmpDir, mainJs, hostPort = server.port)
+        try {
+            // Warm up VM so creationCount == 1
+            source.home()
+            assertEquals(1, runtime.creationCount)
+
+            // 1. First search triggers refreshInFlight: attempt 0 gets HTTP 500 and enters 5 s backoff sleep.
+            var caughtCancel = false
+            val job = launch(Dispatchers.IO) {
+                try {
+                    source.search("潮")
+                } catch (ce: CancellationException) {
+                    caughtCancel = true
+                    throw ce
+                }
+            }
+            val deadline = System.currentTimeMillis() + 3_000L
+            while (runtime.currentActiveTimerCount() == 0 && System.currentTimeMillis() < deadline) {
+                delay(10)
+            }
+            assertEquals("Attempt 1 should have hit /refresh before backoff sleep", 1, refreshAttempts.get())
+            assertTrue("Backoff timer must be active", runtime.currentActiveTimerCount() >= 1)
+
+            // 2. Cancel during backoff sleep -> must unwind cleanly, run `finally { refreshInFlight = null }`,
+            //    and NOT rebuild the VM!
+            job.cancel()
+            job.join()
+            assertTrue(caughtCancel)
+            assertEquals("VM must NOT be rebuilt", 1, runtime.creationCount)
+            assertTrue(runtime.isInitialized)
+            assertEquals("Cancelled call must NOT send a 2nd /refresh request", 1, refreshAttempts.get())
+
+            // 3. Next call immediately succeeds on the SAME VM (proving refreshInFlight was cleared
+            //    instead of staying permanently stuck on an unsettled promise!)
+            val res = source.search("雾")
+            assertEquals(1, runtime.creationCount)
+            assertEquals(2, refreshAttempts.get())
+            assertEquals(listOf("tok-2:2"), res.items.map { it.id })
+            assertTrue(
+                "Zero ERROR logs expected, got: ${runtime.logger.recentEntries()}",
+                runtime.logger.recentEntries().none { it.level == PluginLogLevel.ERROR },
+            )
+        } finally {
+            runCatching { source.close() }
+            runCatching { server.shutdown() }
+            tmpDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun backgroundWarmUpEnablesSuggestCapsTimeoutBacksOffAndLogsAtMostOneNonErrorWarning() = runBlocking {
         val tmpDir = Files.createTempDirectory("d3-rt-warmup").toFile()
+        assertEquals(5_000L, PluginRuntime.DEFAULT_WARM_UP_TIMEOUT_MS)
+        assertTrue(PluginRuntime.DEFAULT_WARM_UP_FAILURE_BACKOFF_MS >= 10_000L)
+
         val okJs = """
             export default {
               async init() {},
@@ -599,28 +736,94 @@ class PluginRuntimeSearchCancellationAndLoggingTest {
               suggest(ctx, { query }) { return [query]; }
             };
         """.trimIndent()
+        val hangingInitJs = """
+            export default {
+              async init() { await new Promise((r) => setTimeout(r, 20000)); },
+              home() { return []; },
+              browse() { return { items: [], next: null }; },
+              detail(ctx, { itemId }) { return { id: itemId, kind: 'movie', title: 'T' }; },
+              playback() { return { url: 'https://cdn.example.com/a.mp4' }; },
+              search() { return { items: [], next: null }; },
+              suggest(ctx, { query }) { return [query]; }
+            };
+        """.trimIndent()
 
+        var fakeNowMs = 1_000_000L
         val (okRuntime, okSource) = buildRuntimeAndSource(File(tmpDir, "ok").apply { mkdirs() }, okJs)
-        val (badRuntime, badSource) = buildRuntimeAndSource(File(tmpDir, "bad").apply { mkdirs() }, brokenInitJs)
+        val (badRuntime, badSource) = buildRuntimeAndSource(
+            File(tmpDir, "bad").apply { mkdirs() },
+            brokenInitJs,
+            clockMs = { fakeNowMs },
+        )
+        val (hangRuntime, hangSource) = buildRuntimeAndSource(
+            File(tmpDir, "hang").apply { mkdirs() },
+            hangingInitJs,
+            clockMs = { fakeNowMs },
+        )
+        val searchScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         try {
-            // Before warm-up: cold VM skips suggest()
+            // 1. Before warm-up: cold VM skips suggest(); warm-up enables suggest() on 1 VM
             assertFalse(okRuntime.isInitialized)
             assertTrue(okSource.suggest("潮").isEmpty())
             assertEquals(0, okRuntime.creationCount)
 
-            // Warm-up initializes VM once, after which suggest() works immediately
-            okSource.warmUpIfNeeded()
+            assertTrue(okSource.warmUpIfNeeded())
             assertTrue(okRuntime.isInitialized)
             assertEquals(1, okRuntime.creationCount)
             assertEquals(listOf("潮 1", "潮 2"), okSource.suggest("潮"))
-            assertEquals(1, okRuntime.creationCount)
 
-            // Failing init(ctx) during background warm-up is swallowed silently
-            badSource.warmUpIfNeeded()
+            // 2. Failing init during background warm-up via SearchWarmUpCoordinator:
+            //    - emits ZERO ERROR logs
+            //    - emits AT MOST 1 non-ERROR (WARN) log for this source on entering Search
+            //    - activates backoff so immediate retry skips without creating another VM or logging again
+            val coordinator = SearchWarmUpCoordinator(ioDispatcher = Dispatchers.IO)
+            val badSearchable = PluginSearchableSource(badSource, "SearchRT", knownNeedsAuth = false)
+            assertEquals(listOf(badSource.source.id), coordinator.warmUpUninitialized(listOf(badSearchable), searchScope))
+            val waitBad = System.currentTimeMillis() + 3_000L
+            while (badRuntime.logger.recentEntries().isEmpty() && System.currentTimeMillis() < waitBad) {
+                delay(15)
+            }
             assertFalse(badRuntime.isInitialized)
+            assertEquals(1, badRuntime.creationCount)
+            val badLogs1 = badRuntime.logger.recentEntries()
+            assertTrue("Warm-up failure must NOT log ERROR, got: $badLogs1", badLogs1.none { it.level == PluginLogLevel.ERROR })
+            assertEquals("Expected at most 1 non-ERROR log for warm-up failure, got: $badLogs1", 1, badLogs1.size)
+            assertEquals(PluginLogLevel.WARN, badLogs1.single().level)
+
+            // Re-calling coordinator in same Search session does nothing, AND direct warmUpIfNeeded
+            // within the 30 s backoff window also returns false with ZERO extra VM creations or logs!
+            assertTrue(coordinator.warmUpUninitialized(listOf(badSearchable), searchScope).isEmpty())
+            assertFalse(badSource.warmUpIfNeeded())
+            assertEquals(1, badRuntime.creationCount)
+            assertEquals(1, badRuntime.logger.recentEntries().size)
+
+            // Advancing clock past backoff allows a subsequent warm-up attempt
+            fakeNowMs += PluginRuntime.DEFAULT_WARM_UP_FAILURE_BACKOFF_MS + 1L
+            assertFalse(badSource.warmUpIfNeeded())
+            assertEquals(2, badRuntime.creationCount)
+            assertTrue(badRuntime.logger.recentEntries().none { it.level == PluginLogLevel.ERROR })
+            assertEquals(2, badRuntime.logger.recentEntries().size)
+
+            // 3. Hanging init(ctx) aborts promptly at the short warm-up timeout (NOT 15 s / 30 s),
+            //    logs 1 WARN (0 ERROR), and enters backoff
+            val hangStart = System.currentTimeMillis()
+            assertFalse(hangSource.warmUpIfNeeded(timeoutMsOverride = 350L))
+            val hangElapsed = System.currentTimeMillis() - hangStart
+            assertTrue("Hanging warm-up should abort near short budget (was ${hangElapsed}ms)", hangElapsed < 2_000L)
+            assertFalse(hangRuntime.isInitialized)
+            val hangLogs = hangRuntime.logger.recentEntries()
+            assertTrue("Hanging warm-up must NOT log ERROR, got: $hangLogs", hangLogs.none { it.level == PluginLogLevel.ERROR })
+            assertEquals(1, hangLogs.size)
+            assertEquals(PluginLogLevel.WARN, hangLogs.single().level)
+
+            // Still backed off right after timeout
+            assertFalse(hangSource.warmUpIfNeeded(timeoutMsOverride = 350L))
+            assertEquals(1, hangRuntime.creationCount)
         } finally {
+            searchScope.cancel()
             runCatching { okSource.close() }
             runCatching { badSource.close() }
+            runCatching { hangSource.close() }
             tmpDir.deleteRecursively()
         }
     }
