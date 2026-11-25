@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -701,8 +702,12 @@ private fun SeriesDetailContent(
             RoundButton(WallIcons.ChevL, { nav.back() }, filled = true)
         }
 
-        // Header metadata & primary CTA matching series.html (left:64px, top:112px, width:820px)
-        Column(Modifier.offset(64.dp, 112.dp).width(840.dp)) {
+        // series.html places the header at top:112, tabs at 404 and the strip at 488, but those
+        // absolute positions only hold for a one-line overview. The three blocks flow in a column
+        // so a taller header pushes the tabs and episodes down instead of sitting on top of them.
+        val headerHasNotice = (detailError != null && source != null) || actionNotice != null
+        Column(Modifier.offset(y = 112.dp).fillMaxWidth()) {
+        Column(Modifier.padding(start = 64.dp).width(840.dp).heightIn(min = 268.dp)) {
             Text(
                 item.title,
                 style = WallType.Display,
@@ -724,7 +729,8 @@ private fun SeriesDetailContent(
                     overview,
                     style = WallType.Body,
                     color = Color(0xFFC4C6CB),
-                    maxLines = 2,
+                    // A notice row below the buttons needs the height of the second line.
+                    maxLines = if (headerHasNotice) 1 else 2,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.padding(top = 12.dp),
                 )
@@ -810,9 +816,10 @@ private fun SeriesDetailContent(
             }
         }
 
-        // Season tabs matching series.html (left:38px, top:404px)
+        Spacer(Modifier.height(24.dp))
+        // Season tabs matching series.html (left:38px, top:404px for a one-line overview)
         LazyRow(
-            Modifier.offset(y = 404.dp).fillMaxWidth(),
+            Modifier.fillMaxWidth(),
             contentPadding = PaddingValues(horizontal = 38.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
@@ -841,8 +848,9 @@ private fun SeriesDetailContent(
             }
         }
 
-        // Episode horizontal strip matching series.html (top:488px)
-        Box(Modifier.offset(y = 488.dp).fillMaxWidth().height(216.dp)) {
+        Spacer(Modifier.height(24.dp))
+        // Episode horizontal strip matching series.html (top:488px for a one-line overview)
+        Box(Modifier.fillMaxWidth().height(216.dp)) {
             val epErr = activeState.error
             when {
                 source == null -> Unit
@@ -958,6 +966,7 @@ private fun SeriesDetailContent(
                     }
                 }
             }
+        }
         }
     }
 }
