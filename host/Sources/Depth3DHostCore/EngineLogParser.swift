@@ -14,6 +14,9 @@ public enum EngineLogEvent: Equatable, Sendable {
     case clientConnected
     /// Logged once per ENet client disconnect (`CLIENT DISCONNECTED`).
     case clientDisconnected
+    /// The engine stopped the streamed app (`Process terminated`). It does this when the client
+    /// quits the stream or the last session ends, and a quit does not log `CLIENT DISCONNECTED`.
+    case allSessionsEnded
     case audioTapActive(hostMuted: Bool?)
     case audioTapFailed
     case pairingExpired
@@ -70,6 +73,9 @@ public struct EngineLogState: Equatable, Sendable {
             if activeSessions == 0 {
                 pendingConnectAcks = 0
             }
+        case .allSessionsEnded:
+            activeSessions = 0
+            pendingConnectAcks = 0
         case .audioTapActive(let muted):
             systemAudioTapActive = true
             systemAudioTapFailed = false
@@ -140,6 +146,9 @@ public enum EngineLogParser {
         // Only decrement on `CLIENT DISCONNECTED` (not debug `Session ended`) to prevent double-decrement.
         if line.contains("CLIENT DISCONNECTED") {
             return .clientDisconnected
+        }
+        if line.contains("Process terminated") {
+            return .allSessionsEnded
         }
 
         if line.contains("Core Audio tap: Host audio disabled (muted)") {

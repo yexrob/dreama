@@ -129,6 +129,24 @@ final class EngineAndSystemTests: XCTestCase {
         XCTAssertEqual(state.activeSessions, 0)
     }
 
+    /// A client that quits the stream makes the engine stop the app without logging
+    /// `CLIENT DISCONNECTED`; the status must not stay on "streaming".
+    func testQuitWithoutDisconnectLineEndsStreaming() {
+        var state = EngineLogState()
+        state.apply(EngineLogParser.parse(line: "Info: New streaming session started [active sessions: 1]")!)
+        state.apply(EngineLogParser.parse(line: "Info: CLIENT CONNECTED")!)
+        XCTAssertEqual(state.activeSessions, 1)
+        state.apply(EngineLogParser.parse(line: "[2026-11-25 07:52:46.877]: Info: Process terminated")!)
+        XCTAssertEqual(state.activeSessions, 0)
+
+        // The next session counts from one again.
+        state.apply(EngineLogParser.parse(line: "Info: New streaming session started [active sessions: 1]")!)
+        state.apply(EngineLogParser.parse(line: "Info: CLIENT CONNECTED")!)
+        XCTAssertEqual(state.activeSessions, 1)
+        state.apply(EngineLogParser.parse(line: "Info: CLIENT DISCONNECTED")!)
+        XCTAssertEqual(state.activeSessions, 0)
+    }
+
     func testSystemAudioControllerMultiSessionAndCrashRecovery() {
         let tmpDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("depth3d-audio-test-\(UUID().uuidString)", isDirectory: true)
