@@ -389,3 +389,237 @@ class HostDiscovery(context: Context) {
         _hosts.value = registry.snapshot()
     }
 }
+
+/**
+ * One generic LAN service discovered over Android NsdManager (mDNS/Bonjour), reusing
+ * [HostDiscovery.chooseAddress] and the same API 34+ `ServiceInfoCallback` / legacy resolve queue.
+ */
+data class DiscoveredLanService(
+    val serviceType: String,
+    val serviceName: String,
+    val address: String,
+    val port: Int,
+    val txt: Map<String, String?> = emptyMap(),
+) {
+    val endpointKey: String
+        get() = "${serviceType.lowercase()}@${RawComputer.normalizeAddress(address)}:$port"
+
+    fun suggestedUrl(): String {
+        val scheme = if (port == 443 || txt["scheme"].equals("https", ignoreCase = true)) "https" else "http"
+        val host = HttpHostProtocolClient.formatAuthorityHost(address)
+        val omitPort = (scheme == "http" && port == 80) || (scheme == "https" && port == 443)
+        return if (omitPort) "$scheme://$host" else "$scheme://$host:$port"
+    }
+}
+
+/**
+ * Reusable NsdManager browser for any mDNS service type (e.g. `_jellyfin._tcp`), sharing the
+ * same system NSD lifecycle and IPv4 address filtering as [HostDiscovery].
+ */
+class NsdServiceBrowser(
+    context: Context,
+    rawServiceType: String,
+) {
+    val serviceType: String = normalizeServiceType(rawServiceType)
+
+    private val appContext = context.applicationContext
+    private val nsd = appContext.getSystemService(Context.NSD_SERVICE) as? NsdManager
+    private val lock = Any()
+    private val byEndpoint = LinkedHashMap<String, DiscoveredLanService>()
+    private val pendingResolves = ArrayDeque<NsdServiceInfo>()
+    private val activeCallbacks = LinkedHashMap<String, Any>()
+    private val executor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "depth3d-nsd-$serviceType").apply { isDaemon = true }
+    }
+
+    private var discoveryListener: NsdManager.DiscoveryListener? = null
+    private var resolving = false
+    private var started = false
+
+    private val _services = MutableStateFlow<List<DiscoveredLanService>>(emptyList())
+    val services: StateFlow<List<DiscoveredLanService>> get() = _services
+
+    fun start() {
+        val manager = nsd ?: return
+        synchronized(lock) {
+            if (started) return
+            started = true
+            val listener = object : NsdManager.DiscoveryListener {
+                override fun onDiscoveryStarted(regType: String) {
+                    LimeLog.info("depth3d: plugin mDNS discovery started for $serviceType")
+                }
+
+                override fun onServiceFound(serviceInfo: NsdServiceInfo) {
+                    resolve(serviceInfo)
+                }
+
+                override fun onServiceLost(serviceInfo: NsdServiceInfo) {
+                    val name = serviceInfo.serviceName ?: return
+                    synchronized(lock) {
+                        val changed = byEndpoint.entries.removeIf { it.value.serviceName == name }
+                        removeCallbackLocked(name)
+                        if (changed) publishLocked()
+                    }
+                }
+
+                override fun onDiscoveryStopped(regType: String) = Unit
+
+                override fun onStartDiscoveryFailed(regType: String, errorCode: Int) {
+                    LimeLog.warning("depth3d: plugin mDNS start failed for $serviceType: $errorCode")
+                    synchronized(lock) {
+                        started = false
+                        discoveryListener = null
+                    }
+                }
+
+                override fun onStopDiscoveryFailed(regType: String, errorCode: Int) = Unit
+            }
+            discoveryListener = listener
+            try {
+                manager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, listener)
+            } catch (e: RuntimeException) {
+                LimeLog.warning("depth3d: plugin mDNS discoverServices failed for $serviceType: ${e.javaClass.simpleName}")
+                started = false
+                discoveryListener = null
+            }
+        }
+    }
+
+    fun stop() {
+        val manager = nsd ?: return
+        synchronized(lock) {
+            if (!started) return
+            started = false
+            pendingResolves.clear()
+            resolving = false
+            activeCallbacks.keys.toList().forEach { removeCallbackLocked(it) }
+            val listener = discoveryListener
+            discoveryListener = null
+            if (listener != null) {
+                try {
+                    manager.stopServiceDiscovery(listener)
+                } catch (_: RuntimeException) {
+                }
+            }
+        }
+    }
+
+    private fun resolve(info: NsdServiceInfo) {
+        val manager = nsd ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            val key = info.serviceName ?: return
+            synchronized(lock) {
+                if (!started) return
+                removeCallbackLocked(key)
+                val cb = object : NsdManager.ServiceInfoCallback {
+                    @Volatile var lastEndpoint: String? = null
+
+                    override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) = Unit
+
+                    override fun onServiceUpdated(updated: NsdServiceInfo) {
+                        val ep = handleResolved(updated, lastEndpoint)
+                        if (ep != null) lastEndpoint = ep
+                    }
+
+                    override fun onServiceLost() {
+                        synchronized(lock) {
+                            val ep = lastEndpoint
+                            if (ep != null && byEndpoint.remove(ep) != null) {
+                                publishLocked()
+                            }
+                        }
+                    }
+
+                    override fun onServiceInfoCallbackUnregistered() = Unit
+                }
+                try {
+                    manager.registerServiceInfoCallback(info, executor, cb)
+                    activeCallbacks[key] = cb
+                } catch (_: RuntimeException) {
+                }
+            }
+        } else {
+            synchronized(lock) {
+                if (!started) return
+                pendingResolves.addLast(info)
+                if (!resolving) drainResolveQueueLocked()
+            }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun drainResolveQueueLocked() {
+        val manager = nsd ?: return
+        if (!started || pendingResolves.isEmpty()) {
+            resolving = false
+            return
+        }
+        val next = pendingResolves.removeFirst()
+        resolving = true
+        try {
+            manager.resolveService(next, object : NsdManager.ResolveListener {
+                override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                    synchronized(lock) { drainResolveQueueLocked() }
+                }
+
+                override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
+                    handleResolved(serviceInfo, null)
+                    synchronized(lock) { drainResolveQueueLocked() }
+                }
+            })
+        } catch (_: RuntimeException) {
+            resolving = false
+        }
+    }
+
+    private fun handleResolved(info: NsdServiceInfo, previousEndpoint: String?): String? {
+        val addrs = ArrayList<InetAddress>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            addrs.addAll(info.hostAddresses)
+        }
+        @Suppress("DEPRECATION")
+        info.host?.let { addrs.add(it) }
+        val addr = HostDiscovery.chooseAddress(addrs) ?: return null
+        val port = info.port
+        if (port !in 1..65535) return null
+        val txt = LinkedHashMap<String, String?>()
+        info.attributes?.forEach { (k, v) ->
+            txt[k] = v?.let { String(it, StandardCharsets.UTF_8) }
+        }
+        val svc = DiscoveredLanService(
+            serviceType = serviceType,
+            serviceName = info.serviceName?.takeIf { it.isNotBlank() } ?: addr,
+            address = addr,
+            port = port,
+            txt = txt,
+        )
+        synchronized(lock) {
+            if (!started) return null
+            if (previousEndpoint != null && previousEndpoint != svc.endpointKey) {
+                byEndpoint.remove(previousEndpoint)
+            }
+            byEndpoint[svc.endpointKey] = svc
+            publishLocked()
+        }
+        return svc.endpointKey
+    }
+
+    private fun removeCallbackLocked(key: String) {
+        val cb = activeCallbacks.remove(key) ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            try {
+                nsd?.unregisterServiceInfoCallback(cb as NsdManager.ServiceInfoCallback)
+            } catch (_: RuntimeException) {
+            }
+        }
+    }
+
+    private fun publishLocked() {
+        _services.value = byEndpoint.values.toList()
+    }
+
+    companion object {
+        fun normalizeServiceType(raw: String): String =
+            raw.trim().removeSuffix(".local.").removeSuffix(".local").removeSuffix(".")
+    }
+}

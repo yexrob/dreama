@@ -66,6 +66,7 @@ private enum class SettingsCategory(
     val subRes: Int,
     val icon: ImageVector,
 ) {
+    SOURCES(R.string.settings_cat_sources, R.string.settings_cat_sources_sub, WallIcons.Server),
     STREAM(R.string.settings_cat_stream, R.string.settings_cat_stream_sub, WallIcons.Computer),
     PLAYBACK_3D(R.string.settings_cat_3d, R.string.settings_cat_3d_sub, WallIcons.Eye),
     SCREEN_ENV(R.string.settings_cat_screen, R.string.settings_cat_screen_sub, WallIcons.Headset),
@@ -86,8 +87,10 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
     val store = remember(context) { AndroidPrefsStore.defaultPrefs(context) }
     val isGen1 = remember { PreferenceConfiguration.isXr2Gen1Headset() }
 
-    var selectedCategory by rememberSaveable { mutableStateOf(SettingsCategory.STREAM) }
+    var selectedCategory by rememberSaveable { mutableStateOf(SettingsCategory.SOURCES) }
     var snapshot by remember { mutableStateOf(StreamSettingsMapper.read(store, isGen1)) }
+    val sourcesList by model.sources.collectAsState()
+    val installedPlugins by model.installedPlugins.collectAsState()
     val dlna by CastReceiver.status.collectAsState()
     var showRenameSheet by remember { mutableStateOf(false) }
     var showLicenseSheet by remember { mutableStateOf(false) }
@@ -139,6 +142,43 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
             }
 
             when (selectedCategory) {
+                SettingsCategory.SOURCES -> {
+                    item("sources-manage") {
+                        SettingRow(
+                            title = stringResource(R.string.sources_tab_sources),
+                            sub = stringResource(R.string.settings_sources_summary_sources, sourcesList.size),
+                        ) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                WallButton(
+                                    text = stringResource(R.string.sources_add_source_btn),
+                                    onClick = { nav.openAddSource() },
+                                    icon = WallIcons.Plus,
+                                    kind = ButtonKind.Primary,
+                                    small = true,
+                                )
+                                WallButton(
+                                    text = stringResource(R.string.settings_sources_open_btn),
+                                    onClick = { nav.openSources(SourcesTab.SOURCES) },
+                                    small = true,
+                                )
+                            }
+                        }
+                    }
+                    item("plugins-manage") {
+                        SettingRow(
+                            title = stringResource(R.string.sources_tab_plugins),
+                            sub = stringResource(R.string.settings_sources_summary_plugins, installedPlugins.size),
+                        ) {
+                            WallButton(
+                                text = stringResource(R.string.sources_tab_plugins),
+                                onClick = { nav.openSources(SourcesTab.PLUGINS) },
+                                icon = WallIcons.Cube,
+                                small = true,
+                            )
+                        }
+                    }
+                }
+
                 SettingsCategory.STREAM -> {
                     item("res") {
                         SettingRow(

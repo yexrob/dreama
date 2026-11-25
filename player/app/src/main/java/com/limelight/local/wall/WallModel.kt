@@ -17,7 +17,10 @@ import com.limelight.local.media.WebDavSource
 import com.limelight.local.plugin.InstalledPluginEntity
 import com.limelight.local.plugin.PluginInstanceEntity
 import com.limelight.local.plugin.PluginLogEntry
+import com.limelight.local.plugin.PluginManifest
 import com.limelight.local.plugin.PluginMediaSource
+import com.limelight.local.plugin.PluginRepoEntity
+import com.limelight.local.plugin.PluginRepoIndex
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -74,6 +77,9 @@ class WallModel(app: Application) : AndroidViewModel(app) {
         pluginHost.database.pluginInstances().observeAll()
             .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
+    private val _pluginRepos = MutableStateFlow<List<PluginRepoEntity>>(emptyList())
+    val pluginRepos: StateFlow<List<PluginRepoEntity>> get() = _pluginRepos
+
     val shelves = mutableStateMapOf<String, Load<List<Shelf>>>()
 
     /** A WebDAV server found on the network while none is set up yet. */
@@ -93,12 +99,14 @@ class WallModel(app: Application) : AndroidViewModel(app) {
         refreshAll()
         viewModelScope.launch {
             pluginHost.awaitBuiltInReady()
+            refreshPluginRepos()
             combine(
                 pluginHost.database.pluginPackages().observeAll(),
                 pluginHost.database.pluginInstances().observeAll(),
                 pluginHost.changes,
             ) { pkgs, insts, _ -> pkgs to insts }
                 .collect { (pkgs, insts) ->
+                    refreshPluginRepos()
                     val reconciled = pluginManager.reconcile(pkgs, insts)
                     reconciled.removedSourceIds.forEach { shelves.remove(it) }
                     pluginSources.value = reconciled.sources
@@ -166,6 +174,75 @@ class WallModel(app: Application) : AndroidViewModel(app) {
     fun recentLogsForPlugin(pluginId: String): List<PluginLogEntry> = pluginHost.recentLogs(pluginId)
 
     fun clearLogsForPlugin(pluginId: String) = pluginHost.clearLogs(pluginId)
+
+    fun localizedManifestFor(entity: InstalledPluginEntity): PluginManifest =
+        runCatching { pluginHost.localizeManifest(entity) }
+            .getOrElse { com.limelight.local.plugin.ManifestParser.parseAndValidate(entity.manifestJson) }
+
+    suspend fun refreshPluginRepos() {
+        _pluginRepos.value = withContext(Dispatchers.IO) {
+            pluginHost.database.pluginRepos().listAll()
+        }
+    }
+
+    suspend fun syncPluginRepo(url: String): PluginRepoIndex {
+        val index = withContext(Dispatchers.IO) {
+            pluginHost.packageManager.syncRepository(url.trim())
+        }
+        refreshPluginRepos()
+        pluginHost.notifyChanged()
+        return index
+    }
+
+    suspend fun removePluginRepo(url: String) {
+        withContext(Dispatchers.IO) {
+            pluginHost.database.pluginRepos().delete(url)
+        }
+        refreshPluginRepos()
+        pluginHost.notifyChanged()
+    }
+
+    suspend fun setPluginEnabled(pluginId: String, enabled: Boolean) {
+        withContext(Dispatchers.IO) {
+            pluginHost.packageManager.setPluginEnabled(pluginId, enabled)
+        }
+        pluginHost.notifyChanged()
+    }
+
+    suspend fun confirmPluginPermissions(pluginId: String) {
+        withContext(Dispatchers.IO) {
+            pluginHost.packageManager.confirmPermissions(pluginId)
+        }
+        pluginHost.notifyChanged()
+    }
+
+    suspend fun uninstallPlugin(entity: InstalledPluginEntity) {
+        val strings = com.limelight.local.stream.AndroidStringLookup(getApplication())
+        withContext(Dispatchers.IO) {
+            PluginInstallGuard.uninstallIfAllowed(pluginHost.packageManager, entity, strings)
+        }
+        pluginHost.notifyChanged()
+    }
+
+    suspend fun deletePluginInstance(instanceId: String) {
+        withContext(Dispatchers.IO) {
+            pluginHost.packageManager.deleteInstance(instanceId)
+        }
+        shelves.remove(PluginMediaSource.sourceIdFor(instanceId))
+        pluginHost.notifyChanged()
+    }
+
+    suspend fun renamePluginInstance(instanceId: String, newName: String) {
+        withContext(Dispatchers.IO) {
+            val cfg = pluginHost.packageManager.getInstanceConfig(instanceId)
+            pluginHost.packageManager.updateInstanceConfig(
+                instanceId = instanceId,
+                displayName = newName.trim(),
+                config = cfg,
+            )
+        }
+        pluginHost.notifyChanged()
+    }
 
     fun progress(sourceId: String, itemId: String): Flow<WatchProgress?> =
         WallDatabase.get(getApplication()).progress().observe(sourceId, itemId)

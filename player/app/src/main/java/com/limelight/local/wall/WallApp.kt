@@ -58,6 +58,18 @@ sealed interface Page {
     data class Detail(val sourceId: String, val item: Item) : Page
     data class PcApps(val computer: StreamingComputer) : Page
     data object Settings : Page
+    data class Sources(val initialTab: SourcesTab = SourcesTab.SOURCES) : Page
+    data object AddSource : Page
+    data class PluginForm(
+        val pluginId: String,
+        val instanceId: String? = null,
+        val prefillServerUrl: String? = null,
+        val suggestedName: String? = null,
+        val reloginOnly: Boolean = false,
+    ) : Page
+    data class SourceEdit(val instanceId: String) : Page
+    data class PluginDetail(val pluginId: String) : Page
+    data class RepoBrowse(val repoUrl: String) : Page
 }
 
 /** The pages and the moves between them, shared by every screen. */
@@ -74,6 +86,8 @@ class WallNav(
         private set
     var refreshSignal by mutableIntStateOf(0)
         private set
+    var pendingLibrarySourceId by mutableStateOf<String?>(null)
+        private set
 
     val top: Page get() = stack.last()
 
@@ -86,6 +100,17 @@ class WallNav(
         stack.clear()
         kept.clear()
         stack += Page.Tabs(t)
+    }
+
+    fun openLibrarySelecting(sourceId: String) {
+        pendingLibrarySourceId = sourceId
+        tab(Tab.Library)
+    }
+
+    fun consumePendingLibrarySourceId(): String? {
+        val v = pendingLibrarySourceId
+        pendingLibrarySourceId = null
+        return v
     }
 
     fun open(p: Page) {
@@ -139,24 +164,67 @@ class WallNav(
 
     fun openSettings() = open(Page.Settings)
 
+    fun openSources(initialTab: SourcesTab = SourcesTab.SOURCES) = open(Page.Sources(initialTab))
+
+    fun openAddSource() = open(Page.AddSource)
+
+    fun openPluginForm(
+        pluginId: String,
+        instanceId: String? = null,
+        prefillServerUrl: String? = null,
+        suggestedName: String? = null,
+        reloginOnly: Boolean = false,
+    ) = open(Page.PluginForm(pluginId, instanceId, prefillServerUrl, suggestedName, reloginOnly))
+
+    fun openSourceEdit(instanceId: String) = open(Page.SourceEdit(instanceId))
+
+    fun openPluginDetail(pluginId: String) = open(Page.PluginDetail(pluginId))
+
+    fun openRepoBrowse(repoUrl: String) = open(Page.RepoBrowse(repoUrl))
+
     fun openPcApps(computer: StreamingComputer) = open(Page.PcApps(computer))
 
     fun pluginLogin(source: MediaSource) {
-        openSettings()
+        val pluginId = model.pluginIdForSource(source)
+        val instanceId = (source as? PluginMediaSource)?.instanceId
+            ?: source.source.id.removePrefix(PluginHost.PLUGIN_SOURCE_PREFIX).takeIf { it != source.source.id }
+        if (pluginId != null && instanceId != null) {
+            openPluginForm(pluginId = pluginId, instanceId = instanceId, reloginOnly = true)
+        } else {
+            openSources()
+        }
     }
 
     fun pluginSettings(source: MediaSource) {
-        openSettings()
+        val pluginId = model.pluginIdForSource(source)
+        val pkg = pluginId?.let { id -> model.installedPlugins.value.firstOrNull { it.pluginId == id } }
+        if (pkg != null && pkg.needsPermissionReconfirm) {
+            openPluginDetail(pkg.pluginId)
+            return
+        }
+        val instanceId = (source as? PluginMediaSource)?.instanceId
+            ?: source.source.id.removePrefix(PluginHost.PLUGIN_SOURCE_PREFIX).takeIf { it != source.source.id }
+        if (instanceId != null) {
+            openSourceEdit(instanceId)
+        } else {
+            openSources()
+        }
     }
 
     fun pluginLogs(source: MediaSource) {
         val pluginId = model.pluginIdForSource(source) ?: return
+        openPluginLogs(pluginId)
+    }
+
+    fun openPluginLogs(pluginId: String) {
         pluginLogsSheet = pluginId to model.pluginDisplayName(pluginId)
     }
 
     fun closePluginLogs() {
         pluginLogsSheet = null
     }
+
+    fun toast(text: String) = actions.toast(text)
 
     fun disablePlugin(source: MediaSource) {
         scope.launch {
@@ -256,6 +324,12 @@ fun WallApp(model: WallModel, actions: WallActions, pendingTab: StateFlow<Tab?>)
                     is Page.Detail -> DetailScreen(model, nav, page)
                     is Page.PcApps -> PcAppsScreen(model, nav, page)
                     Page.Settings -> SettingsScreen(model, nav)
+                    is Page.Sources -> SourcesScreen(model, nav, page.initialTab)
+                    Page.AddSource -> AddSourceScreen(model, nav)
+                    is Page.PluginForm -> PluginFormScreen(model, nav, page)
+                    is Page.SourceEdit -> SourceEditScreen(model, nav, page)
+                    is Page.PluginDetail -> PluginDetailScreen(model, nav, page)
+                    is Page.RepoBrowse -> RepoBrowseScreen(model, nav, page)
                 }
             }
             nav.webDavSheet?.let { WebDavSheet(model, nav, it) }

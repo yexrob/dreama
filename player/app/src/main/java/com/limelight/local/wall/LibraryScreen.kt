@@ -108,6 +108,12 @@ fun LibraryScreen(model: WallModel, nav: WallNav) {
     val sources by model.sources.collectAsState()
     val found by model.discovered.collectAsState()
     var selectedId by rememberSaveable { mutableStateOf(LocalVideoSource.ID) }
+    val pendingSelected = nav.pendingLibrarySourceId
+    LaunchedEffect(pendingSelected) {
+        if (pendingSelected != null) {
+            selectedId = nav.consumePendingLibrarySourceId() ?: selectedId
+        }
+    }
     val selected = sources.firstOrNull { it.source.id == selectedId } ?: sources.firstOrNull()
     val listing = rememberListing(nav, Page.Tabs(Tab.Library), selected, MediaSource.ROOT)
 
@@ -139,8 +145,19 @@ fun LibraryScreen(model: WallModel, nav: WallNav) {
                     lead = WallIcons.Plus) { nav.editWebDav(found) }
             }
         }
-        Box(Modifier.offset(64.dp, 620.dp)) {
-            WallButton(stringResource(R.string.library_manage_sources), { nav.editWebDav(found) }, icon = WallIcons.Gear, kind = ButtonKind.Ghost, small = true)
+        Row(
+            Modifier.offset(64.dp, 620.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            WallButton(
+                stringResource(R.string.library_add_source),
+                { nav.openAddSource() },
+                icon = WallIcons.Plus,
+                kind = ButtonKind.Plain,
+                small = true,
+            )
+            RoundButton(WallIcons.Gear, { nav.openSources() }, filled = true)
         }
         if (selected != null) {
             Column(Modifier.offset(488.dp, 120.dp)) {

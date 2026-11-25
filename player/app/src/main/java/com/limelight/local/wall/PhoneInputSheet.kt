@@ -181,12 +181,18 @@ fun PhoneInputSheet(
     }
 
     val title = stringResource(
-        if (mode == PhoneInputServer.Mode.ADD_COMPUTER) R.string.phone_input_add_pc_title
-        else R.string.phone_input_device_name_title,
+        when (mode) {
+            PhoneInputServer.Mode.ADD_COMPUTER -> R.string.phone_input_add_pc_title
+            PhoneInputServer.Mode.DEVICE_NAME -> R.string.phone_input_device_name_title
+            PhoneInputServer.Mode.PLUGIN_REPO -> R.string.phone_input_repo_title
+        },
     )
     val sub = stringResource(
-        if (mode == PhoneInputServer.Mode.ADD_COMPUTER) R.string.phone_input_add_pc_sub
-        else R.string.phone_input_device_name_sub,
+        when (mode) {
+            PhoneInputServer.Mode.ADD_COMPUTER -> R.string.phone_input_add_pc_sub
+            PhoneInputServer.Mode.DEVICE_NAME -> R.string.phone_input_device_name_sub
+            PhoneInputServer.Mode.PLUGIN_REPO -> R.string.phone_input_repo_sub
+        },
     )
 
     Box(
@@ -294,12 +300,18 @@ fun PhoneInputSheet(
                 }
             } else {
                 val fieldLabel = stringResource(
-                    if (mode == PhoneInputServer.Mode.ADD_COMPUTER) R.string.phone_input_addr_label
-                    else R.string.phone_input_name_label,
+                    when (mode) {
+                        PhoneInputServer.Mode.ADD_COMPUTER -> R.string.phone_input_addr_label
+                        PhoneInputServer.Mode.DEVICE_NAME -> R.string.phone_input_name_label
+                        PhoneInputServer.Mode.PLUGIN_REPO -> R.string.phone_input_repo_label
+                    },
                 )
                 val placeholder = stringResource(
-                    if (mode == PhoneInputServer.Mode.ADD_COMPUTER) R.string.phone_input_addr_placeholder
-                    else R.string.phone_input_name_placeholder,
+                    when (mode) {
+                        PhoneInputServer.Mode.ADD_COMPUTER -> R.string.phone_input_addr_placeholder
+                        PhoneInputServer.Mode.DEVICE_NAME -> R.string.phone_input_name_placeholder
+                        PhoneInputServer.Mode.PLUGIN_REPO -> R.string.phone_input_repo_placeholder
+                    },
                 )
                 Column(Modifier.padding(top = 28.dp)) {
                     Text(fieldLabel, style = WallType.Caption, color = Wall.Text2)
@@ -308,7 +320,7 @@ fun PhoneInputSheet(
                         modifier = Modifier.padding(top = 8.dp).fillMaxWidth(),
                         textStyle = WallType.Body,
                         keyboardOptions = KeyboardOptions(
-                            keyboardType = if (mode == PhoneInputServer.Mode.ADD_COMPUTER) KeyboardType.Uri else KeyboardType.Text,
+                            keyboardType = if (mode == PhoneInputServer.Mode.DEVICE_NAME) KeyboardType.Text else KeyboardType.Uri,
                             autoCorrectEnabled = false,
                             imeAction = ImeAction.Done,
                         ),
@@ -354,7 +366,7 @@ fun PhoneInputSheet(
                 if (useHeadsetKeyboard) {
                     WallButton(
                         text = if (busy) stringResource(R.string.phone_input_connecting)
-                        else stringResource(if (mode == PhoneInputServer.Mode.ADD_COMPUTER) R.string.action_add else R.string.action_save),
+                        else stringResource(if (mode == PhoneInputServer.Mode.DEVICE_NAME) R.string.action_save else R.string.action_add),
                         onClick = { triggerSubmitFromKeyboard(textFieldState.text.toString()) },
                         kind = ButtonKind.Primary,
                     )
