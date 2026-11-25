@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import dgram from 'node:dgram';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,7 +8,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { checkPlugin, loadPluginSource } from '../src/check.js';
-import { main as cliMain } from '../src/cli.js';
+import { main as cliMain, parseArgs as cliParseArgs } from '../src/cli.js';
 import { CookieJarQuotaExceededError, PluginCookieJar } from '../src/cookies.js';
 import { pluginCrypto } from '../src/crypto.js';
 import { FetchGateway, FetchResponseTooLargeError } from '../src/fetch-gateway.js';
@@ -16,7 +17,16 @@ import { NetworkPolicy, NetworkPolicyError } from '../src/network-policy.js';
 import { inspectArchiveBuffer, packPluginToBuffer, packPluginToFile, sha256Hex } from '../src/pack.js';
 import { PluginCallError, QuickJsPluginHost } from '../src/runtime.js';
 import { SCHEMA_DIR, validateManifest, validateProtocolType, validateRepository } from '../src/schema.js';
-import { startDevServer } from '../src/serve.js';
+import {
+  DEV_DISCOVERY_PORT,
+  DEV_DISCOVERY_PROBE,
+  MAX_DISCOVERY_NAME_CHARS,
+  MAX_DISCOVERY_REPLY_BYTES,
+  UdpRateLimiter,
+  buildDiscoveryReplyFromManifest,
+  isPrivateDiscoveryAddress,
+  startDevServer,
+} from '../src/serve.js';
 import { PluginStorage } from '../src/storage.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1965,5 +1975,379 @@ test('manifest discover accepts mDNS service types and built-in udp:jellyfin/udp
   for (const bad of ['udp:custom', 'udp:1234', 'udp:', 'http://192.168.1.1', 'jellyfin._tcp', 'tcp:jellyfin']) {
     const res = validateManifest(makeWithDiscover(bad));
     assert.equal(res.valid, false, `expected discover='${bad}' to be rejected`);
+  }
+});
+
+test('d3plugin serve UDP discovery answers private probes with {name,id,version,port}, honors --no-discover, and restricts HTTP paths', async () => {
+  assert.notEqual(DEV_DISCOVERY_PORT, 7359, 'UDP discovery port must not occupy Jellyfin/Emby 7359');
+
+  // 1. Strict RFC1918 / IPv6 ULA filter for UDP discovery source addresses
+  for (const allowed of ['192.168.1.20', '10.0.0.5', '172.16.0.1', '172.31.255.254', '::ffff:192.168.1.42', 'fd00::1', 'fc12:3456::1']) {
+    assert.equal(isPrivateDiscoveryAddress(allowed, false), true, `Expected ${allowed} to be accepted`);
+  }
+  for (const blocked of ['127.0.0.1', '::1', '169.254.1.10', 'fe80::1', '8.8.8.8', '1.1.1.1', '100.64.0.1', '198.18.0.1', '224.0.0.1', '2001:4860:4860::8888', '0.0.0.0', '']) {
+    assert.equal(isPrivateDiscoveryAddress(blocked, false), false, `Expected ${blocked} to be rejected`);
+  }
+  assert.equal(isPrivateDiscoveryAddress('127.0.0.1', true), true);
+
+  function sendUdpProbe(port, payload, timeoutMs = 400) {
+    return new Promise((resolve) => {
+      const sock = dgram.createSocket('udp4');
+      let done = false;
+      const finish = (val) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        try { sock.close(); } catch {}
+        resolve(val);
+      };
+      const timer = setTimeout(() => finish(null), timeoutMs);
+      sock.on('message', (msg) => finish(msg.toString('utf8')));
+      sock.send(Buffer.from(payload, 'utf8'), port, '127.0.0.1');
+    });
+  }
+
+  // 2. Production default rejects loopback probes (only private LAN addresses get replies)
+  const prodSrv = await startDevServer(REF_PLUGIN_DIR, {
+    host: '127.0.0.1',
+    port: 0,
+    discover: true,
+    discoverPort: 0,
+    allowLoopbackDiscoveryForTesting: false,
+  });
+  try {
+    assert.equal(prodSrv.discoverEnabled, true);
+    assert.ok(prodSrv.discoverPort > 0);
+    const ignored = await sendUdpProbe(prodSrv.discoverPort, DEV_DISCOVERY_PROBE, 250);
+    assert.equal(ignored, null, 'Loopback probe must be ignored when allowLoopbackDiscoveryForTesting is false');
+
+    // HTTP restricts strictly to /, /index.json, /manifest.json, /plugin.d3plugin, /health
+    for (const forbiddenPath of ['/main.js', '/locales/zh-CN.json', '/../package.json', '/etc/passwd']) {
+      const r = await fetch(`http://127.0.0.1:${prodSrv.port}${forbiddenPath}`);
+      assert.equal(r.status, 404, `Expected 404 for ${forbiddenPath}`);
+    }
+    const health = await fetch(`http://127.0.0.1:${prodSrv.port}/health`);
+    assert.equal(health.status, 200);
+  } finally {
+    await prodSrv.close();
+  }
+
+  // 3. Valid probe returns localized JSON {name, id, version, port}; unknown probe string is ignored
+  const testSrv = await startDevServer(REF_PLUGIN_DIR, {
+    host: '127.0.0.1',
+    port: 0,
+    discover: true,
+    discoverPort: 0,
+    allowLoopbackDiscoveryForTesting: true,
+  });
+  try {
+    const rawReply = await sendUdpProbe(testSrv.discoverPort, DEV_DISCOVERY_PROBE, 1000);
+    assert.ok(rawReply, 'Expected UDP discovery JSON reply');
+    const parsed = JSON.parse(rawReply);
+    assert.equal(parsed.id, 'dev.depth3d.reference');
+    assert.equal(parsed.version, '1.0.0');
+    assert.equal(parsed.port, testSrv.port);
+    assert.ok(parsed.name && !parsed.name.startsWith('$t:'), `Expected localized plugin name, got ${parsed.name}`);
+
+    const wrongProbe = await sendUdpProbe(testSrv.discoverPort, 'who is JellyfinServer?', 250);
+    assert.equal(wrongProbe, null, 'Wrong probe string must be ignored');
+  } finally {
+    await testSrv.close();
+  }
+
+  // 4. discover: false (--no-discover) disables UDP discovery responder completely
+  const noDiscSrv = await startDevServer(REF_PLUGIN_DIR, {
+    host: '127.0.0.1',
+    port: 0,
+    discover: false,
+  });
+  try {
+    assert.equal(noDiscSrv.discoverEnabled, false);
+    assert.equal(noDiscSrv.discoverPort, null);
+  } finally {
+    await noDiscSrv.close();
+  }
+});
+
+test('d3plugin serve UDP discovery caches reply at startup, enforces payload cap, and rate-limits', async () => {
+  // 1. UdpRateLimiter enforces per-source-IP and global caps cleanly across time windows
+  const limiter = new UdpRateLimiter({ windowMs: 1000, maxPerIp: 2, maxGlobal: 3, maxTrackedIps: 10 });
+  assert.equal(limiter.allow('192.168.1.10', 1000), true);
+  assert.equal(limiter.allow('192.168.1.10', 1010), true);
+  assert.equal(limiter.allow('192.168.1.10', 1020), false, '3rd probe from same IP within window must be dropped');
+  assert.equal(limiter.allow('192.168.1.11', 1030), true, 'Other IP still allowed under global cap');
+  assert.equal(limiter.allow('192.168.1.12', 1040), false, '4th probe hits global cap');
+  assert.equal(limiter.allow('192.168.1.10', 2100), true, 'Window reset allows probing again');
+
+  // 2. Oversized plugin name is truncated and total reply JSON stays <= MAX_DISCOVERY_REPLY_BYTES;
+  //    oversized id or version that still exceeds 512 bytes MUST return null (never reply > 512 bytes).
+  const hugeName = '超长插件名称测试'.repeat(60);
+  const capped = buildDiscoveryReplyFromManifest(
+    { id: 'com.example.longname', name: hugeName, version: '1.0.0' },
+    8787,
+  );
+  assert.ok(capped !== null);
+  assert.ok(Array.from(capped.name).length <= MAX_DISCOVERY_NAME_CHARS);
+  assert.ok(capped.name.endsWith('…'));
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(capped), 'utf8') <= MAX_DISCOVERY_REPLY_BYTES,
+    'Encoded discovery reply must not exceed MAX_DISCOVERY_REPLY_BYTES',
+  );
+
+  // Oversized `id` (> 512 bytes even when `name` is trimmed empty) -> MUST return null
+  const hugeId = `com.example.${'a'.repeat(520)}`;
+  assert.equal(
+    buildDiscoveryReplyFromManifest({ id: hugeId, name: 'Long ID', version: '1.0.0' }, 8787),
+    null,
+    'Manifest with oversized id exceeding 512 bytes must return null instead of replying > 512 bytes',
+  );
+
+  // Oversized `version` (> 512 bytes even when `name` is trimmed empty) -> MUST return null
+  const hugeVersion = `1.0.0-${'v'.repeat(520)}`;
+  assert.equal(
+    buildDiscoveryReplyFromManifest({ id: 'com.example.longver', name: 'Long Ver', version: hugeVersion }, 8787),
+    null,
+    'Manifest with oversized version exceeding 512 bytes must return null instead of replying > 512 bytes',
+  );
+
+  // Borderline `id` (e.g. 460 bytes): `name` shrinks to fit strictly <= 512 bytes without falling back to huge id
+  const borderlineId = `com.example.${'b'.repeat(440)}`;
+  const borderlineReply = buildDiscoveryReplyFromManifest(
+    { id: borderlineId, name: 'Borderline Plugin Name That Must Shrink', version: '1.0.0' },
+    8787,
+  );
+  assert.ok(borderlineReply !== null);
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(borderlineReply), 'utf8') <= MAX_DISCOVERY_REPLY_BYTES,
+    'Borderline id reply must remain strictly <= 512 bytes',
+  );
+
+  // 3. Cached startup reply (zero per-packet disk reads) + live UDP per-IP rate limiting
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'd3-serve-cache-'));
+  try {
+    fs.writeFileSync(
+      path.join(tmpDir, 'manifest.json'),
+      JSON.stringify({
+        api: 1,
+        id: 'com.example.cached',
+        name: 'Cached Plugin',
+        version: '1.0.0',
+        permissions: { hosts: [], userHosts: false, lan: false },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.js'),
+      'export default { home(){return []}, browse(){return {items:[]}}, detail(){return {id:"1",kind:"movie",title:"1"}}, playback(){return {url:"https://example.com/1.mp4"}} };',
+    );
+
+    const srv = await startDevServer(tmpDir, {
+      host: '127.0.0.1',
+      port: 0,
+      discover: true,
+      discoverPort: 0,
+      allowLoopbackDiscoveryForTesting: true,
+      discoverMaxPerIp: 2,
+      discoverMaxGlobal: 5,
+      discoverRateWindowMs: 5000,
+    });
+    try {
+      // Delete manifest.json after startup: UDP must STILL reply from in-memory cache without touching disk!
+      fs.unlinkSync(path.join(tmpDir, 'manifest.json'));
+
+      const replies = await new Promise((resolve) => {
+        const sock = dgram.createSocket('udp4');
+        const got = [];
+        sock.on('message', (m) => got.push(JSON.parse(m.toString('utf8'))));
+        sock.bind(0, '127.0.0.1', () => {
+          const probe = Buffer.from(DEV_DISCOVERY_PROBE, 'utf8');
+          // Send 5 probes rapidly -> rate limiter caps replies at discoverMaxPerIp (2)
+          for (let i = 0; i < 5; i++) {
+            sock.send(probe, srv.discoverPort, '127.0.0.1');
+          }
+          setTimeout(() => {
+            try { sock.close(); } catch {}
+            resolve(got);
+          }, 300);
+        });
+      });
+
+      assert.equal(replies.length, 2, `Expected exactly 2 rate-limited replies, got ${replies.length}`);
+      assert.equal(replies[0].id, 'com.example.cached');
+      assert.equal(replies[0].name, 'Cached Plugin');
+    } finally {
+      await srv.close();
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('d3plugin serve refreshes UDP discovery cache on manifest edit without HTTP and suppresses >512B live replies', async () => {
+  function sendSingleProbe(port, timeoutMs = 400) {
+    return new Promise((resolve) => {
+      const sock = dgram.createSocket('udp4');
+      let done = false;
+      const finish = (val) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        try { sock.close(); } catch {}
+        resolve(val);
+      };
+      const timer = setTimeout(() => finish(null), timeoutMs);
+      sock.on('message', (msg) => finish(msg));
+      sock.send(Buffer.from(DEV_DISCOVERY_PROBE, 'utf8'), port, '127.0.0.1');
+    });
+  }
+
+  // 1. Live UDP responder suppresses replies when manifest id exceeds 512 bytes
+  const hugeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'd3-serve-huge-'));
+  try {
+    fs.writeFileSync(
+      path.join(hugeDir, 'manifest.json'),
+      JSON.stringify({
+        api: 1,
+        id: `com.example.${'x'.repeat(520)}`,
+        name: 'Huge ID',
+        version: '1.0.0',
+        permissions: { hosts: [], userHosts: false, lan: false },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(hugeDir, 'main.js'),
+      'export default { home(){return []}, browse(){return {items:[]}}, detail(){return {id:"1",kind:"movie",title:"1"}}, playback(){return {url:"https://example.com/1.mp4"}} };',
+    );
+    const hugeSrv = await startDevServer(hugeDir, {
+      host: '127.0.0.1',
+      port: 0,
+      discover: true,
+      discoverPort: 0,
+      allowLoopbackDiscoveryForTesting: true,
+    });
+    try {
+      const reply = await sendSingleProbe(hugeSrv.discoverPort, 250);
+      assert.equal(reply, null, 'Server MUST NOT send a UDP discovery reply exceeding 512 bytes');
+    } finally {
+      await hugeSrv.close();
+    }
+  } finally {
+    fs.rmSync(hugeDir, { recursive: true, force: true });
+  }
+
+  // 2. Editing manifest.json on disk (WITHOUT hitting HTTP) lazily refreshes cached UDP reply
+  //    Test BOTH with fs.watch disabled (pure throttled async mtime path) AND with fs.watch enabled.
+  for (const useWatch of [false, true]) {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `d3-serve-refresh-${useWatch ? 'w' : 'm'}-`));
+    try {
+      const manifestFile = path.join(tmpDir, 'manifest.json');
+      const writeManifest = (version, name) => {
+        fs.writeFileSync(
+          manifestFile,
+          JSON.stringify({
+            api: 1,
+            id: 'com.example.refresh',
+            name,
+            version,
+            permissions: { hosts: [], userHosts: false, lan: false },
+          }),
+        );
+      };
+      writeManifest('1.0.0', 'Before Edit');
+      fs.writeFileSync(
+        path.join(tmpDir, 'main.js'),
+        'export default { home(){return []}, browse(){return {items:[]}}, detail(){return {id:"1",kind:"movie",title:"1"}}, playback(){return {url:"https://example.com/1.mp4"}} };',
+      );
+
+      const srv = await startDevServer(tmpDir, {
+        host: '127.0.0.1',
+        port: 0,
+        discover: true,
+        discoverPort: 0,
+        allowLoopbackDiscoveryForTesting: true,
+        discoverWatch: useWatch,
+        discoverRefreshIntervalMs: 30,
+        discoverMaxPerIp: 20,
+        discoverMaxGlobal: 50,
+      });
+      try {
+        const firstRaw = await sendSingleProbe(srv.discoverPort, 500);
+        assert.ok(firstRaw);
+        const first = JSON.parse(firstRaw.toString('utf8'));
+        assert.equal(first.version, '1.0.0');
+        assert.equal(first.name, 'Before Edit');
+
+        // Wait slightly so filesystem mtime advances distinctly, then overwrite manifest.json
+        await new Promise((r) => setTimeout(r, 60));
+        writeManifest('2.1.0', 'After Edit');
+        const futureSec = (Date.now() + 2000) / 1000;
+        fs.utimesSync(manifestFile, futureSec, futureSec);
+
+        // Probe until the async refresh swaps the cached reply (NO HTTP requests made!)
+        let updated = null;
+        for (let attempt = 0; attempt < 15; attempt++) {
+          await new Promise((r) => setTimeout(r, 60));
+          const raw = await sendSingleProbe(srv.discoverPort, 400);
+          if (raw) {
+            const parsed = JSON.parse(raw.toString('utf8'));
+            if (parsed.version === '2.1.0' && parsed.name === 'After Edit') {
+              updated = parsed;
+              break;
+            }
+          }
+        }
+        assert.ok(
+          updated,
+          `Expected UDP discovery cache to refresh to 2.1.0 after manifest.json edit (discoverWatch=${useWatch})`,
+        );
+      } finally {
+        await srv.close();
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('CLI parseArgs and subcommands handle --no-discover without breaking run/check/pack', async () => {
+  // --no-discover BEFORE directory must NOT swallow the directory positional
+  const before = cliParseArgs(['serve', '--no-discover', './my-plugin', '--port', '9000']);
+  assert.deepEqual(before.positionals, ['serve', './my-plugin']);
+  assert.equal(before.flags['no-discover'], true);
+  assert.equal(before.flags.port, '9000');
+
+  // --no-discover AFTER directory
+  const after = cliParseArgs(['serve', './my-plugin', '--port', '9001', '--no-discover', '--host', '127.0.0.1']);
+  assert.deepEqual(after.positionals, ['serve', './my-plugin']);
+  assert.equal(after.flags['no-discover'], true);
+  assert.equal(after.flags.port, '9001');
+  assert.equal(after.flags.host, '127.0.0.1');
+
+  // Existing subcommands argument parsing remains intact
+  const runParsed = cliParseArgs([
+    'run', 'browse', './my-plugin', '--category', 'movies',
+    '--filter', 'year=2025', '--filter', 'genre=scifi', '--config', '{"server":"http://192.168.1.2:8096"}',
+  ]);
+  assert.deepEqual(runParsed.positionals, ['run', 'browse', './my-plugin']);
+  assert.equal(runParsed.flags.category, 'movies');
+  assert.deepEqual(runParsed.flags.filter, ['year=2025', 'genre=scifi']);
+  assert.equal(runParsed.flags.config, '{"server":"http://192.168.1.2:8096"}');
+
+  const packParsed = cliParseArgs(['pack', './my-plugin', '-o', '/tmp/out.d3plugin']);
+  assert.deepEqual(packParsed.positionals, ['pack', './my-plugin']);
+  assert.equal(packParsed.flags.o, '/tmp/out.d3plugin');
+
+  const checkParsed = cliParseArgs(['check', './p1', './p2', '--config', '{}']);
+  assert.deepEqual(checkParsed.positionals, ['check', './p1', './p2']);
+  assert.equal(checkParsed.flags.config, '{}');
+
+  // End-to-end CLI invocation of check & pack & run home
+  const tmpOut = path.join(os.tmpdir(), `d3-cli-pack-${Date.now()}.d3plugin`);
+  try {
+    assert.equal(await cliMain(['check', REF_PLUGIN_DIR]), 0);
+    assert.equal(await cliMain(['pack', REF_PLUGIN_DIR, '-o', tmpOut]), 0);
+    assert.equal(fs.existsSync(tmpOut), true);
+    assert.equal(await cliMain(['run', 'home', REF_PLUGIN_DIR]), 0);
+  } finally {
+    if (fs.existsSync(tmpOut)) fs.unlinkSync(tmpOut);
   }
 });

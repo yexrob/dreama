@@ -363,6 +363,12 @@ class PluginMediaSource(
         onLoggedOut?.invoke() ?: Unit
     }
 
+    suspend fun verifyInitialized() = guarded {
+        runtime.verifyInitialized()
+    }
+
+    internal fun collectLiveSecretValues(): List<String> = runtime.collectLiveSecretValues()
+
     suspend fun shutdown() {
         runtime.shutdown()
     }

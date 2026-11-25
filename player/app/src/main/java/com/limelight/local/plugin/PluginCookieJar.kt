@@ -191,6 +191,20 @@ class PluginCookieJar(
         }
     }
 
+    /**
+     * Returns all stored cookie values (length >= 3) for diagnostic & log redaction
+     * without mutating cookie state or flushing to disk.
+     */
+    internal fun allCookieValues(): List<String> = lock.write {
+        runCatching { ensureLoadedLocked() }.onFailure { return@write emptyList() }
+        val out = LinkedHashSet<String>()
+        for (cookie in store.values) {
+            val v = cookie.value.trim()
+            if (v.length >= 3) out += v
+        }
+        out.toList()
+    }
+
     private fun saveStoredCookies(cookies: List<StoredCookie>) {
         if (cookies.isEmpty()) return
         lock.write {

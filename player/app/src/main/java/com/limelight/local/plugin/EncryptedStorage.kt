@@ -3,8 +3,10 @@ package com.limelight.local.plugin
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import java.io.File
 import java.io.IOException
 import java.security.KeyStore
@@ -213,6 +215,20 @@ class InstanceStorage(
         entries.keys.toList()
     }
 
+    /**
+     * Extracts token/credential-like string values stored in `ctx.storage` so logs and
+     * Developer Mode diagnostics redact persisted session tokens and API keys without
+     * mutating storage or throwing on corrupted files.
+     */
+    internal fun allSecretLikeValues(): List<String> = lock.write {
+        runCatching { ensureLoadedLocked() }.onFailure { return@write emptyList() }
+        val out = LinkedHashSet<String>()
+        for ((k, v) in entries) {
+            collectSecretLikeValues(keyName = k, element = v, out = out, depth = 0)
+        }
+        out.toList()
+    }
+
     fun clear() = lock.write {
         entries.clear()
         loaded = true
@@ -263,5 +279,65 @@ class InstanceStorage(
 
     companion object {
         const val MAX_STORAGE_BYTES = 1024 * 1024
+
+        private val SECRET_KEY_REGEX = Regex(
+            "(?i)(token|secret|password|passwd|pwd|auth|session|cookie|api_?key|access_?key|private_?key|secret_?key|sig|signature|jwt|pin|credential|bearer|sessdata|bili_jct|ticket|csrf|xsrf)",
+        )
+        private val JWT_OR_AUTH_VALUE_REGEX = Regex(
+            """^(?:eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|(?:Bearer|Basic|Token)\s+\S{6,})$""",
+        )
+        private val OPAQUE_TOKEN_VALUE_REGEX = Regex("""^[A-Za-z0-9+/=_-]{24,}$""")
+        private val NON_SECRET_LITERALS = setOf("true", "false", "null", "none", "ok")
+
+        private fun collectSecretLikeValues(
+            keyName: String?,
+            element: JsonElement,
+            out: MutableSet<String>,
+            depth: Int,
+        ) {
+            if (depth > 6) return
+            val keyLooksSecret = keyName != null && SECRET_KEY_REGEX.containsMatchIn(keyName)
+            when (element) {
+                is JsonPrimitive -> {
+                    if (!element.isString) return
+                    val v = element.content.trim()
+                    if (v.length < 4 || v.lowercase() in NON_SECRET_LITERALS) return
+                    if (keyLooksSecret || looksLikeSecretTokenValue(v)) {
+                        out += v
+                    }
+                }
+                is JsonObject -> {
+                    for ((childKey, childVal) in element) {
+                        val effectiveKey = if (keyLooksSecret && childKey.isBlank()) keyName else childKey
+                        collectSecretLikeValues(
+                            keyName = if (keyLooksSecret) "${keyName}_$effectiveKey" else effectiveKey,
+                            element = childVal,
+                            out = out,
+                            depth = depth + 1,
+                        )
+                    }
+                }
+                is JsonArray -> {
+                    for (item in element) {
+                        collectSecretLikeValues(
+                            keyName = keyName,
+                            element = item,
+                            out = out,
+                            depth = depth + 1,
+                        )
+                    }
+                }
+            }
+        }
+
+        private fun looksLikeSecretTokenValue(value: String): Boolean {
+            if (JWT_OR_AUTH_VALUE_REGEX.matches(value)) return true
+            if (OPAQUE_TOKEN_VALUE_REGEX.matches(value)) {
+                val hasLetter = value.any { it.isLetter() }
+                val hasDigit = value.any { it.isDigit() }
+                return hasLetter && hasDigit
+            }
+            return false
+        }
     }
 }

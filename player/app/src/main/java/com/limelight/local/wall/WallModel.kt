@@ -249,9 +249,9 @@ class WallModel(app: Application) : AndroidViewModel(app) {
         pluginHost.notifyChanged()
     }
 
-    suspend fun confirmPluginPermissions(pluginId: String) {
+    suspend fun confirmPluginPermissions(pluginId: String, expectedSha256: String? = null) {
         withContext(Dispatchers.IO) {
-            pluginHost.packageManager().confirmPermissions(pluginId)
+            pluginHost.packageManager().confirmPermissions(pluginId, expectedSha256 = expectedSha256)
         }
         pluginHost.notifyChanged()
     }

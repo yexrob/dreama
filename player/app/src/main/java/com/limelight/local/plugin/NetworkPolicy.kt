@@ -48,6 +48,10 @@ class NetworkPolicy(
         InetAddress.getAllByName(host).toList()
     },
     private val requireHttpsAlways: Boolean = false,
+    private val restrictToLanPrivateOnly: Boolean = false,
+    private val pinnedSingleHost: String? = null,
+    private val pinnedSinglePort: Int? = null,
+    private val pinnedSingleScheme: String? = null,
 ) {
     private val normalizedHosts: List<String> = permissions.hosts.map { canonicalizePattern(it) }
     private val normalizedUserHosts: Set<String> = userConfiguredHosts.map { canonicalizeHost(it) }.toSet()
@@ -61,6 +65,14 @@ class NetworkPolicy(
     fun validateFetchUrl(rawUrl: String, previousScheme: String? = null): ValidatedUrl {
         val url = parseAndCheckScheme(rawUrl, previousScheme)
         val host = canonicalizeHost(url.host)
+
+        if (restrictToLanPrivateOnly) {
+            validateDevLanHostAndAddresses(url, host, previousScheme)
+            val addresses = resolveHost(host)
+            checkDevLanAddresses(host, addresses)
+            return ValidatedUrl(url, host, addresses)
+        }
+
         rejectForbiddenHostName(host)
 
         val addresses = resolveHost(host)
@@ -104,6 +116,14 @@ class NetworkPolicy(
     fun validateResourceUrl(rawUrl: String, previousScheme: String? = null): ValidatedUrl {
         val url = parseAndCheckScheme(rawUrl, previousScheme)
         val host = canonicalizeHost(url.host)
+
+        if (restrictToLanPrivateOnly) {
+            validateDevLanHostAndAddresses(url, host, previousScheme)
+            val addresses = resolveHost(host)
+            checkDevLanAddresses(host, addresses)
+            return ValidatedUrl(url, host, addresses)
+        }
+
         rejectForbiddenHostName(host)
 
         val addresses = resolveHost(host)
@@ -185,6 +205,12 @@ class NetworkPolicy(
                 val rawV6 = rawAuthority.substring(1, endBracket)
                 val parsedV6 = parseIpv6Literal(rawV6)
                 if (parsedV6 != null && isAlwaysBlockedAddress(parsedV6)) {
+                    if (restrictToLanPrivateOnly) {
+                        if (previousScheme != null && pinnedSingleHost != null && canonicalizeHost(rawV6) != pinnedSingleHost) {
+                            throw NetworkPolicyException("开发模式禁止重定向到其他主机：$rawV6")
+                        }
+                        throwDevBlockedAddressError(rawV6, parsedV6)
+                    }
                     throw NetworkPolicyException("禁止访问回环、链路本地或保留地址：$rawV6")
                 }
             }
@@ -233,6 +259,69 @@ class NetworkPolicy(
         }
     }
 
+    private fun validateDevLanHostAndAddresses(url: HttpUrl, host: String, previousScheme: String?) {
+        if (pinnedSingleScheme != null && !url.scheme.equals(pinnedSingleScheme, ignoreCase = true)) {
+            if (previousScheme != null) {
+                throw NetworkPolicyException("开发模式禁止重定向切换协议（仅允许 $pinnedSingleScheme）")
+            }
+            throw NetworkPolicyException("开发模式仅允许使用已指定的协议：$pinnedSingleScheme")
+        }
+        if (pinnedSingleHost != null && host != pinnedSingleHost) {
+            if (previousScheme != null) {
+                throw NetworkPolicyException("开发模式禁止重定向到其他主机：$host")
+            }
+            throw NetworkPolicyException("开发模式仅允许访问指定的开发服务器主机：$pinnedSingleHost")
+        }
+        if (pinnedSinglePort != null && url.port != pinnedSinglePort) {
+            if (previousScheme != null) {
+                throw NetworkPolicyException("开发模式禁止重定向到其他端口（仅允许端口 $pinnedSinglePort）")
+            }
+            throw NetworkPolicyException("开发模式仅允许访问指定的开发服务器端口：$pinnedSinglePort")
+        }
+        if (isForbiddenHostName(host)) {
+            throw NetworkPolicyException("开发模式禁止访问回环地址（$host），请填写电脑的局域网私有地址。")
+        }
+    }
+
+    /**
+     * Returns a copy of this policy strictly pinned to [scheme], [host], and [port]
+     * under LAN-private-only dev server rules, preserving the existing [dnsResolver].
+     */
+    internal fun withPinnedEndpoint(scheme: String, host: String, port: Int): NetworkPolicy {
+        val canonical = canonicalizeHost(host)
+        return NetworkPolicy(
+            permissions = PluginPermissions(hosts = emptyList(), userHosts = true, lan = true),
+            userConfiguredHosts = setOf(canonical),
+            dnsResolver = dnsResolver,
+            requireHttpsAlways = false,
+            restrictToLanPrivateOnly = true,
+            pinnedSingleHost = canonical,
+            pinnedSinglePort = port,
+            pinnedSingleScheme = scheme.lowercase(Locale.ROOT),
+        )
+    }
+
+    private fun checkDevLanAddresses(host: String, addresses: List<InetAddress>) {
+        for (addr in addresses) {
+            if (isAlwaysBlockedAddress(addr)) {
+                throwDevBlockedAddressError(host, addr)
+            }
+            if (!isLanPrivateRfc1918OrUla(addr)) {
+                throw NetworkPolicyException("开发模式仅允许局域网私有地址（RFC1918 / IPv6 ULA），已拒绝公网或非私有地址：$host")
+            }
+        }
+    }
+
+    private fun throwDevBlockedAddressError(host: String, addr: InetAddress): Nothing {
+        if (isLoopbackOrEmbeddedLoopback(addr)) {
+            throw NetworkPolicyException("开发模式禁止访问回环地址（$host），请填写电脑的局域网私有地址。")
+        }
+        if (isLinkLocalOrEmbeddedLinkLocal(addr)) {
+            throw NetworkPolicyException("开发模式禁止访问链路本地地址（$host），请填写局域网私有地址。")
+        }
+        throw NetworkPolicyException("开发模式禁止访问保留或不可用地址（$host），请填写局域网私有地址。")
+    }
+
     companion object {
         /**
          * Public-only policy for repository index and `.d3plugin` package
@@ -248,18 +337,40 @@ class NetworkPolicy(
         )
 
         /**
-         * Dev-only policy for `d3plugin serve` on LAN (`lan=true`, allows HTTP
-         * on the explicitly entered dev host, still blocks loopback/link-local/reserved).
+         * Dev-only policy for `d3plugin serve` on LAN:
+         * - Allows plain HTTP strictly to [devHost] (and optional [pinnedPort] / [pinnedScheme])
+         *   on RFC1918 or IPv6 ULA addresses only
+         * - Rejects loopback, link-local, public, and reserved addresses with specific Chinese errors
+         * - Rejects any redirect or URL switching scheme, host, or port
          */
         fun forDevServer(
             devHost: String,
-            dnsResolver: (String) -> List<InetAddress> = { InetAddress.getAllByName(it).toList() },
-        ): NetworkPolicy = NetworkPolicy(
-            permissions = PluginPermissions(hosts = emptyList(), userHosts = true, lan = true),
-            userConfiguredHosts = setOf(canonicalizeHost(devHost)),
+            dnsResolver: (String) -> List<InetAddress>,
+        ): NetworkPolicy = forDevServer(
+            devHost = devHost,
+            pinnedPort = null,
+            pinnedScheme = null,
             dnsResolver = dnsResolver,
-            requireHttpsAlways = false,
         )
+
+        fun forDevServer(
+            devHost: String,
+            pinnedPort: Int? = null,
+            pinnedScheme: String? = null,
+            dnsResolver: (String) -> List<InetAddress> = { InetAddress.getAllByName(it).toList() },
+        ): NetworkPolicy {
+            val canonical = canonicalizeHost(devHost)
+            return NetworkPolicy(
+                permissions = PluginPermissions(hosts = emptyList(), userHosts = true, lan = true),
+                userConfiguredHosts = setOf(canonical),
+                dnsResolver = dnsResolver,
+                requireHttpsAlways = false,
+                restrictToLanPrivateOnly = true,
+                pinnedSingleHost = canonical,
+                pinnedSinglePort = pinnedPort,
+                pinnedSingleScheme = pinnedScheme?.lowercase(Locale.ROOT),
+            )
+        }
 
         fun canonicalizeHost(raw: String): String {
             var h = raw.trim().lowercase(Locale.ROOT)
@@ -509,6 +620,59 @@ class NetworkPolicy(
             }
             if (bytes.size == 16) {
                 return isPrivateIpv6(bytes)
+            }
+            return false
+        }
+
+        /**
+         * Strict RFC1918 (10/8, 172.16/12, 192.168/16) and IPv6 ULA (fc00::/7) check
+         * used by developer mode (`forDevServer`). Excludes CGNAT (100.64/10),
+         * benchmarking (198.18/15), link-local, loopback, NAT64, and public addresses.
+         */
+        fun isLanPrivateRfc1918OrUla(addr: InetAddress): Boolean {
+            if (isAlwaysBlockedAddress(addr)) return false
+            val b = addr.address
+            if (b.size == 4) {
+                val b0 = b[0].toInt() and 0xFF
+                val b1 = b[1].toInt() and 0xFF
+                return b0 == 10 ||
+                    (b0 == 172 && b1 in 16..31) ||
+                    (b0 == 192 && b1 == 168)
+            }
+            if (b.size == 16) {
+                val b0 = b[0].toInt() and 0xFF
+                return (b0 and 0xFE) == 0xFC
+            }
+            return false
+        }
+
+        private fun isLoopbackOrEmbeddedLoopback(addr: InetAddress): Boolean {
+            if (addr.isLoopbackAddress) return true
+            val b = addr.address
+            if (b.size == 4) return (b[0].toInt() and 0xFF) == 127
+            if (b.size == 16) {
+                val first15Zero = (0 until 15).all { b[it] == 0.toByte() }
+                if (first15Zero && b[15] == 1.toByte()) return true
+                extractEmbeddedIpv4(b)?.let { v4 ->
+                    if ((v4[0].toInt() and 0xFF) == 127) return true
+                }
+            }
+            return false
+        }
+
+        private fun isLinkLocalOrEmbeddedLinkLocal(addr: InetAddress): Boolean {
+            if (addr.isLinkLocalAddress) return true
+            val b = addr.address
+            if (b.size == 4) {
+                return (b[0].toInt() and 0xFF) == 169 && (b[1].toInt() and 0xFF) == 254
+            }
+            if (b.size == 16) {
+                val b0 = b[0].toInt() and 0xFF
+                val b1 = b[1].toInt() and 0xFF
+                if (b0 == 0xFE && (b1 and 0xC0) == 0x80) return true
+                extractEmbeddedIpv4(b)?.let { v4 ->
+                    if ((v4[0].toInt() and 0xFF) == 169 && (v4[1].toInt() and 0xFF) == 254) return true
+                }
             }
             return false
         }

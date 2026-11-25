@@ -6,10 +6,13 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.net.InetAddress
 import java.net.Proxy
 import java.security.MessageDigest
 import java.util.Locale
@@ -38,7 +41,27 @@ data class VerifiedPackageDownload(
     val sourceUrl: String,
 )
 
-class RepositoryVerificationException(message: String, cause: Throwable? = null) : IOException(message, cause)
+data class NormalizedDevServer(
+    val baseUrl: String,
+    val indexUrl: String,
+    val displayAddress: String,
+    val scheme: String,
+    val host: String,
+    val port: Int,
+)
+
+data class DevPluginFetchResult(
+    val server: NormalizedDevServer,
+    val index: PluginRepoIndex,
+    val entry: RepoPluginEntry,
+    val download: VerifiedPackageDownload,
+)
+
+class RepositoryVerificationException(
+    message: String,
+    cause: Throwable? = null,
+    val technicalDetail: String? = null,
+) : IOException(message, cause)
 
 /**
  * Fetches and verifies plugin repository indices and `.d3plugin` archives
@@ -126,18 +149,171 @@ class PluginRepositoryClient(
         }
 
     /**
+     * Normalizes a user-entered developer server address (e.g. `192.168.1.20:8787`,
+     * `http://192.168.1.20:8787`, `http://192.168.1.20:8787/any/path`, `[fd00::1]:8787`)
+     * into a canonical base URL + `/index.json`, strictly enforcing RFC1918 / IPv6 ULA
+     * via [NetworkPolicy.forDevServer].
+     */
+    fun normalizeDevServerAddress(
+        rawInput: String,
+        dnsResolver: ((String) -> List<InetAddress>)? = null,
+    ): NormalizedDevServer {
+        val trimmed = rawInput.trim()
+        if (trimmed.isEmpty()) {
+            throw RepositoryVerificationException("请输入电脑的开发服务器地址，例如 192.168.1.20:8787")
+        }
+        if (trimmed.any { it.isWhitespace() || it.code < 0x20 }) {
+            throw RepositoryVerificationException("开发服务器地址不能包含空格或控制字符")
+        }
+
+        val candidateUrl = buildDevCandidateUrl(trimmed)
+        val parsed = candidateUrl.toHttpUrlOrNull()
+            ?: throw RepositoryVerificationException("开发服务器地址格式无效，请检查后重试")
+        if (parsed.username.isNotEmpty() || parsed.password.isNotEmpty()) {
+            throw RepositoryVerificationException("开发服务器地址不支持包含用户名或密码")
+        }
+
+        val canonicalHost = NetworkPolicy.canonicalizeHost(parsed.host)
+        val policy = if (dnsResolver != null) {
+            NetworkPolicy.forDevServer(
+                devHost = canonicalHost,
+                dnsResolver = dnsResolver,
+                pinnedPort = parsed.port,
+                pinnedScheme = parsed.scheme,
+            )
+        } else {
+            devPolicyFactory(canonicalHost).withPinnedEndpoint(parsed.scheme, canonicalHost, parsed.port)
+        }
+        try {
+            // Validate candidateUrl directly so bracketed raw IPv6 forms (e.g. [::ffff:127.0.0.1]) are caught cleanly
+            policy.validateResourceUrl(candidateUrl, previousScheme = null)
+        } catch (e: NetworkPolicyException) {
+            throw RepositoryVerificationException(e.message ?: "不允许访问该开发服务器地址", e)
+        }
+
+        val hostForUrl = if (parsed.host.contains(':')) "[${parsed.host}]" else parsed.host
+        val portPart = if (parsed.port == HttpUrl.defaultPort(parsed.scheme)) "" else ":${parsed.port}"
+        val baseUrl = "${parsed.scheme}://$hostForUrl$portPart"
+        val indexUrl = "$baseUrl/index.json"
+        val displayAddress = "$hostForUrl:${parsed.port}"
+        return NormalizedDevServer(
+            baseUrl = baseUrl,
+            indexUrl = indexUrl,
+            displayAddress = displayAddress,
+            scheme = parsed.scheme,
+            host = canonicalHost,
+            port = parsed.port,
+        )
+    }
+
+    /**
+     * Developer-mode fetch for `d3plugin serve` on a LAN host:
+     * 1. Normalizes & validates the server address (RFC1918 / IPv6 ULA only)
+     * 2. Fetches `/index.json` pinned to exact scheme + host + port (rejects redirects switching any of them)
+     * 3. Downloads `/plugin.d3plugin` using the SAME pinned scheme + host + port dev policy
+     * 4. Verifies SHA-256, zip consistency, and inner manifest id/version
+     */
+    suspend fun fetchDevPlugin(rawServerAddress: String): DevPluginFetchResult =
+        withContext(Dispatchers.IO) {
+            val normalized = normalizeDevServerAddress(rawServerAddress)
+            val devPolicy = devPolicyFactory(normalized.host)
+                .withPinnedEndpoint(normalized.scheme, normalized.host, normalized.port)
+            val indexBytes = downloadBytes(
+                url = normalized.indexUrl,
+                maxBytes = maxIndexBytes,
+                policy = devPolicy,
+                extractServerError = true,
+            )
+            val index = parseAndValidateIndex(String(indexBytes, Charsets.UTF_8))
+            val entry = index.plugins.firstOrNull()
+                ?: throw RepositoryVerificationException("开发服务器索引中没有可用插件")
+            val pkgBytes = downloadBytes(
+                url = entry.url,
+                maxBytes = maxPackageBytes,
+                policy = devPolicy,
+                extractServerError = true,
+            )
+            verifyPackageBytes(
+                bytes = pkgBytes,
+                expectedSha256 = entry.sha256,
+                expectedId = entry.id,
+                expectedVersion = entry.version,
+            )
+            DevPluginFetchResult(
+                server = normalized,
+                index = index,
+                entry = entry,
+                download = VerifiedPackageDownload(
+                    bytes = pkgBytes,
+                    sha256 = entry.sha256.lowercase(Locale.ROOT),
+                    sourceUrl = entry.url,
+                ),
+            )
+        }
+
+    /**
      * Developer-mode download for `d3plugin serve` on a LAN host (§9).
-     * Allows plain HTTP to the explicitly entered LAN dev host while still
-     * enforcing 8 MB cap, timeout, and loopback/link-local/reserved rejections.
+     * Allows plain HTTP to the explicitly entered LAN dev host while enforcing
+     * RFC1918 / IPv6 ULA only, exact scheme/host/port pinning, 8 MB cap, timeout,
+     * and no cross-host/port/scheme redirects.
      */
     suspend fun downloadDevPackage(url: String): VerifiedPackageDownload =
         withContext(Dispatchers.IO) {
-            val parsed = url.trim().toHttpUrlOrNull()
+            val trimmed = url.trim()
+            val parsed = trimmed.toHttpUrlOrNull()
                 ?: throw RepositoryVerificationException("无效的开发服务器地址：$url")
             val devPolicy = devPolicyFactory(parsed.host)
-            val bytes = downloadBytes(url, maxPackageBytes, devPolicy)
-            VerifiedPackageDownload(bytes = bytes, sha256 = sha256Hex(bytes), sourceUrl = url)
+                .withPinnedEndpoint(parsed.scheme, parsed.host, parsed.port)
+            val bytes = downloadBytes(trimmed, maxPackageBytes, devPolicy, extractServerError = true)
+            VerifiedPackageDownload(bytes = bytes, sha256 = sha256Hex(bytes), sourceUrl = trimmed)
         }
+
+    private fun buildDevCandidateUrl(trimmed: String): String {
+        if (trimmed.contains("://")) {
+            val scheme = trimmed.substringBefore("://").lowercase(Locale.ROOT)
+            if (scheme != "http" && scheme != "https") {
+                throw RepositoryVerificationException("仅支持 http 或 https 协议，请填写局域网开发服务器地址")
+            }
+            val afterScheme = trimmed.substringAfter("://")
+            val authority = afterScheme.substringBefore("/").substringBefore("?").substringBefore("#")
+            if (authority.contains('@')) {
+                throw RepositoryVerificationException("开发服务器地址不支持包含用户名或密码")
+            }
+            if (authority.isEmpty()) {
+                throw RepositoryVerificationException("开发服务器地址格式无效，请检查后重试")
+            }
+            return "$scheme://$authority/index.json"
+        }
+        val colonCount = trimmed.count { it == ':' }
+        val isBareIpv6 = !trimmed.startsWith("[") && colonCount >= 2 &&
+            !trimmed.substringBefore("/").contains('.')
+        if (isBareIpv6) {
+            val bareHost = trimmed.substringBefore("/").substringBefore("?").substringBefore("#")
+            if (bareHost.contains('@')) {
+                throw RepositoryVerificationException("开发服务器地址不支持包含用户名或密码")
+            }
+            return "http://[$bareHost]:$DEFAULT_DEV_SERVER_PORT/index.json"
+        }
+        val nonHttpScheme = NON_HTTP_SCHEME_REGEX.containsMatchIn(trimmed)
+        if (nonHttpScheme) {
+            throw RepositoryVerificationException("仅支持 http 或 https 协议，请填写局域网开发服务器地址")
+        }
+        val authority = trimmed.substringBefore("/").substringBefore("?").substringBefore("#")
+        if (authority.contains('@')) {
+            throw RepositoryVerificationException("开发服务器地址不支持包含用户名或密码")
+        }
+        if (authority.isEmpty()) {
+            throw RepositoryVerificationException("开发服务器地址格式无效，请检查后重试")
+        }
+        val hasExplicitPort = if (authority.startsWith("[")) {
+            val end = authority.indexOf(']')
+            end > 0 && end + 1 < authority.length && authority[end + 1] == ':'
+        } else {
+            authority.contains(':')
+        }
+        val withPort = if (hasExplicitPort) authority else "$authority:$DEFAULT_DEV_SERVER_PORT"
+        return "http://$withPort/index.json"
+    }
 
     fun verifyPackageBytes(
         bytes: ByteArray,
@@ -168,7 +344,12 @@ class PluginRepositoryClient(
         }
     }
 
-    private fun downloadBytes(url: String, maxBytes: Int, policy: NetworkPolicy): ByteArray {
+    private fun downloadBytes(
+        url: String,
+        maxBytes: Int,
+        policy: NetworkPolicy,
+        extractServerError: Boolean = false,
+    ): ByteArray {
         val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(totalTimeoutMs)
         val executor = SafePluginHttpExecutor(
             networkPolicy = policy,
@@ -189,7 +370,12 @@ class PluginRepositoryClient(
 
         resp.use { r ->
             if (!r.isSuccessful) {
-                throw RepositoryVerificationException("下载失败（HTTP ${r.code}）：$url")
+                val detail = if (extractServerError) extractJsonErrorDetail(r) else null
+                throw RepositoryVerificationException(
+                    message = if (detail != null) "开发服务器返回错误（HTTP ${r.code}）：$detail"
+                    else "下载失败（HTTP ${r.code}）：$url",
+                    technicalDetail = detail,
+                )
             }
             val len = r.body.contentLength()
             if (len > maxBytes) {
@@ -216,11 +402,36 @@ class PluginRepositoryClient(
         }
     }
 
+    private fun extractJsonErrorDetail(resp: okhttp3.Response): String? {
+        return try {
+            val buf = ByteArray(4096)
+            val out = ByteArrayOutputStream()
+            resp.body.byteStream().use { stream ->
+                var total = 0
+                while (total < 4096) {
+                    val n = stream.read(buf, 0, minOf(buf.size, 4096 - total))
+                    if (n <= 0) break
+                    out.write(buf, 0, n)
+                    total += n
+                }
+            }
+            val raw = out.toString(Charsets.UTF_8.name()).trim()
+            if (raw.isEmpty()) return null
+            val obj = runCatching { json.parseToJsonElement(raw) as? JsonObject }.getOrNull()
+            (obj?.get("error") as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
+                ?: raw.take(1024)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     companion object {
         const val MAX_INDEX_BYTES = 2 * 1024 * 1024
         /** §11.4: maximum plugin package size is 8 MB. */
         const val MAX_PACKAGE_BYTES = 8 * 1024 * 1024
         const val DEFAULT_TOTAL_TIMEOUT_SEC = 30L
+        const val DEFAULT_DEV_SERVER_PORT = 8787
+        private val NON_HTTP_SCHEME_REGEX = Regex("^[a-zA-Z][a-zA-Z0-9+.-]*:(?![0-9]+(?:/|\\?|#|$))")
 
         private val DEFAULT_CLIENT = OkHttpClient.Builder()
             .proxy(Proxy.NO_PROXY)

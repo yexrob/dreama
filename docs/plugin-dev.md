@@ -196,20 +196,59 @@ d3plugin check ./my-media-plugin
 d3plugin check plugins/reference plugins/jellyfin
 ```
 
-### 第四步：打包与头显联调
+### 第四步：在头显上加载与调试
+
+写好插件后，有两条无需架设 HTTPS 插件仓库就能在头显上安装和调试的路：
+
+#### 方式一：开发者模式（从电脑实时加载，开发调试推荐）
+
+让电脑和头显连在**同一个 Wi‑Fi**，在电脑上启动实时打包服务：
 
 ```bash
-# 打包成 .d3plugin 并输出 SHA-256（用于填入插件仓库 index.json）
-d3plugin pack ./my-media-plugin -o dist/my-media-plugin-1.0.0.d3plugin
-
-# 开发模式：启动本地实时打包服务，在头显「播放源 › 插件 › 开发者」填入本机地址
 d3plugin serve ./my-media-plugin --port 8787
 ```
 
-`d3plugin serve` 每次收到请求都会从磁盘实时重新打包，暴露：
-- `/index.json`：实时附带最新 `sha256` 的单插件仓库索引；
-- `/manifest.json`：当前 manifest；
-- `/plugin.d3plugin`：实时打包的 `.d3plugin`。
+`d3plugin serve` 每次收到请求都会从磁盘实时重新打包，仅暴露 `/`、`/index.json`、`/manifest.json`、`/plugin.d3plugin`、`/health` 五个固定路径，并同时在局域网 UDP 端口 `18787` 响应头显的自动发现（加 `--no-discover` 可关闭自动发现；只应答来自局域网私有地址的探测）。启动后终端会打印本机局域网地址（例如 `http://192.168.1.20:8787`）。
+
+在头显里操作：
+
+1. 打开「设置 › 播放源与插件 › 插件」页签，滑到底部点「开发者」。
+2. **找到电脑**（二选一）：
+   - 等待上方「在局域网里找到的开发服务器」自动列出电脑上的插件（也可点「重新搜索」），直接点「加载」；
+   - 或点右上角「输入电脑地址」，用手机扫码（或切到头显键盘）填入电脑的局域网地址（支持 `192.168.1.20:8787`、`http://192.168.1.20:8787`、IPv6 ULA 等，仅允许 RFC1918 / IPv6 ULA 私有地址，严格锁定协议与 `主机:端口`，拒绝回环/链路本地/公网及任何跨主机/端口/协议重定向）。
+3. 核对确认卡片上的权限与「开发版 · 来自 <电脑地址>，未经仓库校验」提示，点「确认安装」。
+4. 回到「播放源」页签添加该插件的播放源实例后即可在首页/媒体库联调。
+5. **改代码后一键重载**：在开发者页（或该插件的详情页）点「重新加载」。**不需要改 `manifest.json` 的版本号**，只要内容（SHA-256）变了就会生效：
+   - 运行时重建，已建实例的配置、`ctx.storage` 和 Cookie 全部保留；首页与媒体库会自动刷新；
+   - 权限未变或缩小时直接重载，权限扩大（`hosts`/`userHosts`/`lan` 任一增加）时重新弹出确认卡片，确认后立即生效；
+   - 如果电脑换了局域网 IP，在开发者页用新地址加载同 `id` 开发版会弹出「切换开发服务器地址」确认，确认后保留已有播放源、配置与本地数据；
+   - 如果电脑关机或暂时连不上，头显会保留当前已装的版本并提示可从开发者页用新地址加载；
+   - 开发者页右侧直接展示该插件最近日志（重载后自动滚到最新），遇到 JS 语法错误、`manifest.json` 校验失败或 `init` 抛错时会展示经脱敏（自动抹除密码/令牌/Cookie）的错误消息与行号。
+
+> 注意：开发版插件带有「开发版」标识且不参与仓库自动更新；若头显里已装同 `id` 的内置、仓库或本地文件版，装开发版（或反过来换回正式版）会弹出显式替换确认并清除原实例数据。
+
+#### 方式二：从文件安装（离线 `.d3plugin` 包或单个 HTTPS 直链）
+
+先打包生成 `.d3plugin`：
+
+```bash
+d3plugin pack ./my-media-plugin -o dist/my-media-plugin-1.0.0.d3plugin
+```
+
+在头显里打开「设置 › 播放源与插件 › 插件 › 添加插件 › 从文件安装」，有三种安装方式（均会在预览阶段校验 8 MB 体积上限、zip 完整性、`manifest.json` 和 `minApp`，确认后严格安装预览时读入的同一份字节，不重新读盘或重新下载）：
+
+1. **通过 `adb push` 放到应用专属目录（推荐，所有 Android 版本免存储权限）**：
+   ```bash
+   # Release 包
+   adb push dist/my-media-plugin-1.0.0.d3plugin /sdcard/Android/data/dev.depth3d.player/files/plugins/
+   # Debug 包（applicationIdSuffix 为 .debug）
+   adb push dist/my-media-plugin-1.0.0.d3plugin /sdcard/Android/data/dev.depth3d.player.debug/files/plugins/
+   ```
+   推送后在头显「从文件安装」页面点「刷新」，直接点对应 `.d3plugin` 即可安装。
+2. **放进头显 `Download/` 目录或点「选择文件」**：
+   - 在 **Android 10** 设备上，**授予存储权限后**页面会自动列出 `Download/` 里的 `.d3plugin`；未授权时页面会提示点「允许访问」或直接点「选择文件」。
+   - 在 **Android 11+** 分区存储设备上，系统限制直接枚举 `Download/` 里的非媒体文件，若未列出请直接点右上角「选择文件」（系统文件选择器 `ACTION_OPEN_DOCUMENT`）选取 `.d3plugin`。
+3. **粘贴单个 `.d3plugin` 的 HTTPS 地址**：点「粘贴 HTTPS 地址」，用手机扫码粘贴以 `https://` 开头的单包地址，头显下载校验后确认安装（仅支持 HTTPS，不允许私网地址）。
 
 ---
 

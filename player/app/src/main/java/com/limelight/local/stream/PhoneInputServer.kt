@@ -87,6 +87,36 @@ data class PhoneInputCopy(
                 doneTitle = s.get(R.string.phone_html_done_title),
                 doneSubtitle = s.get(R.string.phone_html_done_subtitle),
             )
+            PhoneInputServer.Mode.PLUGIN_DEV_SERVER -> PhoneInputCopy(
+                pageTitle = s.get(R.string.phone_html_dev_page_title),
+                heading = s.get(R.string.phone_html_dev_heading),
+                hint = s.get(R.string.phone_html_dev_hint),
+                codeLabel = s.get(R.string.phone_html_code_label),
+                codePlaceholder = s.get(R.string.phone_html_code_placeholder),
+                valueLabel = s.get(R.string.phone_input_dev_label),
+                valuePlaceholder = s.get(R.string.phone_html_dev_placeholder),
+                submitLabel = s.get(R.string.phone_html_dev_submit),
+                errWrongCode = s.get(R.string.phone_html_err_wrong_code),
+                errLockedOut = s.get(R.string.phone_html_err_locked),
+                errEmptyOrLong = s.get(R.string.phone_html_err_empty_or_long),
+                doneTitle = s.get(R.string.phone_html_done_title),
+                doneSubtitle = s.get(R.string.phone_html_done_subtitle),
+            )
+            PhoneInputServer.Mode.PLUGIN_DIRECT_URL -> PhoneInputCopy(
+                pageTitle = s.get(R.string.phone_html_direct_page_title),
+                heading = s.get(R.string.phone_html_direct_heading),
+                hint = s.get(R.string.phone_html_direct_hint),
+                codeLabel = s.get(R.string.phone_html_code_label),
+                codePlaceholder = s.get(R.string.phone_html_code_placeholder),
+                valueLabel = s.get(R.string.phone_input_direct_label),
+                valuePlaceholder = s.get(R.string.phone_html_direct_placeholder),
+                submitLabel = s.get(R.string.phone_html_direct_submit),
+                errWrongCode = s.get(R.string.phone_html_err_wrong_code),
+                errLockedOut = s.get(R.string.phone_html_err_locked),
+                errEmptyOrLong = s.get(R.string.phone_html_err_empty_or_long),
+                doneTitle = s.get(R.string.phone_html_done_title),
+                doneSubtitle = s.get(R.string.phone_html_done_subtitle),
+            )
         }
     }
 }
@@ -97,6 +127,8 @@ object PhoneInputErrorHelper {
         PhoneInputServer.Mode.ADD_COMPUTER -> s.get(R.string.stream_action_add_pc)
         PhoneInputServer.Mode.DEVICE_NAME -> s.get(R.string.phone_action_rename_device)
         PhoneInputServer.Mode.PLUGIN_REPO -> s.get(R.string.phone_action_add_repo)
+        PhoneInputServer.Mode.PLUGIN_DEV_SERVER -> s.get(R.string.phone_action_dev_server)
+        PhoneInputServer.Mode.PLUGIN_DIRECT_URL -> s.get(R.string.phone_action_direct_url)
     }
 
     fun timeoutError(s: StringLookup, mode: PhoneInputServer.Mode): UserFacingError = UserFacingError(
@@ -151,6 +183,8 @@ class PhoneInputServer(
         ADD_COMPUTER,
         DEVICE_NAME,
         PLUGIN_REPO,
+        PLUGIN_DEV_SERVER,
+        PLUGIN_DIRECT_URL,
     }
 
     private val closed = AtomicBoolean(false)

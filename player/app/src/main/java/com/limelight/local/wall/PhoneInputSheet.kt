@@ -185,6 +185,8 @@ fun PhoneInputSheet(
             PhoneInputServer.Mode.ADD_COMPUTER -> R.string.phone_input_add_pc_title
             PhoneInputServer.Mode.DEVICE_NAME -> R.string.phone_input_device_name_title
             PhoneInputServer.Mode.PLUGIN_REPO -> R.string.phone_input_repo_title
+            PhoneInputServer.Mode.PLUGIN_DEV_SERVER -> R.string.phone_input_dev_title
+            PhoneInputServer.Mode.PLUGIN_DIRECT_URL -> R.string.phone_input_direct_title
         },
     )
     val sub = stringResource(
@@ -192,6 +194,8 @@ fun PhoneInputSheet(
             PhoneInputServer.Mode.ADD_COMPUTER -> R.string.phone_input_add_pc_sub
             PhoneInputServer.Mode.DEVICE_NAME -> R.string.phone_input_device_name_sub
             PhoneInputServer.Mode.PLUGIN_REPO -> R.string.phone_input_repo_sub
+            PhoneInputServer.Mode.PLUGIN_DEV_SERVER -> R.string.phone_input_dev_sub
+            PhoneInputServer.Mode.PLUGIN_DIRECT_URL -> R.string.phone_input_direct_sub
         },
     )
 
@@ -304,6 +308,8 @@ fun PhoneInputSheet(
                         PhoneInputServer.Mode.ADD_COMPUTER -> R.string.phone_input_addr_label
                         PhoneInputServer.Mode.DEVICE_NAME -> R.string.phone_input_name_label
                         PhoneInputServer.Mode.PLUGIN_REPO -> R.string.phone_input_repo_label
+                        PhoneInputServer.Mode.PLUGIN_DEV_SERVER -> R.string.phone_input_dev_label
+                        PhoneInputServer.Mode.PLUGIN_DIRECT_URL -> R.string.phone_input_direct_label
                     },
                 )
                 val placeholder = stringResource(
@@ -311,6 +317,8 @@ fun PhoneInputSheet(
                         PhoneInputServer.Mode.ADD_COMPUTER -> R.string.phone_input_addr_placeholder
                         PhoneInputServer.Mode.DEVICE_NAME -> R.string.phone_input_name_placeholder
                         PhoneInputServer.Mode.PLUGIN_REPO -> R.string.phone_input_repo_placeholder
+                        PhoneInputServer.Mode.PLUGIN_DEV_SERVER -> R.string.phone_input_dev_placeholder
+                        PhoneInputServer.Mode.PLUGIN_DIRECT_URL -> R.string.phone_input_direct_placeholder
                     },
                 )
                 Column(Modifier.padding(top = 28.dp)) {
@@ -366,7 +374,14 @@ fun PhoneInputSheet(
                 if (useHeadsetKeyboard) {
                     WallButton(
                         text = if (busy) stringResource(R.string.phone_input_connecting)
-                        else stringResource(if (mode == PhoneInputServer.Mode.DEVICE_NAME) R.string.action_save else R.string.action_add),
+                        else stringResource(
+                            when (mode) {
+                                PhoneInputServer.Mode.DEVICE_NAME -> R.string.action_save
+                                PhoneInputServer.Mode.PLUGIN_DEV_SERVER -> R.string.plugins_action_load
+                                PhoneInputServer.Mode.PLUGIN_DIRECT_URL -> R.string.plugins_action_download
+                                else -> R.string.action_add
+                            },
+                        ),
                         onClick = { triggerSubmitFromKeyboard(textFieldState.text.toString()) },
                         kind = ButtonKind.Primary,
                     )

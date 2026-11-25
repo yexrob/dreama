@@ -71,6 +71,8 @@ sealed interface Page {
     data class SourceEdit(val instanceId: String) : Page
     data class PluginDetail(val pluginId: String) : Page
     data class RepoBrowse(val repoUrl: String) : Page
+    data object PluginDeveloper : Page
+    data object PluginFileInstall : Page
 }
 
 /** The pages and the moves between them, shared by every screen. */
@@ -182,6 +184,10 @@ class WallNav(
     fun openPluginDetail(pluginId: String) = open(Page.PluginDetail(pluginId))
 
     fun openRepoBrowse(repoUrl: String) = open(Page.RepoBrowse(repoUrl))
+
+    fun openPluginDeveloper() = open(Page.PluginDeveloper)
+
+    fun openPluginFileInstall() = open(Page.PluginFileInstall)
 
     fun openPcApps(computer: StreamingComputer) = open(Page.PcApps(computer))
 
@@ -332,6 +338,8 @@ fun WallApp(model: WallModel, actions: WallActions, pendingTab: StateFlow<Tab?>)
                     is Page.SourceEdit -> SourceEditScreen(model, nav, page)
                     is Page.PluginDetail -> PluginDetailScreen(model, nav, page)
                     is Page.RepoBrowse -> RepoBrowseScreen(model, nav, page)
+                    Page.PluginDeveloper -> PluginDeveloperScreen(model, nav)
+                    Page.PluginFileInstall -> PluginFileInstallScreen(model, nav)
                 }
             }
             nav.webDavSheet?.let { WebDavSheet(model, nav, it) }

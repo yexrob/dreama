@@ -15,9 +15,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
@@ -82,6 +84,7 @@ class WallPluginSourceManager(
         val instanceUpdatedAt: Long,
         val authState: String,
         val pluginVersion: String,
+        val pluginSha256: String,
         val pluginUpdatedAt: Long,
         val needsPermissionReconfirm: Boolean,
     )
@@ -128,6 +131,7 @@ class WallPluginSourceManager(
                 instanceUpdatedAt = inst.updatedAt,
                 authState = inst.authState,
                 pluginVersion = pkg.version,
+                pluginSha256 = pkg.sha256,
                 pluginUpdatedAt = pkg.updatedAt,
                 needsPermissionReconfirm = pkg.needsPermissionReconfirm,
             )
@@ -320,46 +324,74 @@ fun PluginLogsSheet(
 
             Spacer(Modifier.height(24.dp))
 
-            if (entries.isEmpty()) {
-                Box(
-                    Modifier
-                        .fillMaxWidth()
-                        .height(340.dp)
-                        .clip(RoundedCornerShape(Wall.Radius))
-                        .background(Wall.Surface)
-                        .padding(28.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(stringResource(R.string.plugin_logs_empty), style = WallType.Body, color = Wall.Text2)
+            PluginLogListPanel(
+                entries = entries,
+                emptyText = stringResource(R.string.plugin_logs_empty),
+                modifier = Modifier.fillMaxWidth().height(380.dp),
+            )
+        }
+    }
+}
+
+/**
+ * Shared redacted log viewer backed by [PluginLogger.recentEntries], reused by both
+ * [PluginLogsSheet] (newest first) and [PluginDeveloperScreen] (chronological + auto-scroll
+ * to latest after reload).
+ */
+@Composable
+internal fun PluginLogListPanel(
+    entries: List<PluginLogEntry>,
+    emptyText: String,
+    modifier: Modifier = Modifier,
+    autoScrollToLatest: Boolean = false,
+    scrollToken: Int = 0,
+) {
+    val timeFmt = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
+    val listState = rememberLazyListState()
+
+    if (autoScrollToLatest) {
+        LaunchedEffect(entries.size, scrollToken) {
+            if (entries.isNotEmpty()) {
+                listState.scrollToItem(entries.lastIndex)
+            }
+        }
+    }
+
+    if (entries.isEmpty()) {
+        Box(
+            modifier
+                .clip(RoundedCornerShape(Wall.Radius))
+                .background(Wall.Surface)
+                .padding(24.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(emptyText, style = WallType.Caption, color = Wall.Text2)
+        }
+    } else {
+        LazyColumn(
+            state = listState,
+            modifier = modifier
+                .clip(RoundedCornerShape(Wall.Radius))
+                .background(Wall.Surface)
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            items(entries) { entry ->
+                val levelColor = when (entry.level) {
+                    PluginLogLevel.ERROR -> Wall.Danger
+                    PluginLogLevel.WARN -> Wall.Accent
+                    else -> Wall.Text2
                 }
-            } else {
-                LazyColumn(
-                    Modifier
-                        .fillMaxWidth()
-                        .height(380.dp)
-                        .clip(RoundedCornerShape(Wall.Radius))
-                        .background(Wall.Surface)
-                        .padding(20.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    items(entries) { entry ->
-                        val levelColor = when (entry.level) {
-                            PluginLogLevel.ERROR -> Wall.Danger
-                            PluginLogLevel.WARN -> Wall.Accent
-                            else -> Wall.Text2
-                        }
-                        val ts = timeFmt.format(Date(entry.timestampMs))
-                        Text(
-                            text = "$ts [${entry.level.name}] ${entry.message}",
-                            style = WallType.Caption.copy(
-                                fontFamily = FontFamily.Monospace,
-                                fontSize = 18.sp,
-                                lineHeight = 24.sp,
-                            ),
-                            color = levelColor,
-                        )
-                    }
-                }
+                val ts = timeFmt.format(Date(entry.timestampMs))
+                Text(
+                    text = "$ts [${entry.level.name}] ${entry.message}",
+                    style = WallType.Caption.copy(
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 18.sp,
+                        lineHeight = 24.sp,
+                    ),
+                    color = levelColor,
+                )
             }
         }
     }

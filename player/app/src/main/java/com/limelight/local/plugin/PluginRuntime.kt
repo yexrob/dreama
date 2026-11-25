@@ -197,6 +197,17 @@ class PluginRuntime(
 
     internal fun currentActiveTimerCount(): Int = activeTimerCount.get()
 
+    /**
+     * Collects live in-memory secret values from this runtime's cookie jar and `ctx.storage`
+     * (covering values written in-flight before disk flush) for log & diagnostic redaction.
+     */
+    internal fun collectLiveSecretValues(): List<String> {
+        val out = LinkedHashSet<String>()
+        out += cookieJar.allCookieValues()
+        out += storage.allSecretLikeValues()
+        return out.toList()
+    }
+
     internal fun tryReserveTimerSlot(): Boolean {
         while (true) {
             val cur = activeTimerCount.get()
@@ -318,6 +329,20 @@ class PluginRuntime(
             cleanupActiveCall(callScope)
             runCatching { cookieJar.flush() }
         }
+    }
+
+    /**
+     * Ensures `main.js` is compiled, registered, and optional `init(ctx)` has run.
+     * Used by developer-mode reload verification to surface syntax or `init` failures immediately.
+     */
+    suspend fun verifyInitialized(timeoutMsOverride: Long? = null) = callMutex.withLock {
+        if (closed) {
+            throw PluginErrorMapper.toException(
+                PluginErrorPayload(PluginErrorCode.INTERNAL),
+                context = androidContext,
+            )
+        }
+        ensureInitializedLocked(timeoutMsOverride ?: defaultTimeoutMs)
     }
 
     suspend fun reset() = callMutex.withLock {
@@ -1106,6 +1131,78 @@ class PluginRuntime(
 
         private val SHARED_BOOTSTRAP_JS: String by lazy {
             JsonSchemaValidator.loadBundledResourceText("runtime-bootstrap.js")
+        }
+
+        /**
+         * Evaluates ES module syntax, top-level module statements, and default export shape
+         * of [mainJsSource] in a **zero-capability** QuickJS sandbox:
+         * - NO host bridge bindings (`__d3_host` is absent)
+         * - NO `ctx`, NO network gateway, NO storage, NO cookies, NO filesystem access
+         *
+         * Because ES module evaluation executes top-level module code, callers MUST only invoke
+         * this AFTER explicit user confirmation (or during a same-origin, non-permission-expanded
+         * developer reload) and NEVER during unconfirmed package preview.
+         */
+        internal suspend fun probeModuleLoadNoCapabilities(
+            mainJsSource: String,
+            memoryLimitBytes: Long = DEFAULT_MEMORY_LIMIT_BYTES,
+            timeoutMs: Long = DEFAULT_CALL_TIMEOUT_MS,
+        ) {
+            val probeExecutor = Executors.newSingleThreadExecutor { runnable ->
+                Thread(runnable, "depth3d-qjs-probe").apply { isDaemon = true }
+            }
+            val probeDispatcher = probeExecutor.asCoroutineDispatcher()
+            val loader = moduleLoader {
+                load { name ->
+                    when (name) {
+                        "plugin/main.js", "./main.js", "main.js" -> ModuleContent.Source(mainJsSource)
+                        else -> null
+                    }
+                }
+            }
+            val qjs = QuickJs.create(jobDispatcher = probeDispatcher, moduleLoader = loader)
+            qjs.memoryLimit = memoryLimitBytes
+            qjs.maxStackSize = MAX_STACK_BYTES
+            qjs.evaluationTimeoutMillis = timeoutMs
+            try {
+                withContext(probeDispatcher) {
+                    withTimeout(timeoutMs) {
+                        qjs.evaluate<Unit>(
+                            """
+                            globalThis.__d3_probe_register = function(mod) {
+                              if (!mod || typeof mod !== 'object') {
+                                throw new TypeError('Plugin module must export a default object');
+                              }
+                            };
+                            undefined;
+                            """.trimIndent(),
+                            filename = "__d3_probe.js",
+                        )
+                        qjs.evaluate<Unit>(
+                            """
+                            import __plugin from 'plugin/main.js';
+                            globalThis.__d3_probe_register(__plugin);
+                            """.trimIndent(),
+                            filename = "__d3_entry.js",
+                            asModule = true,
+                        )
+                    }
+                }
+            } finally {
+                try { qjs.interruptEvaluation() } catch (_: Throwable) {}
+                try {
+                    withContext(probeDispatcher) { qjs.close() }
+                } catch (_: Throwable) {
+                    runCatching { qjs.close() }
+                }
+                probeExecutor.shutdown()
+                try {
+                    probeExecutor.awaitTermination(SHUTDOWN_WAIT_MS, TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+                probeExecutor.shutdownNow()
+            }
         }
     }
 }
