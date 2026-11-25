@@ -185,6 +185,7 @@ data class PaletteStrings(
     val screenSizeDisabledInRoom: String = "影院房间里画面固定在银幕上",
     val screenDistDisabledInRoom: String = "影院房间里距离固定",
     val screenGestureHint: String = "指着画面按住扳机，再推右摇杆：前后调远近 · 左右调大小",
+    val depthModelUnavailableReason: String = "深度模型不可用，仅支持原生 3D",
 )
 
 /** Per-video persisted overrides (only the 4 per-video items per §6.3). */
@@ -267,6 +268,7 @@ class PaletteController(
     var cylinderSupported: Boolean = true,
     var danmakuSupported: Boolean = false,
     var danmakuLoadFailed: Boolean = false,
+    var depthModelUnavailable: Boolean = false,
 ) {
     var global: GlobalPaletteSettings = initialGlobal
         private set
@@ -301,9 +303,21 @@ class PaletteController(
     private var subtitleDefaultCaptured: Boolean = false
     private var audioDefaultCaptured: Boolean = false
 
-    /** Effective 3D strength (per-video override, else 2D Settings default). */
+    /** Effective 3D strength (OFF when AI depth model failed in AUTO mode so UI matches actual flat output). */
     val effectiveStrength: DepthStrength
-        get() = video.strength ?: global.defaultStrength
+        get() = if (depthModelUnavailable && effectiveSourceFormat == StereoSourceFormat.AUTO) {
+            DepthStrength.OFF
+        } else {
+            video.strength ?: global.defaultStrength
+        }
+
+    /** Why 3D strength row is disabled right now, or null if adjustable. */
+    val strengthDisabledMessage: String?
+        get() = if (depthModelUnavailable && effectiveSourceFormat == StereoSourceFormat.AUTO) {
+            strings.depthModelUnavailableReason
+        } else {
+            null
+        }
 
     /** Effective stereo source format (explicit per-video override, else plugin/container hint, else AUTO). */
     val effectiveSourceFormat: StereoSourceFormat
@@ -316,7 +330,13 @@ class PaletteController(
             val wanted = video.subtitleId ?: defaultSubtitleId ?: return 0
             if (wanted == SUBTITLE_OFF_ID) return 0
             val idx = subtitleTracks.indexOfFirst { it.id == wanted }
-            return if (idx >= 0) idx + 1 else 0
+            if (idx >= 0) return idx + 1
+            val normalizedWanted = PaletteTrackManager.normalizeLegacyTrackId(wanted)
+            if (normalizedWanted != wanted) {
+                val nIdx = subtitleTracks.indexOfFirst { it.id == normalizedWanted }
+                if (nIdx >= 0) return nIdx + 1
+            }
+            return 0
         }
 
     val selectedSubtitleTrack: PaletteSubtitleTrack?
@@ -336,6 +356,11 @@ class PaletteController(
             if (wanted != null) {
                 val idx = audioTracks.indexOfFirst { it.id == wanted }
                 if (idx >= 0) return idx
+                val normalizedWanted = PaletteTrackManager.normalizeLegacyTrackId(wanted)
+                if (normalizedWanted != wanted) {
+                    val nIdx = audioTracks.indexOfFirst { it.id == normalizedWanted }
+                    if (nIdx >= 0) return nIdx
+                }
             }
             return 0
         }
@@ -426,7 +451,13 @@ class PaletteController(
         val defaultSepUnits = com.limelight.preferences.PreferenceConfiguration.defaultSeparation(depthModel)
         val defaultConvPct = com.limelight.preferences.PreferenceConfiguration.defaultConvergence(depthModel)
         val strength = effectiveStrength
-        val on = strength != DepthStrength.OFF
+        val srcFmt = effectiveSourceFormat
+        val on = if (srcFmt != StereoSourceFormat.AUTO) {
+            // Native SBS/OU never relies on the depth model; stays stereo even if depthGaveUp
+            true
+        } else {
+            !depthModelUnavailable && strength != DepthStrength.OFF
+        }
         val sepUnits = when (strength) {
             DepthStrength.OFF -> 0
             DepthStrength.SOFT -> DepthPresets.value(DepthPresets.COMFORT, defaultSepUnits)
@@ -497,7 +528,11 @@ class PaletteController(
     }
 
     fun isRowAdjustable(tab: Int, page: Int, row: Int): Boolean = when (tab) {
-        XrShared.PALETTE_TAB_3D -> row in 0..3
+        XrShared.PALETTE_TAB_3D -> when (row) {
+            0 -> strengthDisabledMessage == null
+            1, 2, 3 -> true
+            else -> false
+        }
         XrShared.PALETTE_TAB_SCREEN -> when (row) {
             0 -> screenSizeDisabledMessage == null
             1 -> screenDistDisabledMessage == null
@@ -529,7 +564,7 @@ class PaletteController(
     /** Whether the reset button (.rs) should be visible on this row (§6.3 strict rule). */
     fun isRowResetVisible(tab: Int, page: Int, row: Int): Boolean = when (tab) {
         XrShared.PALETTE_TAB_3D -> when (row) {
-            0 -> effectiveStrength != global.defaultStrength
+            0 -> strengthDisabledMessage == null && effectiveStrength != global.defaultStrength
             1 -> effectiveSourceFormat != defaultSourceFormat
             2 -> !global.floatAuto || global.floatAutoOffsetSteps != 0
             3 -> global.depthLayer != DepthLayerLevel.MEDIUM
@@ -819,38 +854,41 @@ class PaletteController(
         else -> PaletteActionResult()
     }
 
-    fun selectChip(row: Int, chipIdx: Int): PaletteActionResult = when (activeTab) {
-        XrShared.PALETTE_TAB_3D -> when (row) {
-            0 -> setStrength(DepthStrength.entries.getOrElse(chipIdx) { DepthStrength.STANDARD })
-            1 -> setSourceFormat(StereoSourceFormat.entries.getOrElse(chipIdx) { StereoSourceFormat.AUTO })
-            3 -> setDepthLayer(DepthLayerLevel.fromOrdinal(chipIdx))
+    fun selectChip(row: Int, chipIdx: Int): PaletteActionResult {
+        if (!isRowAdjustable(activeTab, danmakuPage, row)) return PaletteActionResult()
+        return when (activeTab) {
+            XrShared.PALETTE_TAB_3D -> when (row) {
+                0 -> setStrength(DepthStrength.entries.getOrElse(chipIdx) { DepthStrength.STANDARD })
+                1 -> setSourceFormat(StereoSourceFormat.entries.getOrElse(chipIdx) { StereoSourceFormat.AUTO })
+                3 -> setDepthLayer(DepthLayerLevel.fromOrdinal(chipIdx))
+                else -> PaletteActionResult()
+            }
+            XrShared.PALETTE_TAB_SCREEN -> if (row == 3) {
+                setEnvironment(PaletteEnvironment.fromOrdinal(chipIdx))
+            } else {
+                PaletteActionResult()
+            }
+            XrShared.PALETTE_TAB_DANMAKU -> if (danmakuPage == 0) {
+                when (row) {
+                    0 -> setDanmakuOn(chipIdx == 0)
+                    1 -> setDanmakuArea(DanmakuArea.fromOrdinal(chipIdx))
+                    else -> PaletteActionResult()
+                }
+            } else {
+                when (row) {
+                    0 -> setDanmakuSize(TextSizeTier.fromOrdinal(chipIdx))
+                    1 -> setDanmakuSpeed(DanmakuSpeed.fromOrdinal(chipIdx))
+                    2 -> toggleDanmakuBlock(chipIdx)
+                    else -> PaletteActionResult()
+                }
+            }
+            XrShared.PALETTE_TAB_SUBTITLE -> if (row == 2 && !selectedSubtitleIsBitmap) {
+                setSubtitleTextSize(TextSizeTier.fromOrdinal(chipIdx))
+            } else {
+                PaletteActionResult()
+            }
             else -> PaletteActionResult()
         }
-        XrShared.PALETTE_TAB_SCREEN -> if (row == 3) {
-            setEnvironment(PaletteEnvironment.fromOrdinal(chipIdx))
-        } else {
-            PaletteActionResult()
-        }
-        XrShared.PALETTE_TAB_DANMAKU -> if (danmakuPage == 0) {
-            when (row) {
-                0 -> setDanmakuOn(chipIdx == 0)
-                1 -> setDanmakuArea(DanmakuArea.fromOrdinal(chipIdx))
-                else -> PaletteActionResult()
-            }
-        } else {
-            when (row) {
-                0 -> setDanmakuSize(TextSizeTier.fromOrdinal(chipIdx))
-                1 -> setDanmakuSpeed(DanmakuSpeed.fromOrdinal(chipIdx))
-                2 -> toggleDanmakuBlock(chipIdx)
-                else -> PaletteActionResult()
-            }
-        }
-        XrShared.PALETTE_TAB_SUBTITLE -> if (row == 2 && !selectedSubtitleIsBitmap) {
-            setSubtitleTextSize(TextSizeTier.fromOrdinal(chipIdx))
-        } else {
-            PaletteActionResult()
-        }
-        else -> PaletteActionResult()
     }
 
     /** Steps a row value by `steps` discrete increments (right stick X or 8 mm hand-tracking drag). */
@@ -995,18 +1033,20 @@ class PaletteController(
     }
 
     /** Resets a single row per §6.3: per-video -> Settings default & clear override; global -> factory default. */
-    fun resetRow(row: Int): PaletteActionResult = when (activeTab) {
-        XrShared.PALETTE_TAB_3D -> when (row) {
-            0 -> {
-                video = video.copy(strength = null)
-                PaletteActionResult(
-                    changed = true,
-                    stereoChanged = true,
-                    hapticKind = XrShared.PALETTE_HAPTIC_TICK,
-                    clickSound = true,
-                    saveVideoOverrides = true,
-                )
-            }
+    fun resetRow(row: Int): PaletteActionResult {
+        if (!isRowAdjustable(activeTab, danmakuPage, row)) return PaletteActionResult()
+        return when (activeTab) {
+            XrShared.PALETTE_TAB_3D -> when (row) {
+                0 -> {
+                    video = video.copy(strength = null)
+                    PaletteActionResult(
+                        changed = true,
+                        stereoChanged = true,
+                        hapticKind = XrShared.PALETTE_HAPTIC_TICK,
+                        clickSound = true,
+                        saveVideoOverrides = true,
+                    )
+                }
             1 -> {
                 video = video.copy(sourceFormat = null)
                 PaletteActionResult(
@@ -1088,6 +1128,7 @@ class PaletteController(
             else -> PaletteActionResult()
         }
         else -> PaletteActionResult()
+        }
     }
 
     // ---- Individual setters ----
@@ -1495,6 +1536,7 @@ class PaletteController(
         mixBool(cylinderSupported)
         mixBool(danmakuSupported)
         mixBool(danmakuLoadFailed)
+        mixBool(depthModelUnavailable)
 
         when (val hv = hover) {
             PaletteHover.None -> mixInt(0)

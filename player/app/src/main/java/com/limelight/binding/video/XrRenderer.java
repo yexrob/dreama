@@ -359,6 +359,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                                       int clickState, int rowStep, boolean rowReset,
                                       int tabStep, int pageStep) { }
         default void onVrScreenDimensionsSaved(float fovDeg, float distM) { }
+        default void onVrDepthModelUnavailable() { }
     }
 
     public void setInputListener(InputListener listener) {
@@ -417,14 +418,23 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
      * thread; it goes up once the frame loop next comes round.
      */
     public void showNotice(String text, String more) {
-        showNotice(text, more, false);
+        showNotice(text, more, false, null);
+    }
+
+    /** Same as {@link #showNotice(String, String)}, running {@code onShown} once the toast is actually uploaded & displayed. */
+    public void showNotice(String text, String more, Runnable onShown) {
+        showNotice(text, more, false, onShown);
     }
 
     // The same, where the second line is a path: cut from the middle when it
     // will not fit, so the folder it starts in and the file both stay in view
     private void showNotice(String text, String more, boolean path) {
+        showNotice(text, more, path, null);
+    }
+
+    private void showNotice(String text, String more, boolean path, Runnable onShown) {
         if (text != null) {
-            pendingNotices.add(new NoticeWords(text, more, path));
+            pendingNotices.add(new NoticeWords(text, more, path, onShown));
         }
     }
 
@@ -433,11 +443,13 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         final String text;
         final String more;
         final boolean path;
+        Runnable onShown;
 
-        NoticeWords(String text, String more, boolean path) {
+        NoticeWords(String text, String more, boolean path, Runnable onShown) {
             this.text = text;
             this.more = more;
             this.path = path;
+            this.onShown = onShown;
         }
     }
 
@@ -489,7 +501,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                                    boolean perfOverlay,
                                    boolean ambilight, int ambiLevel, boolean roomLight,
                                    int envResTier, boolean localMedia,
-                                   boolean startStereoLive);
+                                   boolean startStereoLive, int initialSourceFormat);
     private native void nativeSetCaptureDir(long ctx, String dir);
     private native int nativeGetTexId(long ctx);
     private native ByteBuffer nativeGetModelInput(long ctx, int pair);
@@ -621,6 +633,9 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     private volatile boolean localMedia;
     private volatile boolean cylinderSupportedCached = true;
     private volatile boolean initialStereoLive = true;
+    private volatile int initialSourceFormat = STEREO_SRC_AUTO;
+    private final java.util.concurrent.atomic.AtomicBoolean depthUnavailableNotified =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     /** Before start(): this session plays a local file rather than a stream. */
     public void setLocalMedia(boolean on) {
@@ -630,6 +645,24 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     /** Before start(): allows local playback to start with 3D off while keeping stereo ready to toggle on. */
     public void setInitialStereoLive(boolean on) {
         initialStereoLive = on;
+    }
+
+    /** Before start(): sets initial stereo source format (AUTO / SBS / OU) so swapchain & depth init match frame 0. */
+    public void setInitialSourceFormat(int format) {
+        initialSourceFormat = format;
+    }
+
+    private void markDepthModelUnavailable() {
+        long ctx = nativeCtx;
+        if (ctx != 0) {
+            nativeDepthGaveUp(ctx);
+        }
+        if (depthUnavailableNotified.compareAndSet(false, true)) {
+            InputListener listener = inputListener;
+            if (listener != null) {
+                listener.onVrDepthModelUnavailable();
+            }
+        }
     }
 
     public boolean isCylinderSupported() {
@@ -829,13 +862,14 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 lazyDepthRoute = depthRoute;
                 depthThreadStarted = false;
                 firstDepthCapturePending = false;
+                depthUnavailableNotified.set(false);
                 nativeCtx = nativeInit(activity, videoWidth, videoHeight, prefs.fps,
                         prefs.vrDepthMode, mapSize.width, mapSize.height,
                         prefs.vrDepthDebug, prefs.vrConvergence, prefs.vrDepthScale,
                         prefs.vrHandTracking, prefs.vrSharpening, prefs.vrSupersampling,
                         prefs.enablePerfOverlay,
                         prefs.vrAmbilight, prefs.vrAmbilightLevel, prefs.vrRoomLight,
-                        prefs.vrEnvResTier, localMedia, initialStereoLive);
+                        prefs.vrEnvResTier, localMedia, initialStereoLive, initialSourceFormat);
                 if (nativeCtx == 0) {
                     initLatch.countDown();
                     return;
@@ -892,11 +926,18 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 surfaceTexture.setOnFrameAvailableListener(XrRenderer.this);
                 inputSurface = new Surface(surfaceTexture);
 
-                if (prefs.vrDepthMode == DEPTH_MODE_MODEL && (!localMedia || initialStereoLive)) {
-                    FileLog.event("depth model "+depthSpec.name+", "+depthRoute.label()
-                            +", map "+mapSize);
-                    depthThreadStarted = true;
-                    startDepthThread(prefsContext, depthSpec, depthRoute);
+                if (prefs.vrDepthMode == DEPTH_MODE_MODEL
+                        && (!localMedia || (initialStereoLive && initialSourceFormat == STEREO_SRC_AUTO))) {
+                    if (localMedia && !nativeEnsureDepthModel(nativeCtx)) {
+                        LimeLog.warning("depth3d: depth GL pre-warm unavailable at session start");
+                        depthThreadStarted = true;
+                        markDepthModelUnavailable();
+                    } else {
+                        FileLog.event("depth model "+depthSpec.name+", "+depthRoute.label()
+                                +", map "+mapSize);
+                        depthThreadStarted = true;
+                        startDepthThread(prefsContext, depthSpec, depthRoute);
+                    }
                 }
 
                 initOk[0] = true;
@@ -1006,7 +1047,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_MORE_FAVORABLE);
 
                 if (!nativeBindDepthContext(nativeCtx)) {
-                    nativeDepthGaveUp(nativeCtx);
+                    markDepthModelUnavailable();
                     return;
                 }
 
@@ -1019,7 +1060,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                         outputs[i] = nativeGetModelOutput(nativeCtx, i);
                         if (inputs[i] == null || outputs[i] == null) {
                             LimeLog.severe("Depth staging buffers missing");
-                            nativeDepthGaveUp(nativeCtx);
+                            markDepthModelUnavailable();
                             return;
                         }
                     }
@@ -1031,7 +1072,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                         // initialized with, so zero disparity, and the
                         // stream stays watchable
                         LimeLog.severe("Depth source init failed, stereo will be flat");
-                        nativeDepthGaveUp(nativeCtx);
+                        markDepthModelUnavailable();
                         return;
                     }
                     depthLabel = spec.name+" "+route.size+" "+model.runtimeLabel();
@@ -1070,7 +1111,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_MORE_FAVORABLE);
                 if (!nativeBindDepthStageContext(nativeCtx)) {
                     LimeLog.severe("Depth stage context would not bind, stereo will stay as it is");
-                    nativeDepthGaveUp(nativeCtx);
+                    markDepthModelUnavailable();
                     return;
                 }
                 try {
@@ -1397,7 +1438,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                     firstDepthCapturePending = true;
                 } else {
                     LimeLog.warning("depth3d: lazy depth GL init failed");
-                    nativeDepthGaveUp(nativeCtx);
+                    markDepthModelUnavailable();
                 }
             }
             boolean stereoBack = stereoOn && !stereoLive;
@@ -2469,7 +2510,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
             case TOAST_EXIT_AGAIN:
                 text = prefsContext.getString(R.string.vr_toast_exit_again);
                 break;
-            case TOAST_TEXT:
+            case TOAST_TEXT: {
                 NoticeWords words = arg >= 0 && arg < TOAST_TEXT_SLOTS ? noticeTexts[arg] : null;
                 if (words == null) {
                     return;
@@ -2477,7 +2518,14 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 text = words.text;
                 more = words.more;
                 path = words.path;
-                break;
+                nativeUploadToast(nativeCtx, toast.draw(text, more, path), kind, arg);
+                Runnable cb = words.onShown;
+                if (cb != null) {
+                    words.onShown = null;
+                    cb.run();
+                }
+                return;
+            }
             default:
                 return;
         }

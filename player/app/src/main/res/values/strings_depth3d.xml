@@ -630,7 +630,6 @@
     <string name="search_kind_collection_label">合集</string>
     <string name="search_kind_person_label">人物</string>
     <string name="search_list_sep">、</string>
-||||||| 5b49c22
 
     <!-- VR Quick Palette, Control Bar buttons & hand-mount setting (G2) -->
     <string name="settings_palette_hand_title">调色板挂在</string>
@@ -721,4 +720,8 @@
     <string name="vr_lang_de">德语</string>
     <string name="vr_lang_es">西班牙语</string>
     <string name="vr_lang_ru">俄语</string>
+
+    <!-- G2 follow-ups: depth model unavailable notice & palette reason -->
+    <string name="vr_depth_unavailable_toast">3D 深度模型初始化失败，已保持 2D 播放</string>
+    <string name="vr_depth_unavailable_reason">深度模型不可用，仅支持原生 3D</string>
 </resources>

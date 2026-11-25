@@ -729,9 +729,28 @@ int paletteShowDimmerLayer(int localMedia, int roomOn, int passthrough,
     return (localMedia && !roomOn && passthrough && passthroughDim && dimmerArtReady) ? 1 : 0;
 }
 
-int paletteNeedsDepthInference(int stereoMode, int stereoLive, int stereoSourceFormat) {
-    return (stereoMode != DEPTH_MODE_OFF && stereoLive
+int paletteNeedsDepthInference(int stereoMode, int stereoLive, int stereoSourceFormat,
+                               int depthGaveUp) {
+    return (stereoMode != DEPTH_MODE_OFF && stereoLive && !depthGaveUp
             && stereoSourceFormat == STEREO_SRC_AUTO) ? 1 : 0;
+}
+
+int paletteNeedStereoSwapchain(int localMedia, int stereoMode, int stereoLive,
+                               int stereoSourceFormat, int depthGaveUp) {
+    if (!localMedia) {
+        return stereoMode != DEPTH_MODE_OFF ? 1 : 0;
+    }
+    if (stereoSourceFormat == STEREO_SRC_SBS || stereoSourceFormat == STEREO_SRC_OU) {
+        return 1;
+    }
+    return (stereoMode != DEPTH_MODE_OFF && stereoLive && !depthGaveUp) ? 1 : 0;
+}
+
+int paletteMergeHaptic(int currentKind, int incomingKind) {
+    if (incomingKind <= PALETTE_HAPTIC_NONE) {
+        return currentKind;
+    }
+    return incomingKind > currentKind ? incomingKind : currentKind;
 }
 
 float paletteVideoHeightOverWidth(int videoW, int videoH, int stereoSourceFormat) {

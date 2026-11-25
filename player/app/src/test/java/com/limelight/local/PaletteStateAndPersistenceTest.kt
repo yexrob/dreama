@@ -561,4 +561,66 @@ class PaletteStateAndPersistenceTest {
         assertEquals(16f / 9f, PaletteController.effectiveVideoAspect(1920, 2160, StereoSourceFormat.OU), 1e-3f)
         assertEquals(16f / 9f, PaletteController.effectiveVideoAspect(1920, 1080, StereoSourceFormat.OU), 1e-3f)
     }
+
+    @Test
+    fun g2FollowUpsDepthFailureDisabledRowMedia3ChildPrefixAndZeroBlockSaveBuffer() {
+        // 1. depthModelUnavailable disables 3D strength row with reason in AUTO, forces flat output,
+        //    and still allows native SBS/OU stereo.
+        val c = PaletteController()
+        c.depthModelUnavailable = true
+        assertNotNull(c.strengthDisabledMessage)
+        assertEquals(DepthStrength.OFF, c.effectiveStrength)
+        assertFalse(c.isRowAdjustable(XrShared.PALETTE_TAB_3D, 0, 0))
+        assertEquals(0, c.activeRowMask() and 1)
+        assertFalse(c.computeStereoParams(null).on)
+        // Clicking/stepping disabled strength row does nothing
+        assertFalse(c.selectChip(0, DepthStrength.STRONG.ordinal).changed)
+        // Switching to native SBS still outputs stereo!
+        c.selectChip(1, StereoSourceFormat.SBS.ordinal)
+        assertNull(c.strengthDisabledMessage)
+        assertTrue(c.computeStereoParams(null).on)
+
+        // 2. Synchronous plugin SBS/OU hint resolution before prepare()
+        assertEquals(
+            StereoSourceFormat.SBS,
+            PaletteTrackManager.resolveInitialSourceFormat(null, StereoSourceFormat.SBS),
+        )
+        assertEquals(
+            StereoSourceFormat.AUTO,
+            PaletteTrackManager.resolveInitialSourceFormat(StereoSourceFormat.AUTO, StereoSourceFormat.SBS),
+        )
+
+        // 3. Media3 MergingMediaSource childIndex: prefix stripped so reordered sidecars stay matched
+        assertEquals("sub_zh", PaletteTrackManager.normalizeFormatId("1:sub_zh"))
+        assertEquals("sub_zh", PaletteTrackManager.normalizeFormatId("3:sub_zh"))
+        assertEquals("0", PaletteTrackManager.normalizeFormatId("2:0"))
+        assertEquals("2", PaletteTrackManager.normalizeFormatId("2")) // plain numeric MKV ID kept
+        val subOrderA = listOf(
+            RawTrackInfo(1, 0, "1:sub_zh", "zh", "简体", "text/vtt"),
+            RawTrackInfo(2, 0, "2:sub_en", "en", "English", "text/vtt"),
+        )
+        val subOrderB = listOf(
+            RawTrackInfo(1, 0, "1:sub_en", "en", "English", "text/vtt"),
+            RawTrackInfo(2, 0, "2:sub_zh", "zh", "简体", "text/vtt"),
+        )
+        val snapA = PaletteTrackManager.buildTracks(subOrderA, emptyList())
+        val snapB = PaletteTrackManager.buildTracks(subOrderB, emptyList())
+        assertEquals(snapA.subtitles[0].id, snapB.subtitles[1].id)
+        // Legacy saved ID containing "1:" prefix still matches normalized track!
+        val legacySavedId = "sub|id=1:sub_zh|lang=zh|lbl=简体"
+        val cLegacy = PaletteController(initialVideo = VideoPaletteOverrides(subtitleId = legacySavedId))
+        cLegacy.setTracks(snapB.subtitles, emptyList(), PaletteController.SUBTITLE_OFF_ID, null)
+        assertEquals("简体中文 · 简体", cLegacy.selectedSubtitleTrack?.label)
+
+        // 4. Lock-free pending save buffer captures dirty state and drains cleanly once for onDestroy
+        val buf = PalettePendingSaveBuffer()
+        val g = GlobalPaletteSettings(screenFovDeg = 66f)
+        val v = VideoPaletteOverrides(strength = DepthStrength.STRONG)
+        buf.publish(true, g, true, "k1", v)
+        val drained = buf.drainForDestroy()
+        assertNotNull(drained)
+        assertEquals(66f, drained!!.global!!.screenFovDeg, 0.01f)
+        assertEquals(DepthStrength.STRONG, drained.video!!.strength)
+        assertNull(buf.drainForDestroy())
+    }
 }

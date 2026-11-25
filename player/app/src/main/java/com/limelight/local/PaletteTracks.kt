@@ -115,13 +115,68 @@ object PaletteTrackManager {
     }
 
     /**
-     * Builds a stable track identifier based on `Format.id` + `language` + `label` (plus audio
-     * channel count), disambiguating identical metadata via occurrence ordinal. Falls back to
-     * group/track indices ONLY when all metadata fields are empty.
+     * Strips Media3 `MergingMediaSource`'s leading `"<childIndex>:"` prefix (e.g. `"1:sub_zh"` ->
+     * `"sub_zh"`) so persisted track IDs stay matched even when sidecar subtitle order changes.
+     * Plain numeric IDs without a colon (e.g. MKV track `"2"`) are preserved unchanged.
+     */
+    @JvmStatic
+    fun normalizeFormatId(rawId: String?): String {
+        val s = rawId?.trim().orEmpty()
+        if (s.isEmpty()) return ""
+        val colon = s.indexOf(':')
+        if (colon > 0) {
+            var allDigits = true
+            for (i in 0 until colon) {
+                if (s[i] !in '0'..'9') {
+                    allDigits = false
+                    break
+                }
+            }
+            if (allDigits) {
+                return s.substring(colon + 1)
+            }
+        }
+        return s
+    }
+
+    /**
+     * Normalizes a previously persisted track ID whose `id=` segment may still carry a legacy
+     * Media3 `"<childIndex>:"` prefix, enabling seamless matching across upgrades.
+     */
+    @JvmStatic
+    fun normalizeLegacyTrackId(trackId: String?): String? {
+        if (trackId == null) return null
+        val marker = "|id="
+        val start = trackId.indexOf(marker)
+        if (start < 0) return trackId
+        val valStart = start + marker.length
+        val valEnd = trackId.indexOf("|lang=", valStart)
+        if (valEnd < 0) return trackId
+        val rawFmtId = trackId.substring(valStart, valEnd)
+        val norm = normalizeFormatId(rawFmtId)
+        if (norm == rawFmtId) return trackId
+        return trackId.substring(0, valStart) + norm + trackId.substring(valEnd)
+    }
+
+    /**
+     * Resolves the initial stereo source format synchronously BEFORE `ExoPlayer.prepare()` so a
+     * plugin SBS/OU hint immediately suppresses unnecessary depth-model startup unless the user
+     * explicitly persisted an AUTO override for this video.
+     */
+    @JvmStatic
+    fun resolveInitialSourceFormat(
+        savedVideoOverride: StereoSourceFormat?,
+        pluginHint: StereoSourceFormat,
+    ): StereoSourceFormat = savedVideoOverride ?: pluginHint
+
+    /**
+     * Builds a stable track identifier based on `Format.id` (stripped of Media3's `childIndex:`
+     * prefix) + `language` + `label` (plus audio channel count), disambiguating identical metadata
+     * via occurrence ordinal. Falls back to group/track indices ONLY when all metadata fields are empty.
      */
     @JvmStatic
     fun buildStableTrackId(kind: String, raw: RawTrackInfo, duplicateOrdinal: Int): String {
-        val fmtId = raw.formatId?.trim().orEmpty()
+        val fmtId = normalizeFormatId(raw.formatId)
         val lang = raw.language?.trim()?.lowercase(Locale.US).orEmpty()
         val lbl = raw.label?.trim().orEmpty()
         if (fmtId.isEmpty() && lang.isEmpty() && lbl.isEmpty()) {

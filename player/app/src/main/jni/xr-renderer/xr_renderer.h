@@ -1440,9 +1440,12 @@ typedef struct {
     int paletteArtReady;
     unsigned char* paletteFlipBuf;
 
-    // depth3d G2: lazy depth-model GL readiness (deferred when local playback starts 3D OFF)
+    // depth3d G2: depth-model GL readiness (pre-warmed behind splash without loading weights)
     int depthModelGlReady;
+    int depthModelGlFailed;
     int depthReadyRendered;
+    // Whether ctx->swapchain is double-wide (videoWidth * 2) for stereo rendering
+    int swapchainStereo;
 
     // depth3d G2: mutex-guarded pending commands from non-render threads, applied
     // exclusively on the render thread at the start of nativeUpdateInput / nativeEndFrame.
@@ -1755,6 +1758,7 @@ typedef void (*PFNDELETEQUERIESEXT)(GLsizei, const GLuint*);
 // xr_session.c: instance, session, swapchain and lifecycle
 int checkXr(XrResult res, const char* what);
 const char* xrResultName(XrResult res);
+int ensureVideoSwapchainStereo(XrCtx* ctx);
 
 // xr_gl.c: GL setup, the warp passes and the GPU timer
 extern const float VERTEX_DATA[16];

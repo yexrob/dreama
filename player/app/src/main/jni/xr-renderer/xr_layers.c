@@ -1514,6 +1514,16 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
     // Where the controllers are this frame, before anything draws them
     updateControllerModels(ctx);
 
+    // Lazily upgrade a local 2D single-wide swapchain to double-wide when 3D or
+    // SBS/OU is turned on mid-session, BEFORE acquiring or drawing the frame.
+    int depthGaveUpNow = atomic_load_explicit(&ctx->depthGaveUp, memory_order_relaxed);
+    int wantStereoChain = paletteNeedStereoSwapchain(
+            ctx->localMedia, ctx->stereoMode, ctx->stereoLive, ctx->stereoSourceFormat,
+            depthGaveUpNow);
+    if (wantStereoChain && !ctx->swapchainStereo && ctx->shouldRender) {
+        ensureVideoSwapchainStereo(ctx);
+    }
+
     // A switch of the 3D redraws the frame already latched, since the decoder
     // sends nothing while the picture stands still
     int redraw = ctx->warpRedraw && ctx->everRendered;
@@ -1547,8 +1557,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
     FrameView view;
     view.aspect = paletteVideoHeightOverWidth(ctx->videoWidth, ctx->videoHeight,
                                               ctx->stereoSourceFormat);
-    view.stereo = (ctx->stereoMode != DEPTH_MODE_OFF)
-            || (ctx->localMedia && ctx->stereoSourceFormat != STEREO_SRC_AUTO && ctx->stereoLive);
+    view.stereo = ctx->swapchainStereo && wantStereoChain;
     int roomStyle = roomEffective(ctx);
     view.roomOn = roomStyle > 0;
     view.headLocked = headLocked;
