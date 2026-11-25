@@ -239,7 +239,13 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
                                     display.ifBlank { manifest.name },
                                 ),
                             )
-                            nav.openLibrarySelecting(PluginMediaSource.sourceIdFor(instanceId))
+                            val completedSourceId = PluginMediaSource.sourceIdFor(instanceId)
+                            if (page.returnAfterSuccess) {
+                                nav.notifyPluginAuthenticated(completedSourceId)
+                                nav.back()
+                            } else {
+                                nav.openLibrarySelecting(completedSourceId)
+                            }
                             return@launch
                         }
                         LoginPollStatus.EXPIRED -> {
@@ -397,7 +403,13 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
                             savedInst.displayName,
                         ),
                     )
-                    nav.openLibrarySelecting(PluginMediaSource.sourceIdFor(savedInst.instanceId))
+                    val completedSourceId = PluginMediaSource.sourceIdFor(savedInst.instanceId)
+                    if (page.returnAfterSuccess) {
+                        nav.notifyPluginAuthenticated(completedSourceId)
+                        nav.back()
+                    } else {
+                        nav.openLibrarySelecting(completedSourceId)
+                    }
                 }
             }
         } catch (e: CancellationException) {

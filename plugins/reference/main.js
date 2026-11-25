@@ -610,26 +610,47 @@ export default {
   },
 
   async search(ctx, { query = '', cursor = null, kind = null } = {}) {
-    const q = String(query).trim().toLowerCase();
+    const q = String(query ?? '').trim().toLowerCase();
+    if (!q) {
+      return { items: [], next: null };
+    }
+    const knownKinds = new Set([
+      'movie', 'series', 'season', 'episode', 'video', 'live', 'folder', 'collection', 'person',
+    ]);
+    const requestedKind = typeof kind === 'string' && knownKinds.has(kind) ? kind : null;
     const matches = Object.values(CATALOG).filter((it) => {
-      if (kind && it.kind !== kind) return false;
-      return !q || it.title.toLowerCase().includes(q) || (it.overview || '').toLowerCase().includes(q);
+      if (requestedKind) {
+        if (requestedKind === 'series') {
+          if (it.kind !== 'series' && it.kind !== 'episode') return false;
+        } else if (it.kind !== requestedKind) {
+          return false;
+        }
+      }
+      return it.title.toLowerCase().includes(q) || (it.overview || '').toLowerCase().includes(q);
     });
-    const offset = cursor ? Number(cursor) || 0 : 0;
+    const offset = cursor ? Math.max(0, Number(cursor) || 0) : 0;
     const limit = 4;
     const page = await mapWithUserState(ctx, matches.slice(offset, offset + limit));
-    return {
-      items: page,
-      next: offset + limit < matches.length ? String(offset + limit) : null,
-    };
+    const next = page.length > 0 && offset + page.length < matches.length ? String(offset + page.length) : null;
+    return { items: page, next };
   },
 
   suggest(ctx, { query = '' } = {}) {
-    const q = String(query).trim().toLowerCase();
-    return Object.values(CATALOG)
-      .map((it) => it.title)
-      .filter((t) => !q || t.toLowerCase().includes(q))
-      .slice(0, 5);
+    const q = String(query ?? '').trim().toLowerCase();
+    if (!q) return [];
+    const seen = new Set();
+    const out = [];
+    for (const it of Object.values(CATALOG)) {
+      if (it.title.toLowerCase().includes(q)) {
+        const key = it.title.toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          out.push(it.title);
+          if (out.length >= 5) break;
+        }
+      }
+    }
+    return out;
   },
 
   async reportProgress(ctx, { itemId, positionMs, durationMs, event, session = null }) {

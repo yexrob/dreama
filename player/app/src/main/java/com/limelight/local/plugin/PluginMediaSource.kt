@@ -229,10 +229,19 @@ class PluginMediaSource(
 
     override suspend fun suggest(query: String): List<String> = guarded {
         requireCapability(PluginCapability.SEARCH)
+        if (!runtime.isInitialized || runtime.isMethodKnownMissing("suggest")) return@guarded emptyList()
         val arg = buildJsonObject { put("query", query) }
-        val raw = runtime.invoke("suggest", arg)
+        val raw = runtime.invokeOptionalIfReadyAndIdle("suggest", arg) ?: return@guarded emptyList()
         mapper.mapSuggest(raw)
     }
+
+    /** True once the runtime has loaded and confirmed `suggest` is not exported. */
+    val isSuggestKnownUnsupported: Boolean
+        get() = runtime.isMethodKnownMissing("suggest")
+
+    /** True when the underlying QuickJS VM is already warm and initialized. */
+    val isRuntimeInitialized: Boolean
+        get() = runtime.isInitialized
 
     override suspend fun reportProgress(
         itemId: String,

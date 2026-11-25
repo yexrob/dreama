@@ -104,7 +104,7 @@ fun HomeScreen(model: WallModel, nav: WallNav) {
                 }
             }
         }
-        NavBar(Tab.Home, nav::tab, nav::openSettings, solid = scrolled || hero == null)
+        NavBar(Tab.Home, nav::tab, nav::openSettings, solid = scrolled || hero == null, onSearch = nav::openSearch)
     }
 }
 

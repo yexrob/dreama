@@ -45,6 +45,17 @@ data class SeriesInitialResolution(
 )
 
 /**
+ * Resolved detail screen target: when opened from an [ItemKind.EPISODE] (e.g. a search result
+ * card per `ux-spec.md` §3.9.7), resolves up through its parent Season/Series (or multi-part video)
+ * so the user lands on the series detail page focused directly on that episode.
+ */
+data class EpisodeTargetResolution(
+    val displayItem: Item,
+    val focusSeasonId: String? = null,
+    val focusEpisodeId: String? = null,
+)
+
+/**
  * Pure, JVM-testable helper logic for movie & series detail screens (`movie.html` & `series.html`):
  * - Classifying series vs movie layout
  * - Merging local `WatchProgress` with plugin-provided `progressMs`/`played`
@@ -58,6 +69,77 @@ object DetailStateLogic {
 
     fun isSeriesLayout(item: Item): Boolean =
         item.kind == ItemKind.SERIES || item.seasons.isNotEmpty() || item.episodes.isNotEmpty()
+
+    /**
+     * Resolves an item opened in [DetailScreen]:
+     * - By default (`resolveEpisodeParent = false`, used by Home Continue Watching, Library,
+     *   Grid, and Next Episode), executes a single `source.detail(initialItem.id)` call —
+     *   preserving exact pre-search behavior with zero extra network hops.
+     * - Only when the caller explicitly requests episode-to-series navigation
+     *   (`resolveEpisodeParent = true`, e.g. clicking an [ItemKind.EPISODE] in Search results
+     *   per `ux-spec.md` §3.9.7), traverses `Episode -> Season -> Series` (up to 3 `detail()`
+     *   calls total) inside a single bounded [parentResolveTimeoutMs] budget. Any parent
+     *   lookup failure or budget exhaustion falls back cleanly to the episode's own detail.
+     */
+    suspend fun resolveDetailTarget(
+        source: MediaSource,
+        initialItem: Item,
+        requestedFocusSeasonId: String? = null,
+        requestedFocusEpisodeId: String? = null,
+        resolveEpisodeParent: Boolean = false,
+        parentResolveTimeoutMs: Long = DEFAULT_RESOLVE_TIMEOUT_MS,
+    ): EpisodeTargetResolution {
+        if (!resolveEpisodeParent || initialItem.kind != ItemKind.EPISODE) {
+            return EpisodeTargetResolution(
+                displayItem = source.detail(initialItem.id),
+                focusSeasonId = requestedFocusSeasonId,
+                focusEpisodeId = requestedFocusEpisodeId,
+            )
+        }
+        var fetchedEpisode: Item? = null
+        val resolved = withTimeoutOrNull(parentResolveTimeoutMs) {
+            val epDetail = source.detail(initialItem.id)
+            fetchedEpisode = epDetail
+            val parentId = epDetail.parentId?.takeIf { it.isNotBlank() }
+                ?: initialItem.parentId?.takeIf { it.isNotBlank() }
+                ?: return@withTimeoutOrNull EpisodeTargetResolution(displayItem = epDetail)
+
+            val parent = try {
+                source.detail(parentId)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                null
+            }
+            if (parent != null) {
+                if (parent.kind == ItemKind.SEASON && !parent.parentId.isNullOrBlank()) {
+                    val series = try {
+                        source.detail(parent.parentId)
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (series != null && isSeriesLayout(series)) {
+                        return@withTimeoutOrNull EpisodeTargetResolution(
+                            displayItem = series,
+                            focusSeasonId = parent.id,
+                            focusEpisodeId = epDetail.id,
+                        )
+                    }
+                }
+                if (isSeriesLayout(parent)) {
+                    return@withTimeoutOrNull EpisodeTargetResolution(
+                        displayItem = parent,
+                        focusSeasonId = parent.id.takeIf { parent.kind == ItemKind.SEASON },
+                        focusEpisodeId = epDetail.id,
+                    )
+                }
+            }
+            EpisodeTargetResolution(displayItem = epDetail)
+        }
+        return resolved ?: EpisodeTargetResolution(displayItem = fetchedEpisode ?: initialItem)
+    }
 
     /** Specials seasons use index == 0 (e.g. Jellyfin Season 0 "Specials") and are sorted last (#10). */
     fun isSpecialsSeason(season: Item): Boolean = season.index == 0
@@ -134,16 +216,36 @@ object DetailStateLogic {
 
     /**
      * Picks the primary button target for a series/season:
-     * 1. In-progress episode (prefers most recently updated local progress)
-     * 2. First unwatched episode after any watched episode
-     * 3. First episode in the season
+     * - When [explicitFocusEpisodeId] is explicitly provided (only from Search episode clicks
+     *   or callers explicitly targeting a specific episode), prefers that episode so the user
+     *   can play the exact episode they selected.
+     * - Otherwise (all standard entries: Home, Continue Watching, Library, Next Episode):
+     *   1. In-progress episode (prefers most recently updated local progress)
+     *   2. First unwatched episode after any watched episode
+     *   3. First episode in the season
      */
     fun pickPlayTarget(
         seasonNumber: Int?,
         episodes: List<Item>,
         localProgress: Map<String, WatchProgress>,
+        explicitFocusEpisodeId: String? = null,
     ): SeriesPlayTarget? {
         if (episodes.isEmpty()) return null
+
+        if (!explicitFocusEpisodeId.isNullOrBlank()) {
+            val focusIdx = episodes.indexOfFirst { it.id == explicitFocusEpisodeId }
+            if (focusIdx >= 0) {
+                val ep = episodes[focusIdx]
+                val ws = computeWatchState(ep, localProgress[ep.id])
+                return SeriesPlayTarget(
+                    seasonNumber = seasonNumber,
+                    episodeNumber = ep.index?.takeIf { it > 0 } ?: (focusIdx + 1),
+                    episode = ep,
+                    resumePositionMs = (ws as? WatchState.InProgress)?.positionMs ?: 0L,
+                    isResume = ws is WatchState.InProgress,
+                )
+            }
+        }
 
         val states = episodes.mapIndexed { idx, ep ->
             Triple(idx, ep, computeWatchState(ep, localProgress[ep.id]))
@@ -210,6 +312,8 @@ object DetailStateLogic {
         loadMoreInSeason: (suspend (seasonId: String) -> List<Item>)? = null,
         knownParentIds: Map<String, String?> = emptyMap(),
         timeoutMs: Long = DEFAULT_RESOLVE_TIMEOUT_MS,
+        focusSeasonId: String? = null,
+        focusEpisodeId: String? = null,
     ): SeriesInitialResolution? {
         if (seasons.isEmpty()) return null
         val ordered = orderSeasons(seasons)
@@ -224,6 +328,42 @@ object DetailStateLogic {
                 for (ep in season.episodes) {
                     preloadedSeasonByEpId[ep.id] = sIdx
                 }
+            }
+
+            // Explicit episode focus (e.g. clicking an episode card in Search results, §3.9.7)
+            if (!focusEpisodeId.isNullOrBlank()) {
+                val explicitSeasonIdx = focusSeasonId?.let { seasonIndexById[it] }
+                    ?: preloadedSeasonByEpId[focusEpisodeId]
+                    ?: defaultIdx
+                val targetSeason = ordered[explicitSeasonIdx]
+                val targetSeasonNum = seasonNumberFor(ordered, explicitSeasonIdx)
+                var eps = try {
+                    loadSeasonEpisodes(targetSeason.id)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    emptyList()
+                }
+                var epIdx = eps.indexOfFirst { it.id == focusEpisodeId }
+                var pagesTried = 0
+                while (epIdx < 0 && loadMoreInSeason != null && pagesTried < 5) {
+                    pagesTried++
+                    val expanded = try {
+                        loadMoreInSeason(targetSeason.id)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        break
+                    }
+                    if (expanded.size <= eps.size) break
+                    eps = expanded
+                    epIdx = eps.indexOfFirst { it.id == focusEpisodeId }
+                }
+                return@withTimeoutOrNull SeriesInitialResolution(
+                    seasonId = targetSeason.id,
+                    seasonNumber = targetSeasonNum,
+                    target = pickPlayTarget(targetSeasonNum, eps, localProgress, focusEpisodeId),
+                )
             }
 
             var matchedSeasonIdx: Int? = null
@@ -672,5 +812,43 @@ class SeriesLoaderCoordinator(
 
     fun reset(seasonId: String) {
         loaders[seasonId]?.resetForRetry()
+    }
+}
+
+/**
+ * Pure, JVM-testable one-shot horizontal auto-scroll controller for the Series episode strip:
+ * - Scrolls ONCE per season on initial load (waiting until cross-season resolution is ready so
+ *   we never scroll twice).
+ * - Scrolls ONCE when an explicit episode focus (e.g. from Search §3.9.7) becomes available.
+ * - NEVER re-scrolls the same season when Room watch progress updates change `playTarget`,
+ *   preventing interruption of manual horizontal scrolling.
+ */
+class SeriesAutoScrollController {
+    private val scrolledSeasons = HashSet<String>()
+    private var appliedExplicitFocus: Pair<String, String>? = null
+
+    fun consumeScrollTargetIndex(
+        seasonKey: String,
+        episodes: List<Item>,
+        targetEpisodeId: String?,
+        explicitFocusEpisodeId: String? = null,
+        readyForInitialScroll: Boolean = true,
+    ): Int? {
+        if (episodes.isEmpty()) return null
+
+        if (!explicitFocusEpisodeId.isNullOrBlank()) {
+            val pair = seasonKey to explicitFocusEpisodeId
+            if (appliedExplicitFocus != pair && episodes.any { it.id == explicitFocusEpisodeId }) {
+                appliedExplicitFocus = pair
+                scrolledSeasons.add(seasonKey)
+                return DetailStateLogic.initialScrollIndex(episodes, explicitFocusEpisodeId)
+            }
+        }
+
+        if (!readyForInitialScroll) return null
+        if (scrolledSeasons.add(seasonKey)) {
+            return DetailStateLogic.initialScrollIndex(episodes, targetEpisodeId)
+        }
+        return null
     }
 }

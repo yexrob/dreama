@@ -325,7 +325,7 @@
     <string name="settings_cat_input">手柄与手势</string>
     <string name="settings_cat_input_sub">手势、射线、指针与音效</string>
     <string name="settings_cat_privacy">隐私</string>
-    <string name="settings_cat_privacy_sub">本地运行日志、重置配对信息</string>
+    <string name="settings_cat_privacy_sub">搜索记录、本地运行日志、重置配对信息</string>
     <string name="settings_cat_about">关于</string>
     <string name="settings_cat_about_sub">版本、开源许可与第三方组件</string>
 
@@ -561,4 +561,73 @@
     <string name="settings_screen_dist_current_sub">当前 %1$s · 仅调整纵深，保持视角大小不变</string>
     <string name="settings_curved_flat_label">平面</string>
     <string name="settings_curved_percent">%1$d%%</string>
+
+    <!-- Settings: Search privacy -->
+    <string name="settings_remember_search_title">记住搜索记录</string>
+    <string name="settings_remember_search_sub">仅保存在这台头显本地；关闭会立即清空已有记录，且不再保存新搜索</string>
+
+    <!-- Aggregated Search (ux-spec.md §3.9, 08-search.md) -->
+    <string name="search_placeholder">搜索片名、剧集或视频</string>
+    <string name="search_placeholder_nosource">没有可以搜索的播放源</string>
+    <string name="search_source_generic_label">插件</string>
+    <string name="search_kind_all">全部</string>
+    <string name="search_kind_movie">电影</string>
+    <string name="search_kind_series">剧集</string>
+    <string name="search_kind_video">视频</string>
+    <string name="search_idle_recent_queries">最近搜过</string>
+    <string name="search_idle_clear_history">清除</string>
+    <string name="search_idle_history_cleared">搜索记录已清除</string>
+    <string name="search_idle_history_undo">撤销</string>
+    <string name="search_idle_recent_watched">最近看过</string>
+    <string name="search_idle_empty_hint">输入片名开始搜索</string>
+    <string name="search_item_watched">已看完</string>
+    <string name="search_typing_prefix">搜索</string>
+    <string name="search_typing_verbatim">「%1$s」</string>
+    <string name="search_typing_local_meta">%1$s · %2$s</string>
+    <string name="search_stat_searching">正在搜 %1$d 个播放源</string>
+    <string name="search_stat_searched">搜了 %1$d 个播放源</string>
+    <string name="search_tail_still_searching">还在搜：%1$s</string>
+    <string name="search_tail_not_found_in">没找到：%1$s</string>
+    <string name="search_tail_unsupported">不支持搜索：%1$s</string>
+    <string name="search_row_sub_exact">%1$s · %2$d 个</string>
+    <string name="search_row_sub_more">%1$s · %2$d 个以上</string>
+    <string name="search_more_all">全部</string>
+    <string name="search_more_count">%1$d 个</string>
+    <string name="search_more_count_plus">%1$d+ 个</string>
+    <string name="search_expanded_title">%1$s 里的「%2$s」</string>
+    <string name="search_expanded_loading_page">正在加载第 %1$d 页</string>
+    <string name="search_expanded_page_error">第 %1$d 页没加载出来</string>
+    <string name="search_expanded_end_no_more">共 %1$d 个，到底了</string>
+    <string name="search_expanded_kind_empty">「%1$s」里没有%2$s结果</string>
+    <string name="search_err_needs_auth">「%1$s」登录后才能搜</string>
+    <string name="search_err_action_login">登录</string>
+    <string name="search_err_unavailable">「%1$s」连不上，这次没搜它</string>
+    <string name="search_err_timeout">「%1$s」%2$d 秒没有响应</string>
+    <string name="search_err_rate_limited_min">「%1$s」暂时不让搜，%2$d 分钟后再试</string>
+    <string name="search_err_rate_limited">「%1$s」暂时不让搜，%2$d 秒后再试</string>
+    <string name="search_err_rate_limited_ready">「%1$s」暂时不让搜，现在可以重试</string>
+    <string name="search_err_empty_after_retry">「%1$s」里没有找到</string>
+    <string name="search_err_retrying">正在重新搜索「%1$s」…</string>
+    <string name="search_noresult_title">没有找到「%1$s」</string>
+    <string name="search_noresult_body">%1$s里都没有。换个说法，或者少打几个字。</string>
+    <string name="search_noresult_suggest_heading">是不是要找</string>
+    <string name="search_noresult_unsupported">%1$s不支持搜索</string>
+    <string name="search_noresult_go_library">去媒体库翻翻</string>
+    <string name="search_nosource_title">你的播放源都不支持搜索</string>
+    <string name="search_nosource_body">%1$s只能按文件夹翻。加一个 Jellyfin、Emby 或支持搜索的插件，这里就能搜。</string>
+    <string name="search_nosource_body_none">还没有添加播放源。</string>
+    <string name="search_nosource_go_library">去媒体库</string>
+    <string name="search_nosource_add_source">添加播放源</string>
+    <string name="search_kind_folder_count">文件夹 · %1$d 项</string>
+    <string name="search_kind_folder">文件夹</string>
+    <string name="search_kind_movie_year">电影 %1$d</string>
+    <string name="search_kind_movie_label">电影</string>
+    <string name="search_kind_series_year">剧集 %1$d</string>
+    <string name="search_kind_series_label">剧集</string>
+    <string name="search_kind_episode_label">单集</string>
+    <string name="search_kind_video_label">视频</string>
+    <string name="search_kind_live_label">直播</string>
+    <string name="search_kind_collection_label">合集</string>
+    <string name="search_kind_person_label">人物</string>
+    <string name="search_list_sep">、</string>
 </resources>

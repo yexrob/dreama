@@ -14,7 +14,10 @@ import com.limelight.local.media.SourceUnavailableException
 import com.limelight.local.media.StereoHint
 import com.limelight.local.media.WatchProgress
 import com.limelight.local.stream.XmlStringLookup
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -214,5 +217,147 @@ class DetailStage3Test {
         val series = Item("s1", ItemKind.SERIES, "潮汐表", year = 2024, rating = 9.1f)
         val seriesMeta = DetailStateLogic.formatSeriesMeta(series, 3, "NAS", strings)
         assertEquals("剧集 · 3 季 · 2024 · ★ 9.1 · 来自 NAS", seriesMeta)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun resolveDetailTargetOnlyTraversesEpisodeParentWhenExplicitlyRequestedAndHonorsBudget() = runTest {
+        val ep3 = Item("ep-3", ItemKind.EPISODE, "退潮之后", parentId = "season-2", index = 3)
+        val season2 = Item("season-2", ItemKind.SEASON, "第 2 季", parentId = "series-1", index = 2)
+        val series = Item("series-1", ItemKind.SERIES, "潮汐表", seasons = listOf(season2))
+
+        val detailCalls = ArrayList<String>()
+        var parentDelayMs = 0L
+        var failParent = false
+        val src = object : MediaSource {
+            override val source = Source("plugin:nas", "NAS", SourceKind.PLUGIN, "NAS")
+            override suspend fun home(): List<Shelf> = emptyList()
+            override suspend fun browse(categoryId: String, page: Int): MediaPage<Item> = MediaPage(emptyList(), null)
+            override suspend fun detail(itemId: String): Item {
+                detailCalls += itemId
+                if (itemId == "season-2") {
+                    if (parentDelayMs > 0L) delay(parentDelayMs)
+                    if (failParent) throw SourceUnavailableException("parent failed")
+                }
+                return when (itemId) {
+                    "ep-3" -> ep3
+                    "season-2" -> season2
+                    "series-1" -> series
+                    else -> throw SourceUnavailableException("missing $itemId")
+                }
+            }
+            override suspend fun playback(itemId: String): PlaybackInfo = PlaybackInfo("http://example.invalid/$itemId")
+        }
+
+        // 1. Default entry (Home Continue Watching / Library / Next Episode): resolveEpisodeParent = false
+        //    MUST make ONLY 1 detail() call and return the episode directly (exact pre-Task-H behavior)
+        val defaultRes = DetailStateLogic.resolveDetailTarget(src, ep3)
+        assertEquals(listOf("ep-3"), detailCalls)
+        assertEquals("ep-3", defaultRes.displayItem.id)
+        assertNull(defaultRes.focusSeasonId)
+        assertNull(defaultRes.focusEpisodeId)
+
+        // 2. Explicit Search episode entry (resolveEpisodeParent = true): resolves Episode -> Season -> Series
+        detailCalls.clear()
+        val searchRes = DetailStateLogic.resolveDetailTarget(src, ep3, resolveEpisodeParent = true)
+        assertEquals(listOf("ep-3", "season-2", "series-1"), detailCalls)
+        assertEquals("series-1", searchRes.displayItem.id)
+        assertEquals("season-2", searchRes.focusSeasonId)
+        assertEquals("ep-3", searchRes.focusEpisodeId)
+
+        // 3. Explicit entry with parent failure falls back cleanly to original episode detail
+        detailCalls.clear()
+        failParent = true
+        val errFallback = DetailStateLogic.resolveDetailTarget(src, ep3, resolveEpisodeParent = true)
+        assertEquals("ep-3", errFallback.displayItem.id)
+        assertNull(errFallback.focusSeasonId)
+        assertNull(errFallback.focusEpisodeId)
+
+        // 4. Explicit entry exceeding overall budget stops at parentResolveTimeoutMs and falls back cleanly
+        detailCalls.clear()
+        failParent = false
+        parentDelayMs = 15_000L
+        val t0 = testScheduler.currentTime
+        val timeoutFallback = DetailStateLogic.resolveDetailTarget(
+            source = src,
+            initialItem = ep3,
+            resolveEpisodeParent = true,
+            parentResolveTimeoutMs = 2_000L,
+        )
+        assertEquals(2_000L, testScheduler.currentTime - t0)
+        assertEquals("ep-3", timeoutFallback.displayItem.id)
+        assertNull(timeoutFallback.focusEpisodeId)
+    }
+
+    @Test
+    fun pickPlayTargetOnlyOverridesNextEpisodeWhenExplicitFocusProvided() {
+        val ep1 = Item("e1", ItemKind.EPISODE, "第1集", index = 1, durationMs = 2_400_000L, played = true)
+        val ep2 = Item("e2", ItemKind.EPISODE, "第2集", index = 2, durationMs = 2_400_000L, played = true)
+        val ep3 = Item("e3", ItemKind.EPISODE, "第3集", index = 3, durationMs = 2_400_000L)
+        val episodes = listOf(ep1, ep2, ep3)
+
+        // Standard entries (Home/Library/Next Episode, explicitFocusEpisodeId = null):
+        // picks next unwatched episode (e3), never overridden by already-watched e1
+        val normalTarget = DetailStateLogic.pickPlayTarget(1, episodes, emptyMap())!!
+        assertEquals("e3", normalTarget.episode.id)
+        assertTrue(normalTarget.isResume)
+
+        // Explicit Search episode focus on already-watched e1: focuses e1 directly
+        val focusedTarget = DetailStateLogic.pickPlayTarget(1, episodes, emptyMap(), explicitFocusEpisodeId = "e1")!!
+        assertEquals("e1", focusedTarget.episode.id)
+        assertFalse(focusedTarget.isResume)
+        assertEquals(0L, focusedTarget.resumePositionMs)
+    }
+
+    @Test
+    fun seriesAutoScrollControllerScrollsOncePerSeasonAndNeverReScrollsOnProgressUpdate() {
+        val episodes = (1..8).map { n -> Item("e$n", ItemKind.EPISODE, "第 $n 集", index = n) }
+
+        // 1. Standard entry: scrolls ONCE on initial ready, NEVER re-scrolls when progress shifts playTarget
+        val normalCtrl = SeriesAutoScrollController()
+        // Wait while initial resolution is still running
+        assertNull(normalCtrl.consumeScrollTargetIndex("s1", episodes, "e1", readyForInitialScroll = false))
+        // Ready with target e4 -> scrolls once to index 2 (1 episode to the left of e4)
+        assertEquals(2, normalCtrl.consumeScrollTargetIndex("s1", episodes, "e4", readyForInitialScroll = true))
+        // Room progress update changes target to e5 -> MUST return null (do not interrupt manual scroll!)
+        assertNull(normalCtrl.consumeScrollTargetIndex("s1", episodes, "e5", readyForInitialScroll = true))
+        assertNull(normalCtrl.consumeScrollTargetIndex("s1", episodes, "e6", readyForInitialScroll = true))
+        // Switching to season 2 scrolls ONCE for season 2, then stops on progress updates
+        assertEquals(0, normalCtrl.consumeScrollTargetIndex("s2", episodes, "e1", readyForInitialScroll = true))
+        assertNull(normalCtrl.consumeScrollTargetIndex("s2", episodes, "e2", readyForInitialScroll = true))
+
+        // 2. Explicit Search episode focus: scrolls once to focused episode (e6 -> index 4), never re-scrolls
+        val focusCtrl = SeriesAutoScrollController()
+        // Page 1 only has e1..e4 while resolution is still fetching page 2 -> does not waste scroll
+        assertNull(
+            focusCtrl.consumeScrollTargetIndex(
+                seasonKey = "s1",
+                episodes = episodes.take(4),
+                targetEpisodeId = "e1",
+                explicitFocusEpisodeId = "e6",
+                readyForInitialScroll = false,
+            ),
+        )
+        // Page 2 arrives containing e6 -> scrolls once to index 4 (e5 visible on the left)
+        assertEquals(
+            4,
+            focusCtrl.consumeScrollTargetIndex(
+                seasonKey = "s1",
+                episodes = episodes,
+                targetEpisodeId = "e6",
+                explicitFocusEpisodeId = "e6",
+                readyForInitialScroll = true,
+            ),
+        )
+        // Later watch progress updates never trigger another scroll
+        assertNull(
+            focusCtrl.consumeScrollTargetIndex(
+                seasonKey = "s1",
+                episodes = episodes,
+                targetEpisodeId = "e7",
+                explicitFocusEpisodeId = "e6",
+                readyForInitialScroll = true,
+            ),
+        )
     }
 }

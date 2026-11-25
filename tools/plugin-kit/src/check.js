@@ -301,15 +301,118 @@ export async function checkPlugin(targetPath, opts = {}) {
           else checks.push('categories() schema');
         }
         if (caps.has('search')) {
-          const sr = await host.invoke('search', { query: 'test' });
-          const sErrs = validateMethodResult('search', sr, manifest, host.networkPolicy);
+          // 1. Empty & whitespace query must not throw and must return empty ItemPage
+          for (const emptyQ of ['', '   ']) {
+            const emptyRes = await host.invoke('search', { query: emptyQ });
+            const emptyErrs = validateMethodResult('search', emptyRes, manifest, host.networkPolicy);
+            if (emptyErrs.length) {
+              errors.push(...emptyErrs.map((e) => `search(${JSON.stringify(emptyQ)}): ${e}`));
+            } else if ((emptyRes.items || []).length > 0 || emptyRes.next) {
+              errors.push(`search(${JSON.stringify(emptyQ)}) must return empty items and next=null`);
+            }
+          }
+
+          // 2. Standard query (+ fallback token derived from home/browse titles to exercise pagination)
+          let probeQuery = 'test';
+          let sr = await host.invoke('search', { query: probeQuery });
+          let sErrs = validateMethodResult('search', sr, manifest, host.networkPolicy);
           if (sErrs.length) errors.push(...sErrs);
           else checks.push('search() schema & image URLs');
+
+          if (!sErrs.length && !sr.next && (sr.items || []).length === 0 && allItems.length > 0) {
+            const charFreq = new Map();
+            for (const it of allItems) {
+              const title = String(it?.title || '').trim();
+              const seenInTitle = new Set();
+              for (const ch of title) {
+                if (/\s/.test(ch)) continue;
+                if (!seenInTitle.has(ch)) {
+                  seenInTitle.add(ch);
+                  charFreq.set(ch, (charFreq.get(ch) || 0) + 1);
+                }
+              }
+            }
+            const bestChar = [...charFreq.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+            if (bestChar) {
+              probeQuery = bestChar;
+              sr = await host.invoke('search', { query: probeQuery });
+              sErrs = validateMethodResult('search', sr, manifest, host.networkPolicy);
+              if (sErrs.length) errors.push(...sErrs);
+            }
+          }
+
+          // 3. Pagination progression: follow up to 3 subsequent pages, checking schema,
+          //    page-2 duplicate content (ignored cursor), and cursor cycles of any length.
+          if (!sErrs.length && sr?.next) {
+            const page1Ids = new Set(
+              (sr.items || []).map((it) => it?.id).filter((id) => typeof id === 'string' && id.length > 0),
+            );
+            const seenCursors = new Set([sr.next]);
+            let curCursor = sr.next;
+            let paginationOk = true;
+            const maxExtraPages = 3;
+            for (let pageIdx = 2; pageIdx <= 1 + maxExtraPages && curCursor; pageIdx++) {
+              const srNext = await host.invoke('search', { query: probeQuery, cursor: curCursor });
+              const snErrs = validateMethodResult('search', srNext, manifest, host.networkPolicy);
+              if (snErrs.length) {
+                errors.push(...snErrs.map((e) => `search(page${pageIdx}): ${e}`));
+                paginationOk = false;
+                break;
+              }
+              if (pageIdx === 2 && page1Ids.size > 0 && Array.isArray(srNext.items) && srNext.items.length > 0) {
+                const page2Ids = srNext.items.map((it) => it?.id).filter((id) => typeof id === 'string' && id.length > 0);
+                if (page2Ids.length > 0 && page2Ids.every((id) => page1Ids.has(id))) {
+                  errors.push('search() page 2 duplicated page 1 items (plugin appears to ignore cursor)');
+                  paginationOk = false;
+                  break;
+                }
+              }
+              const nextCursor = srNext?.next || null;
+              if (nextCursor) {
+                if (seenCursors.has(nextCursor)) {
+                  errors.push(`search() pagination cursor cycle detected at '${nextCursor}' (infinite loop risk)`);
+                  paginationOk = false;
+                  break;
+                }
+                seenCursors.add(nextCursor);
+              }
+              curCursor = nextCursor;
+            }
+            if (paginationOk) {
+              checks.push('search() pagination cursor progression');
+            }
+          }
+
+          // 4. Kind filter & unknown/unsupported kind tolerance (must not throw)
+          const srKind = await host.invoke('search', { query: probeQuery, kind: 'movie' });
+          const skErrs = validateMethodResult('search', srKind, manifest, host.networkPolicy);
+          if (skErrs.length) errors.push(...skErrs.map((e) => `search(kind=movie): ${e}`));
+
+          const srUnknownKind = await host.invoke('search', { query: probeQuery, kind: 'unknown_future_kind' });
+          const suErrs = validateMethodResult('search', srUnknownKind, manifest, host.networkPolicy);
+          if (suErrs.length) {
+            errors.push(...suErrs.map((e) => `search(unsupported kind): ${e}`));
+          } else if (!skErrs.length) {
+            checks.push('search() empty query, kind & unsupported kind tolerance');
+          }
+
+          // 5. Optional suggest(): validate when exported, silently pass when omitted
           if (exportSet.has('suggest')) {
-            const sug = await host.invoke('suggest', { query: 'te' });
+            const sug = await host.invoke('suggest', { query: probeQuery });
             const sugErrs = validateMethodResult('suggest', sug, manifest, host.networkPolicy);
             if (sugErrs.length) errors.push(...sugErrs);
-            else checks.push('suggest() schema');
+            const emptySug = await host.invoke('suggest', { query: '' });
+            const emptySugErrs = validateMethodResult('suggest', emptySug, manifest, host.networkPolicy);
+            if (emptySugErrs.length) {
+              errors.push(...emptySugErrs.map((e) => `suggest(''): ${e}`));
+            } else if (Array.isArray(emptySug) && emptySug.length > 0) {
+              errors.push("suggest('') must return an empty array []");
+            }
+            if (!sugErrs.length && !emptySugErrs.length) {
+              checks.push('suggest() schema & empty query');
+            }
+          } else {
+            checks.push('suggest() optional (omitted)');
           }
         }
         if (caps.has('filters')) {

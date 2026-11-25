@@ -279,6 +279,7 @@ data class Depth3dSettingsSnapshot(
     val headAim: Boolean,
     val clickSound: Boolean,
     val fileLog: FileLogMode,
+    val rememberSearchHistory: Boolean = true,
     val isGen1Headset: Boolean,
     val screenFovDeg: Float = ScreenReadout.clampFov(
         ScreenReadout.fovDegFromFlatWidth(actualScreenSizeDm / 10f, actualScreenDistanceDm / 10f),
@@ -350,6 +351,7 @@ object StreamSettingsMapper {
     const val KEY_CLICK_SOUND = PreferenceConfiguration.VR_CLICK_SOUND_PREF_STRING
 
     const val KEY_FILE_LOG = PreferenceConfiguration.FILE_LOG_PREF_STRING
+    const val KEY_REMEMBER_SEARCH_HISTORY = "checkbox_remember_search_history"
 
     const val MIN_BITRATE_MBPS = 5
     const val MAX_BITRATE_MBPS = 150
@@ -478,6 +480,7 @@ object StreamSettingsMapper {
             headAim = cfg.vrHeadAim,
             clickSound = cfg.vrClickSound,
             fileLog = FileLogMode.fromPref(cfg.fileLogLevel),
+            rememberSearchHistory = store.getBoolean(KEY_REMEMBER_SEARCH_HISTORY, true),
             isGen1Headset = isGen1Headset,
             screenFovDeg = fovDeg,
             screenDiagonalInches = diagInches,
@@ -699,6 +702,10 @@ object StreamSettingsMapper {
 
     fun setFileLog(store: PrefsStore, mode: FileLogMode) {
         store.putString(KEY_FILE_LOG, mode.prefValue)
+    }
+
+    fun setRememberSearchHistory(store: PrefsStore, enabled: Boolean) {
+        store.putBoolean(KEY_REMEMBER_SEARCH_HISTORY, enabled)
     }
 
     /** Java-friendly helper for the in-VR Stream quick menu tab. */

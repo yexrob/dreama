@@ -171,7 +171,7 @@ fun LibraryScreen(model: WallModel, nav: WallNav) {
                 }
             }
         }
-        NavBar(Tab.Library, nav::tab, nav.settings, solid = true)
+        NavBar(Tab.Library, nav::tab, nav.settings, solid = true, onSearch = nav::openSearch)
     }
 }
 

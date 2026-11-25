@@ -17,6 +17,10 @@ import kotlin.math.sin
  */
 object WallIcons {
     val Play = filled("play", "M8 5.6v12.8c0 .9 1 1.4 1.7.9l9.6-6.4a1.1 1.1 0 0 0 0-1.8L9.7 4.7C9 4.2 8 4.7 8 5.6z")
+    val Search = stroked("search", circle(10.5f, 10.5f, 6.2f), "M15.3 15.3 20 20")
+    val Clock = stroked("clock", circle(12f, 12f, 8.6f), "M12 7.4V12l3.2 2.1")
+    val User = stroked("user", circle(12f, 8.4f, 3.7f), "M4.8 19.8a7.2 7.2 0 0 1 14.4 0")
+    val FillIn = stroked("fill-in", "M17.5 17.5 7.4 7.4", "M7 15.2V7h8.2")
     val Gear = stroked("gear", gear(), circle(12f, 12f, 3.1f))
     val ChevL = stroked("chev-l", "M14.5 5.5 8 12l6.5 6.5")
     val ChevR = stroked("chev-r", "M9.5 5.5 16 12l-6.5 6.5")
