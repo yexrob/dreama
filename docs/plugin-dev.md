@@ -240,9 +240,9 @@ d3plugin pack ./my-media-plugin -o dist/my-media-plugin-1.0.0.d3plugin
 1. **通过 `adb push` 放到应用专属目录（推荐，所有 Android 版本免存储权限）**：
    ```bash
    # Release 包
-   adb push dist/my-media-plugin-1.0.0.d3plugin /sdcard/Android/data/dev.depth3d.player/files/plugins/
+   adb push dist/my-media-plugin-1.0.0.d3plugin /sdcard/Android/data/dev.dreama.player/files/plugins/
    # Debug 包（applicationIdSuffix 为 .debug）
-   adb push dist/my-media-plugin-1.0.0.d3plugin /sdcard/Android/data/dev.depth3d.player.debug/files/plugins/
+   adb push dist/my-media-plugin-1.0.0.d3plugin /sdcard/Android/data/dev.dreama.player.debug/files/plugins/
    ```
    推送后在头显「从文件安装」页面点「刷新」，直接点对应 `.d3plugin` 即可安装。
 2. **放进头显 `Download/` 目录或点「选择文件」**：
