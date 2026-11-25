@@ -50,6 +50,7 @@
 #include "xr_controller.h"
 #include "xr_headaim.h"
 #include "xr_gamepad.h"
+#include "xr_screen_ctrl.h"
 
 #define TAG "moonlight-xr"
 
@@ -146,6 +147,7 @@ static inline int64_t nowNs(void) {
 #define GRAB_NONE   0
 #define GRAB_MOVE   1
 #define GRAB_RESIZE 2
+#define GRAB_SPHERE 3
 
 // Widened along with the grid so a cell stays about the size it was at three
 // columns: five of them now
@@ -1394,6 +1396,18 @@ typedef struct {
     DragRamp grabRamp;
     int roomScreenUnsaved;
     int poseDirty;
+
+    // depth3d G1: local-playback screen manipulation, continuous curvature & UI haptics
+    int triggerScreenAdjustOn;
+    ScreenInputState screenCtrl;
+    XrPosef adjustSnapPose;
+    float adjustSnapWidth;
+    float adjustSnapRadius;
+    int adjustSnapValid;
+    int screenAdjustActive;
+    int64_t uiHapticSecondAtNs;
+    int64_t uiHapticSecondDurNs;
+    float uiHapticSecondAmp;
 
     // Hover state, read by the frame loop to decide which handle to draw
     int hoverKind;

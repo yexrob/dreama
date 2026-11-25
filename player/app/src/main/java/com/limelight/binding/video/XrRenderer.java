@@ -240,6 +240,13 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     // under it: queued from any thread, then kept in slots the native side
     // names them by
     private XrPanels.Toast toast;
+    private boolean screenAdjustActive;
+    private final int[] screenReadoutCache = {
+            Integer.MIN_VALUE, Integer.MIN_VALUE, Integer.MIN_VALUE,
+            Integer.MIN_VALUE, Integer.MIN_VALUE
+    };
+    private String[] screenPresetLabels;
+    private String screenInchUnit;
     // The marks on the display tab's cells, drawn on the frame loop when one
     // moves, and the cells they were last drawn for
     private XrPanels.Marks cogMarks;
@@ -342,6 +349,13 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         void onVrModifiers(int modifiers);
         // The exit prompt was confirmed, so the session is to end
         void onVrExit();
+        // Local-playback discrete actions & screen-adjust state (G1)
+        default void onVrLocalPlayPause() { }
+        default void onVrLocalSeek(int deltaSec) { }
+        default void onVrLocalBack(int action) { }
+        default void onVrLocalToggleDanmaku() { }
+        default void onVrLocalTogglePalette() { }
+        default void onVrScreenAdjustChanged(boolean active) { }
     }
 
     public void setInputListener(InputListener listener) {
@@ -537,6 +551,8 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     private native void nativeSetStreamOptions(long ctx, int resCell, int bitrateCell, int mouseCell);
     // Whether this session may show the hand lock hint, before the first frame
     private native void nativeSetHandHint(long ctx, boolean wanted);
+    // Whether holding trigger+stick enters screen adjustment in local playback (§3.8)
+    private native void nativeSetTriggerScreenAdjust(long ctx, boolean enabled);
     private native void nativeUploadStereoButton(long ctx, ByteBuffer off, ByteBuffer on);
     private native void nativeUploadRayButton(long ctx, ByteBuffer off, ByteBuffer on);
     private native void nativeUploadAimButton(long ctx, ByteBuffer off, ByteBuffer on);
@@ -1388,6 +1404,15 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         // Nothing drawn yet, so the first look at either tab draws it
         Arrays.fill(readoutDrawn, -2);
         toast = new XrPanels.Toast();
+        screenPresetLabels = new String[] {
+                prefsContext.getString(R.string.vr_screen_preset_small),
+                prefsContext.getString(R.string.vr_screen_preset_medium),
+                prefsContext.getString(R.string.vr_screen_preset_large),
+                prefsContext.getString(R.string.vr_screen_preset_giant)
+        };
+        screenInchUnit = prefsContext.getString(R.string.vr_screen_unit_inch);
+        Arrays.fill(screenReadoutCache, Integer.MIN_VALUE);
+        screenAdjustActive = false;
         cogMarks = new XrPanels.Marks();
         cogClock = new XrPanels.ClockStrip();
         clock = new XrClock(prefsContext);
@@ -1401,6 +1426,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         // one way the controllers switch themselves
         nativeSetGamepad(nativeCtx, prefs.vrGamepadToggle, prefs.deadzonePercentage);
         nativeSetControllerModel(nativeCtx, prefs.vrControllerModel);
+        nativeSetTriggerScreenAdjust(nativeCtx, prefs.vrTriggerScreenAdjust);
         final boolean handHint = prefs.vrHandTracking && !prefs.vrHandLockHintSeen;
         nativeSetHandHint(nativeCtx, handHint);
 
@@ -1444,6 +1470,10 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         boolean curveOk;
         synchronized (nativeLock) {
             curveOk = nativeCtx != 0 && nativeGetCylinderSupported(nativeCtx);
+        }
+        if (prefsContext != null) {
+            PreferenceConfiguration.saveCylinderSupported(
+                    PreferenceManager.getDefaultSharedPreferences(prefsContext), curveOk);
         }
         // Same for the 3D rows with stereo turned off in settings. Their ticks
         // mark the running model's own pair.
@@ -1680,6 +1710,31 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 inputState[IN_EXIT] = 0.0f;
                 inputListener.onVrExit();
             }
+
+            if (localMedia) {
+                boolean adjusting = inputState[IN_ADJUST_ACTIVE] != 0.0f;
+                if (adjusting != screenAdjustActive) {
+                    screenAdjustActive = adjusting;
+                    inputListener.onVrScreenAdjustChanged(adjusting);
+                }
+                if (inputState[IN_LOCAL_PLAY_PAUSE] != 0.0f) {
+                    inputListener.onVrLocalPlayPause();
+                }
+                int seekSec = (int)inputState[IN_LOCAL_SEEK_SEC];
+                if (seekSec != 0) {
+                    inputListener.onVrLocalSeek(seekSec);
+                }
+                int bAct = (int)inputState[IN_LOCAL_B_ACTION];
+                if (bAct != 0) {
+                    inputListener.onVrLocalBack(bAct);
+                }
+                if (inputState[IN_LOCAL_Y_DANMAKU] != 0.0f) {
+                    inputListener.onVrLocalToggleDanmaku();
+                }
+                if (inputState[IN_LOCAL_MENU] != 0.0f) {
+                    inputListener.onVrLocalTogglePalette();
+                }
+            }
         }
 
         // The report sheet's fields take the keys while it is up, and nothing
@@ -1697,6 +1752,18 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         // would lose where they had the screen in every other environment.
         if (inputState[IN_POSE_DIRTY] != 0.0f && !EnvironmentIds.isRoomCell(environmentChoice)) {
             saveScreenPose();
+        }
+        if (inputState[IN_ADJUST_SAVED] != 0.0f && prefsContext != null
+                && !EnvironmentIds.isRoomCell(environmentChoice)) {
+            float fovDeg = inputState[IN_ADJUST_FOV_TENTHS] / 10.0f;
+            float distM = inputState[IN_ADJUST_DIST_CM] / 100.0f;
+            PreferenceConfiguration.saveGlobalScreenDimensions(
+                    PreferenceManager.getDefaultSharedPreferences(prefsContext), fovDeg, distM);
+            if (prefConfig != null) {
+                prefConfig.vrDistance = Math.max(20, Math.min(80, Math.round(distM * 10.0f)));
+                prefConfig.vrScreenSize = Math.max(8, Math.min(80,
+                        Math.round(ScreenReadout.flatWidthMeters(fovDeg, distM) * 10.0f)));
+            }
         }
 
         int pick = (int)inputState[IN_PICKER_PICK];
@@ -2114,6 +2181,42 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
             noticeTexts[slot] = notice;
             nativePushNotice(nativeCtx, TOAST_TEXT, slot);
         }
+        if (localMedia && inputState[IN_ADJUST_ACTIVE] != 0.0f
+                && toast != null && prefsContext != null) {
+            int axis = (int)inputState[IN_ADJUST_AXIS];
+            int fovTenths = (int)inputState[IN_ADJUST_FOV_TENTHS];
+            int distCm = (int)inputState[IN_ADJUST_DIST_CM];
+            int inches = (int)inputState[IN_ADJUST_INCHES];
+            int preset = (int)inputState[IN_ADJUST_PRESET];
+            if (axis != screenReadoutCache[0] || fovTenths != screenReadoutCache[1]
+                    || distCm != screenReadoutCache[2] || inches != screenReadoutCache[3]
+                    || preset != screenReadoutCache[4]) {
+                screenReadoutCache[0] = axis;
+                screenReadoutCache[1] = fovTenths;
+                screenReadoutCache[2] = distCm;
+                screenReadoutCache[3] = inches;
+                screenReadoutCache[4] = preset;
+                String readout = ScreenReadout.formatReadoutText(axis, fovTenths, distCm, inches,
+                        preset, screenPresetLabels, screenInchUnit);
+                boolean isDist = axis == ADJUST_AXIS_DIST;
+                float progress = isDist
+                        ? ScreenReadout.distNorm(distCm / 100.0f)
+                        : ScreenReadout.sizeNorm(fovTenths / 10.0f);
+                float[] ticks = isDist
+                        ? ScreenReadout.DIST_TICK_POSITIONS
+                        : ScreenReadout.SIZE_TICK_POSITIONS;
+                String[] tickLabels = isDist
+                        ? ScreenReadout.DIST_TICK_LABELS
+                        : ScreenReadout.SIZE_TICK_LABELS;
+                nativeUploadToast(nativeCtx,
+                        toast.drawScreenReadout(readout, progress, ticks, tickLabels),
+                        TOAST_SCREEN_READOUT, 0);
+            }
+            return;
+        }
+        if (screenReadoutCache[0] != Integer.MIN_VALUE) {
+            Arrays.fill(screenReadoutCache, Integer.MIN_VALUE);
+        }
         int kind = (int)inputState[IN_TOAST];
         if (kind < 0 || toast == null || prefsContext == null) {
             return;
@@ -2153,6 +2256,12 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 break;
             case TOAST_POINTER_MODE:
                 text = prefsContext.getString(R.string.vr_toast_pointer_mode);
+                break;
+            case TOAST_SCREEN_HINT:
+                text = prefsContext.getString(R.string.vr_toast_screen_hint);
+                break;
+            case TOAST_EXIT_AGAIN:
+                text = prefsContext.getString(R.string.vr_toast_exit_again);
                 break;
             case TOAST_TEXT:
                 NoticeWords words = arg >= 0 && arg < TOAST_TEXT_SLOTS ? noticeTexts[arg] : null;
@@ -2307,6 +2416,16 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
             com.limelight.local.stream.StreamSettingsMapper.applyVrStreamMouseCell(
                     prefsContext, value);
             FileLog.event("stream mouse cell " + value + " saved for next connect");
+        }
+        else if (setting == SETTING_CURVATURE) {
+            int pct = PreferenceConfiguration.clampCurvature(value);
+            if (prefConfig != null) {
+                prefConfig.vrCurvature = pct;
+            }
+            PreferenceManager.getDefaultSharedPreferences(prefsContext).edit()
+                    .putInt(PreferenceConfiguration.VR_CURVATURE_PREF_STRING, pct)
+                    .apply();
+            FileLog.event("screen curvature " + pct + "% saved");
         }
         else if (setting == SETTING_AMBI_LEVEL) {
             if (prefConfig != null) {

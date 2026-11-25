@@ -83,6 +83,7 @@ typedef struct {
     XrCompositionLayerCylinderKHR cylinder[2];
     XrCompositionLayerQuad overlay;
     XrCompositionLayerQuad transport;
+    XrCompositionLayerCylinderKHR transportCylinder;
     XrCompositionLayerQuad handle;
     XrCompositionLayerQuad envButton;
     XrCompositionLayerQuad cogButton;
@@ -455,7 +456,7 @@ static void addVideoLayers(XrCtx* ctx, const FrameView* view, FrameLayers* layer
         XrEyeVisibility visibility = viewCount == 1 ? XR_EYE_VISIBILITY_BOTH :
                 (eye == 0 ? XR_EYE_VISIBILITY_LEFT : XR_EYE_VISIBILITY_RIGHT);
 
-        if (view->curve > 0.01f && ctx->cylinderSupported) {
+        if (view->curve > SCREEN_CURVE_EPS && ctx->cylinderSupported) {
             XrCompositionLayerCylinderKHR* cyl = &layers->cylinder[eye];
             memset(cyl, 0, sizeof(*cyl));
             cyl->type = XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR;
@@ -530,15 +531,46 @@ static void addOverlayLayer(XrCtx* ctx, const FrameView* view, FrameLayers* laye
 // VR control bar is visible (view->barArea) AND whenever Java turns it on for
 // a red network-degradation warning (ctx->transportVisible).
 static void addTransportLayer(XrCtx* ctx, const FrameView* view, FrameLayers* layers) {
+    // §6.12: hide control bar while screen distance/size is being adjusted
+    if (ctx->localMedia && ctx->screenAdjustActive) {
+        return;
+    }
     int show = ctx->localMedia ? ctx->transportVisible : (ctx->transportVisible || view->barArea);
     if (!ctx->transportHasContent || !show
             || ctx->transportSwapchain == XR_NULL_HANDLE) {
         return;
     }
-    float margin = view->screenWidth * 0.02f;
+    if (view->screenCurved) {
+        CurvedStrip strip;
+        float texAspect = (float)TRANSPORT_WIDTH / (float)TRANSPORT_HEIGHT;
+        if (screenCurvedStrip(view->screenPose, view->screenWidth, view->screenHeight,
+                              ctx->screenRadius, TRANSPORT_MARGIN_FRAC, texAspect,
+                              TRANSPORT_PROUD_M, &strip)) {
+            XrCompositionLayerCylinderKHR* cyl = &layers->transportCylinder;
+            memset(cyl, 0, sizeof(*cyl));
+            cyl->type = XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR;
+            cyl->next = layers->settingsChain;
+            cyl->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            cyl->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            cyl->subImage.swapchain = ctx->transportSwapchain;
+            cyl->subImage.imageRect.offset.x = 0;
+            cyl->subImage.imageRect.offset.y = 0;
+            cyl->subImage.imageRect.extent.width = TRANSPORT_WIDTH;
+            cyl->subImage.imageRect.extent.height = TRANSPORT_HEIGHT;
+            cyl->subImage.imageArrayIndex = 0;
+            cyl->space = view->space;
+            cyl->pose = strip.axisPose;
+            cyl->radius = strip.radius;
+            cyl->centralAngle = strip.centralAngle;
+            cyl->aspectRatio = strip.aspectRatio;
+            pushLayer(ctx, layers, cyl);
+            return;
+        }
+    }
+    float margin = view->screenWidth * TRANSPORT_MARGIN_FRAC;
     float w = view->screenWidth - 2.0f * margin;
     float h = w * (float)TRANSPORT_HEIGHT / (float)TRANSPORT_WIDTH;
-    Vec3 local = { 0.0f, -view->screenHeight * 0.5f + h * 0.5f + margin, 0.012f };
+    Vec3 local = { 0.0f, -view->screenHeight * 0.5f + h * 0.5f + margin, TRANSPORT_PROUD_M };
     quadLayer(&layers->transport, layers->settingsChain,
               XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT, ctx->transportSwapchain,
               TRANSPORT_WIDTH, TRANSPORT_HEIGHT, view->space,
@@ -1190,7 +1222,32 @@ static void addPointerLayers(XrCtx* ctx, const FrameView* view, FrameLayers* lay
 // tests it: a press aimed through it lands on whatever is behind. It shows
 // while the notice it was drawn for is the one up, and fades out after.
 static void addToastLayer(XrCtx* ctx, FrameLayers* layers, int64_t now) {
-    int shown = ctx->toastArtReady && noticeShowing(&ctx->notices, now)
+    // §6.7 & §6.12: screen-adjust readout reuses the toast slot and stays up
+    // continuously until the adjustment finishes
+    int readoutUp = ctx->localMedia && ctx->screenAdjustActive
+            && ctx->toastArtReady && ctx->toastDrawnKind == TOAST_SCREEN_READOUT;
+    if (readoutUp) {
+        fadeStep(&ctx->toastFade, 1, now, ctx->fadeNs, ctx->colorScaleSupported);
+        float level = ctx->toastFade.level;
+        if (level <= 0.0f) {
+            return;
+        }
+        XrPosef pose;
+        memset(&pose, 0, sizeof(pose));
+        pose.orientation.w = 1.0f;
+        float dist = SCREEN_READOUT_DIST_M;
+        pose.position.y = -dist * tanf(SCREEN_READOUT_DROP_DEG * (float)M_PI / 180.0f);
+        pose.position.z = -dist;
+        float w = 2.0f * dist * tanf(SCREEN_READOUT_FOV_W_DEG * (float)M_PI / 360.0f);
+        float h = w * (float)TOAST_TEX_H / (float)TOAST_TEX_W;
+        quadLayer(&layers->toast, fadeNext(ctx, layers, FADE_SLOT_TOAST, 1, level),
+                  XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT, ctx->toastSwapchain,
+                  TOAST_TEX_W, TOAST_TEX_H, ctx->viewSpace, pose, w, h);
+        pushLayer(ctx, layers, &layers->toast);
+        return;
+    }
+    int shown = ctx->toastArtReady && ctx->toastDrawnKind != TOAST_SCREEN_READOUT
+            && noticeShowing(&ctx->notices, now)
             && ctx->toastDrawnKind == ctx->notices.current.kind
             && ctx->toastDrawnArg == ctx->notices.current.arg;
     fadeStep(&ctx->toastFade, shown, now, ctx->fadeNs, ctx->colorScaleSupported);
@@ -1470,7 +1527,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
     view.screenHeight = view.screenWidth * view.aspect;
     // The same test the picture's own layer makes below, so the furniture that
     // is pinned to the picture sits on whichever surface actually goes up
-    view.screenCurved = view.curve > 0.01f && ctx->cylinderSupported;
+    view.screenCurved = view.curve > SCREEN_CURVE_EPS && ctx->cylinderSupported;
     view.bar = barFrame(ctx);
     logBarPlacement(ctx, &view.bar);
     // A panel on its way out keeps the furniture down until it has gone, the
@@ -1481,7 +1538,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
     int splashUp = ctx->splash.phase == SPLASH_UP;
     view.barArea = !ctx->pickerOpen && !ctx->cogOpen && !ctx->kbOpen
             && !ctx->exitConfirmOpen && !ctx->reportOpen && !ctx->hintOpen
-            && !ctx->panelFadingOut
+            && !ctx->panelFadingOut && !(ctx->localMedia && ctx->screenAdjustActive)
             && (ctx->hoverKind == HOVER_BAR || ctx->hoverKind == HOVER_ENVBUTTON
                 || ctx->hoverKind == HOVER_COGBUTTON
                 || ctx->hoverKind == HOVER_KBBUTTON

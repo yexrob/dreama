@@ -72,6 +72,7 @@
 // track. Drawn in Java, laid along the bottom of the picture.
 #define TRANSPORT_WIDTH 1536
 #define TRANSPORT_HEIGHT 112
+#define TRANSPORT_MARGIN_FRAC 0.02f
 
 // The sheet the launch splash shows: the logo over the app's name, drawn once
 // per number of the logo's wedges open, none to all six, one under the other,
@@ -111,6 +112,21 @@
 #define TOAST_HEAD_AIM_ON 7
 #define TOAST_GAMEPAD_MODE 8
 #define TOAST_POINTER_MODE 9
+// depth3d G1: screen manipulation hint, double-B exit prompt, and persistent
+// readout reusing the toast layer slot
+#define TOAST_SCREEN_HINT 10
+#define TOAST_EXIT_AGAIN 11
+#define TOAST_SCREEN_READOUT 12
+
+// Screen adjust axis and size preset identifiers shared with Java readout
+#define ADJUST_AXIS_NONE 0
+#define ADJUST_AXIS_DIST 1
+#define ADJUST_AXIS_SIZE 2
+#define SCREEN_PRESET_NONE -1
+#define SCREEN_PRESET_SMALL 0
+#define SCREEN_PRESET_MEDIUM 1
+#define SCREEN_PRESET_LARGE 2
+#define SCREEN_PRESET_GIANT 3
 
 // Slots in the float array handed back to Java each frame
 #define IN_HIT      0
@@ -214,7 +230,20 @@
 // Set to 1 the frame the hand lock hint is put away with "Don't show this
 // again", which Java stores so later sessions skip it. 0 otherwise.
 #define IN_HINT     (IN_PAD_RY + 1)
-#define IN_SLOTS    (IN_HINT + 1)
+// Local-playback discrete actions and screen-adjust readout state (G1)
+#define IN_LOCAL_PLAY_PAUSE (IN_HINT + 1)
+#define IN_LOCAL_SEEK_SEC (IN_LOCAL_PLAY_PAUSE + 1)
+#define IN_LOCAL_B_ACTION (IN_LOCAL_SEEK_SEC + 1)
+#define IN_LOCAL_Y_DANMAKU (IN_LOCAL_B_ACTION + 1)
+#define IN_LOCAL_MENU (IN_LOCAL_Y_DANMAKU + 1)
+#define IN_ADJUST_ACTIVE (IN_LOCAL_MENU + 1)
+#define IN_ADJUST_AXIS (IN_ADJUST_ACTIVE + 1)
+#define IN_ADJUST_FOV_TENTHS (IN_ADJUST_AXIS + 1)
+#define IN_ADJUST_DIST_CM (IN_ADJUST_FOV_TENTHS + 1)
+#define IN_ADJUST_INCHES (IN_ADJUST_DIST_CM + 1)
+#define IN_ADJUST_PRESET (IN_ADJUST_INCHES + 1)
+#define IN_ADJUST_SAVED (IN_ADJUST_PRESET + 1)
+#define IN_SLOTS    (IN_ADJUST_SAVED + 1)
 
 // Gamepad mode's buttons, in the bits Moonlight's controller packet carries
 // them in, which are ControllerPacket's flags: the four face buttons, the
@@ -275,6 +304,8 @@
 #define SETTING_STREAM_RES 24
 #define SETTING_STREAM_BITRATE 25
 #define SETTING_STREAM_MOUSE 26
+// Continuous screen curvature 0..100 (5% steps), persisted globally
+#define SETTING_CURVATURE 27
 
 // The lanes the Room tab's rows move along, in the units the preferences
 // hold. Brightness is the room's own in hundredths of the room as baked, from

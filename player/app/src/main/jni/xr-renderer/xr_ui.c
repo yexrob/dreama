@@ -41,7 +41,7 @@ BarFrame barFrame(XrCtx* ctx) {
     BarFrame frame;
     memset(&frame, 0, sizeof(frame));
     frame.pose = ctx->screenPose;
-    frame.curved = effectiveCurvature(ctx) > 0.01f && ctx->cylinderSupported;
+    frame.curved = effectiveCurvature(ctx) > SCREEN_CURVE_EPS && ctx->cylinderSupported;
     frame.radius = ctx->screenRadius;
     float fit = frame.curved ? cylinderFit(ctx->screenWidth, ctx->screenRadius) : 1.0f;
     frame.width = ctx->screenWidth * fit;
@@ -752,19 +752,36 @@ void cogApplySlider(XrCtx* ctx, int face, int slider, float pu) {
         ctx->screenPose.orientation = quatNorm(quatMul(turn, ctx->screenPose.orientation));
     }
     else if (slider == COG_SLIDER_CURVE) {
-        ctx->panelCurve = t;
-        // The radius updatePlacement would have picked for this curve, so a
-        // reseed later agrees with what is on screen now
+        // Spec §6.12: R = D / c, 5% steps, preserving horizontal angular width
         XrVector3f p = ctx->screenPose.position;
         float d = sqrtf(p.x * p.x + p.y * p.y + p.z * p.z);
-        ctx->screenRadius = d * (1.0f + 3.0f * (1.0f - t));
+        if (d < 0.05f) {
+            d = SCREEN_DIST_DEFAULT_M;
+        }
+        int wasCurved = effectiveCurvature(ctx) > SCREEN_CURVE_EPS && ctx->cylinderSupported;
+        float fovDeg = screenFovFromPlacement(ctx->screenWidth, d, ctx->screenRadius, wasCurved);
+        float newCurve = screenQuantizeCurve(t);
+        ctx->panelCurve = newCurve;
+        if (newCurve > SCREEN_CURVE_EPS && ctx->cylinderSupported) {
+            ctx->screenRadius = screenCurvatureRadius(d, newCurve);
+            ctx->screenWidth = screenCurvedArcWidth(fovDeg, d, newCurve);
+        }
+        else {
+            ctx->screenRadius = d * 4.0f;
+            ctx->screenWidth = screenFlatWidth(fovDeg, d);
+        }
     }
     else if (slider == COG_SLIDER_SIZE) {
         float wanted = SCREEN_MIN_WIDTH + t * (SCREEN_MAX_WIDTH - SCREEN_MIN_WIDTH);
-        if (ctx->screenWidth > 0.01f) {
-            // Keeping the arc the same shape rather than flattening as it
-            // grows, same rule the corner resize follows
-            ctx->screenRadius *= wanted / ctx->screenWidth;
+        float curve = effectiveCurvature(ctx);
+        if (curve > SCREEN_CURVE_EPS && ctx->cylinderSupported) {
+            // Under R = D / c, changing size keeps distance and curvature radius unchanged
+            XrVector3f p = ctx->screenPose.position;
+            float d = sqrtf(p.x * p.x + p.y * p.y + p.z * p.z);
+            if (d < 0.05f) {
+                d = SCREEN_DIST_DEFAULT_M;
+            }
+            ctx->screenRadius = screenCurvatureRadius(d, curve);
         }
         // Centre and facing untouched, so it grows about the middle rather
         // than away from a corner
@@ -1079,8 +1096,13 @@ void cogDragEnded(XrCtx* ctx, float* out) {
         LOGEV("head aim dead zone %d deg/s from the panel", ctx->headAimDeadZone);
     }
     else if (face == COG_TAB_SCREEN) {
-        // The placement is saved from the pose the frame hands back
+        // The placement is saved from the pose the frame hands back; curve also
+        // persists to the global curvature preference so 2D settings stay in sync
         ctx->poseDirty = 1;
+        if (slider == COG_SLIDER_CURVE) {
+            out[IN_SETTING] = (float)SETTING_CURVATURE;
+            out[IN_SETTING_VALUE] = roundf(effectiveCurvature(ctx) * 100.0f);
+        }
     }
     else if (face == COG_FACE_ROOM) {
         // The room's own units, written under the room showing. A room gone

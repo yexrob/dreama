@@ -19,6 +19,7 @@ LOCAL_SRC_FILES := xr_log.c \
                    xr_controller.c \
                    xr_headaim.c \
                    xr_gamepad.c \
+                   xr_screen_ctrl.c \
                    xr_shaders.c \
                    xr_session.c \
                    xr_display.c \

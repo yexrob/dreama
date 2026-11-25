@@ -743,10 +743,16 @@ int updatePlacement(XrCtx* ctx, float distance, float quadWidth, float curvature
         memset(&ctx->screenPose, 0, sizeof(ctx->screenPose));
         ctx->screenPose.orientation.w = 1.0f;
         ctx->screenPose.position.z = -distance;
-        ctx->screenWidth = quadWidth;
-        // Radius runs from 4x distance (slightly curved) down to the distance
-        // itself (wrapped around the viewer) as curvature rises
-        ctx->screenRadius = distance * (1.0f + 3.0f * (1.0f - curvature));
+        // Spec §6.12: R = D / c keeping horizontal angular width invariant
+        float fovDeg = screenFovFromFlatWidth(quadWidth, distance);
+        if (curvature > SCREEN_CURVE_EPS && ctx->cylinderSupported) {
+            ctx->screenRadius = screenCurvatureRadius(distance, curvature);
+            ctx->screenWidth = screenCurvedArcWidth(fovDeg, distance, curvature);
+        }
+        else {
+            ctx->screenWidth = quadWidth;
+            ctx->screenRadius = distance > 0.05f ? distance * 4.0f : 4.0f;
+        }
         ctx->placementValid = 1;
         ctx->grabMode = GRAB_NONE;
         ctx->poseDirty = 1;
@@ -910,6 +916,11 @@ static void applyGrab(XrCtx* ctx, XrPosef* aims, const int* valid, const float* 
         int wasDown = ctx->grabDown[h];
         ctx->grabDown[h] = grab[h] > (wasDown ? PRESS_OFF : PRESS_ON);
         ctx->gripEdge[h] = ctx->grabDown[h] && !wasDown;
+    }
+
+    // GRAB_SPHERE is owned by local-playback screen control (updateLocalMediaInput)
+    if (ctx->grabMode == GRAB_SPHERE) {
+        return;
     }
 
     if (ctx->grabMode != GRAB_NONE) {
@@ -1105,8 +1116,16 @@ static void applyGrab(XrCtx* ctx, XrPosef* aims, const int* valid, const float* 
     if (width < SCREEN_MIN_WIDTH) width = SCREEN_MIN_WIDTH;
     if (width > SCREEN_MAX_WIDTH) width = SCREEN_MAX_WIDTH;
 
-    // Keeping the arc the same shape rather than flattening as it grows
-    ctx->screenRadius = ctx->grabRadius * (width / ctx->grabWidth);
+    float curve = effectiveCurvature(ctx);
+    if (curve > SCREEN_CURVE_EPS && ctx->cylinderSupported) {
+        XrVector3f p = ctx->grabScreen.position;
+        float d = sqrtf(p.x * p.x + p.y * p.y + p.z * p.z);
+        if (d < 0.05f) d = SCREEN_DIST_DEFAULT_M;
+        ctx->screenRadius = screenCurvatureRadius(d, curve);
+    }
+    else {
+        ctx->screenRadius = ctx->grabRadius * (width / ctx->grabWidth);
+    }
     ctx->screenWidth = width;
 
     // The centre stays where it was, so the screen grows evenly about the spot
@@ -1382,6 +1401,17 @@ static void releaseInput(XrCtx* ctx, float* out) {
         ctx->grabByGaze = 0;
         ctx->poseDirty = 1;
     }
+    if (ctx->screenAdjustActive) {
+        if (ctx->adjustSnapValid) {
+            ctx->screenPose = ctx->adjustSnapPose;
+            ctx->screenWidth = ctx->adjustSnapWidth;
+            ctx->screenRadius = ctx->adjustSnapRadius;
+            ctx->adjustSnapValid = 0;
+        }
+        ctx->screenAdjustActive = 0;
+    }
+    ctx->uiHapticSecondAtNs = 0;
+    screenInputReset(&ctx->screenCtrl);
     if (ctx->cogDragSlider >= 0) {
         // Same for a slider: a drag must not survive the trigger it
         // was being held with going unwatched. Ending it here still
@@ -2757,6 +2787,10 @@ static void beamToHandle(XrCtx* ctx, InputFrame* f) {
             local.x = 0.0f;
             local.y = -(f->bar.height * 0.5f + BAR_DROP_FRAC * f->bar.width);
         }
+        else if (ctx->grabMode == GRAB_SPHERE) {
+            local.x = 0.0f;
+            local.y = 0.0f;
+        }
         else {
             // The bracket being held sits a half bracket outside the
             // corner, so the ray has to end out there with it
@@ -2831,13 +2865,15 @@ static void sendPointer(XrCtx* ctx, InputFrame* f, int hit) {
 }
 
 // Works out which host buttons are down, and logs each trigger transition
-static void updateButtons(XrCtx* ctx, InputFrame* f, int hit) {
+static void updateButtons(XrCtx* ctx, InputFrame* f, int hit, int suppressLeft) {
     int mask = 0;
-    for (int h = 0; h < HAND_COUNT; h++) {
-        // Per hand rather than either hand, so a trigger spent on the grid or a
-        // panel is out of the count while the other one still clicks
-        if (ctx->triggerDown[h] && !ctx->triggerSwallowed[h]) {
-            mask |= VR_BUTTON_LEFT;
+    if (!suppressLeft) {
+        for (int h = 0; h < HAND_COUNT; h++) {
+            // Per hand rather than either hand, so a trigger spent on the grid or a
+            // panel is out of the count while the other one still clicks
+            if (ctx->triggerDown[h] && !ctx->triggerSwallowed[h]) {
+                mask |= VR_BUTTON_LEFT;
+            }
         }
     }
     // Only a controller has these, and in gamepad mode they are the pad's
@@ -3188,6 +3224,276 @@ static void updateRumble(XrCtx* ctx, int live) {
     }
 }
 
+// Short single or double UI haptic pulses on the right controller (§4.5, §6.12)
+static void sendUiHapticPulse(XrCtx* ctx, int64_t durationNs, float amp) {
+    if (ctx->hapticAction == XR_NULL_HANDLE || !ctx->hapticBound || ctx->padAttached
+            || ctx->profileKind[HAND_RIGHT] != PROFILE_CONTROLLER) {
+        return;
+    }
+    XrHapticActionInfo info = { XR_TYPE_HAPTIC_ACTION_INFO };
+    info.action = ctx->hapticAction;
+    info.subactionPath = ctx->handPaths[HAND_RIGHT];
+    XrHapticVibration vib = { XR_TYPE_HAPTIC_VIBRATION };
+    vib.duration = durationNs;
+    vib.frequency = XR_FREQUENCY_UNSPECIFIED;
+    vib.amplitude = amp;
+    xrApplyHapticFeedback(ctx->session, &info, (const XrHapticBaseHeader*)&vib);
+}
+
+static void applyUiHaptic(XrCtx* ctx, int hapticEvent, int64_t now) {
+    if (ctx->uiHapticSecondAtNs != 0 && now >= ctx->uiHapticSecondAtNs) {
+        int64_t dur = ctx->uiHapticSecondDurNs;
+        float amp = ctx->uiHapticSecondAmp;
+        ctx->uiHapticSecondAtNs = 0;
+        sendUiHapticPulse(ctx, dur, amp);
+    }
+    if (hapticEvent == SCREEN_HAPTIC_HINT) {
+        sendUiHapticPulse(ctx, (int64_t)SCREEN_HAPTIC_HINT_MS * 1000000LL, SCREEN_HAPTIC_HINT_AMP);
+    }
+    else if (hapticEvent == SCREEN_HAPTIC_DETENT) {
+        sendUiHapticPulse(ctx, (int64_t)SCREEN_HAPTIC_DETENT_MS * 1000000LL,
+                          SCREEN_HAPTIC_DETENT_AMP);
+    }
+    else if (hapticEvent == SCREEN_HAPTIC_LIMIT) {
+        int64_t pulseNs = (int64_t)SCREEN_HAPTIC_LIMIT_MS * 1000000LL;
+        sendUiHapticPulse(ctx, pulseNs, SCREEN_HAPTIC_LIMIT_AMP);
+        ctx->uiHapticSecondAtNs = now + pulseNs
+                + (int64_t)SCREEN_HAPTIC_LIMIT_GAP_MS * 1000000LL;
+        ctx->uiHapticSecondDurNs = pulseNs;
+        ctx->uiHapticSecondAmp = SCREEN_HAPTIC_LIMIT_AMP;
+    }
+}
+
+// Applies local-playback screen manipulation, continuous curvature, and §6.4
+// input rules without disturbing PC streaming (!ctx->localMedia).
+static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, int* outSuppressLeft) {
+    *outSuppressLeft = 0;
+
+    ScreenInputFrame in;
+    memset(&in, 0, sizeof(in));
+    in.nowNs = f->now;
+    in.dt = f->dt;
+    in.triggerAdjustEnabled = ctx->triggerScreenAdjustOn ? 1 : 0;
+    in.inRoom = f->roomOn ? 1 : 0;
+
+    int modalOpen = ctx->pickerOpen || ctx->cogOpen || ctx->exitConfirmOpen
+            || ctx->reportOpen || ctx->hintOpen;
+    in.paletteOpen = (ctx->cogOpen || ctx->pickerOpen || ctx->exitConfirmOpen) ? 1 : 0;
+
+    if (modalOpen) {
+        in.target = SCREEN_TARGET_CONTROL;
+    }
+    else if (f->hover == HOVER_SCREEN) {
+        float videoAspect = (float)ctx->videoWidth / (float)(ctx->videoHeight > 0 ? ctx->videoHeight : 1);
+        int onBar = ctx->transportVisible && f->hand >= 0
+                && screenTransportBarHit(f->hitU[f->hand], f->hitV[f->hand], videoAspect);
+        in.target = onBar ? SCREEN_TARGET_CONTROL : SCREEN_TARGET_SCREEN;
+    }
+    else if (f->hover != HOVER_NONE && f->hover != HOVER_HALO) {
+        in.target = SCREEN_TARGET_CONTROL;
+    }
+    else {
+        in.target = SCREEN_TARGET_NONE;
+    }
+
+    int pointingHands = (f->hand >= 0 && f->hand < HAND_COUNT && ctx->usingHands[f->hand])
+            || f->hand == SRC_GAZE
+            || (ctx->screenCtrl.adjustActive && ctx->screenCtrl.adjustByHand);
+    in.isHandTracking = pointingHands ? 1 : 0;
+
+    if (ctx->screenCtrl.adjustActive && !ctx->screenCtrl.adjustByGrip) {
+        in.triggerDown = ctx->triggerDown[HAND_RIGHT] || ctx->triggerDown[HAND_LEFT];
+    }
+    else if (f->hand >= 0 && f->hand < SRC_COUNT) {
+        in.triggerDown = ctx->triggerDown[f->hand] && !ctx->triggerSwallowed[f->hand];
+    }
+    else {
+        in.triggerDown = (ctx->triggerDown[HAND_RIGHT] && !ctx->triggerSwallowed[HAND_RIGHT])
+                || (ctx->triggerDown[HAND_LEFT] && !ctx->triggerSwallowed[HAND_LEFT]);
+    }
+    in.gripDown = ctx->grabDown[HAND_RIGHT]
+            || (f->hand == HAND_LEFT && ctx->grabDown[HAND_LEFT]);
+
+    if (ctx->profileKind[HAND_RIGHT] == PROFILE_CONTROLLER) {
+        in.rStickX = f->stick[HAND_RIGHT].x;
+        in.rStickY = f->stick[HAND_RIGHT].y;
+        in.rStickClick = actionBool(ctx, ctx->toggleAction, HAND_RIGHT);
+        in.btnA = actionBool(ctx, ctx->rightClickAction, HAND_RIGHT);
+        in.btnB = actionBool(ctx, ctx->middleClickAction, HAND_RIGHT);
+    }
+    if (ctx->profileKind[HAND_LEFT] == PROFILE_CONTROLLER) {
+        in.lStickX = f->stick[HAND_LEFT].x;
+        in.lStickY = f->stick[HAND_LEFT].y;
+        in.btnY = actionBool(ctx, ctx->middleClickAction, HAND_LEFT);
+        in.btnMenu = actionBool(ctx, ctx->menuAction, HAND_LEFT);
+    }
+
+    int aimHand = (f->hand >= 0 && f->hand < SRC_COUNT) ? f->hand : HAND_RIGHT;
+    Vec3 fwdLocal = { 0.0f, 0.0f, -1.0f };
+    in.aimDir = f->aimValid[aimHand]
+            ? quatRotate(f->aimPoses[aimHand].orientation, fwdLocal) : fwdLocal;
+    if (aimHand < HAND_COUNT && pinchTracked(ctx, aimHand)) {
+        in.handPos = ctx->pinchPoint[aimHand];
+    }
+    else if (aimHand < SRC_COUNT && f->aimValid[aimHand]) {
+        in.handPos.x = f->aimPoses[aimHand].position.x;
+        in.handPos.y = f->aimPoses[aimHand].position.y;
+        in.handPos.z = f->aimPoses[aimHand].position.z;
+    }
+
+    // Horizontal right and forward vectors from the head for hand-tracking adjust
+    Vec3 hFwd = f->headValid ? quatRotate(f->headPose.orientation, fwdLocal) : fwdLocal;
+    hFwd.y = 0.0f;
+    if (vecDot(hFwd, hFwd) < 1e-4f) {
+        hFwd.x = 0.0f;
+        hFwd.y = 0.0f;
+        hFwd.z = -1.0f;
+    }
+    else {
+        hFwd = vecNorm(hFwd);
+    }
+    Vec3 worldUp = { 0.0f, 1.0f, 0.0f };
+    in.headForward = hFwd;
+    in.headRight = vecNorm(vecCross(hFwd, worldUp));
+
+    Vec3 head = { ctx->headPos.x, ctx->headPos.y, ctx->headPos.z };
+    Vec3 sp = { ctx->screenPose.position.x, ctx->screenPose.position.y,
+                ctx->screenPose.position.z };
+    Vec3 diff = vecSub(sp, head);
+    float dist = sqrtf(vecDot(diff, diff));
+    if (dist < 0.1f) {
+        dist = SCREEN_DIST_DEFAULT_M;
+    }
+    in.curDistM = dist;
+    in.curFovDeg = screenFovFromPlacement(ctx->screenWidth, dist, ctx->screenRadius, f->curved);
+
+    ScreenInputResult res;
+    screenInputStep(&ctx->screenCtrl, &in, &res);
+    applyUiHaptic(ctx, res.hapticEvent, f->now);
+
+    if (res.adjustStarted) {
+        ctx->adjustSnapPose = ctx->screenPose;
+        ctx->adjustSnapWidth = ctx->screenWidth;
+        ctx->adjustSnapRadius = ctx->screenRadius;
+        ctx->adjustSnapValid = 1;
+        if (ctx->grabMode == GRAB_SPHERE) {
+            ctx->grabMode = GRAB_NONE;
+        }
+        LOGEV("depth3d: screen adjust started (fov %.1f deg, dist %.2f m, %s)",
+              res.fovDeg, res.distM, ctx->screenCtrl.adjustByHand ? "hand"
+              : (ctx->screenCtrl.adjustByGrip ? "grip" : "trigger"));
+    }
+
+    if (res.adjustUndone && ctx->adjustSnapValid) {
+        ctx->screenPose = ctx->adjustSnapPose;
+        ctx->screenWidth = ctx->adjustSnapWidth;
+        ctx->screenRadius = ctx->adjustSnapRadius;
+        ctx->adjustSnapValid = 0;
+        f->screenPose = ctx->screenPose;
+        f->height = ctx->screenWidth * (float)ctx->videoHeight / (float)ctx->videoWidth;
+        f->radius = ctx->screenRadius;
+        f->bar = barFrame(ctx);
+        LOGEV("depth3d: screen adjust undone by B");
+    }
+    else if (res.adjustActive || res.adjustSaved) {
+        Vec3 dirVec = vecDot(diff, diff) > 1e-4f ? vecNorm(diff) : fwdLocal;
+        ctx->screenPose.position.x = head.x + dirVec.x * res.distM;
+        ctx->screenPose.position.y = head.y + dirVec.y * res.distM;
+        ctx->screenPose.position.z = head.z + dirVec.z * res.distM;
+        float curve = f->roomOn ? 0.0f : effectiveCurvature(ctx);
+        int curvedNow = !f->roomOn && curve > SCREEN_CURVE_EPS && ctx->cylinderSupported;
+        if (curvedNow) {
+            ctx->screenRadius = screenCurvatureRadius(res.distM, curve);
+            ctx->screenWidth = screenCurvedArcWidth(res.fovDeg, res.distM, curve);
+        }
+        else {
+            ctx->screenRadius = res.distM * 4.0f;
+            ctx->screenWidth = screenFlatWidth(res.fovDeg, res.distM);
+        }
+        f->screenPose = ctx->screenPose;
+        f->height = ctx->screenWidth * (float)ctx->videoHeight / (float)ctx->videoWidth;
+        f->radius = ctx->screenRadius;
+        f->bar = barFrame(ctx);
+        if (res.adjustSaved) {
+            ctx->poseDirty = 1;
+            ctx->adjustSnapValid = 0;
+            f->out[IN_ADJUST_SAVED] = 1.0f;
+            LOGEV("depth3d: screen adjust saved (fov %.1f deg, dist %.2f m, %d in)",
+                  res.fovDeg, res.distM, res.diagonalInches);
+        }
+    }
+
+    // Grip-on-screen sphere drag (preserves distance from viewer)
+    if (res.sphereDragActive && (ctx->grabMode == GRAB_NONE || ctx->grabMode == GRAB_SPHERE)) {
+        int gh = ctx->grabDown[HAND_RIGHT] ? HAND_RIGHT : HAND_LEFT;
+        if (f->aimValid[gh]) {
+            if (ctx->grabMode != GRAB_SPHERE) {
+                ctx->grabMode = GRAB_SPHERE;
+                ctx->grabHand = gh;
+                ctx->grabAim = f->aimPoses[gh];
+                ctx->grabScreen = ctx->screenPose;
+                ctx->grabPitch = screenPitch(ctx);
+                ctx->grabRoll = screenRoll(ctx);
+            }
+            ctx->screenPose = screenSphereDrag(ctx->grabScreen, ctx->grabAim,
+                                               f->aimPoses[ctx->grabHand], head,
+                                               ctx->grabPitch, ctx->grabRoll);
+            f->screenPose = ctx->screenPose;
+            f->bar = barFrame(ctx);
+        }
+    }
+    else if (ctx->grabMode == GRAB_SPHERE) {
+        ctx->grabMode = GRAB_NONE;
+        if (!res.adjustStarted && !res.adjustActive && !res.adjustUndone) {
+            ctx->poseDirty = 1;
+        }
+    }
+
+    if (res.showHintToast) {
+        noticePush(&ctx->notices, TOAST_SCREEN_HINT, 0);
+    }
+    if (res.bAction == SCREEN_B_CLOSE_PALETTE) {
+        ctx->cogOpen = 0;
+        ctx->pickerOpen = 0;
+        ctx->exitConfirmOpen = 0;
+        f->out[IN_LOCAL_B_ACTION] = 2.0f;
+    }
+    else if (res.bAction == SCREEN_B_CLOSE_CARD) {
+        f->out[IN_LOCAL_B_ACTION] = 1.0f;
+    }
+    else if (res.bAction == SCREEN_B_EXIT_PROMPT) {
+        noticePush(&ctx->notices, TOAST_EXIT_AGAIN, 0);
+    }
+    else if (res.bAction == SCREEN_B_EXIT_CONFIRM) {
+        f->out[IN_EXIT] = 1.0f;
+    }
+
+    if (res.playPause) {
+        f->out[IN_LOCAL_PLAY_PAUSE] = 1.0f;
+    }
+    if (res.seekDeltaSec != 0) {
+        f->out[IN_LOCAL_SEEK_SEC] = (float)res.seekDeltaSec;
+    }
+    if (res.yToggleDanmaku) {
+        f->out[IN_LOCAL_Y_DANMAKU] = 1.0f;
+    }
+    if (res.menuTogglePalette) {
+        f->out[IN_LOCAL_MENU] = 1.0f;
+    }
+
+    ctx->screenAdjustActive = res.adjustActive;
+    f->out[IN_ADJUST_ACTIVE] = res.adjustActive ? 1.0f : 0.0f;
+    f->out[IN_ADJUST_AXIS] = (float)res.adjustAxis;
+    f->out[IN_ADJUST_FOV_TENTHS] = roundf(res.fovDeg * 10.0f);
+    f->out[IN_ADJUST_DIST_CM] = roundf(res.distM * 100.0f);
+    f->out[IN_ADJUST_INCHES] = (float)res.diagonalInches;
+    f->out[IN_ADJUST_PRESET] = (float)res.sizePresetIdx;
+
+    // Only clicks that began on a control (e.g. visible TransportBar) pass
+    // VR_BUTTON_LEFT to Java; screen clicks use IN_LOCAL_PLAY_PAUSE instead.
+    *outSuppressLeft = (ctx->screenCtrl.trigState != SCREEN_HOLD_CONTROL) ? 1 : 0;
+}
+
 // The parts of a chord as the log names them
 static const char* chordPartNames(int parts, char* buf, size_t size) {
     static const char* names[PAD_PART_COUNT] = { "L3", "R3", "LT", "RT", "left grip",
@@ -3461,9 +3767,15 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
     ctx->actionsSynced = 1;
 
     // The pad before anything points, so a switch between the two lands
-    // before the controllers are read for the pointer
-    updatePad(ctx);
-    updateRumble(ctx, 1);
+    // before the controllers are read for the pointer. Local playback never
+    // enters Xbox gamepad mode (left menu button is reserved for palette).
+    if (!ctx->localMedia) {
+        updatePad(ctx);
+        updateRumble(ctx, 1);
+    }
+    else {
+        restPad(ctx, "local playback");
+    }
     if (!pointerEnabled) {
         // The pointer is switched off in the settings, so only the pad and
         // the switch to it are read
@@ -3474,11 +3786,12 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
     }
 
     // In gamepad mode the stick clicks are the pad's, and while the gamepad
-    // shortcut has one each hand is read as the shortcut leaves it
+    // shortcut has one each hand is read as the shortcut leaves it. In local
+    // playback right stick click resets palette rows instead of hiding pointer.
     int toggle = chordHasStickClick(ctx)
             ? seenStickClick(ctx, HAND_LEFT) || seenStickClick(ctx, HAND_RIGHT)
             : actionBool(ctx, ctx->toggleAction, -1);
-    if (toggle && !ctx->togglePrev && !ctx->padMode) {
+    if (toggle && !ctx->togglePrev && !ctx->padMode && !ctx->localMedia) {
         ctx->pointerOn = !ctx->pointerOn;
         LOGI("pointer %s", ctx->pointerOn ? "on" : "off");
     }
@@ -3494,7 +3807,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
     f.roomOn = roomEffective(ctx) > 0;
     f.xform.toHead = headLocked && !f.roomOn;
     f.height = ctx->screenWidth * (float)ctx->videoHeight / (float)ctx->videoWidth;
-    f.curved = !f.roomOn && effectiveCurvature(ctx) > 0.01f && ctx->cylinderSupported;
+    f.curved = !f.roomOn && effectiveCurvature(ctx) > SCREEN_CURVE_EPS && ctx->cylinderSupported;
     f.radius = ctx->screenRadius;
     f.cornerSide = cornerSide(ctx);
     f.screenPose = ctx->screenPose;
@@ -3573,6 +3886,11 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
     f.radius = ctx->screenRadius;
     f.bar = barFrame(ctx);
 
+    int suppressLeftButton = 0;
+    if (ctx->localMedia && (ctx->grabMode == GRAB_NONE || ctx->grabMode == GRAB_SPHERE)) {
+        updateLocalMediaInput(ctx, &f, &suppressLeftButton);
+    }
+
     // A handle stays lit while it is being dragged, however far the ray has
     // wandered from it in the meantime
     if (ctx->grabMode == GRAB_MOVE) {
@@ -3580,6 +3898,9 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
     }
     else if (ctx->grabMode == GRAB_RESIZE) {
         ctx->hoverKind = HOVER_CORNER;
+    }
+    else if (ctx->grabMode == GRAB_SPHERE) {
+        ctx->hoverKind = HOVER_SCREEN;
     }
     else {
         ctx->hoverKind = f.hover;
@@ -3628,8 +3949,10 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
         beamToFurniture(ctx, &f);
     }
     sendPointer(ctx, &f, hit);
-    updateButtons(ctx, &f, hit);
-    updateScroll(ctx, &f, hit);
+    updateButtons(ctx, &f, hit, suppressLeftButton);
+    if (!ctx->localMedia) {
+        updateScroll(ctx, &f, hit);
+    }
     beamIntoRoom(ctx, &f);
 
     writeInputPose(ctx, out);
@@ -3717,4 +4040,17 @@ Java_com_limelight_binding_video_XrRenderer_nativeSetHandHint(JNIEnv* env, jobje
     LOGI("hand lock hint %s", ctx->hintWanted ? "shows the first time a hand points"
                               : ctx->handsEnabled ? "put away for good in an earlier session"
                                                   : "not wanted, hands are off");
+}
+
+// Whether trigger+stick enters screen adjustment in local playback (§3.8, §6.4 Rule 12)
+JNIEXPORT void JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeSetTriggerScreenAdjust(JNIEnv* env, jobject thiz,
+                                                                         jlong handle,
+                                                                         jboolean enabled) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx == NULL) {
+        return;
+    }
+    ctx->triggerScreenAdjustOn = enabled ? 1 : 0;
+    LOGI("depth3d: trigger screen adjust %s", enabled ? "on" : "off");
 }

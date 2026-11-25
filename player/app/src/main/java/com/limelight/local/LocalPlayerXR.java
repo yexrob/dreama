@@ -135,6 +135,7 @@ public class LocalPlayerXR extends Activity
     private TransportBar bar;
     private volatile float pointerU = -1f, pointerV = -1f;
     private volatile long pointerMovedMs;
+    private volatile boolean screenAdjusting;
     private float lastU, lastV;
     private static final long BAR_LINGER_MS = 3000;
     private static final long BAR_TICK_MS = 200;
@@ -988,6 +989,8 @@ public class LocalPlayerXR extends Activity
                         errorCanRetry,
                         retryHot,
                         backHot));
+            } else if (screenAdjusting) {
+                r.setTransportVisible(false);
             } else {
                 boolean show = !on || since < BAR_LINGER_MS;
                 r.setTransportVisible(show);
@@ -1026,6 +1029,53 @@ public class LocalPlayerXR extends Activity
     @Override
     public void onVrExit() {
         main.post(this::finish);
+    }
+
+    @Override
+    public void onVrLocalPlayPause() {
+        main.post(() -> {
+            ExoPlayer p = player;
+            if (p == null || errored) {
+                return;
+            }
+            pointerMovedMs = System.currentTimeMillis();
+            setPlaying(!playing());
+            tickBar();
+        });
+    }
+
+    @Override
+    public void onVrLocalSeek(int deltaSec) {
+        if (deltaSec == 0) {
+            return;
+        }
+        main.post(() -> {
+            ExoPlayer p = player;
+            XrRenderer r = renderer;
+            if (p == null || r == null || errored || !p.isCurrentMediaItemSeekable()) {
+                return;
+            }
+            long to = position() + (long) deltaSec * 1000L;
+            long d = duration();
+            if (d > 1000) {
+                to = Math.min(d - 1000, to);
+            }
+            long clamped = Math.max(0, to);
+            lastKnownPositionMs = clamped;
+            p.seekTo(clamped);
+            pointerMovedMs = System.currentTimeMillis();
+            tickBar();
+        });
+    }
+
+    @Override
+    public void onVrScreenAdjustChanged(boolean active) {
+        screenAdjusting = active;
+        XrRenderer r = renderer;
+        if (active && r != null) {
+            r.setTransportVisible(false);
+        }
+        main.post(this::tickBar);
     }
 
     @Override

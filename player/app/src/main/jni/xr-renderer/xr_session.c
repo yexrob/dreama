@@ -1002,6 +1002,9 @@ Java_com_limelight_binding_video_XrRenderer_nativeInit(JNIEnv* env, jobject thiz
     padChordReset(&ctx->padChord, 0);
     padRest(&ctx->pad);
     ctx->padResting = 1;
+    // Local-playback trigger+stick screen adjustment starts enabled until Java hands down pref
+    ctx->triggerScreenAdjustOn = 1;
+    screenInputInit(&ctx->screenCtrl);
     // Comfort comes from absolute disparity and depth comes from the steps
     // between objects, so the overall shape is pulled toward the screen plane
     // while the local detail is boosted. Measured on captured frames this is

@@ -68,9 +68,9 @@ public class XrPadTest {
         assertEquals(XrShared.IN_PAD_LX + 1, XrShared.IN_PAD_LY);
         assertEquals(XrShared.IN_PAD_LY + 1, XrShared.IN_PAD_RX);
         assertEquals(XrShared.IN_PAD_RX + 1, XrShared.IN_PAD_RY);
-        // Only the hand lock hint's slot follows the gamepad axes/buttons.
+        // The hand lock hint and local-playback screen-control slots follow the gamepad axes/buttons.
         assertEquals(XrShared.IN_PAD_RY + 1, XrShared.IN_HINT);
-        assertEquals(XrShared.IN_HINT + 1, XrShared.IN_SLOTS);
+        assertEquals(XrShared.IN_HINT + 1, XrShared.IN_LOCAL_PLAY_PAUSE);
         // A stick's full tilt and the largest button bit survive the float
         // slots exactly
         assertEquals(32766, (int)(float)32766);

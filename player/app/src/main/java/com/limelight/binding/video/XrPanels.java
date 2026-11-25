@@ -307,6 +307,7 @@ final class XrPanels {
     private final String[] sliderRows;
     private final String needsHeadLock;
     private final String notInRoom;
+    private final String curveUnsupported;
     private final String[] roomRows;
     private final String[] roomSwitch;
     private final String roomFixedHint;
@@ -343,6 +344,7 @@ final class XrPanels {
         sliderRows = words(COG_SLIDER_ROWS);
         needsHeadLock = context.getString(COG_NEEDS_HEAD_LOCK);
         notInRoom = context.getString(COG_NOT_IN_ROOM);
+        curveUnsupported = context.getString(R.string.vr_curve_unsupported_headset);
         roomRows = words(COG_ROOM_ROWS);
         roomSwitch = words(COG_ROOM_SWITCH);
         roomFixedHint = context.getString(COG_ROOM_FIXED_HINT);
@@ -752,6 +754,10 @@ final class XrPanels {
                 drawGreyedReason(canvas, y, needsHeadLock);
                 continue;
             }
+            if (row == COG_SLIDER_CURVE && !live) {
+                drawGreyedReason(canvas, y, curveUnsupported);
+                continue;
+            }
 
             track.setColor(live ? 0x66FFFFFF : 0x30FFFFFF);
             canvas.drawLine(COG_RUN_L * COG_TEX_W, y, COG_RUN_R * COG_TEX_W, y, track);
@@ -1141,8 +1147,18 @@ final class XrPanels {
                 Bitmap.Config.ARGB_8888);
         private final Canvas canvas = new Canvas(bitmap);
         private final Paint sheet = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint border = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint line = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint detail = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint readoutText = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint trackBg = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint trackFill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint tickPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint tickText = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint thumbPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF pillRect = new RectF(1.0f, 1.0f, TOAST_TEX_W - 1.0f, TOAST_TEX_H - 1.0f);
+        private final RectF trackRect = new RectF();
+        private final RectF fillRect = new RectF();
         private final ByteBuffer pixels = ByteBuffer.allocateDirect(TOAST_TEX_W * TOAST_TEX_H * 4);
 
         private static final float DETAIL_SIZE = 32.0f;
@@ -1150,12 +1166,70 @@ final class XrPanels {
 
         Toast() {
             sheet.setColor(0xF0141416);
+            border.setStyle(Paint.Style.STROKE);
+            border.setStrokeWidth(2.0f);
+            border.setColor(0x33FFFFFF);
             line.setColor(Color.WHITE);
             line.setTextSize(44.0f);
             line.setTextAlign(Paint.Align.CENTER);
             detail.setColor(0xB0FFFFFF);
             detail.setTextSize(DETAIL_SIZE);
             detail.setTextAlign(Paint.Align.CENTER);
+            readoutText.setColor(0xFFECECEE);
+            readoutText.setTextSize(38.0f);
+            readoutText.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+            readoutText.setTextAlign(Paint.Align.CENTER);
+            trackBg.setColor(0x3DFFFFFF);
+            trackFill.setColor(0xFF7FD7FF);
+            tickPaint.setColor(0x88FFFFFF);
+            tickText.setColor(0x99ECECEE);
+            tickText.setTextSize(20.0f);
+            tickText.setTextAlign(Paint.Align.CENTER);
+            thumbPaint.setColor(Color.WHITE);
+        }
+
+        // Draws the screen-adjust readout pill reusing the toast swapchain (§6.12).
+        // Zero per-frame allocations; only called when displayed values change.
+        ByteBuffer drawScreenReadout(String text, float progress, float[] ticks,
+                                     String[] tickLabels) {
+            canvas.drawColor(0, PorterDuff.Mode.CLEAR);
+            canvas.drawRoundRect(pillRect, 36.0f, 36.0f, sheet);
+            canvas.drawRoundRect(pillRect, 36.0f, 36.0f, border);
+
+            float mid = TOAST_TEX_W * 0.5f;
+            float room = TOAST_TEX_W - 80.0f;
+            canvas.drawText(fit(text, readoutText, room), mid, 60.0f, readoutText);
+
+            float trackL = 72.0f;
+            float trackR = TOAST_TEX_W - 72.0f;
+            float trackY = 104.0f;
+            float trackHalfH = 4.0f;
+            float clamped = Math.max(0.0f, Math.min(1.0f, progress));
+            float thumbX = trackL + clamped * (trackR - trackL);
+
+            trackRect.set(trackL, trackY - trackHalfH, trackR, trackY + trackHalfH);
+            canvas.drawRoundRect(trackRect, trackHalfH, trackHalfH, trackBg);
+
+            fillRect.set(trackL, trackY - trackHalfH, thumbX, trackY + trackHalfH);
+            canvas.drawRoundRect(fillRect, trackHalfH, trackHalfH, trackFill);
+
+            if (ticks != null) {
+                for (int i = 0; i < ticks.length; i++) {
+                    float tx = trackL + Math.max(0.0f, Math.min(1.0f, ticks[i])) * (trackR - trackL);
+                    canvas.drawRect(tx - 1.5f, trackY - 10.0f, tx + 1.5f, trackY + 10.0f, tickPaint);
+                    if (tickLabels != null && i < tickLabels.length && tickLabels[i] != null) {
+                        canvas.drawText(tickLabels[i], tx, 142.0f, tickText);
+                    }
+                }
+            }
+
+            canvas.drawCircle(thumbX, trackY, 11.0f, trackFill);
+            canvas.drawCircle(thumbX, trackY, 7.0f, thumbPaint);
+
+            pixels.rewind();
+            bitmap.copyPixelsToBuffer(pixels);
+            pixels.rewind();
+            return pixels;
         }
 
         // A second line that is a path is cut from the middle rather than the
