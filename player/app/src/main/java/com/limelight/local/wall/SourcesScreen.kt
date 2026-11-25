@@ -864,21 +864,29 @@ fun PluginDetailScreen(model: WallModel, nav: WallNav, page: Page.PluginDetail) 
 
     var showUninstallConfirm by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
-    var reloadJob by remember { mutableStateOf<Job?>(null) }
+    val reloadRunner = remember { SingleFlightOpRunner() }
+    var reloadBusy by remember { mutableStateOf(false) }
+    var reloadCancelling by remember { mutableStateOf(false) }
     var reloadBusyMsg by remember { mutableStateOf<String?>(null) }
     var reloadError by remember { mutableStateOf<String?>(null) }
     var pendingReloadConfirm by remember { mutableStateOf<PendingPluginInstall?>(null) }
 
     DisposableEffect(Unit) {
-        onDispose { reloadJob?.cancel() }
+        onDispose { reloadRunner.cancel() }
     }
 
     fun startDevReload() {
         val url = devServerUrl ?: return
-        if (reloadJob?.isActive == true) return
-        reloadError = null
-        reloadBusyMsg = context.getString(R.string.dev_reloading_pkg)
-        reloadJob = scope.launch {
+        val started = reloadRunner.tryLaunch(
+            scope = scope,
+            onStateChanged = { b, c ->
+                reloadBusy = b
+                reloadCancelling = c
+                if (!b) reloadBusyMsg = null
+            },
+        ) {
+            reloadError = null
+            reloadBusyMsg = context.getString(R.string.dev_reloading_pkg)
             try {
                 val outcome = withContext(Dispatchers.IO) {
                     PluginInstallGuard.reloadDevPlugin(
@@ -904,12 +912,10 @@ fun PluginDetailScreen(model: WallModel, nav: WallNav, page: Page.PluginDetail) 
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                val baseErr = PluginInstallGuard.formatInstallError(e, strings)
-                reloadError = "$baseErr ${context.getString(R.string.dev_reload_offline_hint)}"
-            } finally {
-                reloadBusyMsg = null
+                reloadError = PluginInstallGuard.formatDevReloadError(e, strings).first
             }
         }
+        if (!started) return
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -1054,7 +1060,7 @@ fun PluginDetailScreen(model: WallModel, nav: WallNav, page: Page.PluginDetail) 
                                 onClick = { startDevReload() },
                                 icon = WallIcons.Refresh,
                                 kind = if (entity.needsPermissionReconfirm) ButtonKind.Plain else ButtonKind.Primary,
-                                enabled = !busy && reloadBusyMsg == null,
+                                enabled = !busy && !reloadBusy,
                             )
                         }
                         WallButton(
@@ -1075,13 +1081,20 @@ fun PluginDetailScreen(model: WallModel, nav: WallNav, page: Page.PluginDetail) 
             }
         }
 
-        reloadBusyMsg?.let { msg ->
+        if (reloadBusy) {
             BusyModal(
-                message = msg,
+                message = if (reloadCancelling) {
+                    stringResource(R.string.dev_cancelling_op)
+                } else {
+                    reloadBusyMsg ?: stringResource(R.string.dev_reloading_pkg)
+                },
                 onCancel = {
-                    reloadJob?.cancel()
-                    reloadJob = null
-                    reloadBusyMsg = null
+                    if (!reloadCancelling) {
+                        reloadRunner.cancel { b, c ->
+                            reloadBusy = b
+                            reloadCancelling = c
+                        }
+                    }
                 },
             )
         }
@@ -1214,8 +1227,8 @@ fun RepoBrowseScreen(model: WallModel, nav: WallNav, page: Page.RepoBrowse) {
                 val repoOrigin = PluginPackageManager.canonicalSourceOrigin(repoUrl = page.repoUrl, sourceUrl = null)
                 items(entries, key = { it.id }) { entry ->
                     val existing = installedById[entry.id]
-                    val sameOrigin = existing != null && existing.sourceOrigin == repoOrigin
-                    val alreadyLatest = sameOrigin && existing.version == entry.version
+                    val action = PluginInstallGuard.classifyRepoEntryAction(existing, repoOrigin, entry.version)
+                    val alreadyLatest = action == RepoEntryAction.INSTALLED
                     val sub = buildString {
                         append(entry.version)
                         if (entry.description.isNotBlank()) append(" · ").append(entry.description)
@@ -1235,9 +1248,9 @@ fun RepoBrowseScreen(model: WallModel, nav: WallNav, page: Page.RepoBrowse) {
                                 }
                             } else {
                                 WallButton(
-                                    text = when {
-                                        existing != null && !sameOrigin -> stringResource(R.string.plugins_repo_replace)
-                                        existing != null -> stringResource(R.string.plugins_update_to, entry.version)
+                                    text = when (action) {
+                                        RepoEntryAction.REPLACE -> stringResource(R.string.plugins_repo_replace)
+                                        RepoEntryAction.UPDATE -> stringResource(R.string.plugins_update_to, entry.version)
                                         else -> stringResource(R.string.plugins_repo_install)
                                     },
                                     onClick = { startDownload(entry) },
@@ -1307,6 +1320,11 @@ fun PluginInstallConfirmSheet(
 
     val devAddr = pending.devDisplayAddress ?: PluginPackageManager.devDisplayAddressFromOrigin(preview.sourceOrigin)
     val isDev = preview.isDevSource || devAddr != null
+    val isDevAddressSwitch = requireExplicitReplace &&
+        mismatchExistingOrigin != null &&
+        PluginPackageManager.isDevOrigin(mismatchExistingOrigin!!) &&
+        preview.isDevSource &&
+        mismatchExistingOrigin != preview.sourceOrigin
     val replaceWarningText = remember(mismatchExistingOrigin, preview.sourceOrigin, reposByUrl) {
         PluginPermissionSummary.replacementWarningText(
             existingSourceOrigin = mismatchExistingOrigin,
@@ -1317,8 +1335,10 @@ fun PluginInstallConfirmSheet(
     }
 
     val titleRes = when {
+        isDevAddressSwitch -> R.string.plugins_install_dev_switch_title
         requireExplicitReplace -> R.string.plugins_install_replace_title
-        pending.confirmExpandedPermissionsOnInstall -> R.string.plugins_install_permission_expanded_title
+        pending.confirmExpandedPermissionsOnInstall || preview.needsPermissionReconfirm ->
+            R.string.plugins_install_permission_expanded_title
         preview.isUpdate -> R.string.plugins_install_update_title
         else -> R.string.plugins_install_confirm_title
     }
@@ -1381,7 +1401,7 @@ fun PluginInstallConfirmSheet(
                 }
                 for (warn in preview.permissionWarnings) {
                     val isWildcardDup = warn.contains(PluginPackageManager.WILDCARD_LAN_WARNING) && preview.allowsWildcardLanAccess
-                    val isReplaceDup = requireExplicitReplace && warn.contains("来源不同")
+                    val isReplaceDup = requireExplicitReplace && (warn.contains("来源不同") || warn.contains("来源地址"))
                     if (!isWildcardDup && !isReplaceDup) {
                         Notice(warn, danger = true)
                     }
@@ -1393,10 +1413,10 @@ fun PluginInstallConfirmSheet(
                     Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(Wall.Radius))
-                        .background(Wall.Danger.copy(alpha = 0.14f))
+                        .background(if (isDevAddressSwitch) Wall.Accent.copy(alpha = 0.14f) else Wall.Danger.copy(alpha = 0.14f))
                         .padding(18.dp),
                 ) {
-                    Notice(replaceWarningText, danger = true)
+                    Notice(replaceWarningText, danger = !isDevAddressSwitch)
                 }
             }
 
@@ -1409,8 +1429,10 @@ fun PluginInstallConfirmSheet(
                 WallButton(
                     text = stringResource(
                         when {
+                            isDevAddressSwitch -> R.string.plugins_install_dev_switch_btn
                             requireExplicitReplace -> R.string.plugins_install_replace_btn
-                            pending.confirmExpandedPermissionsOnInstall -> R.string.plugins_install_permission_expanded_btn
+                            pending.confirmExpandedPermissionsOnInstall || preview.needsPermissionReconfirm ->
+                                R.string.plugins_install_permission_expanded_btn
                             else -> R.string.plugins_install_confirm_btn
                         },
                     ),

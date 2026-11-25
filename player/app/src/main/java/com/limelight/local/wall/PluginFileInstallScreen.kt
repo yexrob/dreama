@@ -39,15 +39,17 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.limelight.R
+import com.limelight.local.media.LocalVideoSource
 import com.limelight.local.plugin.PackageInstallException
 import com.limelight.local.stream.AndroidStringLookup
 import com.limelight.local.stream.PhoneInputServer
 import com.limelight.local.stream.UserFacingError
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
@@ -56,73 +58,102 @@ import java.util.Locale
 
 /**
  * Local file & direct HTTPS `.d3plugin` installer (`docs/specs/05-plugin-dev-install.md` §2):
- * - Scans `Download/` and `Android/data/<package>/files/plugins/` (the latter needs zero storage
- *   permissions and serves as the universal `adb push` drop folder).
- * - Silently ignores unreadable `Download/` on Android 11+ Scoped Storage (`targetSdk 36`) and
+ * - Scans `Android/data/<package>/files/plugins/` (needs zero storage permissions; universal
+ *   `adb push` drop folder) and `Download/` on `Dispatchers.IO` (zero disk I/O in composition).
+ * - On Android 10 (API <= 29), listing `Download/` requires `READ_EXTERNAL_STORAGE`: when not
+ *   yet granted, surfaces an explicit 「允许访问」 action (and auto-rescans on resume) alongside
+ *   「选择文件」.
+ * - On Android 11+ (`targetSdk 36` Scoped Storage), silently ignores unreadable `Download/` and
  *   provides `ACTION_OPEN_DOCUMENT` as the universal system file picker.
  * - Also supports direct HTTPS `.d3plugin` URL install via [PhoneInputSheet] (`PLUGIN_DIRECT_URL`).
- * - Every path runs `previewPackage` and shows the shared [PluginInstallConfirmSheet].
+ * - Every path reads bounded bytes (<= 8 MB) ONCE during preview and installs strictly from those
+ *   previewed bytes (bound to preview SHA-256) after user confirmation on [PluginInstallConfirmSheet].
  */
 @Composable
 fun PluginFileInstallScreen(model: WallModel, nav: WallNav) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val strings = remember(context) { AndroidStringLookup(context) }
     val scope = rememberCoroutineScope()
     val dateFmt = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()) }
 
-    val downloadDir = remember {
-        runCatching {
-            @Suppress("DEPRECATION")
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        }.getOrNull()
-    }
-    val appPluginsDir = remember(context) {
-        runCatching {
-            context.getExternalFilesDir("plugins")?.also { it.mkdirs() }
-        }.getOrNull()
-    }
-    val downloadDisplayPath = remember(downloadDir) {
-        downloadDir?.absolutePath ?: "/storage/emulated/0/Download"
-    }
-    val appDisplayPath = remember(appPluginsDir, context) {
-        appPluginsDir?.absolutePath ?: "/storage/emulated/0/Android/data/${context.packageName}/files/plugins"
-    }
     val downloadLabel = stringResource(R.string.file_install_dir_download)
     val appDirLabel = stringResource(R.string.file_install_dir_app)
+
+    var downloadDisplayPath by remember { mutableStateOf("/storage/emulated/0/Download") }
+    var appDisplayPath by remember(context.packageName) {
+        mutableStateOf("/storage/emulated/0/Android/data/${context.packageName}/files/plugins")
+    }
+    var hasLegacyStoragePerm by remember {
+        mutableStateOf(Build.VERSION.SDK_INT > Build.VERSION_CODES.Q || LocalVideoSource.hasPermission(context))
+    }
 
     var refreshToken by remember { mutableIntStateOf(0) }
     var scanning by remember { mutableStateOf(true) }
     var scannedFiles by remember { mutableStateOf<List<LocalPluginFileEntry>>(emptyList()) }
     var errorText by remember { mutableStateOf<String?>(null) }
-    var busyJob by remember { mutableStateOf<Job?>(null) }
+
+    val opRunner = remember { SingleFlightOpRunner() }
+    var opBusy by remember { mutableStateOf(false) }
+    var opCancelling by remember { mutableStateOf(false) }
     var busyMessage by remember { mutableStateOf<String?>(null) }
     var pendingInstall by remember { mutableStateOf<PendingPluginInstall?>(null) }
     var showDirectUrlSheet by remember { mutableStateOf(false) }
 
     DisposableEffect(Unit) {
-        onDispose { busyJob?.cancel() }
+        onDispose { opRunner.cancel() }
     }
 
-    LaunchedEffect(refreshToken, downloadDir, appPluginsDir) {
+    // Re-check Android 10 storage permission and rescan when returning from permission dialog
+    DisposableEffect(lifecycleOwner, context) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME && Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q) {
+                val grantedNow = LocalVideoSource.hasPermission(context)
+                if (grantedNow != hasLegacyStoragePerm) {
+                    hasLegacyStoragePerm = grantedNow
+                    refreshToken++
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    LaunchedEffect(refreshToken) {
         scanning = true
-        val results = withContext(Dispatchers.IO) {
-            appPluginsDir?.let { runCatching { it.mkdirs() } }
-            LocalPluginFileScanner.scanDirectories(
+        val scanResult = withContext(Dispatchers.IO) {
+            val dlDir = runCatching {
+                @Suppress("DEPRECATION")
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            }.getOrNull()
+            val appDir = runCatching {
+                context.getExternalFilesDir("plugins")?.also { it.mkdirs() }
+            }.getOrNull()
+            val files = LocalPluginFileScanner.scanDirectories(
                 listOf(
-                    appDirLabel to appPluginsDir,
-                    downloadLabel to downloadDir,
+                    appDirLabel to appDir,
+                    downloadLabel to dlDir,
                 ),
             )
+            Triple(dlDir?.absolutePath, appDir?.absolutePath, files)
         }
-        scannedFiles = results
+        scanResult.first?.let { downloadDisplayPath = it }
+        scanResult.second?.let { appDisplayPath = it }
+        scannedFiles = scanResult.third
         scanning = false
     }
 
     fun startPrepareLocalFile(file: File) {
-        if (busyJob?.isActive == true) return
-        errorText = null
-        busyMessage = context.getString(R.string.file_install_reading)
-        busyJob = scope.launch {
+        opRunner.tryLaunch(
+            scope = scope,
+            onStateChanged = { b, c ->
+                opBusy = b
+                opCancelling = c
+                if (!b) busyMessage = null
+            },
+        ) {
+            errorText = null
+            busyMessage = context.getString(R.string.file_install_reading)
             try {
                 val prepared = withContext(Dispatchers.IO) {
                     PluginInstallGuard.prepareLocalFileInstall(
@@ -136,17 +167,21 @@ fun PluginFileInstallScreen(model: WallModel, nav: WallNav) {
                 throw e
             } catch (e: Exception) {
                 errorText = PluginInstallGuard.formatInstallError(e, strings)
-            } finally {
-                busyMessage = null
             }
         }
     }
 
     fun startPrepareDocumentUri(uri: Uri) {
-        if (busyJob?.isActive == true) return
-        errorText = null
-        busyMessage = context.getString(R.string.file_install_reading)
-        busyJob = scope.launch {
+        opRunner.tryLaunch(
+            scope = scope,
+            onStateChanged = { b, c ->
+                opBusy = b
+                opCancelling = c
+                if (!b) busyMessage = null
+            },
+        ) {
+            errorText = null
+            busyMessage = context.getString(R.string.file_install_reading)
             try {
                 val prepared = withContext(Dispatchers.IO) {
                     val name = queryDocumentDisplayName(context.contentResolver, uri)
@@ -166,8 +201,6 @@ fun PluginFileInstallScreen(model: WallModel, nav: WallNav) {
                 throw e
             } catch (e: Exception) {
                 errorText = PluginInstallGuard.formatInstallError(e, strings)
-            } finally {
-                busyMessage = null
             }
         }
     }
@@ -206,15 +239,19 @@ fun PluginFileInstallScreen(model: WallModel, nav: WallNav) {
             WallButton(
                 text = stringResource(R.string.file_install_direct_url_btn),
                 onClick = {
-                    errorText = null
-                    showDirectUrlSheet = true
+                    if (!opBusy) {
+                        errorText = null
+                        showDirectUrlSheet = true
+                    }
                 },
                 icon = WallIcons.Cloud,
                 kind = ButtonKind.Plain,
+                enabled = !opBusy,
             )
             WallButton(
                 text = stringResource(R.string.file_install_pick_btn),
                 onClick = {
+                    if (opBusy) return@WallButton
                     errorText = null
                     try {
                         documentPicker.launch(arrayOf("*/*"))
@@ -226,6 +263,7 @@ fun PluginFileInstallScreen(model: WallModel, nav: WallNav) {
                 },
                 icon = WallIcons.Folder,
                 kind = ButtonKind.Primary,
+                enabled = !opBusy,
             )
         }
 
@@ -264,6 +302,25 @@ fun PluginFileInstallScreen(model: WallModel, nav: WallNav) {
                         style = WallType.Caption,
                         color = Wall.Text3,
                     )
+                } else if (!hasLegacyStoragePerm) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(top = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(16.dp),
+                    ) {
+                        Text(
+                            stringResource(R.string.file_install_storage_perm_hint),
+                            style = WallType.Caption,
+                            color = Wall.Accent,
+                            modifier = Modifier.weight(1f),
+                        )
+                        WallButton(
+                            text = stringResource(R.string.file_install_allow_access_btn),
+                            onClick = { nav.storage() },
+                            kind = ButtonKind.Plain,
+                            small = true,
+                        )
+                    }
                 }
             }
 
@@ -331,9 +388,10 @@ fun PluginFileInstallScreen(model: WallModel, nav: WallNav) {
                                         onClick = { startPrepareLocalFile(entry.file) },
                                         kind = ButtonKind.Plain,
                                         small = true,
+                                        enabled = !opBusy,
                                     )
                                 },
-                                onClick = { startPrepareLocalFile(entry.file) },
+                                onClick = { if (!opBusy) startPrepareLocalFile(entry.file) },
                             )
                         }
                     }
@@ -371,13 +429,20 @@ fun PluginFileInstallScreen(model: WallModel, nav: WallNav) {
             )
         }
 
-        busyMessage?.let { msg ->
+        if (opBusy) {
             BusyModal(
-                message = msg,
+                message = if (opCancelling) {
+                    stringResource(R.string.dev_cancelling_op)
+                } else {
+                    busyMessage ?: stringResource(R.string.file_install_reading)
+                },
                 onCancel = {
-                    busyJob?.cancel()
-                    busyJob = null
-                    busyMessage = null
+                    if (!opCancelling) {
+                        opRunner.cancel { b, c ->
+                            opBusy = b
+                            opCancelling = c
+                        }
+                    }
                 },
             )
         }

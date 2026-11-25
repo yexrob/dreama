@@ -30,17 +30,27 @@ import com.limelight.local.stream.PhoneFormFieldKind
 import com.limelight.local.stream.PhoneFormOption
 import com.limelight.local.stream.StringLookup
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import java.io.ByteArrayOutputStream
+import java.io.EOFException
 import java.io.File
+import java.io.IOException
 import java.io.InputStream
+import java.net.ConnectException
 import java.net.InetAddress
+import java.net.NoRouteToHostException
+import java.net.SocketException
+import java.net.SocketTimeoutException
 import java.net.URI
+import java.net.UnknownHostException
 import java.util.Locale
 import java.util.UUID
 
@@ -514,6 +524,9 @@ object PluginPermissionSummary {
                     strings.get(R.string.plugins_install_replace_to_dev, oldLabel)
                 }
             }
+            oldIsDev && newIsDev -> {
+                strings.get(R.string.plugins_install_dev_switch_warning, oldLabel, newLabel)
+            }
             oldIsDev && !newIsDev -> {
                 strings.get(R.string.plugins_install_replace_dev_to_release, oldLabel, newLabel)
             }
@@ -535,9 +548,76 @@ data class PendingPluginInstall(
     val preview: PluginInstallPreview,
     val devServerUrl: String? = null,
     val devDisplayAddress: String? = null,
-    val localFile: File? = null,
     val confirmExpandedPermissionsOnInstall: Boolean = false,
 )
+
+/**
+ * Single-flight UI task runner preventing parallel installs/reloads on repeated taps AND
+ * refusing a new launch after cancel until the previous coroutine has completely finished.
+ */
+class SingleFlightOpRunner {
+    @Volatile
+    private var activeJob: Job? = null
+
+    @Volatile
+    private var cancellingFlag: Boolean = false
+
+    /** True while the job is either actively running OR still winding down its cancellation cleanup. */
+    val isBusy: Boolean
+        get() = activeJob?.isCompleted == false
+
+    val isCancelling: Boolean
+        get() = cancellingFlag && activeJob?.isCompleted == false
+
+    fun tryLaunch(
+        scope: CoroutineScope,
+        onStateChanged: (busy: Boolean, cancelling: Boolean) -> Unit = { _, _ -> },
+        block: suspend () -> Unit,
+    ): Boolean {
+        if (activeJob?.isCompleted == false) return false
+        cancellingFlag = false
+        onStateChanged(true, false)
+        var createdJob: Job? = null
+        val job = scope.launch {
+            try {
+                block()
+            } finally {
+                withContext(NonCancellable) {
+                    if (activeJob === createdJob) {
+                        activeJob = null
+                        cancellingFlag = false
+                        onStateChanged(false, false)
+                    }
+                }
+            }
+        }
+        createdJob = job
+        activeJob = job
+        if (job.isCompleted) {
+            activeJob = null
+            cancellingFlag = false
+            onStateChanged(false, false)
+        }
+        return true
+    }
+
+    fun cancel(onStateChanged: (busy: Boolean, cancelling: Boolean) -> Unit = { _, _ -> }) {
+        val job = activeJob ?: return
+        if (!job.isCompleted) {
+            cancellingFlag = true
+            onStateChanged(true, true)
+            job.cancel()
+        }
+    }
+}
+
+/** UI action classification for a plugin entry listed in a subscribed repository. */
+enum class RepoEntryAction {
+    INSTALL,
+    INSTALLED,
+    UPDATE,
+    REPLACE,
+}
 
 /** Available update discovered in a subscribed repository for an already-installed plugin. */
 data class AvailablePluginUpdate(
@@ -700,16 +780,19 @@ object PluginInstallGuard {
             preview = localized,
             devServerUrl = fetched.server.baseUrl,
             devDisplayAddress = fetched.server.displayAddress,
+            confirmExpandedPermissionsOnInstall = localized.needsPermissionReconfirm,
         )
     }
 
     /**
      * Reloads an already-installed dev plugin from [rawServerAddress]:
-     * - Same dev origin + unchanged/shrunk permissions: compiles syntax check first (so a syntax
-     *   error never breaks the working version), installs in-place (preserving instances/storage/cookies),
-     *   and verifies `init(ctx)` to report any raw technical error to Developer Mode.
-     * - Expanded permissions or different source: returns [DevReloadOutcome.NeedsConfirmation] so
-     *   the user explicitly reviews and confirms before anything is modified.
+     * - Same dev origin + unchanged/shrunk permissions: runs zero-capability module-load probe
+     *   first (so a syntax/top-level error never breaks the working version), installs in-place
+     *   (preserving instances/storage/cookies), and verifies `init(ctx)` to report any redacted
+     *   technical error to Developer Mode.
+     * - Expanded permissions or different source (including dev address switch): returns
+     *   [DevReloadOutcome.NeedsConfirmation] so the user explicitly reviews and confirms before
+     *   anything is executed or modified.
      */
     suspend fun reloadDevPlugin(
         packageManager: PluginPackageManager,
@@ -734,7 +817,7 @@ object PluginInstallGuard {
             )
         }
         if (verifySyntaxBeforeSwap) {
-            val syntaxErr = packageManager.verifyArchiveMainJsSyntax(pending.bytes)
+            val syntaxErr = packageManager.probeArchiveModuleLoad(pending.bytes)
             if (syntaxErr != null) {
                 throw DevPluginSyntaxException(syntaxErr)
             }
@@ -775,11 +858,10 @@ object PluginInstallGuard {
             bytes = bytes,
             sourceUrl = fileUri,
             repoUrl = null,
-            expectedId = null,
-            expectedVersion = null,
-            expectedSha256 = null,
+            expectedId = localized.manifest.id,
+            expectedVersion = localized.manifest.version,
+            expectedSha256 = rawPreview.sha256,
             preview = localized,
-            localFile = file,
         )
     }
 
@@ -798,11 +880,10 @@ object PluginInstallGuard {
             bytes = bytes,
             sourceUrl = fileUri,
             repoUrl = null,
-            expectedId = null,
-            expectedVersion = null,
-            expectedSha256 = null,
+            expectedId = localized.manifest.id,
+            expectedVersion = localized.manifest.version,
+            expectedSha256 = rawPreview.sha256,
             preview = localized,
-            localFile = null,
         )
     }
 
@@ -827,15 +908,18 @@ object PluginInstallGuard {
             bytes = download.bytes,
             sourceUrl = download.sourceUrl,
             repoUrl = null,
-            expectedId = null,
-            expectedVersion = null,
+            expectedId = localized.manifest.id,
+            expectedVersion = localized.manifest.version,
             expectedSha256 = download.sha256,
             preview = localized,
         )
     }
 
     /**
-     * Installs a previously previewed package.
+     * Installs a previously previewed package strictly from [PendingPluginInstall.bytes]
+     * (bound to [PendingPluginInstall.expectedSha256] / preview SHA-256) so neither local files
+     * nor network endpoints are ever re-read after the user approves the confirmation card.
+     *
      * Security invariant: NEVER sets `confirmReplaceFromDifferentSource = true` unless
      * [userConfirmedReplacement] is explicitly true (the user clicked the replacement warning CTA).
      */
@@ -846,32 +930,53 @@ object PluginInstallGuard {
         verifyDevSyntax: Boolean = true,
     ): InstallResult {
         if (verifyDevSyntax && pending.devServerUrl != null) {
-            val syntaxErr = packageManager.verifyArchiveMainJsSyntax(pending.bytes)
+            val syntaxErr = packageManager.probeArchiveModuleLoad(pending.bytes)
             if (syntaxErr != null) {
                 throw DevPluginSyntaxException(syntaxErr)
             }
         }
-        val result = if (pending.localFile != null) {
-            packageManager.installFromFile(
-                file = pending.localFile,
-                confirmReplaceFromDifferentSource = userConfirmedReplacement,
-            )
-        } else {
-            packageManager.installFromBytes(
-                zipBytes = pending.bytes,
-                sourceUrl = pending.sourceUrl,
-                repoUrl = pending.repoUrl,
-                expectedId = pending.expectedId,
-                expectedVersion = pending.expectedVersion,
-                expectedSha256 = pending.expectedSha256,
-                confirmReplaceFromDifferentSource = userConfirmedReplacement,
-                devServerUrl = pending.devServerUrl,
-            )
-        }
+        val result = packageManager.installFromBytes(
+            zipBytes = pending.bytes,
+            sourceUrl = pending.sourceUrl,
+            repoUrl = pending.repoUrl,
+            expectedId = pending.expectedId,
+            expectedVersion = pending.expectedVersion,
+            expectedSha256 = pending.expectedSha256 ?: pending.preview.sha256,
+            confirmReplaceFromDifferentSource = userConfirmedReplacement,
+            devServerUrl = pending.devServerUrl,
+        )
         if (pending.confirmExpandedPermissionsOnInstall && result.needsPermissionReconfirm) {
             packageManager.confirmPermissions(result.entity.pluginId)
         }
         return result
+    }
+
+    /**
+     * Classifies the button state for an entry in [RepoBrowseScreen]:
+     * - Same version from the SAME repo OR already installed as a built-in plugin -> [RepoEntryAction.INSTALLED]
+     * - Installed as dev or local-file (or different non-builtin origin) -> [RepoEntryAction.REPLACE]
+     * - Same repo with a newer version -> [RepoEntryAction.UPDATE]
+     */
+    fun classifyRepoEntryAction(
+        existing: InstalledPluginEntity?,
+        repoOrigin: String,
+        entryVersion: String,
+    ): RepoEntryAction {
+        if (existing == null) return RepoEntryAction.INSTALL
+        val sameOrigin = existing.sourceOrigin == repoOrigin
+        if (existing.version == entryVersion && (sameOrigin || BuiltInPluginInstaller.isBuiltIn(existing))) {
+            return RepoEntryAction.INSTALLED
+        }
+        if (sameOrigin) {
+            val curVer = SemVer.parse(existing.version)
+            val newVer = SemVer.parse(entryVersion)
+            return if (curVer != null && newVer != null && newVer > curVer) {
+                RepoEntryAction.UPDATE
+            } else {
+                RepoEntryAction.INSTALLED
+            }
+        }
+        return RepoEntryAction.REPLACE
     }
 
     suspend fun uninstallIfAllowed(
@@ -957,25 +1062,83 @@ object PluginInstallGuard {
     }
 
     /**
-     * Developer-screen-only error formatter: returns `(chineseSummary, rawTechnicalDetail)`.
-     * Preserves verbatim English/line-number details for syntax errors, manifest validation
-     * errors, `init` failures, and `d3plugin serve` errors while keeping network/address policy
-     * rejections readable in Simplified Chinese.
+     * Returns true ONLY for transport/connectivity failures (unreachable host, refused connection,
+     * timeout, broken socket) — NEVER for policy rejections, `minApp` mismatch, invalid zip/manifest,
+     * or HTTP 4xx/5xx responses.
+     */
+    fun isConnectionFailure(error: Throwable): Boolean {
+        var cur: Throwable? = error
+        while (cur != null) {
+            when (cur) {
+                is NetworkPolicyException,
+                is ManifestValidationException,
+                is PackageInstallException,
+                is DevPluginSyntaxException,
+                -> return false
+                is ConnectException,
+                is SocketTimeoutException,
+                is UnknownHostException,
+                is NoRouteToHostException,
+                is SocketException,
+                is EOFException,
+                -> return true
+            }
+            cur = cur.cause
+        }
+        if (error is RepositoryVerificationException) {
+            val msg = error.message.orEmpty()
+            if (msg.contains("HTTP ") || msg.contains("SHA-256") || msg.contains("超过大小限制") ||
+                msg.contains("格式无效") || msg.contains("不是有效的") || msg.contains("开发模式") ||
+                msg.contains("仅支持") || msg.contains("不一致") || msg.contains("没有可用插件")
+            ) {
+                return false
+            }
+            return msg.contains("超时") ||
+                msg.contains("Failed to connect", ignoreCase = true) ||
+                msg.contains("Unable to resolve", ignoreCase = true) ||
+                msg.contains("timed out", ignoreCase = true) ||
+                msg.contains("Connection refused", ignoreCase = true)
+        }
+        return error is IOException
+    }
+
+    /**
+     * Developer-screen-only error formatter: returns `(chineseSummary, redactedRawTechnicalDetail)`.
+     * Preserves line numbers & technical details for syntax errors, manifest validation errors,
+     * `init` failures, and `d3plugin serve` errors (redacted via [com.limelight.local.plugin.PluginLogger.redact]),
+     * while keeping network/address policy rejections readable in Simplified Chinese.
      */
     fun formatDeveloperError(error: Throwable, strings: StringLookup): Pair<String, String?> = when (error) {
-        is DevPluginSyntaxException -> strings.get(R.string.dev_tech_error_title) to error.technicalError
+        is DevPluginSyntaxException -> strings.get(R.string.dev_tech_error_title) to
+            com.limelight.local.plugin.PluginLogger.redact(error.technicalError)
         is ManifestValidationException -> strings.get(R.string.plugins_err_invalid_manifest) to
-            (error.message ?: error.errors.joinToString("\n"))
+            com.limelight.local.plugin.PluginLogger.redact(error.message ?: error.errors.joinToString("\n"))
         is RepositoryVerificationException -> {
             if (!error.technicalDetail.isNullOrBlank()) {
-                strings.get(R.string.dev_tech_error_title) to error.technicalDetail
+                strings.get(R.string.dev_tech_error_title) to
+                    com.limelight.local.plugin.PluginLogger.redact(error.technicalDetail)
             } else {
                 formatInstallError(error, strings) to null
             }
         }
         is com.limelight.local.media.PluginInternalException -> {
-            strings.get(R.string.dev_tech_error_title) to PluginPackageManager.extractRawTechnicalError(error)
+            strings.get(R.string.dev_tech_error_title) to
+                com.limelight.local.plugin.PluginLogger.redact(PluginPackageManager.extractRawTechnicalError(error))
         }
         else -> formatInstallError(error, strings) to null
+    }
+
+    /**
+     * Formats an error raised during 「重新加载」: appends the offline / IP-changed hint ONLY
+     * when [isConnectionFailure] is true (never for `minApp`, policy rejection, or bad manifest).
+     */
+    fun formatDevReloadError(error: Throwable, strings: StringLookup): Pair<String, String?> {
+        val (summary, tech) = formatDeveloperError(error, strings)
+        val finalSummary = if (tech == null && isConnectionFailure(error)) {
+            "$summary ${strings.get(R.string.dev_reload_offline_hint)}"
+        } else {
+            summary
+        }
+        return finalSummary to tech
     }
 }

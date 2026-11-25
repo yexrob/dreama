@@ -421,6 +421,11 @@ data class PluginInstallPreview(
 ) {
     val isDevSource: Boolean get() = PluginPackageManager.isDevOrigin(sourceOrigin)
     val isFileSource: Boolean get() = PluginPackageManager.isFileOrigin(sourceOrigin)
+    val isDevAddressSwitch: Boolean
+        get() = existingSourceOrigin != null &&
+            PluginPackageManager.isDevOrigin(existingSourceOrigin) &&
+            PluginPackageManager.isDevOrigin(sourceOrigin) &&
+            existingSourceOrigin != sourceOrigin
 }
 
 /**
@@ -561,10 +566,56 @@ class PluginPackageManager(
     private val packagesDir = File(rootDir, "packages")
     private val instancesDir = File(rootDir, "instances")
     private val activeSources = ConcurrentHashMap<String, PluginMediaSource>()
+    private val pluginLocks = ConcurrentHashMap<String, Mutex>()
     private val instanceLocks = ConcurrentHashMap<String, Mutex>()
+    private val activeStagingDirs = ConcurrentHashMap.newKeySet<String>()
+    private val activeProbeDirs = ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * Lock ordering invariant (deadlock-free): ALWAYS acquire [pluginLockFor] BEFORE [lockFor].
+     * Never acquire [pluginLockFor] while holding [lockFor].
+     */
+    private fun pluginLockFor(pluginId: String): Mutex =
+        pluginLocks.computeIfAbsent(pluginId) { Mutex() }
 
     private fun lockFor(instanceId: String): Mutex =
         instanceLocks.computeIfAbsent(instanceId) { Mutex() }
+
+    /**
+     * Startup / maintenance sweep cleaning leftover `.probe-*` directories, orphaned `.staging-*`
+     * directories from killed processes, and unreferenced version directories left if the process
+     * died between staging rename and Room upsert. Never touches active in-flight directories.
+     */
+    suspend fun cleanupOrphanedFiles() {
+        rootDir.listFiles { f -> f.isDirectory && f.name.startsWith(".probe-") }?.forEach { probeDir ->
+            if (probeDir.name !in activeProbeDirs) {
+                runCatching { probeDir.deleteRecursively() }
+            }
+        }
+        val pluginDirs = packagesDir.listFiles { f -> f.isDirectory } ?: return
+        for (pluginDir in pluginDirs) {
+            val pluginId = pluginDir.name
+            pluginLockFor(pluginId).withLock {
+                val pkg = store.getPackage(pluginId)
+                if (pkg == null) {
+                    val hasActiveStaging = pluginDir.listFiles()?.any { it.name in activeStagingDirs } == true
+                    if (!hasActiveStaging) {
+                        runCatching { pluginDir.deleteRecursively() }
+                    }
+                } else {
+                    val activePath = runCatching { File(pkg.packagePath).canonicalPath }
+                        .getOrDefault(File(pkg.packagePath).absolutePath)
+                    pluginDir.listFiles()?.forEach { child ->
+                        if (child.name in activeStagingDirs) return@forEach
+                        val childPath = runCatching { child.canonicalPath }.getOrDefault(child.absolutePath)
+                        if (childPath != activePath) {
+                            runCatching { child.deleteRecursively() }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /**
      * Inspects a `.d3plugin` archive before installation and returns a
@@ -598,8 +649,12 @@ class PluginPackageManager(
         )
         val existing = store.getPackage(manifest.id)
         val differentSource = existing != null && isDifferentSource(existing.sourceOrigin, newSourceOrigin)
+        val devAddressSwitch = existing != null &&
+            isDevOrigin(existing.sourceOrigin) &&
+            isDevOrigin(newSourceOrigin) &&
+            existing.sourceOrigin != newSourceOrigin
         val isUpdate = existing != null && !differentSource
-        val needsReconfirm = if (isUpdate) {
+        val needsReconfirm = if (isUpdate || devAddressSwitch) {
             val prevApproved = PluginPermissions.fromJsonString(existing.approvedPermissionsJson)
             manifest.permissions.isExpandedFrom(prevApproved) || existing.needsPermissionReconfirm
         } else {
@@ -609,7 +664,9 @@ class PluginPackageManager(
             if (manifest.permissions.allowsWildcardLanAccess) {
                 add(WILDCARD_LAN_WARNING)
             }
-            if (differentSource) {
+            if (devAddressSwitch) {
+                add("开发服务器地址已变化，确认后将切换来源地址并保留现有播放源、配置和本地数据。")
+            } else if (differentSource) {
                 add("已安装同 ID 插件但来源不同，继续安装将替换原插件并清除其所有配置、登录信息和本地数据。")
             }
         }
@@ -672,166 +729,202 @@ class PluginPackageManager(
             devServerUrl = devServerUrl,
         )
         val isDevSource = isDevOrigin(newSourceOrigin)
-        val existing = store.getPackage(manifest.id)
-        val now = clockMs()
 
-        val differentSource = existing != null && isDifferentSource(existing.sourceOrigin, newSourceOrigin)
-        if (differentSource && !confirmReplaceFromDifferentSource) {
-            throw PluginSourceMismatchException(
+        return pluginLockFor(manifest.id).withLock {
+            val existing = store.getPackage(manifest.id)
+            val now = clockMs()
+
+            val differentSource = existing != null && isDifferentSource(existing.sourceOrigin, newSourceOrigin)
+            val devAddressSwitch = existing != null &&
+                isDevOrigin(existing.sourceOrigin) &&
+                isDevOrigin(newSourceOrigin) &&
+                existing.sourceOrigin != newSourceOrigin
+            if (differentSource && !confirmReplaceFromDifferentSource) {
+                throw PluginSourceMismatchException(
+                    pluginId = manifest.id,
+                    existingSourceOrigin = existing.sourceOrigin,
+                    newSourceOrigin = newSourceOrigin,
+                )
+            }
+
+            val shouldWipeInstances = differentSource && !devAddressSwitch
+            val isUpdate = existing != null && !differentSource
+            var needsReconfirm = false
+            var approvedPermsJson = manifest.permissions.toJsonString()
+
+            if (isUpdate || devAddressSwitch) {
+                val prev = existing
+                if (isUpdate && !isDevSource) {
+                    val oldVer = SemVer.parse(prev.version)
+                    val newVer = SemVer.parse(manifest.version)
+                    if (oldVer != null && newVer != null && newVer <= oldVer) {
+                        throw PackageInstallException(
+                            "更新版本号（${manifest.version}）必须大于已安装版本（${prev.version}）",
+                        )
+                    }
+                }
+                val prevApproved = PluginPermissions.fromJsonString(prev.approvedPermissionsJson)
+                if (manifest.permissions.isExpandedFrom(prevApproved)) {
+                    needsReconfirm = true
+                    approvedPermsJson = prev.approvedPermissionsJson
+                } else {
+                    needsReconfirm = prev.needsPermissionReconfirm
+                    if (!needsReconfirm) {
+                        approvedPermsJson = manifest.permissions.toJsonString()
+                    }
+                }
+            }
+
+            // Crash-safe staging write: NEVER delete existing.packagePath before DB commit.
+            // For same-version dev reloads, write into a fresh `<version>-<sha8>` sibling directory
+            // so the previous working files stay intact if writing fails or the process is killed.
+            val pluginRootDir = File(packagesDir, manifest.id)
+            pluginRootDir.mkdirs()
+
+            val existingPath = existing?.packagePath?.let { File(it).absolutePath }
+            val baseDir = File(pluginRootDir, manifest.version)
+            val targetDir = if (existingPath != null && baseDir.absolutePath == existingPath) {
+                val sha8 = actualSha.take(8).lowercase(java.util.Locale.ROOT)
+                val shaDir = File(pluginRootDir, "${manifest.version}-$sha8")
+                if (shaDir.absolutePath == existingPath) {
+                    File(pluginRootDir, "${manifest.version}-$sha8-${UUID.randomUUID().toString().take(6)}")
+                } else {
+                    shaDir
+                }
+            } else {
+                baseDir
+            }
+
+            val stagingName = ".staging-${UUID.randomUUID()}"
+            val stagingDir = File(pluginRootDir, stagingName)
+            activeStagingDirs.add(stagingName)
+            try {
+                writeArchiveToDir(archive, stagingDir)
+                if (targetDir.exists() && targetDir.absolutePath != existingPath) {
+                    targetDir.deleteRecursively()
+                }
+                if (!stagingDir.renameTo(targetDir)) {
+                    stagingDir.copyRecursively(targetDir, overwrite = true)
+                    stagingDir.deleteRecursively()
+                }
+            } catch (e: Exception) {
+                runCatching { stagingDir.deleteRecursively() }
+                throw PackageInstallException("写入插件文件失败：${e.message}", e)
+            } finally {
+                activeStagingDirs.remove(stagingName)
+            }
+
+            val effectiveSourceUrl = devServerUrl ?: sourceUrl
+            val entity = InstalledPluginEntity(
                 pluginId = manifest.id,
-                existingSourceOrigin = existing.sourceOrigin,
-                newSourceOrigin = newSourceOrigin,
+                name = manifest.name,
+                version = manifest.version,
+                author = manifest.author,
+                description = manifest.description,
+                manifestJson = archive.manifestJson,
+                packagePath = targetDir.absolutePath,
+                sourceUrl = if (differentSource) effectiveSourceUrl else (effectiveSourceUrl ?: existing?.sourceUrl),
+                repoUrl = if (differentSource) repoUrl else (repoUrl ?: existing?.repoUrl),
+                sourceOrigin = newSourceOrigin,
+                sha256 = actualSha,
+                enabled = if (shouldWipeInstances) true else (existing?.enabled ?: true),
+                needsPermissionReconfirm = needsReconfirm,
+                approvedPermissionsJson = approvedPermsJson,
+                installedAt = if (shouldWipeInstances) now else (existing?.installedAt ?: now),
+                updatedAt = now,
+            )
+
+            if (shouldWipeInstances) {
+                // §11.4 (S1): Replacing a plugin from a different source (non dev<->dev) MUST wipe all
+                // existing instances' configs/passwords, storage, and cookies.
+                wipeAllInstancesForPlugin(manifest.id)
+                store.deletePackage(manifest.id)
+                store.upsertPackage(entity)
+            } else {
+                // Commit new package metadata FIRST, THEN destroy cached runtimes — all serialized
+                // under pluginLockFor(manifest.id) so concurrent openSource() can NEVER re-cache
+                // an obsolete runtime pointing at the old package directory.
+                store.upsertPackage(entity)
+                shutdownRuntimesForPlugin(manifest.id)
+            }
+
+            // Clean up superseded version dirs and any orphaned staging/version dirs AFTER commit
+            val keepCanonical = runCatching { targetDir.canonicalPath }.getOrDefault(targetDir.absolutePath)
+            pluginRootDir.listFiles()?.forEach { child ->
+                if (child.name in activeStagingDirs) return@forEach
+                val childCanonical = runCatching { child.canonicalPath }.getOrDefault(child.absolutePath)
+                if (childCanonical != keepCanonical) {
+                    runCatching { child.deleteRecursively() }
+                }
+            }
+
+            InstallResult(
+                entity = entity,
+                manifest = manifest,
+                isUpdate = isUpdate,
+                needsPermissionReconfirm = needsReconfirm,
+                replacedDifferentSource = differentSource,
             )
         }
-
-        val isUpdate = existing != null && !differentSource
-        var needsReconfirm = false
-        var approvedPermsJson = manifest.permissions.toJsonString()
-
-        if (isUpdate) {
-            val prev = existing
-            if (!isDevSource) {
-                val oldVer = SemVer.parse(prev.version)
-                val newVer = SemVer.parse(manifest.version)
-                if (oldVer != null && newVer != null && newVer <= oldVer) {
-                    throw PackageInstallException(
-                        "更新版本号（${manifest.version}）必须大于已安装版本（${prev.version}）",
-                    )
-                }
-            }
-            val prevApproved = PluginPermissions.fromJsonString(prev.approvedPermissionsJson)
-            if (manifest.permissions.isExpandedFrom(prevApproved)) {
-                needsReconfirm = true
-                approvedPermsJson = prev.approvedPermissionsJson
-            } else {
-                needsReconfirm = prev.needsPermissionReconfirm
-                if (!needsReconfirm) {
-                    approvedPermsJson = manifest.permissions.toJsonString()
-                }
-            }
-        }
-
-        // Crash-safe staging write: NEVER delete existing.packagePath before DB commit.
-        // For same-version dev reloads, write into a fresh `<version>-<sha8>` sibling directory
-        // so the previous working files stay intact if writing fails or the process is killed.
-        val pluginRootDir = File(packagesDir, manifest.id)
-        pluginRootDir.mkdirs()
-        pluginRootDir.listFiles { f -> f.isDirectory && f.name.startsWith(".staging-") }
-            ?.forEach { runCatching { it.deleteRecursively() } }
-
-        val existingPath = existing?.packagePath?.let { File(it).absolutePath }
-        val baseDir = File(pluginRootDir, manifest.version)
-        val targetDir = if (existingPath != null && baseDir.absolutePath == existingPath) {
-            val sha8 = actualSha.take(8).lowercase(java.util.Locale.ROOT)
-            val shaDir = File(pluginRootDir, "${manifest.version}-$sha8")
-            if (shaDir.absolutePath == existingPath) {
-                File(pluginRootDir, "${manifest.version}-$sha8-${UUID.randomUUID().toString().take(6)}")
-            } else {
-                shaDir
-            }
-        } else {
-            baseDir
-        }
-
-        val stagingDir = File(pluginRootDir, ".staging-${UUID.randomUUID()}")
-        try {
-            writeArchiveToDir(archive, stagingDir)
-            if (targetDir.exists() && targetDir.absolutePath != existingPath) {
-                targetDir.deleteRecursively()
-            }
-            if (!stagingDir.renameTo(targetDir)) {
-                stagingDir.copyRecursively(targetDir, overwrite = true)
-                stagingDir.deleteRecursively()
-            }
-        } catch (e: Exception) {
-            stagingDir.deleteRecursively()
-            throw PackageInstallException("写入插件文件失败：${e.message}", e)
-        }
-
-        if (differentSource) {
-            // §11.4 (S1): Replacing a plugin from a different source MUST wipe all
-            // existing instances' configs/passwords, storage, and cookies.
-            wipeAllInstancesForPlugin(manifest.id)
-            store.deletePackage(manifest.id)
-        } else {
-            // Dispose any running runtimes for this plugin so they reload the updated code
-            // while preserving all existing instances (config, ctx.storage, cookies).
-            shutdownRuntimesForPlugin(manifest.id)
-        }
-
-        val effectiveSourceUrl = devServerUrl ?: sourceUrl
-        val entity = InstalledPluginEntity(
-            pluginId = manifest.id,
-            name = manifest.name,
-            version = manifest.version,
-            author = manifest.author,
-            description = manifest.description,
-            manifestJson = archive.manifestJson,
-            packagePath = targetDir.absolutePath,
-            sourceUrl = if (differentSource) effectiveSourceUrl else (effectiveSourceUrl ?: existing?.sourceUrl),
-            repoUrl = if (differentSource) repoUrl else (repoUrl ?: existing?.repoUrl),
-            sourceOrigin = newSourceOrigin,
-            sha256 = actualSha,
-            enabled = if (differentSource) true else (existing?.enabled ?: true),
-            needsPermissionReconfirm = needsReconfirm,
-            approvedPermissionsJson = approvedPermsJson,
-            installedAt = if (differentSource) now else (existing?.installedAt ?: now),
-            updatedAt = now,
-        )
-        store.upsertPackage(entity)
-
-        // Remove superseded version directories on disk AFTER Room commit succeeds
-        if (existingPath != null && existingPath != targetDir.absolutePath) {
-            runCatching { File(existingPath).deleteRecursively() }
-        }
-
-        return InstallResult(
-            entity = entity,
-            manifest = manifest,
-            isUpdate = isUpdate,
-            needsPermissionReconfirm = needsReconfirm,
-            replacedDifferentSource = differentSource,
-        )
     }
 
     /**
-     * Verifies `main.js` inside [zipBytes] compiles and registers a default export in QuickJS
-     * without running `init(ctx)`. Logs any syntax/load failure to [PluginLogger] and returns
-     * the raw technical error string (with line number when available) for Developer Mode, or
-     * `null` on success.
+     * Collects secret values (configured `password` fields) from all instances of [pluginId]
+     * so developer-screen diagnostic errors can be redacted via [PluginLogger.redact].
      */
-    suspend fun verifyArchiveMainJsSyntax(zipBytes: ByteArray): String? {
+    internal suspend fun collectKnownSecretsForPlugin(pluginId: String): List<String> {
+        val pkg = store.getPackage(pluginId) ?: return emptyList()
+        val manifest = runCatching { ManifestParser.parseAndValidate(pkg.manifestJson) }.getOrNull() ?: return emptyList()
+        val passwordKeys = manifest.passwordConfigKeys()
+        if (passwordKeys.isEmpty()) return emptyList()
+        val out = LinkedHashSet<String>()
+        for (inst in store.listInstancesForPlugin(pluginId)) {
+            val cfg = runCatching { getInstanceConfig(inst.instanceId) }.getOrNull() ?: continue
+            for (k in passwordKeys) {
+                val v = (cfg[k] as? JsonPrimitive)?.takeIf { it.isString }?.content
+                if (!v.isNullOrEmpty()) out += v
+            }
+        }
+        return out.toList()
+    }
+
+    /**
+     * Redacts a raw technical error string for Developer Mode using the shared [PluginLogger.redact]
+     * rules plus all known password-field secrets for [pluginId].
+     */
+    suspend fun redactDeveloperError(pluginId: String?, rawError: String): String {
+        val secrets = if (!pluginId.isNullOrBlank()) collectKnownSecretsForPlugin(pluginId) else emptyList()
+        return PluginLogger.redact(rawError, secrets)
+    }
+
+    /**
+     * Evaluates `main.js` ES module loading (syntax + top-level statements + default export) in
+     * a ZERO-capability QuickJS probe sandbox (no `ctx`, no host bridge, no network, no storage,
+     * no cookies, no files on disk) without running `init(ctx)`.
+     *
+     * **Security note**: ES module import executes module top-level code, so callers MUST invoke
+     * this ONLY AFTER explicit user confirmation (or during a same-origin, non-permission-expanded
+     * dev reload) and NEVER during unconfirmed package preview.
+     *
+     * Returns the redacted raw technical error (with line number when available) for Developer
+     * Mode, or `null` on success.
+     */
+    suspend fun probeArchiveModuleLoad(zipBytes: ByteArray): String? {
         val archive = PluginPackageArchive.inspect(zipBytes)
         val manifest = ManifestParser.parseAndValidate(archive.manifestJson)
-        val locale = PluginLocale.fromMap(archive.locales, deviceInfo.locale)
-        val logger = PluginLogger(pluginId = manifest.id, instanceId = "dev-check")
-        val tmpDir = File(rootDir, ".probe-${UUID.randomUUID()}")
-        val policy = NetworkPolicy(manifest.permissions, emptySet())
-        val storage = InstanceStorage(File(tmpDir, "storage.enc"), secretBox)
-        val cookieJar = PluginCookieJar(File(tmpDir, "cookies.enc"), secretBox)
-        val runtime = PluginRuntime(
-            manifest = locale.localizeManifest(manifest),
+        val secrets = collectKnownSecretsForPlugin(manifest.id)
+        val logger = PluginLogger(
+            pluginId = manifest.id,
             instanceId = "dev-check",
-            mainJsSource = archive.mainJs,
-            config = emptyMap(),
-            fetchGateway = PluginFetchGateway(policy, cookieJar, okHttpClient),
-            storage = storage,
-            cookieJar = cookieJar,
-            logger = logger,
-            locale = locale,
-            deviceInfo = deviceInfo,
-            androidContext = androidContext,
+            knownSecretsProvider = { secrets },
         )
         return try {
-            runtime.verifyModuleCompiles()
+            PluginRuntime.probeModuleLoadNoCapabilities(archive.mainJs)
             null
         } catch (t: Throwable) {
-            val raw = extractRawTechnicalError(t)
-            logger.error("main.js load error: $raw")
-            raw
-        } finally {
-            runCatching { runtime.close() }
-            runCatching { tmpDir.deleteRecursively() }
+            val redacted = PluginLogger.redact(extractRawTechnicalError(t), secrets)
+            logger.error("main.js load error: $redacted")
+            redacted
         }
     }
 
@@ -839,7 +932,8 @@ class PluginPackageManager(
      * Verifies an installed plugin loads and initializes cleanly (`main.js` + optional `init(ctx)`).
      * When instances exist, verifies the first enabled instance with its real config/storage;
      * otherwise probes in a temporary runtime (ignoring `NeedsSetup` / `NeedsAuth` since no config
-     * is filled yet). Returns `null` on success or the raw technical error string for Developer Mode.
+     * is filled yet). Returns `null` on success or the redacted raw technical error string for
+     * Developer Mode (using [PluginLogger.redact] + instance password secrets).
      */
     suspend fun verifyInstalledPluginLoad(
         pluginId: String,
@@ -847,6 +941,7 @@ class PluginPackageManager(
     ): String? {
         val pkg = store.getPackage(pluginId) ?: return null
         if (!pkg.enabled || pkg.needsPermissionReconfirm) return null
+        val secrets = collectKnownSecretsForPlugin(pluginId)
         val instances = store.listInstancesForPlugin(pluginId).filter { it.enabled }
         if (instances.isNotEmpty()) {
             return try {
@@ -858,15 +953,21 @@ class PluginPackageManager(
             } catch (e: com.limelight.local.media.SourceNeedsAuthException) {
                 null
             } catch (t: Throwable) {
-                extractRawTechnicalError(t)
+                PluginLogger.redact(extractRawTechnicalError(t), secrets)
             }
         }
         val manifest = ManifestParser.parseAndValidate(pkg.manifestJson)
         val pkgDir = File(pkg.packagePath)
         val mainJs = File(pkgDir, "main.js").readText(Charsets.UTF_8)
         val locale = PluginLocale.fromPackageDir(pkgDir, deviceInfo.locale)
-        val logger = PluginLogger(pluginId = manifest.id, instanceId = "dev-probe")
-        val tmpDir = File(rootDir, ".probe-${UUID.randomUUID()}")
+        val logger = PluginLogger(
+            pluginId = manifest.id,
+            instanceId = "dev-probe",
+            knownSecretsProvider = { secrets },
+        )
+        val probeName = ".probe-${UUID.randomUUID()}"
+        val tmpDir = File(rootDir, probeName)
+        activeProbeDirs.add(probeName)
         val policy = if (dnsResolver != null) {
             NetworkPolicy(manifest.permissions, emptySet(), dnsResolver)
         } else {
@@ -895,12 +996,13 @@ class PluginPackageManager(
         } catch (e: com.limelight.local.media.SourceNeedsAuthException) {
             null
         } catch (t: Throwable) {
-            val raw = extractRawTechnicalError(t)
-            logger.error("init error: $raw")
-            raw
+            val redacted = PluginLogger.redact(extractRawTechnicalError(t), secrets)
+            logger.error("init error: $redacted")
+            redacted
         } finally {
             runCatching { runtime.close() }
             runCatching { tmpDir.deleteRecursively() }
+            activeProbeDirs.remove(probeName)
         }
     }
 
@@ -911,8 +1013,23 @@ class PluginPackageManager(
         if (file.length() > PluginPackageArchive.MAX_PACKAGE_BYTES) {
             throw PackageInstallException("插件包超过大小限制（上限 8 MB）")
         }
+        val bytes = file.inputStream().use { input ->
+            val out = ByteArrayOutputStream()
+            val buf = ByteArray(16_384)
+            var total = 0L
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                total += n
+                if (total > PluginPackageArchive.MAX_PACKAGE_BYTES) {
+                    throw PackageInstallException("插件包超过大小限制（上限 8 MB）")
+                }
+                out.write(buf, 0, n)
+            }
+            out.toByteArray()
+        }
         return installFromBytes(
-            zipBytes = file.readBytes(),
+            zipBytes = bytes,
             sourceUrl = file.toURI().toString(),
             confirmReplaceFromDifferentSource = confirmReplaceFromDifferentSource,
         )
@@ -948,21 +1065,21 @@ class PluginPackageManager(
         )
     }
 
-    suspend fun confirmPermissions(pluginId: String) {
+    suspend fun confirmPermissions(pluginId: String) = pluginLockFor(pluginId).withLock {
         val pkg = store.getPackage(pluginId)
             ?: throw PackageInstallException("找不到已安装的插件：$pluginId")
         val manifest = ManifestParser.parseAndValidate(pkg.manifestJson)
         store.confirmPackagePermissions(pluginId, manifest.permissions.toJsonString(), clockMs())
     }
 
-    suspend fun setPluginEnabled(pluginId: String, enabled: Boolean) {
+    suspend fun setPluginEnabled(pluginId: String, enabled: Boolean) = pluginLockFor(pluginId).withLock {
         store.setPackageEnabled(pluginId, enabled, clockMs())
         if (!enabled) {
             shutdownRuntimesForPlugin(pluginId)
         }
     }
 
-    suspend fun uninstall(pluginId: String) {
+    suspend fun uninstall(pluginId: String) = pluginLockFor(pluginId).withLock {
         wipeAllInstancesForPlugin(pluginId)
         store.deletePackage(pluginId)
         File(packagesDir, pluginId).deleteRecursively()
@@ -1046,94 +1163,98 @@ class PluginPackageManager(
         dnsResolver: ((String) -> List<java.net.InetAddress>)? = null,
     ): PluginMediaSource {
         activeSources[instanceId]?.let { return it }
-        return lockFor(instanceId).withLock {
-            activeSources[instanceId]?.let { return@withLock it }
-            val inst = store.getInstance(instanceId)
-                ?: throw SourceNeedsSetupException("找不到这个播放源的配置，请重新添加。")
-            val pkg = store.getPackage(inst.pluginId)
-                ?: throw SourceNeedsSetupException("这个播放源对应的插件已卸载。")
-            val manifest = ManifestParser.parseAndValidate(pkg.manifestJson)
-            val pkgDir = File(pkg.packagePath)
-            val mainJs = File(pkgDir, "main.js").readText(Charsets.UTF_8)
-            val locale = PluginLocale.fromPackageDir(pkgDir, deviceInfo.locale)
-            val localizedManifest = locale.localizeManifest(manifest)
-            val config = getInstanceConfig(instanceId)
+        val initialInst = store.getInstance(instanceId)
+            ?: throw SourceNeedsSetupException("找不到这个播放源的配置，请重新添加。")
+        return pluginLockFor(initialInst.pluginId).withLock {
+            lockFor(instanceId).withLock {
+                activeSources[instanceId]?.let { return@withLock it }
+                val inst = store.getInstance(instanceId)
+                    ?: throw SourceNeedsSetupException("找不到这个播放源的配置，请重新添加。")
+                val pkg = store.getPackage(inst.pluginId)
+                    ?: throw SourceNeedsSetupException("这个播放源对应的插件已卸载。")
+                val manifest = ManifestParser.parseAndValidate(pkg.manifestJson)
+                val pkgDir = File(pkg.packagePath)
+                val mainJs = File(pkgDir, "main.js").readText(Charsets.UTF_8)
+                val locale = PluginLocale.fromPackageDir(pkgDir, deviceInfo.locale)
+                val localizedManifest = locale.localizeManifest(manifest)
+                val config = getInstanceConfig(instanceId)
 
-            val passwordKeys = manifest.passwordConfigKeys()
-            val logger = PluginLogger(
-                pluginId = manifest.id,
-                instanceId = instanceId,
-                knownSecretsProvider = {
-                    passwordKeys.mapNotNull { k -> (config[k] as? JsonPrimitive)?.content }
-                },
-            )
-            val instDir = File(instancesDir, instanceId)
-            val storage = InstanceStorage(File(instDir, "storage.enc"), secretBox)
-            val cookieJar = PluginCookieJar(
-                file = File(instDir, "cookies.enc"),
-                secretBox = secretBox,
-                onWarning = { msg -> logger.warn(msg) },
-            )
-            val userHosts = NetworkPolicy.extractUserHosts(manifest, config)
-            val policy = if (dnsResolver != null) {
-                NetworkPolicy(manifest.permissions, userHosts, dnsResolver)
-            } else {
-                NetworkPolicy(manifest.permissions, userHosts)
+                val passwordKeys = manifest.passwordConfigKeys()
+                val logger = PluginLogger(
+                    pluginId = manifest.id,
+                    instanceId = instanceId,
+                    knownSecretsProvider = {
+                        passwordKeys.mapNotNull { k -> (config[k] as? JsonPrimitive)?.content }
+                    },
+                )
+                val instDir = File(instancesDir, instanceId)
+                val storage = InstanceStorage(File(instDir, "storage.enc"), secretBox)
+                val cookieJar = PluginCookieJar(
+                    file = File(instDir, "cookies.enc"),
+                    secretBox = secretBox,
+                    onWarning = { msg -> logger.warn(msg) },
+                )
+                val userHosts = NetworkPolicy.extractUserHosts(manifest, config)
+                val policy = if (dnsResolver != null) {
+                    NetworkPolicy(manifest.permissions, userHosts, dnsResolver)
+                } else {
+                    NetworkPolicy(manifest.permissions, userHosts)
+                }
+                val fetchGateway = PluginFetchGateway(
+                    policy = policy,
+                    cookieJar = cookieJar,
+                    baseClient = okHttpClient,
+                )
+                val runtime = PluginRuntime(
+                    manifest = localizedManifest,
+                    instanceId = instanceId,
+                    mainJsSource = mainJs,
+                    config = config,
+                    fetchGateway = fetchGateway,
+                    storage = storage,
+                    cookieJar = cookieJar,
+                    logger = logger,
+                    locale = locale,
+                    deviceInfo = deviceInfo,
+                    androidContext = androidContext,
+                )
+                val mapper = PluginProtocolMapper(policy, logger, androidContext)
+                val source = PluginMediaSource(
+                    instanceId = instanceId,
+                    displayName = inst.displayName,
+                    manifest = localizedManifest,
+                    runtime = runtime,
+                    mapper = mapper,
+                    okHttpClient = okHttpClient,
+                    stateGuard = {
+                        val latestPkg = store.getPackage(manifest.id)
+                        if (latestPkg == null || !latestPkg.enabled) {
+                            throw SourceNeedsSetupException("这个插件已停用，请先在插件管理中启用。")
+                        }
+                        if (latestPkg.needsPermissionReconfirm) {
+                            throw SourceNeedsSetupException("插件更新后申请了更多权限，请先重新确认后再使用。")
+                        }
+                    },
+                    onNeedsAuth = {
+                        store.updateInstanceAuth(instanceId, "NEEDS_AUTH", null, clockMs())
+                    },
+                    onAuthSuccess = { user ->
+                        val userJson = user?.let {
+                            buildJsonObject {
+                                put("name", it.name)
+                                it.avatar?.let { av -> put("avatar", av.url) }
+                            }.toString()
+                        }
+                        store.updateInstanceAuth(instanceId, "AUTHENTICATED", userJson, clockMs())
+                    },
+                    onLoggedOut = {
+                        store.updateInstanceAuth(instanceId, "NEEDS_AUTH", null, clockMs())
+                    },
+                    androidContext = androidContext,
+                )
+                activeSources[instanceId] = source
+                source
             }
-            val fetchGateway = PluginFetchGateway(
-                policy = policy,
-                cookieJar = cookieJar,
-                baseClient = okHttpClient,
-            )
-            val runtime = PluginRuntime(
-                manifest = localizedManifest,
-                instanceId = instanceId,
-                mainJsSource = mainJs,
-                config = config,
-                fetchGateway = fetchGateway,
-                storage = storage,
-                cookieJar = cookieJar,
-                logger = logger,
-                locale = locale,
-                deviceInfo = deviceInfo,
-                androidContext = androidContext,
-            )
-            val mapper = PluginProtocolMapper(policy, logger, androidContext)
-            val source = PluginMediaSource(
-                instanceId = instanceId,
-                displayName = inst.displayName,
-                manifest = localizedManifest,
-                runtime = runtime,
-                mapper = mapper,
-                okHttpClient = okHttpClient,
-                stateGuard = {
-                    val latestPkg = store.getPackage(manifest.id)
-                    if (latestPkg == null || !latestPkg.enabled) {
-                        throw SourceNeedsSetupException("这个插件已停用，请先在插件管理中启用。")
-                    }
-                    if (latestPkg.needsPermissionReconfirm) {
-                        throw SourceNeedsSetupException("插件更新后申请了更多权限，请先重新确认后再使用。")
-                    }
-                },
-                onNeedsAuth = {
-                    store.updateInstanceAuth(instanceId, "NEEDS_AUTH", null, clockMs())
-                },
-                onAuthSuccess = { user ->
-                    val userJson = user?.let {
-                        buildJsonObject {
-                            put("name", it.name)
-                            it.avatar?.let { av -> put("avatar", av.url) }
-                        }.toString()
-                    }
-                    store.updateInstanceAuth(instanceId, "AUTHENTICATED", userJson, clockMs())
-                },
-                onLoggedOut = {
-                    store.updateInstanceAuth(instanceId, "NEEDS_AUTH", null, clockMs())
-                },
-                androidContext = androidContext,
-            )
-            activeSources[instanceId] = source
-            source
         }
     }
 

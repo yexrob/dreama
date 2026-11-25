@@ -395,6 +395,7 @@ class PluginHost private constructor(
                 builtInDone.complete(BuiltInSyncReport(failed = listOf(t.javaClass.simpleName)))
                 return@launch
             }
+            runCatching { pm.cleanupOrphanedFiles() }
             packageManagerDeferred.complete(pm)
 
             val report = try {

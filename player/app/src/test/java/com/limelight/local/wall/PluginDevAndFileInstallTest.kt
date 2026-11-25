@@ -25,8 +25,16 @@ import com.limelight.local.stream.UdpDiscoveryProtocol
 import com.limelight.local.stream.UdpDiscoveryWindow
 import com.limelight.local.stream.UdpLanServerDiscovery
 import com.limelight.local.stream.XmlStringLookup
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.Dispatcher
@@ -47,14 +55,18 @@ import org.junit.rules.TemporaryFolder
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.net.ConnectException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.Proxy
+import java.net.SocketTimeoutException
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
@@ -192,11 +204,12 @@ class PluginDevAndFileInstallTest {
         }
 
         // 2. Rejections with clear Chinese reasons per category (and preserved through formatInstallError)
-        // Loopback
+        // Loopback (including decimal integer IPv4 2130706433 == 127.0.0.1)
         val loopbackCases = listOf(
             "127.0.0.1:8787",
             "127.1:8787",
             "0x7f.0.0.1:8787",
+            "2130706433:8787",
             "localhost:8787",
             "[::1]:8787",
             "[::ffff:127.0.0.1]:8787",
@@ -223,9 +236,10 @@ class PluginDevAndFileInstallTest {
             }
         }
 
-        // Public / non-RFC1918 (including CGNAT 100.64.0.1 and 172.32.0.1)
+        // Public / non-RFC1918 (including decimal 134744072 == 8.8.8.8, CGNAT 100.64.0.1, 172.32.0.1)
         val publicCases = listOf(
             "8.8.8.8:8787",
+            "134744072:8787",
             "100.64.0.1:8787",
             "172.32.0.1:8787",
             "example.com:8787",
@@ -259,8 +273,18 @@ class PluginDevAndFileInstallTest {
             }
         }
 
-        // Unsupported schemes / empty
-        for (raw in listOf("", "   ", "ftp://192.168.1.20:8787", "file:///tmp/plugin.d3plugin")) {
+        // Unsupported schemes, user@host userinfo, empty
+        for (
+            raw in listOf(
+                "",
+                "   ",
+                "ftp://192.168.1.20:8787",
+                "file:///tmp/plugin.d3plugin",
+                "user@192.168.1.20:8787",
+                "http://user:pass@192.168.1.20:8787",
+                "user@fd00::1",
+            )
+        ) {
             try {
                 validatorClient.normalizeDevServerAddress(raw, dnsTable)
                 fail("Expected rejection for $raw")
@@ -270,8 +294,13 @@ class PluginDevAndFileInstallTest {
             }
         }
 
-        // Pinned host enforcement directly on NetworkPolicy.forDevServer
-        val pinnedPolicy = NetworkPolicy.forDevServer("192.168.1.20", dnsTable)
+        // Pinned scheme + host + port enforcement directly on NetworkPolicy.forDevServer
+        val pinnedPolicy = NetworkPolicy.forDevServer(
+            devHost = "192.168.1.20",
+            dnsResolver = dnsTable,
+            pinnedPort = 8787,
+            pinnedScheme = "http",
+        )
         pinnedPolicy.validateResourceUrl("http://192.168.1.20:8787/plugin.d3plugin")
         try {
             pinnedPolicy.validateResourceUrl("http://192.168.1.21:8787/plugin.d3plugin")
@@ -279,13 +308,38 @@ class PluginDevAndFileInstallTest {
         } catch (e: NetworkPolicyException) {
             assertTrue("Expected pinned-host Chinese reason, got: ${e.message}", e.message!!.contains("指定的开发服务器主机"))
         }
+        try {
+            pinnedPolicy.validateResourceUrl("http://192.168.1.20:9999/plugin.d3plugin")
+            fail("Different port on same LAN host must be rejected by pinned dev policy")
+        } catch (e: NetworkPolicyException) {
+            assertTrue("Expected pinned-port Chinese reason, got: ${e.message}", e.message!!.contains("端口"))
+        }
+        try {
+            pinnedPolicy.validateResourceUrl("https://192.168.1.20:8787/plugin.d3plugin")
+            fail("Different scheme on same LAN host:port must be rejected by pinned dev policy")
+        } catch (e: NetworkPolicyException) {
+            assertTrue("Expected pinned-scheme Chinese reason, got: ${e.message}", e.message!!.contains("协议"))
+        }
 
-        // 3. Live MockWebServer HTTP redirect to another host MUST be rejected
+        // 3. Live MockWebServer: cross-host/port/scheme redirects, malicious index.json URLs, and DNS rebinding
         val redirectServer = MockWebServer()
+        val mode = AtomicReference("redirect")
         val redirectTarget = AtomicReference("http://192.168.1.99:8787/index.json")
+        val maliciousEntryUrl = AtomicReference("http://192.168.1.99:8787/plugin.d3plugin")
+        val validZip = buildZip(makeManifest(), simpleMainJs("Ok"))
+        val validSha = PluginRepositoryClient.sha256Hex(validZip)
         redirectServer.dispatcher = object : Dispatcher() {
-            override fun dispatch(request: RecordedRequest): MockResponse =
-                MockResponse().setResponseCode(302).addHeader("Location", redirectTarget.get())
+            override fun dispatch(request: RecordedRequest): MockResponse = when (mode.get()) {
+                "redirect" -> MockResponse().setResponseCode(302).addHeader("Location", redirectTarget.get())
+                "bad-index-url" -> if (request.path == "/index.json") {
+                    MockResponse().setResponseCode(200).setBody(
+                        makeDevIndexJson("com.example.devplug", "Dev Plug", "1.0.0", validSha, maliciousEntryUrl.get()),
+                    )
+                } else {
+                    MockResponse().setResponseCode(200).setBody(Buffer().write(validZip))
+                }
+                else -> MockResponse().setResponseCode(404)
+            }
         }
         redirectServer.start()
         try {
@@ -301,13 +355,33 @@ class PluginDevAndFileInstallTest {
                 devPolicyFactory = { host -> NetworkPolicy.forDevServer(host) { listOf(InetAddress.getByName(it)) } },
             )
             // Redirect to another LAN IP
-            redirectTarget.set("http://192.168.1.99:8787/index.json")
+            redirectTarget.set("http://192.168.1.99:${redirectServer.port}/index.json")
             try {
                 repoClient.fetchDevPlugin("$lanHost:${redirectServer.port}")
                 fail("Cross-host LAN redirect MUST be rejected")
             } catch (e: RepositoryVerificationException) {
                 val formatted = PluginInstallGuard.formatInstallError(e, strings)
                 assertTrue("Expected Chinese redirect rejection, got: $formatted", formatted.contains("重定向"))
+            }
+
+            // Redirect to a DIFFERENT PORT on the SAME LAN IP
+            redirectTarget.set("http://$lanHost:${redirectServer.port + 1}/index.json")
+            try {
+                repoClient.fetchDevPlugin("$lanHost:${redirectServer.port}")
+                fail("Cross-port redirect on same LAN host MUST be rejected")
+            } catch (e: RepositoryVerificationException) {
+                val formatted = PluginInstallGuard.formatInstallError(e, strings)
+                assertTrue("Expected Chinese port-redirect rejection, got: $formatted", formatted.contains("端口"))
+            }
+
+            // Redirect changing scheme http -> https on same LAN IP
+            redirectTarget.set("https://$lanHost:${redirectServer.port}/index.json")
+            try {
+                repoClient.fetchDevPlugin("$lanHost:${redirectServer.port}")
+                fail("Scheme-switching redirect MUST be rejected")
+            } catch (e: RepositoryVerificationException) {
+                val formatted = PluginInstallGuard.formatInstallError(e, strings)
+                assertTrue("Expected Chinese scheme-redirect rejection, got: $formatted", formatted.contains("协议"))
             }
 
             // Redirect to a public host
@@ -317,7 +391,7 @@ class PluginDevAndFileInstallTest {
                 fail("Public redirect MUST be rejected")
             } catch (e: RepositoryVerificationException) {
                 val formatted = PluginInstallGuard.formatInstallError(e, strings)
-                assertTrue("Expected Chinese redirect/public rejection, got: $formatted", formatted.contains("重定向") || formatted.contains("公网"))
+                assertTrue("Expected Chinese redirect/public rejection, got: $formatted", formatted.contains("重定向") || formatted.contains("公网") || formatted.contains("协议"))
             }
 
             // Redirect to loopback
@@ -328,6 +402,51 @@ class PluginDevAndFileInstallTest {
             } catch (e: RepositoryVerificationException) {
                 val formatted = PluginInstallGuard.formatInstallError(e, strings)
                 assertTrue("Expected Chinese loopback/redirect rejection, got: $formatted", formatted.contains("重定向") || formatted.contains("回环"))
+            }
+
+            // index.json entry.url pointing to another host / another port / another scheme MUST be rejected
+            mode.set("bad-index-url")
+            for (
+                badUrl in listOf(
+                    "http://192.168.1.99:${redirectServer.port}/plugin.d3plugin",
+                    "http://$lanHost:${redirectServer.port + 1}/plugin.d3plugin",
+                    "https://$lanHost:${redirectServer.port}/plugin.d3plugin",
+                )
+            ) {
+                maliciousEntryUrl.set(badUrl)
+                try {
+                    repoClient.fetchDevPlugin("$lanHost:${redirectServer.port}")
+                    fail("Malicious index.json url '$badUrl' MUST be rejected")
+                } catch (e: RepositoryVerificationException) {
+                    val formatted = PluginInstallGuard.formatInstallError(e, strings)
+                    assertTrue(
+                        "Expected Chinese host/port/scheme mismatch for $badUrl, got: $formatted",
+                        formatted.contains("主机") || formatted.contains("端口") || formatted.contains("协议"),
+                    )
+                }
+            }
+
+            // DNS rebinding: hostname resolves to private LAN 192.168.1.50 during address check,
+            // then flips to public 8.8.8.8 on the subsequent request -> MUST be rejected!
+            val dnsLookups = AtomicInteger(0)
+            val rebindingClient = PluginRepositoryClient(
+                httpClient = okHttp,
+                devPolicyFactory = { host ->
+                    NetworkPolicy.forDevServer(host) {
+                        val n = dnsLookups.incrementAndGet()
+                        if (n == 1) listOf(InetAddress.getByName(lanHost))
+                        else listOf(InetAddress.getByName("8.8.8.8"))
+                    }
+                },
+            )
+            maliciousEntryUrl.set("http://rebind.lan:${redirectServer.port}/plugin.d3plugin")
+            try {
+                rebindingClient.fetchDevPlugin("rebind.lan:${redirectServer.port}")
+                fail("DNS rebinding from private IP to public 8.8.8.8 MUST be rejected")
+            } catch (e: RepositoryVerificationException) {
+                val formatted = PluginInstallGuard.formatInstallError(e, strings)
+                assertTrue("Expected Chinese public-IP rejection on DNS rebind, got: $formatted", formatted.contains("公网") || formatted.contains("私有"))
+                assertTrue("Expected multiple DNS resolutions across validate+fetch", dnsLookups.get() >= 2)
             }
         } finally {
             redirectServer.shutdown()
@@ -542,7 +661,7 @@ class PluginDevAndFileInstallTest {
             assertTrue(
                 "Expected verbatim init error message with line number, got: ${initOut.loadTechnicalError}",
                 initOut.loadTechnicalError!!.contains("boom-during-dev-init") &&
-                    initOut.loadTechnicalError!!.contains(":3"),
+                    initOut.loadTechnicalError.contains(":3"),
             )
             val nonDevDisp = SourceErrorDispatcher.dispatch(
                 error = PluginInternalException("Error: boom-during-dev-init at main.js:3"),
@@ -715,6 +834,41 @@ class PluginDevAndFileInstallTest {
         val repoInstalled = PluginInstallGuard.confirmInstall(pm, pendingRepo, userConfirmedReplacement = true)
         assertFalse(PluginPackageManager.isDevOrigin(repoInstalled.entity.sourceOrigin))
         assertEquals("2.0.0", repoInstalled.entity.version)
+
+        // 5. Repo -> Dev direction MUST ALSO require explicit replacement confirmation with clear copy!
+        val repoInst = pm.createInstance(pluginId, "Repo Inst", emptyMap())
+        val devOverRepoPreview = pm.previewPackage(devZip, sourceUrl = "$devBaseUrl/plugin.d3plugin", devServerUrl = devBaseUrl)
+        assertTrue(devOverRepoPreview.requiresReplacementConfirmation)
+        val warnRepoToDev = PluginPermissionSummary.replacementWarningText(
+            existingSourceOrigin = devOverRepoPreview.existingSourceOrigin,
+            newSourceOrigin = devOverRepoPreview.sourceOrigin,
+            reposByUrl = reposByUrl,
+            strings = strings,
+        )
+        assertTrue(
+            "Expected repo->dev replacement copy, got: $warnRepoToDev",
+            warnRepoToDev.contains("测试官方仓库") && warnRepoToDev.contains("正式版") && warnRepoToDev.contains("开发版"),
+        )
+        val pendingDevOverRepo = PendingPluginInstall(
+            bytes = devZip,
+            sourceUrl = "$devBaseUrl/plugin.d3plugin",
+            repoUrl = null,
+            expectedId = pluginId,
+            expectedVersion = "1.0.0",
+            expectedSha256 = PluginRepositoryClient.sha256Hex(devZip),
+            preview = devOverRepoPreview,
+            devServerUrl = devBaseUrl,
+            devDisplayAddress = "192.168.1.20:8787",
+        )
+        try {
+            PluginInstallGuard.confirmInstall(pm, pendingDevOverRepo, userConfirmedReplacement = false)
+            fail("Dev install over repo plugin MUST fail without explicit confirmation")
+        } catch (_: PluginSourceMismatchException) {
+        }
+        assertNotNull("Unconfirmed replacement must keep repo instance intact", store.getInstance(repoInst.instanceId))
+        val replacedBackToDev = PluginInstallGuard.confirmInstall(pm, pendingDevOverRepo, userConfirmedReplacement = true)
+        assertTrue(PluginPackageManager.isDevOrigin(replacedBackToDev.entity.sourceOrigin))
+        assertTrue("Confirmed repo->dev replacement must wipe repo instances", store.listInstancesForPlugin(pluginId).isEmpty())
         pm.shutdownAll()
     }
 
@@ -785,14 +939,13 @@ class PluginDevAndFileInstallTest {
             assertTrue("Expected Chinese minApp error, got: $msg", msg.contains("9.9.0") && msg.contains("及以上版本"))
         }
 
-        // 5. Valid `.d3plugin` file installed via installFromFile -> local-file origin & 「本地文件」 label
+        // 5. Valid `.d3plugin` file installed strictly from previewed bytes -> local-file origin & 「本地文件」 label
         val validFile = File(dropDir, "good-1.0.0.d3plugin")
-        validFile.writeBytes(
-            buildZip(makeManifest(id = "com.example.localgood", name = "Local Good"), simpleMainJs("Local")),
-        )
+        val validFileBytes = buildZip(makeManifest(id = "com.example.localgood", name = "Local Good"), simpleMainJs("Local"))
+        validFile.writeBytes(validFileBytes)
         val pendingFile = PluginInstallGuard.prepareLocalFileInstall(pm, validFile)
         assertTrue(pendingFile.preview.isFileSource)
-        assertEquals(validFile, pendingFile.localFile)
+        assertEquals(PluginRepositoryClient.sha256Hex(validFileBytes), pendingFile.expectedSha256)
         val installed = PluginInstallGuard.confirmInstall(pm, pendingFile)
         assertEquals(PluginPackageManager.LOCAL_FILE_ORIGIN, installed.entity.sourceOrigin)
         assertEquals("本地文件", PluginPermissionSummary.sourceLabel(installed.entity, emptyMap(), strings))
@@ -1091,6 +1244,529 @@ class PluginDevAndFileInstallTest {
             assertEquals("Movie V2", ready2.value.first().items.first().title)
         } finally {
             server.shutdown()
+            pm.shutdownAll()
+        }
+    }
+
+    @Test
+    fun confirmInstallUsesPreviewedBytesWithoutReReadingDiskOrNetworkToctou() = runBlocking {
+        val store = InMemoryPluginStore()
+        val lanHost = "192.168.1.50"
+        val servedZip = AtomicReference<ByteArray>()
+        val requestCounter = AtomicInteger(0)
+        val server = MockWebServer()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                requestCounter.incrementAndGet()
+                val zip = servedZip.get()
+                val sha = PluginRepositoryClient.sha256Hex(zip)
+                return when (request.path) {
+                    "/index.json" -> MockResponse().setResponseCode(200).setBody(
+                        makeDevIndexJson("com.example.toctoudev", "Dev TOCTOU", "1.0.0", sha, "http://$lanHost:${server.port}/plugin.d3plugin"),
+                    )
+                    "/plugin.d3plugin" -> MockResponse().setResponseCode(200).setBody(Buffer().write(zip))
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+        }
+        server.start()
+        val okHttp = OkHttpClient.Builder()
+            .proxy(Proxy.NO_PROXY)
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .socketFactory(LocalRedirectSocketFactory(lanHost, server.port))
+            .build()
+        val dns: (String) -> List<InetAddress> = { listOf(InetAddress.getByName(it)) }
+        val repoClient = PluginRepositoryClient(
+            httpClient = okHttp,
+            devPolicyFactory = { host -> NetworkPolicy.forDevServer(host, dns) },
+        )
+        val pm = PluginPackageManager(
+            rootDir = tempFolder.newFolder("toctou-install"),
+            store = store,
+            secretBox = SoftwareAesSecretBox(),
+            okHttpClient = okHttp,
+            repoClient = repoClient,
+            appVersion = "1.0.0",
+            deviceInfo = DeviceInfo.detect("1.0.0"),
+        )
+        try {
+            // 1. Local file TOCTOU: swap file on disk AFTER preview with a higher-permission package
+            val safeZip = buildZip(
+                makeManifest(id = "com.example.toctoufile", name = "Safe File", hosts = emptyList(), lan = false),
+                simpleMainJs("Safe"),
+            )
+            val evilZip = buildZip(
+                makeManifest(id = "com.example.toctoufile", name = "Evil File", hosts = listOf("evil.example.com"), lan = true),
+                simpleMainJs("Evil"),
+            )
+            val pkgFile = File(tempFolder.newFolder("toctou-disk"), "plug.d3plugin")
+            pkgFile.writeBytes(safeZip)
+
+            val pendingFile = PluginInstallGuard.prepareLocalFileInstall(pm, pkgFile)
+            assertFalse(pendingFile.preview.manifest.permissions.lan)
+            // Attacker swaps the file on disk BEFORE user confirms
+            pkgFile.writeBytes(evilZip)
+            val installedFile = PluginInstallGuard.confirmInstall(pm, pendingFile)
+            assertEquals("Installed SHA-256 MUST equal previewed SHA-256", PluginRepositoryClient.sha256Hex(safeZip), installedFile.entity.sha256)
+            assertFalse("Installed permissions MUST stay previewed (lan=false)", installedFile.manifest.permissions.lan)
+            assertTrue(installedFile.manifest.permissions.hosts.isEmpty())
+
+            // 2. Dev install TOCTOU: swap package on server AFTER preview -> confirmInstall must NOT re-fetch!
+            val devSafe = buildZip(
+                makeManifest(id = "com.example.toctoudev", name = "Dev Safe", hosts = emptyList(), lan = false),
+                simpleMainJs("DevSafe"),
+            )
+            val devEvil = buildZip(
+                makeManifest(id = "com.example.toctoudev", name = "Dev Evil", hosts = listOf("evil.example.com"), lan = true),
+                simpleMainJs("DevEvil"),
+            )
+            servedZip.set(devSafe)
+            val pendingDev = PluginInstallGuard.prepareDevInstall(pm, repoClient, "$lanHost:${server.port}")
+            val requestsAfterPreview = requestCounter.get()
+            servedZip.set(devEvil)
+            val installedDev = PluginInstallGuard.confirmInstall(pm, pendingDev)
+            assertEquals("confirmInstall must NOT re-fetch from dev server", requestsAfterPreview, requestCounter.get())
+            assertEquals(PluginRepositoryClient.sha256Hex(devSafe), installedDev.entity.sha256)
+            assertFalse(installedDev.manifest.permissions.lan)
+
+            // 3. Direct URL TOCTOU: mutate pending bytes -> expectedSha256 mismatch rejects install;
+            //    keeping previewed bytes installs strictly without touching network!
+            val directSafe = buildZip(
+                makeManifest(id = "com.example.toctoudirect", name = "Direct Safe", hosts = emptyList(), lan = false),
+                simpleMainJs("DirectSafe"),
+            )
+            val directEvil = buildZip(
+                makeManifest(id = "com.example.toctoudirect", name = "Direct Evil", hosts = listOf("evil.example.com"), lan = true),
+                simpleMainJs("DirectEvil"),
+            )
+            val directPreview = pm.previewPackage(directSafe, sourceUrl = "https://cdn.example.com/pkg.d3plugin")
+            val directPending = PendingPluginInstall(
+                bytes = directSafe,
+                sourceUrl = "https://cdn.example.com/pkg.d3plugin",
+                repoUrl = null,
+                expectedId = directPreview.manifest.id,
+                expectedVersion = directPreview.manifest.version,
+                expectedSha256 = directPreview.sha256,
+                preview = directPreview,
+            )
+            // Tampering bytes after preview fails SHA-256 check
+            try {
+                PluginInstallGuard.confirmInstall(pm, directPending.copy(bytes = directEvil))
+                fail("Tampered direct-URL bytes after preview must fail SHA-256 check")
+            } catch (_: PackageInstallException) {
+            }
+            val requestsBeforeDirectConfirm = requestCounter.get()
+            val installedDirect = PluginInstallGuard.confirmInstall(pm, directPending)
+            assertEquals(requestsBeforeDirectConfirm, requestCounter.get())
+            assertEquals(PluginRepositoryClient.sha256Hex(directSafe), installedDirect.entity.sha256)
+            assertFalse(installedDirect.manifest.permissions.lan)
+        } finally {
+            server.shutdown()
+            pm.shutdownAll()
+        }
+    }
+
+    @Test
+    fun concurrentOpenSourceDuringReloadNeverCachesStaleRuntimeAndCleanupRemovesOrphans() = runBlocking {
+        val rootDir = tempFolder.newFolder("concurrent-reload")
+        val store = InMemoryPluginStore()
+        val pm = PluginPackageManager(
+            rootDir = rootDir,
+            store = store,
+            secretBox = SoftwareAesSecretBox(),
+            appVersion = "1.0.0",
+            deviceInfo = DeviceInfo.detect("1.0.0"),
+        )
+        val devUrl = "http://192.168.1.50:8787"
+        val pluginId = "com.example.raceplug"
+
+        try {
+            val v0 = buildZip(makeManifest(id = pluginId, version = "1.0.0"), simpleMainJs("Gen-0"))
+            pm.installFromBytes(v0, sourceUrl = "$devUrl/plugin.d3plugin", devServerUrl = devUrl)
+            val inst = pm.createInstance(pluginId, "Race Inst", emptyMap())
+            assertEquals("Gen-0", pm.openSource(inst.instanceId).home().first().category.title)
+
+            // Hammer openSource concurrently while performing 8 consecutive same-version dev reloads
+            val stopHammer = AtomicBoolean(false)
+            val hammerJobs = (1..4).map {
+                async(Dispatchers.IO) {
+                    while (!stopHammer.get()) {
+                        runCatching { pm.openSource(inst.instanceId) }
+                    }
+                }
+            }
+            for (gen in 1..8) {
+                val nextZip = buildZip(makeManifest(id = pluginId, version = "1.0.0"), simpleMainJs("Gen-$gen"))
+                pm.installFromBytes(nextZip, sourceUrl = "$devUrl/plugin.d3plugin", devServerUrl = devUrl)
+            }
+            stopHammer.set(true)
+            hammerJobs.awaitAll()
+
+            // After the final reload, openSource MUST serve Gen-8 (never a stale runtime cached mid-swap)
+            val finalTitle = pm.openSource(inst.instanceId).home().first().category.title
+            assertEquals("Concurrent openSource during reload must never leave stale runtime cached", "Gen-8", finalTitle)
+
+            // Orphan cleanup: simulate killed process leaving .probe-*, .staging-*, and orphan version dir
+            val orphanProbe = File(rootDir, ".probe-dead-proc").apply { mkdirs(); File(this, "x").writeText("1") }
+            val pluginDir = File(rootDir, "packages/$pluginId")
+            val orphanStaging = File(pluginDir, ".staging-dead-proc").apply { mkdirs(); File(this, "x").writeText("1") }
+            val orphanVersion = File(pluginDir, "1.0.0-deadbeef").apply { mkdirs(); File(this, "x").writeText("1") }
+            val activeDir = File(store.getPackage(pluginId)!!.packagePath)
+            assertTrue(activeDir.isDirectory)
+
+            pm.cleanupOrphanedFiles()
+            assertFalse(".probe-* orphan must be removed", orphanProbe.exists())
+            assertFalse(".staging-* orphan must be removed", orphanStaging.exists())
+            assertFalse("Unreferenced orphan version dir must be removed", orphanVersion.exists())
+            assertTrue("Active package directory must remain intact", activeDir.isDirectory)
+
+            // SingleFlightOpRunner: blocks parallel double-click AND blocks re-trigger while cancelling until job truly finishes
+            val runnerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            try {
+                val runner = SingleFlightOpRunner()
+                val startedLatch = CountDownLatch(1)
+                val allowCleanupExit = CountDownLatch(1)
+                val secondDoneLatch = CountDownLatch(1)
+                val runCount = AtomicInteger(0)
+
+                val firstLaunched = runner.tryLaunch(runnerScope) {
+                    runCount.incrementAndGet()
+                    startedLatch.countDown()
+                    try {
+                        delay(10_000L)
+                    } finally {
+                        withContext(NonCancellable) {
+                            withContext(Dispatchers.IO) {
+                                allowCleanupExit.await(3, TimeUnit.SECONDS)
+                            }
+                        }
+                    }
+                }
+                assertTrue(firstLaunched)
+                assertTrue(startedLatch.await(2, TimeUnit.SECONDS))
+                // Duplicate click while running -> rejected!
+                assertFalse("Duplicate click must be rejected while running", runner.tryLaunch(runnerScope) { runCount.incrementAndGet() })
+
+                // Cancel -> while cleanup is still running, re-trigger MUST still be rejected!
+                runner.cancel()
+                assertTrue(runner.isCancelling)
+                assertFalse("Re-trigger during cancellation cleanup must be rejected", runner.tryLaunch(runnerScope) { runCount.incrementAndGet() })
+
+                // Let cancelled task finish cleanup -> now runner becomes idle and accepts a new task!
+                allowCleanupExit.countDown()
+                var waited = 0
+                while (runner.isBusy && waited < 2000) {
+                    delay(20)
+                    waited += 20
+                }
+                assertFalse(runner.isBusy)
+                val secondLaunched = runner.tryLaunch(runnerScope) {
+                    runCount.incrementAndGet()
+                    secondDoneLatch.countDown()
+                }
+                assertTrue("New task must be allowed once cancelled task truly finishes", secondLaunched)
+                assertTrue(secondDoneLatch.await(2, TimeUnit.SECONDS))
+                assertEquals(2, runCount.get())
+            } finally {
+                runnerScope.cancel()
+            }
+        } finally {
+            pm.shutdownAll()
+        }
+    }
+
+    @Test
+    fun devToDevAddressSwitchConfirmsAndPreservesInstancesAndLoadExpandsPermissionsImmediately() = runBlocking {
+        val hostA = "192.168.1.50"
+        val hostB = "192.168.1.60"
+        val zipA = AtomicReference<ByteArray>()
+        val zipB = AtomicReference<ByteArray>()
+        val serverA = MockWebServer()
+        val serverB = MockWebServer()
+        fun makeDispatcher(host: String, portProvider: () -> Int, zipRef: AtomicReference<ByteArray>) = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val z = zipRef.get()
+                val sha = PluginRepositoryClient.sha256Hex(z)
+                return when (request.path) {
+                    "/index.json" -> MockResponse().setResponseCode(200).setBody(
+                        makeDevIndexJson("com.example.dhcpdev", "DHCP Dev", "1.0.0", sha, "http://$host:${portProvider()}/plugin.d3plugin"),
+                    )
+                    "/plugin.d3plugin" -> MockResponse().setResponseCode(200).setBody(Buffer().write(z))
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+        }
+        serverA.dispatcher = makeDispatcher(hostA, { serverA.port }, zipA)
+        serverB.dispatcher = makeDispatcher(hostB, { serverB.port }, zipB)
+        serverA.start()
+        serverB.start()
+
+        val clientA = PluginRepositoryClient(
+            httpClient = OkHttpClient.Builder()
+                .proxy(Proxy.NO_PROXY)
+                .followRedirects(false)
+                .socketFactory(LocalRedirectSocketFactory(hostA, serverA.port))
+                .build(),
+            devPolicyFactory = { h -> NetworkPolicy.forDevServer(h) { listOf(InetAddress.getByName(it)) } },
+        )
+        val clientB = PluginRepositoryClient(
+            httpClient = OkHttpClient.Builder()
+                .proxy(Proxy.NO_PROXY)
+                .followRedirects(false)
+                .socketFactory(LocalRedirectSocketFactory(hostB, serverB.port))
+                .build(),
+            devPolicyFactory = { h -> NetworkPolicy.forDevServer(h) { listOf(InetAddress.getByName(it)) } },
+        )
+        val store = InMemoryPluginStore()
+        val pm = PluginPackageManager(
+            rootDir = tempFolder.newFolder("dev-switch"),
+            store = store,
+            secretBox = SoftwareAesSecretBox(),
+            appVersion = "1.0.0",
+            deviceInfo = DeviceInfo.detect("1.0.0"),
+        )
+        val dns: (String) -> List<InetAddress> = { listOf(InetAddress.getByName(it)) }
+
+        try {
+            val jsA = """
+                export default {
+                  async home(ctx) {
+                    await ctx.storage.set('keep', 'from-A');
+                    await ctx.cookies.set('https://a.example.com/', 'ck=valA');
+                    return [{ id: 's1', title: 'A-' + ctx.config.note, style: 'poster', items: [] }];
+                  },
+                  async browse() { return { items: [], next: null }; },
+                  async detail() { return { id: '1', kind: 'movie', title: '1' }; },
+                  async playback() { return { url: 'https://a.example.com/1.mp4' }; }
+                };
+            """.trimIndent()
+            zipA.set(buildZip(makeManifest(id = "com.example.dhcpdev", name = "DHCP Dev", hosts = listOf("a.example.com")), jsA))
+
+            // Install from hostA + create instance + persist storage & cookie
+            val pA = PluginInstallGuard.prepareDevInstall(pm, clientA, "$hostA:${serverA.port}")
+            PluginInstallGuard.confirmInstall(pm, pA)
+            val inst = pm.createInstance("com.example.dhcpdev", "My Dev", mapOf("note" to JsonPrimitive("cfg1")))
+            assertEquals("A-cfg1", pm.openSource(inst.instanceId, dnsResolver = dns).home().first().category.title)
+
+            // Item 5: Load ("加载" via prepareDevInstall, NOT reloadDevPlugin) an expanded-permission update from hostA
+            // -> confirmExpandedPermissionsOnInstall MUST be true so confirming once activates it immediately!
+            val jsAExpanded = """
+                export default {
+                  async home(ctx) {
+                    const k = await ctx.storage.get('keep');
+                    return [{ id: 's1', title: 'A2-' + k, style: 'poster', items: [] }];
+                  },
+                  async browse() { return { items: [], next: null }; },
+                  async detail() { return { id: '1', kind: 'movie', title: '1' }; },
+                  async playback() { return { url: 'https://a.example.com/1.mp4' }; }
+                };
+            """.trimIndent()
+            zipA.set(
+                buildZip(
+                    makeManifest(id = "com.example.dhcpdev", name = "DHCP Dev", hosts = listOf("a.example.com", "b.example.com"), lan = true),
+                    jsAExpanded,
+                ),
+            )
+            val pendingExpand = PluginInstallGuard.prepareDevInstall(pm, clientA, "$hostA:${serverA.port}")
+            assertTrue("prepareDevInstall must set confirmExpandedPermissionsOnInstall when permissions expand", pendingExpand.confirmExpandedPermissionsOnInstall)
+            PluginInstallGuard.confirmInstall(pm, pendingExpand)
+            assertFalse("After user confirms on card, plugin must NOT stay stuck in needsPermissionReconfirm", store.getPackage("com.example.dhcpdev")!!.needsPermissionReconfirm)
+            assertEquals("A2-from-A", pm.openSource(inst.instanceId, dnsResolver = dns).home().first().category.title)
+
+            // Item 4: Computer DHCP IP changes from hostA to hostB -> explicit confirmation required,
+            // clear A->B copy, AND instances (config, ctx.storage, cookies) MUST BE PRESERVED!
+            val jsB = """
+                export default {
+                  async home(ctx) {
+                    const k = await ctx.storage.get('keep');
+                    const ck = await ctx.cookies.get('https://a.example.com/');
+                    return [{ id: 's1', title: 'B-' + ctx.config.note + '-' + k + '-' + ck, style: 'poster', items: [] }];
+                  },
+                  async browse() { return { items: [], next: null }; },
+                  async detail() { return { id: '1', kind: 'movie', title: '1' }; },
+                  async playback() { return { url: 'https://a.example.com/1.mp4' }; }
+                };
+            """.trimIndent()
+            zipB.set(
+                buildZip(
+                    makeManifest(id = "com.example.dhcpdev", name = "DHCP Dev", hosts = listOf("a.example.com", "b.example.com"), lan = true),
+                    jsB,
+                ),
+            )
+            val pendingSwitch = PluginInstallGuard.prepareDevInstall(pm, clientB, "$hostB:${serverB.port}")
+            assertTrue(pendingSwitch.preview.requiresReplacementConfirmation)
+            assertTrue(pendingSwitch.preview.isDevAddressSwitch)
+            val switchMsg = PluginPermissionSummary.replacementWarningText(
+                existingSourceOrigin = pendingSwitch.preview.existingSourceOrigin,
+                newSourceOrigin = pendingSwitch.preview.sourceOrigin,
+                reposByUrl = emptyMap(),
+                strings = strings,
+            )
+            assertTrue(
+                "Dev->dev address switch warning must name both addresses and note preserved data, got: $switchMsg",
+                switchMsg.contains(hostA) && switchMsg.contains(hostB) && switchMsg.contains("保留"),
+            )
+
+            // Without explicit confirmation -> throws PluginSourceMismatchException
+            try {
+                PluginInstallGuard.confirmInstall(pm, pendingSwitch, userConfirmedReplacement = false)
+                fail("Dev->dev address switch must require explicit confirmation")
+            } catch (_: PluginSourceMismatchException) {
+            }
+
+            // With confirmation -> updates dev origin to hostB AND preserves instance config, storage, and cookies!
+            val switched = PluginInstallGuard.confirmInstall(pm, pendingSwitch, userConfirmedReplacement = true)
+            assertTrue(switched.entity.sourceOrigin.contains(hostB))
+            assertEquals("Instances must be preserved on dev->dev address switch", 1, store.listInstancesForPlugin("com.example.dhcpdev").size)
+            assertEquals(
+                "B-cfg1-from-A-ck=valA",
+                pm.openSource(inst.instanceId, dnsResolver = dns).home().first().category.title,
+            )
+        } finally {
+            serverA.shutdown()
+            serverB.shutdown()
+            pm.shutdownAll()
+        }
+    }
+
+    @Test
+    fun developerDiagnosticsRedactSecretsProbeHasZeroCapabilitiesAndClassifiesErrorsAndRepoEntries() = runBlocking {
+        val store = InMemoryPluginStore()
+        val pm = PluginPackageManager(
+            rootDir = tempFolder.newFolder("dev-redact-probe"),
+            store = store,
+            secretBox = SoftwareAesSecretBox(),
+            appVersion = "1.0.0",
+            deviceInfo = DeviceInfo.detect("1.0.0"),
+        )
+
+        try {
+            // Item 6: Secret redaction in dev init error (configured password, query tokens, Authorization, Cookie)
+            val secretManifest = """
+                {
+                  "api": 1,
+                  "id": "com.example.secretdev",
+                  "name": "Secret Dev",
+                  "version": "1.0.0",
+                  "minApp": "1.0.0",
+                  "permissions": { "hosts": [], "userHosts": false, "lan": false },
+                  "config": [
+                    { "key": "password", "type": "password", "label": "密码", "required": true }
+                  ],
+                  "auth": "none"
+                }
+            """.trimIndent()
+            val leakyInitJs = """
+                export default {
+                  async init(ctx) {
+                    throw new Error('fail pass=' + ctx.config.password + ' url=https://srv.test/api?token=tokSecret99&api_key=keySecret88 Authorization: Bearer jwtSecret77 Cookie: sid=ckSecret66');
+                  },
+                  async home() { return []; },
+                  async browse() { return { items: [], next: null }; },
+                  async detail() { return { id: '1', kind: 'movie', title: '1' }; },
+                  async playback() { return { url: 'https://srv.test/v.mp4' }; }
+                };
+            """.trimIndent()
+            val devUrl = "http://192.168.1.50:8787"
+            pm.installFromBytes(buildZip(secretManifest, leakyInitJs), sourceUrl = "$devUrl/plugin.d3plugin", devServerUrl = devUrl)
+            pm.createInstance(
+                pluginId = "com.example.secretdev",
+                displayName = "Secret Inst",
+                config = mapOf("password" to JsonPrimitive("SuperSecretPwd!23")),
+            )
+            val initErr = pm.verifyInstalledPluginLoad("com.example.secretdev")
+            assertNotNull("Expected redacted init error", initErr)
+            assertFalse("Password must be redacted: $initErr", initErr!!.contains("SuperSecretPwd!23"))
+            assertFalse("URL query token must be redacted: $initErr", initErr.contains("tokSecret99"))
+            assertFalse("URL query api_key must be redacted: $initErr", initErr.contains("keySecret88"))
+            assertFalse("Authorization bearer must be redacted: $initErr", initErr.contains("jwtSecret77"))
+            assertFalse("Cookie value must be redacted: $initErr", initErr.contains("ckSecret66"))
+            assertTrue("Line number must remain visible for developer: $initErr", initErr.contains(":3"))
+
+            // Item 8: probeArchiveModuleLoad runs in a ZERO-capability sandbox (no __d3_host, no ctx, no fetch)
+            val probeCapJs = """
+                if (typeof __d3_host !== 'undefined' || typeof ctx !== 'undefined' || typeof fetch !== 'undefined') {
+                  throw new Error('CAPABILITY_LEAKED');
+                }
+                export default { home(){return []}, browse(){return {items:[]}}, detail(){return {id:'1',kind:'movie',title:'1'}}, playback(){return {url:'https://a.test/1.mp4'}} };
+            """.trimIndent()
+            assertNull(
+                "Zero-capability probe sandbox must expose no host bridge, ctx, or fetch",
+                pm.probeArchiveModuleLoad(buildZip(makeManifest(id = "com.example.probe"), probeCapJs)),
+            )
+
+            // Item 7: Offline/IP-change hint appended ONLY on connection errors, NEVER on minApp/policy/manifest errors
+            val (connSummary, _) = PluginInstallGuard.formatDevReloadError(ConnectException("Connection refused"), strings)
+            assertTrue("Connection failure must include offline/IP-change hint: $connSummary", connSummary.contains("更换了 IP") && connSummary.contains("保留当前安装的版本"))
+            val (timeoutSummary, _) = PluginInstallGuard.formatDevReloadError(SocketTimeoutException("timed out"), strings)
+            assertTrue("Timeout failure must include offline/IP-change hint: $timeoutSummary", timeoutSummary.contains("保留当前安装的版本"))
+
+            val (minAppSummary, _) = PluginInstallGuard.formatDevReloadError(
+                PackageInstallException("此插件需要 depth3d 9.9.0 及以上版本（当前版本 1.0.0）"),
+                strings,
+            )
+            assertFalse("minApp error must NOT append offline hint: $minAppSummary", minAppSummary.contains("电脑暂时连不上"))
+            val (policySummary, _) = PluginInstallGuard.formatDevReloadError(
+                RepositoryVerificationException("开发模式禁止访问回环地址（127.0.0.1），请填写电脑的局域网私有地址。", NetworkPolicyException("loopback")),
+                strings,
+            )
+            assertFalse("Policy rejection must NOT append offline hint: $policySummary", policySummary.contains("电脑暂时连不上"))
+            val (manifestSummary, manifestTech) = PluginInstallGuard.formatDevReloadError(
+                ManifestValidationException(listOf("id invalid")),
+                strings,
+            )
+            assertFalse("Manifest error must NOT append offline hint: $manifestSummary", manifestSummary.contains("电脑暂时连不上"))
+            assertNotNull(manifestTech)
+
+            // Item 11: RepoBrowse classification keeps built-in same-version as INSTALLED, dev/file as REPLACE
+            val repoOrigin = PluginPackageManager.canonicalSourceOrigin(repoUrl = "https://repo.example.com/index.json", sourceUrl = null)
+            val baseEntity = store.getPackage("com.example.secretdev")!!
+            assertEquals(
+                RepoEntryAction.INSTALL,
+                PluginInstallGuard.classifyRepoEntryAction(null, repoOrigin, "1.0.0"),
+            )
+            assertEquals(
+                "Built-in plugin at same version must show INSTALLED, not REPLACE",
+                RepoEntryAction.INSTALLED,
+                PluginInstallGuard.classifyRepoEntryAction(
+                    baseEntity.copy(
+                        sourceOrigin = BuiltInPluginInstaller.sourceOriginFor("dev.depth3d.jellyfin"),
+                        sourceUrl = BuiltInPluginInstaller.sourceUrlFor("dev.depth3d.jellyfin"),
+                        version = "1.0.0",
+                    ),
+                    repoOrigin,
+                    "1.0.0",
+                ),
+            )
+            assertEquals(
+                "Dev plugin at same version must show REPLACE",
+                RepoEntryAction.REPLACE,
+                PluginInstallGuard.classifyRepoEntryAction(
+                    baseEntity.copy(sourceOrigin = "dev:http://192.168.1.50:8787", version = "1.0.0"),
+                    repoOrigin,
+                    "1.0.0",
+                ),
+            )
+            assertEquals(
+                "Local-file plugin at same version must show REPLACE",
+                RepoEntryAction.REPLACE,
+                PluginInstallGuard.classifyRepoEntryAction(
+                    baseEntity.copy(sourceOrigin = PluginPackageManager.LOCAL_FILE_ORIGIN, version = "1.0.0"),
+                    repoOrigin,
+                    "1.0.0",
+                ),
+            )
+            assertEquals(
+                "Same repo newer version must show UPDATE",
+                RepoEntryAction.UPDATE,
+                PluginInstallGuard.classifyRepoEntryAction(
+                    baseEntity.copy(sourceOrigin = repoOrigin, version = "1.0.0"),
+                    repoOrigin,
+                    "1.1.0",
+                ),
+            )
+        } finally {
             pm.shutdownAll()
         }
     }

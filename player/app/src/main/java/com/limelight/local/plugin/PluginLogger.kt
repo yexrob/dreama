@@ -96,10 +96,13 @@ class PluginLogger(
             """(?i)\b((?:set-)?cookie\s*[:=]\s*)([^\r\n]+)""",
         )
         private val JSON_SECRET_REGEX = Regex(
-            """(?i)("?(?:password|passwd|pwd|secret|token|access_?token|refresh_?token|api_?key|x-emby-token|x-mediabrowser-token|sessdata|bili_jct|pin)"?\s*[:=]\s*["']?)([^"',\s&;}\]]+)""",
+            """(?i)("?(?:password|passwd|pwd|secret|token|access_?token|refresh_?token|api_?key|x-emby-token|x-mediabrowser-token|sessdata|bili_jct|pin)"?\s*[:=]\s*["']?)(?!\[REDACTED\])([^"',\s&;}\]]+)""",
         )
         private val URL_USERINFO_REGEX = Regex(
             """(https?://)([^/\s:@]+:[^/\s@]+)(@)""",
+        )
+        private val URL_QUERY_SECRET_REGEX = Regex(
+            """(?i)([?&](?:api_?key|token|access_?token|refresh_?token|auth|password|passwd|pwd|secret|key|sig|signature|session(?:_?id)?|jwt|x-emby-token|x-mediabrowser-token|sessdata|bili_jct|cookie)=)(?!\[REDACTED\])([^&#\s"'<>]+)""",
         )
 
         fun truncateUtf8(input: String, maxBytes: Int): String {
@@ -136,9 +139,16 @@ class PluginLogger(
             for (secret in knownSecrets) {
                 if (secret.length >= 3) {
                     out = out.replace(secret, REDACTED)
+                    val encoded = runCatching { java.net.URLEncoder.encode(secret, "UTF-8") }.getOrNull()
+                    if (!encoded.isNullOrEmpty() && encoded != secret) {
+                        out = out.replace(encoded, REDACTED)
+                        val pct20 = encoded.replace("+", "%20")
+                        if (pct20 != encoded) out = out.replace(pct20, REDACTED)
+                    }
                 }
             }
             out = URL_USERINFO_REGEX.replace(out) { m -> "${m.groupValues[1]}$REDACTED${m.groupValues[3]}" }
+            out = URL_QUERY_SECRET_REGEX.replace(out) { m -> "${m.groupValues[1]}$REDACTED" }
             out = AUTH_HEADER_REGEX.replace(out) { m -> "${m.groupValues[1]}$REDACTED" }
             out = COOKIE_HEADER_REGEX.replace(out) { m -> "${m.groupValues[1]}$REDACTED" }
             out = JSON_SECRET_REGEX.replace(out) { m -> "${m.groupValues[1]}$REDACTED" }

@@ -6,7 +6,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -63,11 +62,11 @@ import kotlinx.coroutines.withContext
  * - Auto-discovers `d3plugin serve` instances on the same Wi-Fi via [UdpLanServerDiscovery]
  *   ([UdpDiscoveryProtocol.PLUGIN_DEV]) with periodic re-probe & stale eviction.
  * - Accepts manual LAN addresses via [PhoneInputSheet] (`PLUGIN_DEV_SERVER`) or headset keyboard.
- * - Loads/reloads dev plugins with same-version SHA-256 replacement, permission-expansion
- *   confirmation, and offline fallback keeping the existing installed version intact.
- * - Displays inline recent logs (auto-scrolling to the latest entry after reload) and verbatim
+ * - Serializes load/reload operations via [SingleFlightOpRunner] so duplicate clicks never run in
+ *   parallel and a cancelled task must finish completely before another operation can start.
+ * - Displays inline recent logs (auto-scrolling to the latest entry after reload) and redacted
  *   raw technical load errors (syntax / manifest / `init` errors with line numbers) — the ONLY
- *   screen permitted to surface English technical diagnostics.
+ *   screen permitted to surface English technical diagnostics (and never sent to the phone web page).
  */
 @Composable
 fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
@@ -94,7 +93,9 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
     var logScrollToken by remember { mutableIntStateOf(0) }
 
     var showManualInput by remember { mutableStateOf(false) }
-    var busyJob by remember { mutableStateOf<Job?>(null) }
+    val opRunner = remember { SingleFlightOpRunner() }
+    var opBusy by remember { mutableStateOf(false) }
+    var opCancelling by remember { mutableStateOf(false) }
     var verifyJob by remember { mutableStateOf<Job?>(null) }
     var busyMessage by remember { mutableStateOf<String?>(null) }
     var pendingInstall by remember { mutableStateOf<PendingPluginInstall?>(null) }
@@ -103,7 +104,7 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
 
     DisposableEffect(Unit) {
         onDispose {
-            busyJob?.cancel()
+            opRunner.cancel()
             verifyJob?.cancel()
         }
     }
@@ -145,7 +146,7 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
 
     // Refresh inline logs smoothly while viewing Developer Mode (so background home() reloads appear)
     LaunchedEffect(selectedLogPluginId, hostChanges) {
-        val pid = selectedLogPluginId ?: return@LaunchedEffect
+        if (selectedLogPluginId == null) return@LaunchedEffect
         logVersion++
         while (isActive) {
             delay(1_500L)
@@ -153,7 +154,7 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
         }
     }
 
-    // Also surface PluginInternalException from post-reload shelf refresh of the selected dev plugin
+    // Also surface redacted PluginInternalException from post-reload shelf refresh of the selected dev plugin
     val selectedPluginInstanceIds = remember(pluginInstances, selectedLogPluginId) {
         val pid = selectedLogPluginId ?: return@remember emptyList()
         pluginInstances.filter { it.pluginId == pid }.map { "${PluginHost.PLUGIN_SOURCE_PREFIX}${it.instanceId}" }
@@ -161,12 +162,19 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
     val shelfFailureForSelected = selectedPluginInstanceIds
         .mapNotNull { (model.shelves[it] as? Load.Failed)?.error as? PluginInternalException }
         .firstOrNull()
-    LaunchedEffect(shelfFailureForSelected) {
+    LaunchedEffect(shelfFailureForSelected, selectedLogPluginId) {
         if (shelfFailureForSelected != null) {
             val (summary, tech) = PluginInstallGuard.formatDeveloperError(shelfFailureForSelected, strings)
+            val redactedTech = if (tech != null) {
+                withContext(Dispatchers.IO) {
+                    model.pluginHost.packageManager().redactDeveloperError(selectedLogPluginId, tech)
+                }
+            } else {
+                null
+            }
             if (devTechError == null) {
                 devErrorSummary = summary
-                devTechError = tech
+                devTechError = redactedTech
             }
             logVersion++
             logScrollToken++
@@ -183,14 +191,21 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
         devTechError = null
     }
 
-    fun recordDeveloperFailure(error: Throwable, appendOfflineHint: Boolean = false) {
-        val (summary, tech) = PluginInstallGuard.formatDeveloperError(error, strings)
-        devErrorSummary = if (appendOfflineHint && tech == null) {
-            "$summary ${context.getString(R.string.dev_reload_offline_hint)}"
+    suspend fun recordDeveloperFailure(error: Throwable, pluginId: String?, isReload: Boolean) {
+        val (summary, tech) = if (isReload) {
+            PluginInstallGuard.formatDevReloadError(error, strings)
         } else {
-            summary
+            PluginInstallGuard.formatDeveloperError(error, strings)
         }
-        devTechError = tech
+        val redactedTech = if (tech != null) {
+            withContext(Dispatchers.IO) {
+                model.pluginHost.packageManager().redactDeveloperError(pluginId, tech)
+            }
+        } else {
+            null
+        }
+        devErrorSummary = summary
+        devTechError = redactedTech
         logVersion++
         logScrollToken++
     }
@@ -212,11 +227,17 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
     }
 
     fun startDevLoad(rawAddress: String, hintPluginId: String? = null) {
-        if (busyJob?.isActive == true) return
-        clearErrors()
-        if (!hintPluginId.isNullOrBlank()) selectedLogPluginId = hintPluginId
-        busyMessage = context.getString(R.string.dev_loading_pkg)
-        busyJob = scope.launch {
+        opRunner.tryLaunch(
+            scope = scope,
+            onStateChanged = { b, c ->
+                opBusy = b
+                opCancelling = c
+                if (!b) busyMessage = null
+            },
+        ) {
+            clearErrors()
+            if (!hintPluginId.isNullOrBlank()) selectedLogPluginId = hintPluginId
+            busyMessage = context.getString(R.string.dev_loading_pkg)
             try {
                 val prepared = withContext(Dispatchers.IO) {
                     PluginInstallGuard.prepareDevInstall(
@@ -230,19 +251,23 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                recordDeveloperFailure(e)
-            } finally {
-                busyMessage = null
+                recordDeveloperFailure(e, hintPluginId ?: selectedLogPluginId, isReload = false)
             }
         }
     }
 
     fun startDevReload(rawAddress: String, pluginId: String) {
-        if (busyJob?.isActive == true) return
-        clearErrors()
-        selectedLogPluginId = pluginId
-        busyMessage = context.getString(R.string.dev_reloading_pkg)
-        busyJob = scope.launch {
+        opRunner.tryLaunch(
+            scope = scope,
+            onStateChanged = { b, c ->
+                opBusy = b
+                opCancelling = c
+                if (!b) busyMessage = null
+            },
+        ) {
+            clearErrors()
+            selectedLogPluginId = pluginId
+            busyMessage = context.getString(R.string.dev_reloading_pkg)
             try {
                 val outcome = withContext(Dispatchers.IO) {
                     PluginInstallGuard.reloadDevPlugin(
@@ -272,9 +297,7 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                recordDeveloperFailure(e, appendOfflineHint = true)
-            } finally {
-                busyMessage = null
+                recordDeveloperFailure(e, pluginId, isReload = true)
             }
         }
     }
@@ -301,9 +324,10 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
             )
             WallButton(
                 text = stringResource(R.string.dev_manual_addr_btn),
-                onClick = { showManualInput = true },
+                onClick = { if (!opBusy) showManualInput = true },
                 icon = WallIcons.Phone,
                 kind = ButtonKind.Primary,
+                enabled = !opBusy,
             )
         }
 
@@ -391,10 +415,12 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
                                 if (isSameDevInstalled) R.string.dev_reload_btn else R.string.plugins_action_load,
                             )
                             val onTrigger = {
-                                if (isSameDevInstalled) {
-                                    startDevReload(serverUrl, pluginId)
-                                } else {
-                                    startDevLoad(serverUrl, pluginId)
+                                if (!opBusy) {
+                                    if (isSameDevInstalled) {
+                                        startDevReload(serverUrl, pluginId)
+                                    } else {
+                                        startDevLoad(serverUrl, pluginId)
+                                    }
                                 }
                             }
                             ManagementRow(
@@ -408,6 +434,7 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
                                         icon = if (isSameDevInstalled) WallIcons.Refresh else null,
                                         kind = ButtonKind.Plain,
                                         small = true,
+                                        enabled = !opBusy,
                                     )
                                 },
                                 onClick = onTrigger,
@@ -462,6 +489,7 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
                                             icon = WallIcons.Refresh,
                                             kind = ButtonKind.Plain,
                                             small = true,
+                                            enabled = !opBusy,
                                         )
                                     }
                                     WallButton(
@@ -482,7 +510,7 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
                 }
             }
 
-            // Right column: developer error details (verbatim raw errors) + inline recent logs
+            // Right column: developer error details (redacted technical errors) + inline recent logs
             Column(
                 Modifier.weight(0.92f).fillMaxHeight(),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -609,11 +637,20 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
                         throw e
                     } catch (e: Exception) {
                         val (summary, tech) = PluginInstallGuard.formatDeveloperError(e, strings)
+                        val redactedTech = if (tech != null) {
+                            withContext(Dispatchers.IO) {
+                                model.pluginHost.packageManager().redactDeveloperError(selectedLogPluginId, tech)
+                            }
+                        } else {
+                            null
+                        }
                         devErrorSummary = summary
-                        devTechError = tech
+                        devTechError = redactedTech
+                        // Security invariant (#6): NEVER send raw technical errors back to the phone web page;
+                        // return only the Simplified Chinese summary while showing redacted details on headset.
                         UserFacingError(
                             context.getString(R.string.phone_action_dev_server),
-                            tech?.let { "$summary\n$it" } ?: summary,
+                            summary,
                         )
                     }
                 },
@@ -621,13 +658,20 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
             )
         }
 
-        busyMessage?.let { msg ->
+        if (opBusy) {
             BusyModal(
-                message = msg,
+                message = if (opCancelling) {
+                    stringResource(R.string.dev_cancelling_op)
+                } else {
+                    busyMessage ?: stringResource(R.string.dev_loading_pkg)
+                },
                 onCancel = {
-                    busyJob?.cancel()
-                    busyJob = null
-                    busyMessage = null
+                    if (!opCancelling) {
+                        opRunner.cancel { b, c ->
+                            opBusy = b
+                            opCancelling = c
+                        }
+                    }
                 },
             )
         }
@@ -643,7 +687,11 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
                     clearErrors()
                     nav.toast(
                         context.getString(
-                            if (pending.preview.isUpdate) R.string.dev_reloaded_toast else R.string.plugins_installed_toast,
+                            if (pending.preview.isUpdate || pending.preview.isDevAddressSwitch) {
+                                R.string.dev_reloaded_toast
+                            } else {
+                                R.string.plugins_installed_toast
+                            },
                             name,
                         ),
                     )

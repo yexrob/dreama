@@ -50,6 +50,8 @@ class NetworkPolicy(
     private val requireHttpsAlways: Boolean = false,
     private val restrictToLanPrivateOnly: Boolean = false,
     private val pinnedSingleHost: String? = null,
+    private val pinnedSinglePort: Int? = null,
+    private val pinnedSingleScheme: String? = null,
 ) {
     private val normalizedHosts: List<String> = permissions.hosts.map { canonicalizePattern(it) }
     private val normalizedUserHosts: Set<String> = userConfiguredHosts.map { canonicalizeHost(it) }.toSet()
@@ -65,7 +67,7 @@ class NetworkPolicy(
         val host = canonicalizeHost(url.host)
 
         if (restrictToLanPrivateOnly) {
-            validateDevLanHostAndAddresses(host, previousScheme)
+            validateDevLanHostAndAddresses(url, host, previousScheme)
             val addresses = resolveHost(host)
             checkDevLanAddresses(host, addresses)
             return ValidatedUrl(url, host, addresses)
@@ -116,7 +118,7 @@ class NetworkPolicy(
         val host = canonicalizeHost(url.host)
 
         if (restrictToLanPrivateOnly) {
-            validateDevLanHostAndAddresses(host, previousScheme)
+            validateDevLanHostAndAddresses(url, host, previousScheme)
             val addresses = resolveHost(host)
             checkDevLanAddresses(host, addresses)
             return ValidatedUrl(url, host, addresses)
@@ -257,16 +259,46 @@ class NetworkPolicy(
         }
     }
 
-    private fun validateDevLanHostAndAddresses(host: String, previousScheme: String?) {
+    private fun validateDevLanHostAndAddresses(url: HttpUrl, host: String, previousScheme: String?) {
+        if (pinnedSingleScheme != null && !url.scheme.equals(pinnedSingleScheme, ignoreCase = true)) {
+            if (previousScheme != null) {
+                throw NetworkPolicyException("开发模式禁止重定向切换协议（仅允许 $pinnedSingleScheme）")
+            }
+            throw NetworkPolicyException("开发模式仅允许使用已指定的协议：$pinnedSingleScheme")
+        }
         if (pinnedSingleHost != null && host != pinnedSingleHost) {
             if (previousScheme != null) {
                 throw NetworkPolicyException("开发模式禁止重定向到其他主机：$host")
             }
             throw NetworkPolicyException("开发模式仅允许访问指定的开发服务器主机：$pinnedSingleHost")
         }
+        if (pinnedSinglePort != null && url.port != pinnedSinglePort) {
+            if (previousScheme != null) {
+                throw NetworkPolicyException("开发模式禁止重定向到其他端口（仅允许端口 $pinnedSinglePort）")
+            }
+            throw NetworkPolicyException("开发模式仅允许访问指定的开发服务器端口：$pinnedSinglePort")
+        }
         if (isForbiddenHostName(host)) {
             throw NetworkPolicyException("开发模式禁止访问回环地址（$host），请填写电脑的局域网私有地址。")
         }
+    }
+
+    /**
+     * Returns a copy of this policy strictly pinned to [scheme], [host], and [port]
+     * under LAN-private-only dev server rules, preserving the existing [dnsResolver].
+     */
+    internal fun withPinnedEndpoint(scheme: String, host: String, port: Int): NetworkPolicy {
+        val canonical = canonicalizeHost(host)
+        return NetworkPolicy(
+            permissions = PluginPermissions(hosts = emptyList(), userHosts = true, lan = true),
+            userConfiguredHosts = setOf(canonical),
+            dnsResolver = dnsResolver,
+            requireHttpsAlways = false,
+            restrictToLanPrivateOnly = true,
+            pinnedSingleHost = canonical,
+            pinnedSinglePort = port,
+            pinnedSingleScheme = scheme.lowercase(Locale.ROOT),
+        )
     }
 
     private fun checkDevLanAddresses(host: String, addresses: List<InetAddress>) {
@@ -306,12 +338,25 @@ class NetworkPolicy(
 
         /**
          * Dev-only policy for `d3plugin serve` on LAN:
-         * - Allows plain HTTP strictly to [devHost] on RFC1918 or IPv6 ULA addresses only
+         * - Allows plain HTTP strictly to [devHost] (and optional [pinnedPort] / [pinnedScheme])
+         *   on RFC1918 or IPv6 ULA addresses only
          * - Rejects loopback, link-local, public, and reserved addresses with specific Chinese errors
-         * - Rejects any redirect to a different host
+         * - Rejects any redirect or URL switching scheme, host, or port
          */
         fun forDevServer(
             devHost: String,
+            dnsResolver: (String) -> List<InetAddress>,
+        ): NetworkPolicy = forDevServer(
+            devHost = devHost,
+            pinnedPort = null,
+            pinnedScheme = null,
+            dnsResolver = dnsResolver,
+        )
+
+        fun forDevServer(
+            devHost: String,
+            pinnedPort: Int? = null,
+            pinnedScheme: String? = null,
             dnsResolver: (String) -> List<InetAddress> = { InetAddress.getAllByName(it).toList() },
         ): NetworkPolicy {
             val canonical = canonicalizeHost(devHost)
@@ -322,6 +367,8 @@ class NetworkPolicy(
                 requireHttpsAlways = false,
                 restrictToLanPrivateOnly = true,
                 pinnedSingleHost = canonical,
+                pinnedSinglePort = pinnedPort,
+                pinnedSingleScheme = pinnedScheme?.lowercase(Locale.ROOT),
             )
         }
 

@@ -45,6 +45,7 @@ data class NormalizedDevServer(
     val baseUrl: String,
     val indexUrl: String,
     val displayAddress: String,
+    val scheme: String,
     val host: String,
     val port: Int,
 )
@@ -174,9 +175,14 @@ class PluginRepositoryClient(
 
         val canonicalHost = NetworkPolicy.canonicalizeHost(parsed.host)
         val policy = if (dnsResolver != null) {
-            NetworkPolicy.forDevServer(canonicalHost, dnsResolver)
+            NetworkPolicy.forDevServer(
+                devHost = canonicalHost,
+                dnsResolver = dnsResolver,
+                pinnedPort = parsed.port,
+                pinnedScheme = parsed.scheme,
+            )
         } else {
-            devPolicyFactory(canonicalHost)
+            devPolicyFactory(canonicalHost).withPinnedEndpoint(parsed.scheme, canonicalHost, parsed.port)
         }
         try {
             // Validate candidateUrl directly so bracketed raw IPv6 forms (e.g. [::ffff:127.0.0.1]) are caught cleanly
@@ -194,6 +200,7 @@ class PluginRepositoryClient(
             baseUrl = baseUrl,
             indexUrl = indexUrl,
             displayAddress = displayAddress,
+            scheme = parsed.scheme,
             host = canonicalHost,
             port = parsed.port,
         )
@@ -202,14 +209,15 @@ class PluginRepositoryClient(
     /**
      * Developer-mode fetch for `d3plugin serve` on a LAN host:
      * 1. Normalizes & validates the server address (RFC1918 / IPv6 ULA only)
-     * 2. Fetches `/index.json` pinned to that single host (rejects redirects to other hosts)
-     * 3. Downloads `/plugin.d3plugin` using the SAME single-host dev policy
+     * 2. Fetches `/index.json` pinned to exact scheme + host + port (rejects redirects switching any of them)
+     * 3. Downloads `/plugin.d3plugin` using the SAME pinned scheme + host + port dev policy
      * 4. Verifies SHA-256, zip consistency, and inner manifest id/version
      */
     suspend fun fetchDevPlugin(rawServerAddress: String): DevPluginFetchResult =
         withContext(Dispatchers.IO) {
             val normalized = normalizeDevServerAddress(rawServerAddress)
             val devPolicy = devPolicyFactory(normalized.host)
+                .withPinnedEndpoint(normalized.scheme, normalized.host, normalized.port)
             val indexBytes = downloadBytes(
                 url = normalized.indexUrl,
                 maxBytes = maxIndexBytes,
@@ -246,7 +254,8 @@ class PluginRepositoryClient(
     /**
      * Developer-mode download for `d3plugin serve` on a LAN host (§9).
      * Allows plain HTTP to the explicitly entered LAN dev host while enforcing
-     * RFC1918 / IPv6 ULA only, 8 MB cap, timeout, and no cross-host redirects.
+     * RFC1918 / IPv6 ULA only, exact scheme/host/port pinning, 8 MB cap, timeout,
+     * and no cross-host/port/scheme redirects.
      */
     suspend fun downloadDevPackage(url: String): VerifiedPackageDownload =
         withContext(Dispatchers.IO) {
@@ -254,6 +263,7 @@ class PluginRepositoryClient(
             val parsed = trimmed.toHttpUrlOrNull()
                 ?: throw RepositoryVerificationException("无效的开发服务器地址：$url")
             val devPolicy = devPolicyFactory(parsed.host)
+                .withPinnedEndpoint(parsed.scheme, parsed.host, parsed.port)
             val bytes = downloadBytes(trimmed, maxPackageBytes, devPolicy, extractServerError = true)
             VerifiedPackageDownload(bytes = bytes, sha256 = sha256Hex(bytes), sourceUrl = trimmed)
         }
@@ -266,7 +276,10 @@ class PluginRepositoryClient(
             }
             val afterScheme = trimmed.substringAfter("://")
             val authority = afterScheme.substringBefore("/").substringBefore("?").substringBefore("#")
-            if (authority.isEmpty() || authority.contains('@')) {
+            if (authority.contains('@')) {
+                throw RepositoryVerificationException("开发服务器地址不支持包含用户名或密码")
+            }
+            if (authority.isEmpty()) {
                 throw RepositoryVerificationException("开发服务器地址格式无效，请检查后重试")
             }
             return "$scheme://$authority/index.json"
@@ -276,6 +289,9 @@ class PluginRepositoryClient(
             !trimmed.substringBefore("/").contains('.')
         if (isBareIpv6) {
             val bareHost = trimmed.substringBefore("/").substringBefore("?").substringBefore("#")
+            if (bareHost.contains('@')) {
+                throw RepositoryVerificationException("开发服务器地址不支持包含用户名或密码")
+            }
             return "http://[$bareHost]:$DEFAULT_DEV_SERVER_PORT/index.json"
         }
         val nonHttpScheme = NON_HTTP_SCHEME_REGEX.containsMatchIn(trimmed)
@@ -283,7 +299,10 @@ class PluginRepositoryClient(
             throw RepositoryVerificationException("仅支持 http 或 https 协议，请填写局域网开发服务器地址")
         }
         val authority = trimmed.substringBefore("/").substringBefore("?").substringBefore("#")
-        if (authority.isEmpty() || authority.contains('@')) {
+        if (authority.contains('@')) {
+            throw RepositoryVerificationException("开发服务器地址不支持包含用户名或密码")
+        }
+        if (authority.isEmpty()) {
             throw RepositoryVerificationException("开发服务器地址格式无效，请检查后重试")
         }
         val hasExplicitPort = if (authority.startsWith("[")) {

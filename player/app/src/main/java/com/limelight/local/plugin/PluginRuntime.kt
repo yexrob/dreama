@@ -334,60 +334,6 @@ class PluginRuntime(
         ensureInitializedLocked(timeoutMsOverride ?: defaultTimeoutMs)
     }
 
-    /**
-     * Compiles and registers `main.js` without invoking `init(ctx)` so developer mode can
-     * detect syntax/export errors before committing a reload over an existing working plugin.
-     */
-    internal suspend fun verifyModuleCompiles(timeoutMsOverride: Long? = null) = callMutex.withLock {
-        val timeoutMs = timeoutMsOverride ?: defaultTimeoutMs
-        val loader = moduleLoader {
-            load { name ->
-                when (name) {
-                    "plugin/main.js", "./main.js", "main.js" -> ModuleContent.Source(mainJsSource)
-                    else -> null
-                }
-            }
-        }
-        val qjs = QuickJs.create(jobDispatcher = dispatcher, moduleLoader = loader)
-        qjs.memoryLimit = memoryLimitBytes
-        qjs.maxStackSize = MAX_STACK_BYTES
-        qjs.evaluationTimeoutMillis = timeoutMs
-        val dl = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
-        callDeadlineNanos = dl
-        domParser.setCallDeadlineNanos(dl)
-        val token = PluginCrypto.hexEncode(PluginCrypto.randomBytes(16))
-        try {
-            bindHostBridge(qjs, token)
-            withContext(dispatcher) {
-                withTimeout(timeoutMs) {
-                    qjs.evaluate<Unit>(SHARED_BOOTSTRAP_JS, filename = "__d3_bootstrap.js")
-                    qjs.evaluate<Unit>(
-                        "__d3_seal_bootstrap(${JsonPrimitive(token)});",
-                        filename = "__d3_seal.js",
-                    )
-                    qjs.evaluate<Unit>(
-                        """
-                        import __plugin from 'plugin/main.js';
-                        globalThis.__d3_register(__plugin);
-                        """.trimIndent(),
-                        filename = "__d3_entry.js",
-                        asModule = true,
-                    )
-                }
-            }
-        } catch (t: Throwable) {
-            handleInvocationFailureLocked(qjs, "load", t, null)
-        } finally {
-            try { qjs.interruptEvaluation() } catch (_: Throwable) {}
-            try {
-                withContext(dispatcher) { qjs.close() }
-            } catch (_: Throwable) {
-                runCatching { qjs.close() }
-            }
-            callDeadlineNanos = Long.MAX_VALUE
-        }
-    }
-
     suspend fun reset() = callMutex.withLock {
         destroyRuntimeLocked(runDispose = true)
     }
@@ -1174,6 +1120,78 @@ class PluginRuntime(
 
         private val SHARED_BOOTSTRAP_JS: String by lazy {
             JsonSchemaValidator.loadBundledResourceText("runtime-bootstrap.js")
+        }
+
+        /**
+         * Evaluates ES module syntax, top-level module statements, and default export shape
+         * of [mainJsSource] in a **zero-capability** QuickJS sandbox:
+         * - NO host bridge bindings (`__d3_host` is absent)
+         * - NO `ctx`, NO network gateway, NO storage, NO cookies, NO filesystem access
+         *
+         * Because ES module evaluation executes top-level module code, callers MUST only invoke
+         * this AFTER explicit user confirmation (or during a same-origin, non-permission-expanded
+         * developer reload) and NEVER during unconfirmed package preview.
+         */
+        internal suspend fun probeModuleLoadNoCapabilities(
+            mainJsSource: String,
+            memoryLimitBytes: Long = DEFAULT_MEMORY_LIMIT_BYTES,
+            timeoutMs: Long = DEFAULT_CALL_TIMEOUT_MS,
+        ) {
+            val probeExecutor = Executors.newSingleThreadExecutor { runnable ->
+                Thread(runnable, "depth3d-qjs-probe").apply { isDaemon = true }
+            }
+            val probeDispatcher = probeExecutor.asCoroutineDispatcher()
+            val loader = moduleLoader {
+                load { name ->
+                    when (name) {
+                        "plugin/main.js", "./main.js", "main.js" -> ModuleContent.Source(mainJsSource)
+                        else -> null
+                    }
+                }
+            }
+            val qjs = QuickJs.create(jobDispatcher = probeDispatcher, moduleLoader = loader)
+            qjs.memoryLimit = memoryLimitBytes
+            qjs.maxStackSize = MAX_STACK_BYTES
+            qjs.evaluationTimeoutMillis = timeoutMs
+            try {
+                withContext(probeDispatcher) {
+                    withTimeout(timeoutMs) {
+                        qjs.evaluate<Unit>(
+                            """
+                            globalThis.__d3_probe_register = function(mod) {
+                              if (!mod || typeof mod !== 'object') {
+                                throw new TypeError('Plugin module must export a default object');
+                              }
+                            };
+                            undefined;
+                            """.trimIndent(),
+                            filename = "__d3_probe.js",
+                        )
+                        qjs.evaluate<Unit>(
+                            """
+                            import __plugin from 'plugin/main.js';
+                            globalThis.__d3_probe_register(__plugin);
+                            """.trimIndent(),
+                            filename = "__d3_entry.js",
+                            asModule = true,
+                        )
+                    }
+                }
+            } finally {
+                try { qjs.interruptEvaluation() } catch (_: Throwable) {}
+                try {
+                    withContext(probeDispatcher) { qjs.close() }
+                } catch (_: Throwable) {
+                    runCatching { qjs.close() }
+                }
+                probeExecutor.shutdown()
+                try {
+                    probeExecutor.awaitTermination(SHUTDOWN_WAIT_MS, TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+                probeExecutor.shutdownNow()
+            }
         }
     }
 }
