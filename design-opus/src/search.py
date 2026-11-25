@@ -72,6 +72,7 @@ CSS = """
 .kb .k.go{width:184px;background:#ECECEE;color:#0E0F12;font-weight:600}
 .kb .k.sp{width:304px}
 .sa{position:absolute;left:160px;width:1280px;top:570px;height:0;border-top:2px dashed rgba(255,255,255,.55);z-index:55;pointer-events:none}
+.circ{width:88px;height:88px;border-radius:50%;background:var(--fill);display:grid;place-items:center}
 .empty{position:absolute;left:64px;right:64px;display:flex;flex-direction:column;align-items:center;text-align:center}
 """
 
@@ -163,13 +164,13 @@ def keyboard():
 
 # ------------------------------------------------------------------ data
 NAS = [
-    ('p', 'tide', '潮汐表', '剧集 · 2023', None, ''),
+    ('p', 'tide', '潮汐表', '剧集 2023', None, ''),
     ('w', 'tide', '退潮之后', '潮汐表 第 2 季第 3 集', None, 'hue-rotate(10deg) brightness(.85)'),
-    ('p', 'night', '暗潮', '电影 · 2019', None, ''),
+    ('p', 'night', '暗潮', '电影 2019', None, ''),
     ('p', 'dusk', '潮声', '剩 64 分钟', 30, ''),
-    ('p', 'salt', '观潮的人', '电影 · 2016', None, ''),
+    ('p', 'salt', '观潮的人', '电影 2016', None, ''),
     ('w', 'tide', '涨潮时分', '潮汐表 第 1 季第 6 集', None, 'brightness(.7) saturate(.8)'),
-    ('p', 'summer', '潮湿的季节', '电影 · 2022', None, ''),
+    ('p', 'summer', '潮湿的季节', '电影 2022', None, ''),
 ]
 VIDS = [
     ('w', 'tide', '看潮汐的一百种方法', '12:40 · 3 天前', None, 'hue-rotate(-20deg)'),
@@ -189,7 +190,7 @@ NAS_SUB = 'Jellyfin · 23 个'
 # ------------------------------------------------------------------ states
 
 def st_idle():
-    hist = ['雾港', '潮汐表', '慢车 第二季', '海边 纪录片', '晚班', '冬至以后', '玻璃城']
+    hist = ['雾港', '潮汐表', '慢车 第二季', '海边 纪录片', '晚班', '冬至以后']
     chips = ''.join(f'<span class="chip{" is-hover" if h == "雾港" else ""}">{ic("clock")}{h}</span>' for h in hist)
     seen = ''.join([
         card('harbor', '雾港', '剩 38 分钟', 66, meta_left=True),
@@ -199,9 +200,9 @@ def st_idle():
         card('glass', '玻璃城', '剩 12 分钟', 90, meta_left=True),
     ])
     added = ''.join(ri('p', sc, t, m) for sc, t, m in (
-        ('snow', '冬至以后', '电影 · NAS'), ('shift', '晚班', '剧集 · NAS'), ('rust', '无人区信号', '电影 · 书房 Mac'),
-        ('echo', '回声测距', '电影 · NAS'), ('summer', '第七个夏天', '电影 · 本机'), ('glass', '玻璃城', '剧集 · NAS'),
-        ('dusk', '远山灯火', '电影 · NAS'), ('salt', '盐湖', '电影 · NAS')))
+        ('snow', '冬至以后', 'NAS'), ('shift', '晚班', 'NAS'), ('rust', '无人区信号', '书房 Mac'),
+        ('echo', '回声测距', 'NAS'), ('summer', '第七个夏天', '本机'), ('glass', '玻璃城', 'NAS'),
+        ('dusk', '远山灯火', 'NAS'), ('salt', '盐湖', 'NAS')))
     return ('<div data-st="idle">' + topbar() +
             '<div class="sec-title" style="top:120px">最近搜过</div>'
             '<div class="abs" style="right:64px;top:112px"><span class="btn ghost sm">清除</span></div>'
@@ -239,7 +240,7 @@ def st_done():
             clip(src_row(192, 'NAS', NAS_SUB, items(NAS, hover='暗潮') + more(23)) +
                  src_row(558, '拾光视频', '插件 · 40 个以上', vids + more('40+')) +
                  src_row(924, '老片库', '插件 · 3 个',
-                         ri('p', 'rust', '潮', '电影 · 1987') + ri('p', 'glass', '潮起潮落', '剧集 · 1994') +
+                         ri('p', 'rust', '潮', '电影 1987') + ri('p', 'glass', '潮起潮落', '剧集 1994') +
                          ri('f', '', '潮系列合集', '文件夹 · 18 项')) +
                  tail(1290, '不支持搜索：本机、Google Drive、旧电脑共享'))
             + cursor(642, 344) + '</div>')
@@ -247,17 +248,17 @@ def st_done():
 
 def st_expanded():
     # scrolled so the second and third lines of the grid are in view; page 2 is loading
-    l1 = [('p', 'tide', '潮汐表', '剧集 · 2023', None, ''),
+    l1 = [('p', 'tide', '潮汐表', '剧集 2023', None, ''),
           ('w', 'tide', '退潮之后', '潮汐表 第 2 季第 3 集', None, 'hue-rotate(10deg) brightness(.85)'),
-          ('p', 'night', '暗潮', '电影 · 2019', None, ''),
+          ('p', 'night', '暗潮', '电影 2019', None, ''),
           ('p', 'dusk', '潮声', '剩 64 分钟', 30, ''),
-          ('p', 'salt', '观潮的人', '电影 · 2016', None, '')]
+          ('p', 'salt', '观潮的人', '电影 2016', None, '')]
     l2 = [('w', 'tide', '涨潮时分', '潮汐表 第 1 季第 6 集', None, 'brightness(.7) saturate(.8)'),
-          ('p', 'summer', '潮湿的季节', '电影 · 2022', None, ''),
-          ('p', 'harbor', '潮水退去', '电影 · 2020', None, 'hue-rotate(30deg)'),
-          ('p', 'echo', '回潮', '剧集 · 2024', None, ''),
-          ('p', 'shift', '潮夜', '电影 · 2018', None, '')]
-    l3 = [('p', 'snow', '冬潮', '电影 · 2021', None, ''),
+          ('p', 'summer', '潮湿的季节', '电影 2022', None, ''),
+          ('p', 'harbor', '潮水退去', '电影 2020', None, 'hue-rotate(30deg)'),
+          ('p', 'echo', '回潮', '剧集 2024', None, ''),
+          ('p', 'shift', '潮夜', '电影 2018', None, '')]
+    l3 = [('p', 'snow', '冬潮', '电影 2021', None, ''),
           ('w', 'tide', '大潮', '潮汐表 第 3 季第 1 集', 40, 'hue-rotate(-24deg) brightness(.9)')]
     line = lambda y, data, extra='', hover=None: f'<div class="srow" style="top:{y}px">{items(data, hover)}{extra}</div>'
     grid = (line(196, l1) + line(498, l2, hover='潮湿的季节') +
@@ -266,7 +267,7 @@ def st_expanded():
     head = ('<div class="abs" style="left:152px;top:32px;display:flex;align-items:baseline;gap:20px;height:64px">'
             '<span class="t-title" style="line-height:64px">NAS 里的「潮」</span><span class="t-cap c2">Jellyfin · 23 个</span></div>')
     return ('<div data-st="expanded">' + f'<span class="ibtn bg back">{ic("chev-l")}</span>' + head +
-            kinds() + clip(grid, scroll=302) + cursor(492, 300) + '</div>')
+            kinds() + clip(grid, scroll=280) + cursor(492, 320) + '</div>')
 
 
 def st_noresult():
@@ -281,7 +282,7 @@ def st_noresult():
             '<div style="margin-top:44px;display:flex;align-items:center;gap:16px">'
             '<span class="t-cap c2">本机、Google Drive、旧电脑共享不支持搜索</span>'
             f'<span class="btn ghost sm">去媒体库翻翻{ic("chev-r")}</span></div></div>'
-            + cursor(520, 452) + '</div>')
+            + cursor(392, 446) + '</div>')
 
 
 def st_trouble():
@@ -290,7 +291,7 @@ def st_trouble():
                  sline(550, 'user', '「拾光视频」登录后才能搜', '登录') +
                  sline(630, 'alert', '「老片库」连不上，这次没搜它', f'{ic("refresh")}重试', danger=True, hover=True) +
                  tail(718, '不支持搜索：本机、Google Drive、旧电脑共享'))
-            + cursor(1178, 666) + '</div>')
+            + cursor(1206, 684) + '</div>')
 
 
 def st_nosource():
@@ -302,7 +303,7 @@ def st_nosource():
             '加一个 Jellyfin、Emby 或支持搜索的插件，这里就能搜。</div>'
             '<div class="btns" style="margin-top:40px;justify-content:center">'
             '<span class="btn primary is-hover">去媒体库</span><span class="btn">添加播放源</span></div></div>'
-            + cursor(552, 560) + '</div>')
+            + cursor(540, 478) + '</div>')
 
 
 STATES = [
