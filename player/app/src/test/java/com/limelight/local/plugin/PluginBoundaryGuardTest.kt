@@ -61,6 +61,8 @@ class PluginBoundaryGuardTest {
         "com/limelight/local/media/Model.kt",
         "com/limelight/local/wall/WallActivity.kt",
         "com/limelight/local/wall/Components.kt",
+        // Talks only to a paired depth3d Host over its pinned-certificate control port.
+        "com/limelight/local/stream/HostProtocolClient.kt",
     )
 
     private val rawPlaybackOrHttpPatterns = listOf(
