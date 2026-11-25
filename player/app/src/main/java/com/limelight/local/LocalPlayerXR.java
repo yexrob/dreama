@@ -28,6 +28,7 @@ import androidx.media3.datasource.DefaultDataSource;
 import androidx.media3.datasource.DefaultHttpDataSource;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector;
 
 import com.limelight.LimeLog;
 import com.limelight.binding.video.XrRenderer;
@@ -35,7 +36,9 @@ import com.limelight.binding.video.XrStartFailure;
 import com.limelight.local.dlna.CastReceiver;
 import com.limelight.local.dlna.PlayerLink;
 import com.limelight.local.dlna.PlayerState;
+import com.limelight.local.media.SourceKind;
 import com.limelight.local.media.WatchHistory;
+import com.limelight.local.plugin.PluginHostGuards;
 import com.limelight.preferences.PreferenceConfiguration;
 
 import java.util.Collections;
@@ -71,6 +74,10 @@ public class LocalPlayerXR extends Activity
     public static final String EXTRA_START_MS = "start_ms";
     public static final String EXTRA_SOURCE_ID = "source_id";
     public static final String EXTRA_ITEM_ID = "item_id";
+    public static final String EXTRA_PARENT_ID = "parent_id";
+    // Plugin playback: opaque instance ID + optional known duration (never raw URL or headers)
+    public static final String EXTRA_PLUGIN_INSTANCE_ID = "plugin_instance_id";
+    public static final String EXTRA_DURATION_MS = "duration_ms";
     // A DLNA cast: which one, so the phone's commands reach only the player
     // showing it, and the stream type where the url does not say
     public static final String EXTRA_CAST_ID = "cast_id";
@@ -98,14 +105,21 @@ public class LocalPlayerXR extends Activity
     // Main thread
     private ExoPlayer player;
     private DefaultHttpDataSource.Factory http;
+    private SourceKind sourceKind = SourceKind.LOCAL;
+    private PluginPlayerSession pluginSession;
+    private long fallbackDurationMs;
+    private boolean refreshInFlight;
     private boolean held;
     private long castId;
     private long startMs;
+    private long lastKnownPositionMs;
     // The current item has been ready once; the session's surface is on the player
     private boolean ready;
     private boolean surfaceSet;
     private boolean wantPlay = true;
     private boolean errored;
+    private String errorReason;
+    private boolean errorCanRetry = true;
     private boolean checkShape;
     private int sessionW, sessionH;
     private Intent relaunch;
@@ -131,8 +145,22 @@ public class LocalPlayerXR extends Activity
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
+        final PluginLaunchArgs pluginArgs;
+        try {
+            pluginArgs = resolvePluginIntentOrThrow(getIntent());
+        } catch (UnsupportedOperationException e) {
+            LimeLog.warning("depth3d: rejected cast attachment on plugin playback intent");
+            Toast.makeText(this, getString(com.limelight.R.string.plugin_cast_unsupported), Toast.LENGTH_LONG).show();
+            finish();
+            return;
+        }
         final Uri uri = getIntent().getData();
-        if (uri == null) {
+        sourceKind = pluginArgs != null
+                ? SourceKind.PLUGIN
+                : (isHttp(uri) ? SourceKind.WEBDAV : SourceKind.LOCAL);
+        final boolean pluginMode = PluginHostGuards.isPluginSource(sourceKind);
+
+        if (!pluginMode && uri == null) {
             finish();
             return;
         }
@@ -140,14 +168,26 @@ public class LocalPlayerXR extends Activity
         CastReceiver.hold(this);
         held = true;
 
-        // The user agent Android's own MediaPlayer sends, which the WebDAV
-        // share always got and which the phones' CDNs take from TV boxes
-        http = new DefaultHttpDataSource.Factory()
-                .setUserAgent("stagefright/1.2 (Linux;Android " + Build.VERSION.RELEASE + ")")
-                .setAllowCrossProtocolRedirects(true);
-        player = new ExoPlayer.Builder(this)
-                .setMediaSourceFactory(new DefaultMediaSourceFactory(new DefaultDataSource.Factory(this, http)))
-                .build();
+        DefaultTrackSelector trackSelector = createTrackSelector(this);
+
+        if (pluginMode) {
+            // Plugin sources NEVER use DefaultHttpDataSource: every manifest, segment,
+            // backup URL, and subtitle goes strictly through PluginPlayback + NetworkPolicy.
+            player = new ExoPlayer.Builder(this)
+                    .setTrackSelector(trackSelector)
+                    .build();
+            pluginSession = PluginPlayerSession.create(this);
+        } else {
+            // The user agent Android's own MediaPlayer sends, which the WebDAV
+            // share always got and which the phones' CDNs take from TV boxes
+            http = new DefaultHttpDataSource.Factory()
+                    .setUserAgent("stagefright/1.2 (Linux;Android " + Build.VERSION.RELEASE + ")")
+                    .setAllowCrossProtocolRedirects(true);
+            player = new ExoPlayer.Builder(this)
+                    .setTrackSelector(trackSelector)
+                    .setMediaSourceFactory(new DefaultMediaSourceFactory(new DefaultDataSource.Factory(this, http)))
+                    .build();
+        }
         player.setAudioAttributes(new AudioAttributes.Builder()
                 .setUsage(C.USAGE_MEDIA)
                 .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
@@ -156,18 +196,113 @@ public class LocalPlayerXR extends Activity
         player.setVideoChangeFrameRateStrategy(C.VIDEO_CHANGE_FRAME_RATE_STRATEGY_OFF);
         player.addListener(events);
         // Buffers while the session starts
-        load(getIntent());
+        if (pluginMode) {
+            loadPlugin(pluginArgs);
+        } else {
+            load(getIntent());
+        }
+        guardCastAttachment(sourceKind, castId);
         PlayerLink.attach(this, castId);
         main.post(barTick);
 
         final boolean cast = castId != 0;
-        new Thread(() -> startSession(uri, cast), "depth3d-start").start();
+        final String logLabel = pluginMode ? ("plugin:" + pluginArgs.getItemId()) : String.valueOf(uri);
+        new Thread(() -> startSession(uri, cast, pluginMode, logLabel), "depth3d-start").start();
+    }
+
+    /** Creates the shared track selector preferring Chinese subtitle tracks across all sources. */
+    static DefaultTrackSelector createTrackSelector(Context context) {
+        DefaultTrackSelector trackSelector = new DefaultTrackSelector(context);
+        trackSelector.setParameters(trackSelector.buildUponParameters()
+                .setPreferredTextLanguage("zh")
+                .setSelectUndeterminedTextLanguage(true));
+        return trackSelector;
+    }
+
+    /**
+     * Parses a plugin launch [Intent] and rejects any non-zero [EXTRA_CAST_ID] BEFORE [loadPlugin]
+     * clears `castId` (§1.4/§2.4), throwing [UnsupportedOperationException] via [PluginHostGuards].
+     */
+    static PluginLaunchArgs resolvePluginIntentOrThrow(Intent intent) {
+        PluginLaunchArgs args = PluginPlayerLaunch.parseIntent(intent);
+        if (args != null && intent != null) {
+            long incomingCastId = intent.getLongExtra(EXTRA_CAST_ID, 0L);
+            guardCastAttachment(SourceKind.PLUGIN, incomingCastId);
+        }
+        return args;
+    }
+
+    /** Enforces §1.4/§2.4: plugin playback may never attach to an active DLNA cast session. */
+    static void guardCastAttachment(SourceKind kind, long activeCastId) {
+        if (activeCastId != 0) {
+            PluginHostGuards.requireNonPluginCast(kind, null, null);
+        }
+    }
+
+    private void loadPlugin(PluginLaunchArgs args) {
+        if (args == null || pluginSession == null || player == null) {
+            finish();
+            return;
+        }
+        castId = 0;
+        startMs = args.getStartMs();
+        lastKnownPositionMs = startMs;
+        fallbackDurationMs = args.getDurationMs() != null ? args.getDurationMs() : 0L;
+        ready = false;
+        errored = false;
+        errorReason = null;
+        errorCanRetry = true;
+        refreshInFlight = false;
+        wantPlay = true;
+        player.setRepeatMode(Player.REPEAT_MODE_OFF);
+        player.setWakeMode(C.WAKE_MODE_NETWORK);
+        player.setPlayWhenReady(false);
+        notice(getString(com.limelight.R.string.plugin_player_opening), title());
+
+        pluginSession.loadAsync(
+                args.getInstanceId(),
+                args.getItemId(),
+                startMs,
+                args.getDurationMs(),
+                new PluginPlayerSession.LoadCallback() {
+                    @Override
+                    public void onLoaded(LoadedPluginMedia media) {
+                        ExoPlayer p = player;
+                        if (p == null || isDestroyedOrFinishing()) {
+                            return;
+                        }
+                        if (media.getDurationMs() != null && media.getDurationMs() > 0L) {
+                            fallbackDurationMs = media.getDurationMs();
+                        }
+                        startMs = media.getResumePositionMs();
+                        p.setMediaSource(media.getMediaSource());
+                        p.prepare();
+                        tickBar();
+                    }
+
+                    @Override
+                    public void onFailed(Throwable error) {
+                        if (isDestroyedOrFinishing()) {
+                            return;
+                        }
+                        LimeLog.warning("depth3d: plugin load failed: " + error.getClass().getSimpleName());
+                        handlePlaybackFailure(error);
+                    }
+                });
+    }
+
+    private boolean isDestroyedOrFinishing() {
+        synchronized (life) {
+            return destroyed || isFinishing();
+        }
     }
 
     private void load(Intent in) {
         Uri uri = in.getData();
         castId = in.getLongExtra(EXTRA_CAST_ID, 0);
         startMs = in.getLongExtra(EXTRA_START_MS, 0);
+        lastKnownPositionMs = startMs;
+        fallbackDurationMs = in.getLongExtra(EXTRA_DURATION_MS, 0);
         String auth = in.getStringExtra(EXTRA_AUTH);
         Map<String, String> h = Collections.emptyMap();
         if (auth != null) {
@@ -184,6 +319,8 @@ public class LocalPlayerXR extends Activity
         }
         ready = false;
         errored = false;
+        errorReason = null;
+        errorCanRetry = true;
         wantPlay = true;
         // A film of its own loops as it always did; a cast ends, for the phone to send the next
         player.setRepeatMode(castId != 0 ? Player.REPEAT_MODE_OFF : Player.REPEAT_MODE_ONE);
@@ -194,12 +331,13 @@ public class LocalPlayerXR extends Activity
     }
 
     // Off the main thread: start() waits on the OpenXR session's init
-    private void startSession(Uri uri, boolean cast) {
+    private void startSession(Uri uri, boolean cast, boolean pluginMode, String logLabel) {
         int[] size;
         float fps;
         boolean guessed = false;
-        if (cast) {
-            // A phone's stream may be HLS or FLV, which only the player reads
+        if (cast || pluginMode) {
+            // A phone's stream or plugin stream may be HLS/DASH/proxied, and plugin URLs
+            // must NEVER be probed with MediaMetadataRetriever / MediaExtractor (§1.3).
             try {
                 probed.await(PROBE_WAIT_MS, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
@@ -227,7 +365,7 @@ public class LocalPlayerXR extends Activity
         // The Gen 1 profile's 12 maps a second is a stream's budget; a film
         // held 20 on a Pico 4 with no missed refreshes
         prefs.vrDepthRate = Math.max(prefs.vrDepthRate, com.limelight.binding.video.XrShared.DEPTH_RATE_DEFAULT);
-        LimeLog.info(String.format(Locale.US, "depth3d: %s %dx%d @ %.2f%s", uri, size[0], size[1], fps,
+        LimeLog.info(String.format(Locale.US, "depth3d: %s %dx%d @ %.2f%s", logLabel, size[0], size[1], fps,
                 guessed ? " (guessed)" : ""));
 
         synchronized (life) {
@@ -284,7 +422,7 @@ public class LocalPlayerXR extends Activity
         }
         final TransportBar b = new TransportBar(size[0], size[1]);
         final int w = size[0], h = size[1];
-        final boolean check = guessed || cast;
+        final boolean check = guessed || cast || pluginMode;
         main.post(() -> sessionUp(r, b, w, h, check));
     }
 
@@ -306,12 +444,104 @@ public class LocalPlayerXR extends Activity
         } else if (!ready) {
             if (castId != 0) {
                 r.showNotice(getString(com.limelight.R.string.player_opening_cast), title());
+            } else if (PluginHostGuards.isPluginSource(sourceKind)) {
+                r.showNotice(getString(com.limelight.R.string.plugin_player_opening), title());
             } else if (isHttp(getIntent().getData())) {
                 r.showNotice(getString(com.limelight.R.string.player_buffering_webdav), title());
             }
         }
         if (ready && !errored) {
             p.setPlayWhenReady(wantPlay);
+            if (wantPlay && PluginHostGuards.isPluginSource(sourceKind) && pluginSession != null) {
+                pluginSession.reportStartAsync(position(), duration());
+            }
+        }
+        tickBar();
+    }
+
+    private void handlePlaybackFailure(Throwable error) {
+        String srcName = pluginSession != null ? pluginSession.getSourceName() : "";
+        boolean needsPermReconfirm = pluginSession != null && pluginSession.getNeedsPermissionReconfirm();
+        PlayerErrorUi ui = PluginPlayerSession.formatPlayerError(
+                this, error, sourceKind, srcName, needsPermReconfirm);
+        errored = true;
+        errorReason = ui.getReason();
+        errorCanRetry = ui.getCanRetry();
+        notice(errorReason, null);
+        probed.countDown();
+        tickBar();
+    }
+
+    private void triggerPluginRefresh(long resumePos, Integer httpCode, Throwable fallbackError) {
+        if (pluginSession == null || refreshInFlight) {
+            if (fallbackError != null) {
+                handlePlaybackFailure(fallbackError);
+            }
+            return;
+        }
+        refreshInFlight = true;
+        notice(getString(com.limelight.R.string.plugin_player_refreshing), null);
+        pluginSession.refreshAsync(resumePos, httpCode, new PluginPlayerSession.RefreshCallback() {
+            @Override
+            public void onRefreshed(LoadedPluginMedia media) {
+                refreshInFlight = false;
+                ExoPlayer p = player;
+                if (p == null || isDestroyedOrFinishing()) {
+                    return;
+                }
+                if (media.getDurationMs() != null && media.getDurationMs() > 0L) {
+                    fallbackDurationMs = media.getDurationMs();
+                }
+                errored = false;
+                errorReason = null;
+                ready = false;
+                startMs = media.getResumePositionMs();
+                p.setMediaSource(media.getMediaSource());
+                p.prepare();
+                tickBar();
+            }
+
+            @Override
+            public void onNoRefreshNeeded() {
+                refreshInFlight = false;
+                if (fallbackError != null && !isDestroyedOrFinishing()) {
+                    handlePlaybackFailure(fallbackError);
+                }
+            }
+
+            @Override
+            public void onFailed(Throwable error) {
+                refreshInFlight = false;
+                if (!isDestroyedOrFinishing()) {
+                    LimeLog.warning("depth3d: plugin refresh failed: " + error.getClass().getSimpleName());
+                    handlePlaybackFailure(error);
+                }
+            }
+        });
+    }
+
+    private void retryCurrentPlayback() {
+        ExoPlayer p = player;
+        if (p == null) {
+            return;
+        }
+        long resumePos = PluginPlayerLaunch.computeRetryPositionMs(position(), lastKnownPositionMs, startMs);
+        if (PluginHostGuards.isPluginSource(sourceKind)) {
+            PluginLaunchArgs parsed = PluginPlayerLaunch.parseIntent(getIntent());
+            loadPlugin(parsed != null ? PluginPlayerLaunch.withResumePosition(parsed, resumePos) : null);
+        } else {
+            startMs = resumePos;
+            lastKnownPositionMs = resumePos;
+            errored = false;
+            errorReason = null;
+            wantPlay = true;
+            if (resumePos > 0) {
+                p.seekTo(resumePos);
+            }
+            p.prepare();
+            if (ready && surfaceSet) {
+                p.setPlayWhenReady(true);
+            }
         }
         tickBar();
     }
@@ -325,19 +555,48 @@ public class LocalPlayerXR extends Activity
             }
             if (state == Player.STATE_READY && !ready) {
                 ready = true;
-                long d = p.getDuration();
+                if (pluginSession != null) {
+                    pluginSession.markPlaybackReady();
+                }
+                long d = duration();
                 // A resume point in the last seconds would only loop round to the start
-                boolean nearEnd = castId == 0 && d != C.TIME_UNSET && startMs >= d - 5000;
+                boolean nearEnd = castId == 0 && d > 0 && startMs >= d - 5000;
                 if (startMs > 0 && !nearEnd) {
                     p.seekTo(startMs);
                 }
                 if (surfaceSet) {
                     p.setPlayWhenReady(wantPlay);
+                    if (wantPlay && PluginHostGuards.isPluginSource(sourceKind) && pluginSession != null) {
+                        pluginSession.reportStartAsync(position(), duration());
+                    }
                 }
-            } else if (state == Player.STATE_BUFFERING && ready && isHttp(getIntent().getData())) {
+            } else if (state == Player.STATE_BUFFERING && ready
+                    && (PluginHostGuards.isPluginSource(sourceKind) || isHttp(getIntent().getData()))) {
                 notice(getString(com.limelight.R.string.player_buffering), null);
+            } else if (state == Player.STATE_ENDED) {
+                saveProgress();
+                if (PluginHostGuards.isPluginSource(sourceKind) && pluginSession != null) {
+                    long d = duration();
+                    pluginSession.reportFinishAsync(d > 0 ? d : position(), d);
+                }
             }
             tickBar();
+        }
+
+        @Override
+        public void onIsPlayingChanged(boolean isPlaying) {
+            if (!PluginHostGuards.isPluginSource(sourceKind) || pluginSession == null || !ready) {
+                return;
+            }
+            ExoPlayer p = player;
+            if (p == null) {
+                return;
+            }
+            if (isPlaying) {
+                pluginSession.reportStartAsync(position(), duration());
+            } else if (p.getPlaybackState() != Player.STATE_ENDED && !errored && !refreshInFlight) {
+                pluginSession.reportPauseAsync(position(), duration());
+            }
         }
 
         @Override
@@ -369,13 +628,24 @@ public class LocalPlayerXR extends Activity
 
         @Override
         public void onPlayerError(PlaybackException e) {
-            errored = true;
+            long curPos = position();
+            if (curPos > 0) {
+                lastKnownPositionMs = curPos;
+            }
+            if (PluginHostGuards.isPluginSource(sourceKind) && pluginSession != null) {
+                Integer httpCode = PluginPlayerSession.extractHttpStatusCode(e);
+                long resumePos = PluginPlayerLaunch.computeRetryPositionMs(curPos, lastKnownPositionMs, startMs);
+                if (!refreshInFlight && pluginSession.canAttemptAutoRefresh(httpCode)) {
+                    LimeLog.info("depth3d: refreshing plugin stream after HTTP " + httpCode);
+                    triggerPluginRefresh(resumePos, httpCode, e);
+                    return;
+                }
+                LimeLog.warning("depth3d: plugin playback error: " + e.getErrorCodeName());
+                handlePlaybackFailure(e);
+                return;
+            }
             LimeLog.warning("depth3d: cannot play " + getIntent().getData() + ": " + e);
-            notice(getString(castId != 0
-                    ? com.limelight.R.string.player_cast_error
-                    : com.limelight.R.string.player_play_error), e.getErrorCodeName());
-            probed.countDown();
-            tickBar();
+            handlePlaybackFailure(e);
         }
     };
 
@@ -408,16 +678,19 @@ public class LocalPlayerXR extends Activity
         }
     }
 
-    // The session's screen has the shape it started with: a cast of another
+    // The session's screen has the shape it started with: a cast or plugin stream of another
     // shape gets a session of its own, at the same place in the video
     private void relaunch() {
         LimeLog.info("depth3d: the picture is another shape, starting the session again");
-        relaunch = new Intent(this, LocalPlayerXR.class)
-                .setData(getIntent().getData())
+        Intent nextIntent = new Intent(this, LocalPlayerXR.class)
                 .putExtras(getIntent())
                 .putExtra(EXTRA_RELAUNCHED, true)
                 .putExtra(EXTRA_START_MS, position())
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        if (getIntent().getData() != null) {
+            nextIntent.setData(getIntent().getData());
+        }
+        relaunch = nextIntent;
         finish();
     }
 
@@ -426,18 +699,45 @@ public class LocalPlayerXR extends Activity
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         ExoPlayer p = player;
-        if (intent.getData() == null || p == null || relaunch != null) {
+        if (p == null || relaunch != null) {
+            return;
+        }
+        final PluginLaunchArgs incomingPlugin;
+        try {
+            incomingPlugin = resolvePluginIntentOrThrow(intent);
+        } catch (UnsupportedOperationException e) {
+            LimeLog.warning("depth3d: rejected cast attachment on incoming plugin intent");
+            notice(getString(com.limelight.R.string.plugin_cast_unsupported), null);
+            Toast.makeText(this, getString(com.limelight.R.string.plugin_cast_unsupported), Toast.LENGTH_LONG).show();
+            return;
+        }
+        boolean incomingIsPlugin = incomingPlugin != null;
+        if (!incomingIsPlugin && intent.getData() == null) {
             return;
         }
         saveProgress();
+        if (PluginHostGuards.isPluginSource(sourceKind) && pluginSession != null) {
+            pluginSession.reportStopFireAndForget(position(), duration());
+        }
+        // Switching between plugin and non-plugin mode requires rebuilding ExoPlayer's data source
+        if (incomingIsPlugin != PluginHostGuards.isPluginSource(sourceKind)) {
+            relaunch = new Intent(intent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            finish();
+            return;
+        }
         long old = castId;
         long next = intent.getLongExtra(EXTRA_CAST_ID, 0);
         if (old != next) {
             PlayerLink.detach(this, old, position(), duration(), true);
         }
         setIntent(intent);
-        load(intent);
+        if (incomingIsPlugin) {
+            loadPlugin(incomingPlugin);
+        } else {
+            load(intent);
+        }
         if (old != next) {
+            guardCastAttachment(sourceKind, castId);
             PlayerLink.attach(this, castId);
         }
         checkShape = surfaceSet;
@@ -451,6 +751,7 @@ public class LocalPlayerXR extends Activity
     }
 
     private int[] videoSize(Uri uri) {
+        PluginHostGuards.requireNonPluginFrameProbe(sourceKind, null, null);
         MediaMetadataRetriever mmr = new MediaMetadataRetriever();
         try {
             if (isHttp(uri)) {
@@ -473,6 +774,7 @@ public class LocalPlayerXR extends Activity
     }
 
     private float frameRate(Uri uri) {
+        PluginHostGuards.requireNonPluginFrameProbe(sourceKind, null, null);
         MediaExtractor ex = new MediaExtractor();
         try {
             ex.setDataSource(this, uri, headers);
@@ -516,7 +818,10 @@ public class LocalPlayerXR extends Activity
     private long duration() {
         ExoPlayer p = player;
         long d = p != null ? p.getDuration() : C.TIME_UNSET;
-        return d == C.TIME_UNSET ? 0 : Math.max(0, d);
+        if (d != C.TIME_UNSET && d > 0) {
+            return d;
+        }
+        return Math.max(0, fallbackDurationMs);
     }
 
     private boolean playing() {
@@ -531,9 +836,8 @@ public class LocalPlayerXR extends Activity
         }
         wantPlay = on;
         if (on && errored) {
-            // Try again: a phone's play after a failed open, or the trigger
-            errored = false;
-            p.prepare();
+            retryCurrentPlayback();
+            return;
         }
         if (on && p.getPlaybackState() == Player.STATE_ENDED) {
             p.seekTo(0);
@@ -585,10 +889,12 @@ public class LocalPlayerXR extends Activity
         if (p == null) {
             return;
         }
+        long clamped = Math.max(0, ms);
+        lastKnownPositionMs = clamped;
         if (!ready) {
-            startMs = ms;
+            startMs = clamped;
         } else {
-            p.seekTo(Math.max(0, ms));
+            p.seekTo(clamped);
         }
         tickBar();
     }
@@ -614,6 +920,14 @@ public class LocalPlayerXR extends Activity
             }
             pointerMovedMs = System.currentTimeMillis();
             float x = b.texX(u, v);
+            if (errored) {
+                if (errorCanRetry && TransportBar.onErrorRetry(x)) {
+                    retryCurrentPlayback();
+                } else if (TransportBar.onErrorBack(x)) {
+                    finish();
+                }
+                return;
+            }
             float f = Float.isNaN(x) || TransportBar.onButton(x)
                     ? Float.NaN : TransportBar.trackFraction(x);
             if (!Float.isNaN(f)) {
@@ -630,7 +944,7 @@ public class LocalPlayerXR extends Activity
 
     // Shown while paused, or for a while after the pointer moves; redrawn a
     // few times a second while it shows. Each round also tells a casting
-    // phone where the player is.
+    // phone where the player is, and ticks plugin expiry refresh / progress reports.
     private void tickBar() {
         main.removeCallbacks(barTick);
         ExoPlayer p = player;
@@ -638,18 +952,51 @@ public class LocalPlayerXR extends Activity
             return;
         }
         report();
+        boolean on = playing();
+        if (ready && !errored && !refreshInFlight) {
+            long curPos = position();
+            if (curPos > 0) {
+                lastKnownPositionMs = curPos;
+            }
+        }
+        if (PluginHostGuards.isPluginSource(sourceKind) && pluginSession != null && ready && !errored) {
+            if (!refreshInFlight && pluginSession.shouldProactiveRefresh()) {
+                LimeLog.info("depth3d: proactively refreshing expiring plugin stream");
+                long resumePos = PluginPlayerLaunch.computeRetryPositionMs(position(), lastKnownPositionMs, startMs);
+                triggerPluginRefresh(resumePos, null, null);
+            }
+            if (on) {
+                pluginSession.reportPeriodicIfDueAsync(position(), duration());
+            }
+        }
         XrRenderer r = renderer;
         TransportBar b = bar;
         if (r != null && b != null) {
-            boolean on = playing();
             long since = System.currentTimeMillis() - pointerMovedMs;
-            boolean show = !on || since < BAR_LINGER_MS;
-            r.setTransportVisible(show);
-            if (show) {
+            if (errored) {
+                r.setTransportVisible(true);
                 float x = since < BAR_LINGER_MS ? b.texX(pointerU, pointerV) : Float.NaN;
-                boolean onBtn = !Float.isNaN(x) && TransportBar.onButton(x);
-                float hover = Float.isNaN(x) || onBtn ? Float.NaN : TransportBar.trackFraction(x);
-                r.postTransport(b.draw(on, (int) position(), (int) duration(), hover, onBtn, title()));
+                boolean retryHot = errorCanRetry && TransportBar.onErrorRetry(x);
+                boolean backHot = TransportBar.onErrorBack(x);
+                String msg = errorReason != null
+                        ? errorReason
+                        : getString(com.limelight.R.string.plugin_player_error_generic);
+                r.postTransport(b.drawError(
+                        msg,
+                        getString(com.limelight.R.string.action_retry),
+                        getString(com.limelight.R.string.player_action_back),
+                        errorCanRetry,
+                        retryHot,
+                        backHot));
+            } else {
+                boolean show = !on || since < BAR_LINGER_MS;
+                r.setTransportVisible(show);
+                if (show) {
+                    float x = since < BAR_LINGER_MS ? b.texX(pointerU, pointerV) : Float.NaN;
+                    boolean onBtn = !Float.isNaN(x) && TransportBar.onButton(x);
+                    float hover = Float.isNaN(x) || onBtn ? Float.NaN : TransportBar.trackFraction(x);
+                    r.postTransport(b.draw(on, (int) position(), (int) duration(), hover, onBtn, title()));
+                }
             }
         }
         main.postDelayed(barTick, BAR_TICK_MS);
@@ -668,7 +1015,9 @@ public class LocalPlayerXR extends Activity
             if (d > 0) {
                 to = Math.min(d - 1000, to);
             }
-            p.seekTo(Math.max(0, to));
+            long clamped = Math.max(0, to);
+            lastKnownPositionMs = clamped;
+            p.seekTo(clamped);
             pointerMovedMs = System.currentTimeMillis();
             tickBar();
         });
@@ -735,7 +1084,14 @@ public class LocalPlayerXR extends Activity
         if (p == null || !ready || source == null || item == null) {
             return;
         }
-        WatchHistory.save(this, source, item, in.getStringExtra(EXTRA_TITLE), position(), duration());
+        WatchHistory.save(
+                this,
+                source,
+                item,
+                in.getStringExtra(EXTRA_TITLE),
+                position(),
+                duration(),
+                in.getStringExtra(EXTRA_PARENT_ID));
     }
 
     // ---- lifecycle ----
@@ -772,6 +1128,13 @@ public class LocalPlayerXR extends Activity
         main.removeCallbacks(barTick);
         ExoPlayer p = player;
         long pos = position(), dur = duration();
+        if (pluginSession != null) {
+            if (relaunch == null) {
+                pluginSession.reportStopFireAndForget(pos, dur);
+            }
+            pluginSession.close();
+            pluginSession = null;
+        }
         if (p != null) {
             saveProgress();
             // Before the renderer lets the surface go, which the codec draws into

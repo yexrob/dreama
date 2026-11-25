@@ -1946,3 +1946,24 @@ test('pack and serve produce valid .d3plugin archive and repository index with m
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('manifest discover accepts mDNS service types and built-in udp:jellyfin/udp:emby while rejecting arbitrary UDP', () => {
+  const baseManifest = JSON.parse(fs.readFileSync(path.join(JF_PLUGIN_DIR, 'manifest.json'), 'utf8'));
+  assert.equal(baseManifest.version, '1.0.1');
+  assert.equal(baseManifest.config[0].discover, 'udp:jellyfin');
+  assert.equal(validateManifest(baseManifest).valid, true);
+
+  const makeWithDiscover = (val) => ({
+    ...baseManifest,
+    config: [{ ...baseManifest.config[0], discover: val }, ...baseManifest.config.slice(1)],
+  });
+
+  for (const good of ['udp:jellyfin', 'udp:emby', '_jellyfin._tcp', '_http._tcp.', '_custom-srv._udp']) {
+    const res = validateManifest(makeWithDiscover(good));
+    assert.equal(res.valid, true, `expected discover='${good}' to be valid, got: ${res.errors.join('; ')}`);
+  }
+  for (const bad of ['udp:custom', 'udp:1234', 'udp:', 'http://192.168.1.1', 'jellyfin._tcp', 'tcp:jellyfin']) {
+    const res = validateManifest(makeWithDiscover(bad));
+    assert.equal(res.valid, false, `expected discover='${bad}' to be rejected`);
+  }
+});

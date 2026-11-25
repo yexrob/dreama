@@ -13,6 +13,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -24,17 +25,29 @@ import com.limelight.R
 import com.limelight.local.media.Item
 import com.limelight.local.media.MediaSource
 import com.limelight.local.media.PlaybackInfo
+import com.limelight.local.plugin.PluginHostGuards
+import com.limelight.local.plugin.PluginMediaSource
 import com.limelight.local.stream.RetryAction
 import com.limelight.local.stream.StreamFlowState
 import com.limelight.local.stream.StreamingComputer
 import com.limelight.nvstream.http.NvApp
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 /** What the wall needs from the Activity: everything that leaves Compose. */
 interface WallActions {
     val hostActivity: Activity
-    fun launchPlayer(info: PlaybackInfo, sourceId: String, itemId: String)
+    fun launchPlayer(info: PlaybackInfo, sourceId: String, itemId: String, parentId: String? = null)
+    fun launchPluginPlayer(
+        instanceId: String,
+        sourceId: String,
+        itemId: String,
+        title: String?,
+        startMs: Long,
+        durationMs: Long?,
+        parentId: String? = null,
+    )
     fun requestStorage()
     fun toast(text: String)
     fun consumePendingTab()
@@ -46,16 +59,35 @@ sealed interface Page {
     data class Detail(val sourceId: String, val item: Item) : Page
     data class PcApps(val computer: StreamingComputer) : Page
     data object Settings : Page
+    data class Sources(val initialTab: SourcesTab = SourcesTab.SOURCES) : Page
+    data object AddSource : Page
+    data class PluginForm(
+        val pluginId: String,
+        val instanceId: String? = null,
+        val prefillServerUrl: String? = null,
+        val suggestedName: String? = null,
+        val reloginOnly: Boolean = false,
+    ) : Page
+    data class SourceEdit(val instanceId: String) : Page
+    data class PluginDetail(val pluginId: String) : Page
+    data class RepoBrowse(val repoUrl: String) : Page
 }
 
 /** The pages and the moves between them, shared by every screen. */
 class WallNav(
     private val model: WallModel,
     private val actions: WallActions,
+    private val scope: CoroutineScope,
     private val starter: (MediaSource, Item, Long) -> Unit,
 ) {
     val stack = mutableStateListOf<Page>(Page.Tabs(Tab.Home))
     var webDavSheet by mutableStateOf<String?>(null)
+        private set
+    var pluginLogsSheet by mutableStateOf<Pair<String, String>?>(null)
+        private set
+    var refreshSignal by mutableIntStateOf(0)
+        private set
+    var pendingLibrarySourceId by mutableStateOf<String?>(null)
         private set
 
     val top: Page get() = stack.last()
@@ -71,12 +103,27 @@ class WallNav(
         stack += Page.Tabs(t)
     }
 
+    fun openLibrarySelecting(sourceId: String) {
+        pendingLibrarySourceId = sourceId
+        tab(Tab.Library)
+    }
+
+    fun consumePendingLibrarySourceId(): String? {
+        val v = pendingLibrarySourceId
+        pendingLibrarySourceId = null
+        return v
+    }
+
     fun open(p: Page) {
         if (top == p) return
         stack += p
     }
 
     fun back(): Boolean {
+        if (pluginLogsSheet != null) {
+            pluginLogsSheet = null
+            return true
+        }
         if (webDavSheet != null) {
             webDavSheet = null
             return true
@@ -99,6 +146,13 @@ class WallNav(
         return false
     }
 
+    fun backAndRefresh(sourceId: String) {
+        back()
+        kept.keys.removeAll { (_, key) -> key.startsWith("listing:$sourceId:") }
+        refreshSignal++
+        model.refresh(sourceId)
+    }
+
     fun detail(source: MediaSource, item: Item) = open(Page.Detail(source.source.id, item))
 
     fun category(source: MediaSource, categoryId: String, title: String, count: Int? = null) =
@@ -111,7 +165,76 @@ class WallNav(
 
     fun openSettings() = open(Page.Settings)
 
+    fun openSources(initialTab: SourcesTab = SourcesTab.SOURCES) = open(Page.Sources(initialTab))
+
+    fun openAddSource() = open(Page.AddSource)
+
+    fun openPluginForm(
+        pluginId: String,
+        instanceId: String? = null,
+        prefillServerUrl: String? = null,
+        suggestedName: String? = null,
+        reloginOnly: Boolean = false,
+    ) = open(Page.PluginForm(pluginId, instanceId, prefillServerUrl, suggestedName, reloginOnly))
+
+    fun openSourceEdit(instanceId: String) = open(Page.SourceEdit(instanceId))
+
+    fun openPluginDetail(pluginId: String) = open(Page.PluginDetail(pluginId))
+
+    fun openRepoBrowse(repoUrl: String) = open(Page.RepoBrowse(repoUrl))
+
     fun openPcApps(computer: StreamingComputer) = open(Page.PcApps(computer))
+
+    fun pluginLogin(source: MediaSource) {
+        val pluginId = model.pluginIdForSource(source)
+        val instanceId = (source as? PluginMediaSource)?.instanceId
+            ?: source.source.id.removePrefix(PluginHost.PLUGIN_SOURCE_PREFIX).takeIf { it != source.source.id }
+        if (pluginId != null && instanceId != null) {
+            openPluginForm(pluginId = pluginId, instanceId = instanceId, reloginOnly = true)
+        } else {
+            openSources()
+        }
+    }
+
+    fun pluginSettings(source: MediaSource) {
+        val pluginId = model.pluginIdForSource(source)
+        val pkg = pluginId?.let { id -> model.installedPlugins.value.firstOrNull { it.pluginId == id } }
+        if (pkg != null && pkg.needsPermissionReconfirm) {
+            openPluginDetail(pkg.pluginId)
+            return
+        }
+        val instanceId = (source as? PluginMediaSource)?.instanceId
+            ?: source.source.id.removePrefix(PluginHost.PLUGIN_SOURCE_PREFIX).takeIf { it != source.source.id }
+        if (instanceId != null) {
+            openSourceEdit(instanceId)
+        } else {
+            openSources()
+        }
+    }
+
+    fun pluginLogs(source: MediaSource) {
+        val pluginId = model.pluginIdForSource(source) ?: return
+        openPluginLogs(pluginId)
+    }
+
+    fun openPluginLogs(pluginId: String) {
+        pluginLogsSheet = pluginId to model.pluginDisplayName(pluginId)
+    }
+
+    fun closePluginLogs() {
+        pluginLogsSheet = null
+    }
+
+    fun toast(text: String) = actions.toast(text)
+
+    fun disablePlugin(source: MediaSource) {
+        scope.launch {
+            val name = model.disablePluginForSource(source)
+            if (name != null) {
+                actions.toast(actions.hostActivity.getString(R.string.plugin_disabled_toast, name))
+            }
+        }
+    }
 
     fun connectComputer(computer: StreamingComputer, app: NvApp? = null) {
         model.streaming.connect(
@@ -146,13 +269,27 @@ class WallNav(
 fun WallApp(model: WallModel, actions: WallActions, pendingTab: StateFlow<Tab?>) {
     val scope = rememberCoroutineScope()
     val nav = remember {
-        WallNav(model, actions) { source, item, startMs ->
-            scope.launch {
-                try {
-                    val info = source.playback(item.id).copy(startPositionMs = startMs)
-                    actions.launchPlayer(info, source.source.id, item.id)
-                } catch (e: Exception) {
-                    actions.toast(actions.hostActivity.getString(R.string.wall_play_failed))
+        WallNav(model, actions, scope) { source, item, startMs ->
+            if (PluginHostGuards.isPluginSource(source.source.kind)) {
+                val instanceId = (source as? PluginMediaSource)?.instanceId
+                    ?: source.source.id.removePrefix(PluginHost.PLUGIN_SOURCE_PREFIX)
+                actions.launchPluginPlayer(
+                    instanceId = instanceId,
+                    sourceId = source.source.id,
+                    itemId = item.id,
+                    title = item.title,
+                    startMs = startMs,
+                    durationMs = item.durationMs,
+                    parentId = item.parentId,
+                )
+            } else {
+                scope.launch {
+                    try {
+                        val info = source.playback(item.id).copy(startPositionMs = startMs)
+                        actions.launchPlayer(info, source.source.id, item.id, item.parentId)
+                    } catch (e: Exception) {
+                        actions.toast(actions.hostActivity.getString(R.string.wall_play_failed))
+                    }
                 }
             }
         }
@@ -167,7 +304,8 @@ fun WallApp(model: WallModel, actions: WallActions, pendingTab: StateFlow<Tab?>)
 
     val flowState by model.streaming.flow.collectAsState()
     BackHandler(
-        enabled = nav.stack.size > 1 || nav.top != Page.Tabs(Tab.Home) || nav.webDavSheet != null || flowState !is StreamFlowState.Idle,
+        enabled = nav.stack.size > 1 || nav.top != Page.Tabs(Tab.Home) ||
+            nav.webDavSheet != null || nav.pluginLogsSheet != null || flowState !is StreamFlowState.Idle,
     ) {
         nav.back()
     }
@@ -188,9 +326,24 @@ fun WallApp(model: WallModel, actions: WallActions, pendingTab: StateFlow<Tab?>)
                     is Page.Detail -> DetailScreen(model, nav, page)
                     is Page.PcApps -> PcAppsScreen(model, nav, page)
                     Page.Settings -> SettingsScreen(model, nav)
+                    is Page.Sources -> SourcesScreen(model, nav, page.initialTab)
+                    Page.AddSource -> AddSourceScreen(model, nav)
+                    is Page.PluginForm -> PluginFormScreen(model, nav, page)
+                    is Page.SourceEdit -> SourceEditScreen(model, nav, page)
+                    is Page.PluginDetail -> PluginDetailScreen(model, nav, page)
+                    is Page.RepoBrowse -> RepoBrowseScreen(model, nav, page)
                 }
             }
             nav.webDavSheet?.let { WebDavSheet(model, nav, it) }
+            nav.pluginLogsSheet?.let { (pluginId, pluginName) ->
+                PluginLogsSheet(
+                    pluginId = pluginId,
+                    pluginName = pluginName,
+                    model = model,
+                    onDismiss = { nav.closePluginLogs() },
+                    onCleared = { actions.toast(actions.hostActivity.getString(R.string.plugin_logs_cleared)) },
+                )
+            }
         }
     }
 }

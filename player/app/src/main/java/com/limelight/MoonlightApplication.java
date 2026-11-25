@@ -5,6 +5,7 @@ import android.preference.PreferenceManager;
 
 import com.limelight.binding.audio.AudioSelfTest;
 import com.limelight.binding.video.DepthSelfTest;
+import com.limelight.local.wall.PluginHost;
 import com.limelight.preferences.PreferenceConfiguration;
 
 /**
@@ -28,6 +29,9 @@ public class MoonlightApplication extends Application {
         PreferenceConfiguration.migrateDepthRate(this);
         PreferenceConfiguration.seedGen1PerfProfile(this);
         PreferenceConfiguration.migrateDepthSource(this);
+
+        // Process-level plugin runtime holder (Room store, Keystore encryption, built-in plugins)
+        PluginHost.initialize(this);
 
         // Debug builds only, and nothing unless their properties are set
         DepthSelfTest.startIfAsked(this);

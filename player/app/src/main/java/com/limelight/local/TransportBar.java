@@ -32,6 +32,12 @@ final class TransportBar {
     private static final float TRACK_START = 330f;
     private static final float TRACK_END = TEX_W - 210f;
 
+    // Error state pill buttons on the right of the strip
+    private static final float ERR_RETRY_X0 = TEX_W - 436f;
+    private static final float ERR_RETRY_X1 = TEX_W - 236f;
+    private static final float ERR_BACK_X0 = TEX_W - 216f;
+    private static final float ERR_BACK_X1 = TEX_W - 32f;
+
     private final Bitmap bitmap = Bitmap.createBitmap(TEX_W, TEX_H, Bitmap.Config.ARGB_8888);
     private final Canvas canvas = new Canvas(bitmap);
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -72,6 +78,14 @@ final class TransportBar {
 
     static boolean onButton(float x) {
         return x <= BTN_END + 20f;
+    }
+
+    static boolean onErrorRetry(float x) {
+        return !Float.isNaN(x) && x >= ERR_RETRY_X0 - 10f && x <= ERR_RETRY_X1 + 10f;
+    }
+
+    static boolean onErrorBack(float x) {
+        return !Float.isNaN(x) && x >= ERR_BACK_X0 - 10f && x <= ERR_BACK_X1 + 10f;
     }
 
     /** 0..1 along the track for texture x, or NaN when it is not on the track. */
@@ -150,6 +164,71 @@ final class TransportBar {
             String t = title.length() > 70 ? title.substring(0, 67) + "…" : title;
             canvas.drawText(t, (x0 + x1) / 2f, 30f, paint);
         }
+        canvas.restore();
+
+        ByteBuffer buf = buffers[next];
+        next = (next + 1) % buffers.length;
+        buf.rewind();
+        bitmap.copyPixelsToBuffer(buf);
+        buf.rewind();
+        return buf;
+    }
+
+    /**
+     * Draws an error state strip with the localized reason plus clickable Retry and Back pills so
+     * a failed plugin or network stream never leaves the user on a silent black screen.
+     */
+    ByteBuffer drawError(String reason, String retryLabel, String backLabel,
+                         boolean showRetry, boolean retryHot, boolean backHot) {
+        canvas.drawColor(0, PorterDuff.Mode.SRC);
+        canvas.save();
+        canvas.translate(0f, TEX_H);
+        canvas.scale(1f, -1f);
+
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(0xE014151A);
+        canvas.drawRoundRect(new RectF(0, 0, TEX_W, TEX_H), TEX_H / 2f, TEX_H / 2f, paint);
+
+        float cy = TEX_H / 2f;
+        // Alert icon circle
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(4.5f);
+        paint.setColor(0xFFEE8577);
+        canvas.drawCircle(64f, cy, 22f, paint);
+        paint.setStyle(Paint.Style.FILL);
+        canvas.drawRoundRect(new RectF(61.5f, cy - 12f, 66.5f, cy + 3f), 2f, 2f, paint);
+        canvas.drawCircle(64f, cy + 11f, 3f, paint);
+
+        // Reason text
+        paint.setTextSize(34f);
+        paint.setColor(0xFFECECEE);
+        paint.setTextAlign(Paint.Align.LEFT);
+        String text = reason != null ? reason : "";
+        float maxTextW = (showRetry ? ERR_RETRY_X0 : ERR_BACK_X0) - 128f;
+        if (paint.measureText(text) > maxTextW && text.length() > 8) {
+            int cut = paint.breakText(text, true, maxTextW - 36f, null);
+            text = text.substring(0, Math.max(1, cut)) + "…";
+        }
+        canvas.drawText(text, 108f, cy + 12f, paint);
+
+        // Retry pill (white primary)
+        if (showRetry) {
+            paint.setColor(retryHot ? Color.WHITE : 0xFFECECEE);
+            canvas.drawRoundRect(new RectF(ERR_RETRY_X0, 18f, ERR_RETRY_X1, TEX_H - 18f), 20f, 20f, paint);
+            paint.setColor(0xFF0E0F12);
+            paint.setTextSize(32f);
+            paint.setTextAlign(Paint.Align.CENTER);
+            canvas.drawText(retryLabel != null ? retryLabel : "", (ERR_RETRY_X0 + ERR_RETRY_X1) / 2f, cy + 11f, paint);
+        }
+
+        // Back pill (translucent plain)
+        paint.setColor(backHot ? 0x47FFFFFF : 0x26FFFFFF);
+        canvas.drawRoundRect(new RectF(ERR_BACK_X0, 18f, ERR_BACK_X1, TEX_H - 18f), 20f, 20f, paint);
+        paint.setColor(0xFFECECEE);
+        paint.setTextSize(32f);
+        paint.setTextAlign(Paint.Align.CENTER);
+        canvas.drawText(backLabel != null ? backLabel : "", (ERR_BACK_X0 + ERR_BACK_X1) / 2f, cy + 11f, paint);
+
         canvas.restore();
 
         ByteBuffer buf = buffers[next];

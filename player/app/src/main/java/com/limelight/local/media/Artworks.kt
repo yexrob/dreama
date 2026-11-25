@@ -42,6 +42,12 @@ object Artworks {
 
     fun cached(art: Artwork, size: Size): Bitmap? = memory.get(key(art, size))
 
+    fun cachedByKey(cacheKey: String): Bitmap? = memory.get(cacheKey)
+
+    fun putCachedByKey(cacheKey: String, bitmap: Bitmap) {
+        memory.put(cacheKey, bitmap)
+    }
+
     suspend fun load(context: Context, art: Artwork, size: Size): Bitmap? {
         if (art.sourceKind == SourceKind.PLUGIN) {
             LimeLog.warning(

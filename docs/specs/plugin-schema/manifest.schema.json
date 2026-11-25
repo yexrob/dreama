@@ -121,7 +121,7 @@
         "required": { "type": ["boolean", "null"] },
         "discover": {
           "type": ["string", "null"],
-          "pattern": "^_[a-zA-Z0-9-]+\\._(tcp|udp)\\.?$"
+          "pattern": "^(?:_[a-zA-Z0-9-]+\\._(tcp|udp)\\.?|udp:(?:jellyfin|emby))$"
         },
         "placeholder": { "type": ["string", "null"] },
         "default": {
