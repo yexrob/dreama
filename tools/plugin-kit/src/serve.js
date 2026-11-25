@@ -10,6 +10,12 @@ import { validateManifest } from './schema.js';
 
 export const DEV_DISCOVERY_PORT = 18787;
 export const DEV_DISCOVERY_PROBE = 'depth3d-plugin-dev-discover-v1';
+export const MAX_DISCOVERY_NAME_CHARS = 80;
+export const MAX_DISCOVERY_REPLY_BYTES = 512;
+export const UDP_RATE_LIMIT_WINDOW_MS = 1000;
+export const UDP_RATE_LIMIT_PER_IP = 4;
+export const UDP_RATE_LIMIT_GLOBAL = 30;
+export const UDP_RATE_LIMIT_MAX_TRACKED_IPS = 256;
 
 /**
  * Returns true strictly for RFC1918 IPv4 (10/8, 172.16/12, 192.168/16) and
@@ -65,6 +71,99 @@ export function listLanIpv4Addresses() {
   return [...new Set(found)];
 }
 
+/**
+ * Bounded fixed-window rate limiter enforcing both per-source-IP and global caps
+ * on UDP discovery replies, with bounded IP tracking memory.
+ */
+export class UdpRateLimiter {
+  constructor({
+    windowMs = UDP_RATE_LIMIT_WINDOW_MS,
+    maxPerIp = UDP_RATE_LIMIT_PER_IP,
+    maxGlobal = UDP_RATE_LIMIT_GLOBAL,
+    maxTrackedIps = UDP_RATE_LIMIT_MAX_TRACKED_IPS,
+  } = {}) {
+    this.windowMs = windowMs;
+    this.maxPerIp = maxPerIp;
+    this.maxGlobal = maxGlobal;
+    this.maxTrackedIps = maxTrackedIps;
+    this.globalWindowStart = 0;
+    this.globalCount = 0;
+    this.perIp = new Map();
+  }
+
+  allow(sourceIp, nowMs = Date.now()) {
+    const key = String(sourceIp || '').trim().toLowerCase();
+    if (!key) return false;
+
+    if (nowMs - this.globalWindowStart >= this.windowMs) {
+      this.globalWindowStart = nowMs;
+      this.globalCount = 0;
+      this.perIp.clear();
+    }
+
+    if (this.globalCount >= this.maxGlobal) {
+      return false;
+    }
+
+    let bucket = this.perIp.get(key);
+    if (!bucket || nowMs - bucket.windowStart >= this.windowMs) {
+      if (!bucket && this.perIp.size >= this.maxTrackedIps) {
+        for (const [k, b] of this.perIp.entries()) {
+          if (nowMs - b.windowStart >= this.windowMs) {
+            this.perIp.delete(k);
+          }
+        }
+        if (this.perIp.size >= this.maxTrackedIps) {
+          return false;
+        }
+      }
+      bucket = { windowStart: nowMs, count: 0 };
+      this.perIp.set(key, bucket);
+    }
+
+    if (bucket.count >= this.maxPerIp) {
+      return false;
+    }
+
+    bucket.count += 1;
+    this.globalCount += 1;
+    return true;
+  }
+}
+
+function truncateChars(str, maxChars) {
+  const chars = Array.from(String(str || ''));
+  if (chars.length <= maxChars) return chars.join('');
+  if (maxChars <= 1) return chars.slice(0, Math.max(0, maxChars)).join('');
+  return `${chars.slice(0, maxChars - 1).join('')}…`;
+}
+
+export function buildDiscoveryReplyFromManifest(manifest, httpPort, locale = null) {
+  const rawName = String(manifest.name || manifest.id);
+  const translated = rawName.startsWith('$t:') && locale
+    ? locale.translate(rawName.slice(3))
+    : rawName;
+  let name = truncateChars(translated || manifest.id, MAX_DISCOVERY_NAME_CHARS);
+  const reply = {
+    name,
+    id: String(manifest.id),
+    version: String(manifest.version),
+    port: httpPort,
+  };
+
+  // Enforce strict UTF-8 byte cap on the entire JSON payload by trimming `name` if needed.
+  let encoded = Buffer.from(JSON.stringify(reply), 'utf8');
+  while (encoded.length > MAX_DISCOVERY_REPLY_BYTES && name.length > 0) {
+    const chars = Array.from(name);
+    const nextLen = Math.max(0, Math.floor(chars.length * 0.75) - 1);
+    name = nextLen > 0 ? truncateChars(chars.slice(0, nextLen).join(''), nextLen) : '';
+    reply.name = name || reply.id;
+    encoded = Buffer.from(JSON.stringify(reply), 'utf8');
+    if (name.length === 0) break;
+  }
+  return reply;
+}
+
 export function buildDiscoveryReply(pluginDir, httpPort) {
   const manifestPath = path.join(pluginDir, 'manifest.json');
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
@@ -73,22 +172,18 @@ export function buildDiscoveryReply(pluginDir, httpPort) {
     throw new Error(`Invalid manifest.json: ${check.errors.join('; ')}`);
   }
   const locale = PluginLocale.fromDir(pluginDir, 'zh-CN');
-  const rawName = String(manifest.name || manifest.id);
-  const displayName = rawName.startsWith('$t:')
-    ? locale.translate(rawName.slice(3))
-    : rawName;
-  return {
-    name: displayName || manifest.id,
-    id: manifest.id,
-    version: manifest.version,
-    port: httpPort,
-  };
+  return buildDiscoveryReplyFromManifest(manifest, httpPort, locale);
 }
 
-function startUdpDiscoveryResponder(absDir, httpPort, opts) {
+function startUdpDiscoveryResponder(getCachedPayload, opts) {
   const requestedPort = opts.discoverPort ?? DEV_DISCOVERY_PORT;
   const allowLoopback = Boolean(opts.allowLoopbackDiscoveryForTesting);
   const bindHost = opts.discoverHost || '0.0.0.0';
+  const rateLimiter = new UdpRateLimiter({
+    windowMs: opts.discoverRateWindowMs ?? UDP_RATE_LIMIT_WINDOW_MS,
+    maxPerIp: opts.discoverMaxPerIp ?? UDP_RATE_LIMIT_PER_IP,
+    maxGlobal: opts.discoverMaxGlobal ?? UDP_RATE_LIMIT_GLOBAL,
+  });
 
   return new Promise((resolve) => {
     const udp = dgram.createSocket({ type: 'udp4', reuseAddr: true });
@@ -102,17 +197,16 @@ function startUdpDiscoveryResponder(absDir, httpPort, opts) {
       }
     });
 
+    // Zero synchronous disk I/O per packet: strictly serves pre-cached Buffer under rate limits.
     udp.on('message', (msg, rinfo) => {
+      if (msg.length > 128) return;
       const text = msg.toString('utf8').trim();
       if (text !== DEV_DISCOVERY_PROBE) return;
       if (!isPrivateDiscoveryAddress(rinfo.address, allowLoopback)) return;
-      try {
-        const reply = buildDiscoveryReply(absDir, httpPort);
-        const payload = Buffer.from(JSON.stringify(reply), 'utf8');
-        udp.send(payload, rinfo.port, rinfo.address, () => {});
-      } catch {
-        // Manifest may be mid-edit; skip replying rather than crashing the dev server
-      }
+      if (!rateLimiter.allow(rinfo.address)) return;
+      const payload = getCachedPayload();
+      if (!payload || payload.length === 0) return;
+      udp.send(payload, rinfo.port, rinfo.address, () => {});
     });
 
     udp.bind(requestedPort, bindHost, () => {
@@ -130,6 +224,29 @@ export async function startDevServer(pluginDir, opts = {}) {
   const host = opts.host || '0.0.0.0';
   const port = opts.port ?? 8787;
   const discoverEnabled = opts.discover !== false;
+
+  let cachedDiscoveryPayload = null;
+  const updateCachedDiscoveryFromDisk = (httpPort) => {
+    try {
+      const reply = buildDiscoveryReply(absDir, httpPort);
+      cachedDiscoveryPayload = Buffer.from(JSON.stringify(reply), 'utf8');
+    } catch {
+      // Leave previous valid cache intact if manifest is mid-edit
+    }
+  };
+  const updateCachedDiscoveryFromManifest = (manifest, httpPort) => {
+    try {
+      const locale = String(manifest.name || '').startsWith('$t:')
+        ? PluginLocale.fromDir(absDir, 'zh-CN')
+        : null;
+      const reply = buildDiscoveryReplyFromManifest(manifest, httpPort, locale);
+      cachedDiscoveryPayload = Buffer.from(JSON.stringify(reply), 'utf8');
+    } catch {
+      // Ignore cache refresh errors
+    }
+  };
+
+  let boundHttpPort = port;
 
   const server = http.createServer(async (req, res) => {
     const reqUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -152,6 +269,7 @@ export async function startDevServer(pluginDir, opts = {}) {
       }
 
       const packed = await packPluginToBuffer(absDir);
+      updateCachedDiscoveryFromManifest(packed.manifest, boundHttpPort);
       const baseOrigin = `http://${req.headers.host || `127.0.0.1:${server.address().port}`}`;
 
       if (reqUrl.pathname === '/manifest.json') {
@@ -208,12 +326,15 @@ export async function startDevServer(pluginDir, opts = {}) {
       resolve({ port: addr.port, host: addr.address });
     });
   });
+  boundHttpPort = httpInfo.port;
 
   let udpSocket = null;
   let actualDiscoverPort = null;
   let discoverError = null;
   if (discoverEnabled) {
-    const udpRes = await startUdpDiscoveryResponder(absDir, httpInfo.port, opts);
+    // Precompute discovery reply ONCE at startup so UDP probes never perform sync disk reads.
+    updateCachedDiscoveryFromDisk(httpInfo.port);
+    const udpRes = await startUdpDiscoveryResponder(() => cachedDiscoveryPayload, opts);
     udpSocket = udpRes.socket;
     actualDiscoverPort = udpRes.port;
     discoverError = udpRes.error;

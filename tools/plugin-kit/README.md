@@ -64,7 +64,7 @@ Serve a plugin directory directly to a depth3d headset on the same Wi‑Fi. Ever
 **LAN UDP auto-discovery**:
 - Listens on UDP port **`18787`** by default (avoids Jellyfin/Emby port `7359`).
 - Responds only to probe packets equal to `depth3d-plugin-dev-discover-v1` sent from **private LAN addresses** (RFC1918 IPv4 or IPv6 ULA; ignores loopback, link-local, and public sources).
-- Replies with JSON `{ "name", "id", "version", "port" }` (resolving `$t:` localized names via `locales/zh-CN.json` when present).
+- Replies with a pre-cached JSON payload `{ "name", "id", "version", "port" }` (resolving `$t:` localized names via `locales/zh-CN.json`, truncated to fit a strict 512-byte cap; zero synchronous disk reads per UDP packet) and enforces both per-source and global rate limits (4/s per IP, 30/s total).
 - Pass `--no-discover` to disable the UDP responder.
 
 On the headset, open **设置 › 播放源与插件 › 插件 › 开发者** to pick up the server automatically or enter the printed LAN address manually.

@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { checkPlugin, loadPluginSource } from '../src/check.js';
-import { main as cliMain } from '../src/cli.js';
+import { main as cliMain, parseArgs as cliParseArgs } from '../src/cli.js';
 import { CookieJarQuotaExceededError, PluginCookieJar } from '../src/cookies.js';
 import { pluginCrypto } from '../src/crypto.js';
 import { FetchGateway, FetchResponseTooLargeError } from '../src/fetch-gateway.js';
@@ -20,6 +20,10 @@ import { SCHEMA_DIR, validateManifest, validateProtocolType, validateRepository 
 import {
   DEV_DISCOVERY_PORT,
   DEV_DISCOVERY_PROBE,
+  MAX_DISCOVERY_NAME_CHARS,
+  MAX_DISCOVERY_REPLY_BYTES,
+  UdpRateLimiter,
+  buildDiscoveryReplyFromManifest,
   isPrivateDiscoveryAddress,
   startDevServer,
 } from '../src/serve.js';
@@ -2062,5 +2066,132 @@ test('d3plugin serve UDP discovery answers private probes with {name,id,version,
     assert.equal(noDiscSrv.discoverPort, null);
   } finally {
     await noDiscSrv.close();
+  }
+});
+
+test('d3plugin serve UDP discovery caches reply at startup, enforces payload cap, and rate-limits', async () => {
+  // 1. UdpRateLimiter enforces per-source-IP and global caps cleanly across time windows
+  const limiter = new UdpRateLimiter({ windowMs: 1000, maxPerIp: 2, maxGlobal: 3, maxTrackedIps: 10 });
+  assert.equal(limiter.allow('192.168.1.10', 1000), true);
+  assert.equal(limiter.allow('192.168.1.10', 1010), true);
+  assert.equal(limiter.allow('192.168.1.10', 1020), false, '3rd probe from same IP within window must be dropped');
+  assert.equal(limiter.allow('192.168.1.11', 1030), true, 'Other IP still allowed under global cap');
+  assert.equal(limiter.allow('192.168.1.12', 1040), false, '4th probe hits global cap');
+  assert.equal(limiter.allow('192.168.1.10', 2100), true, 'Window reset allows probing again');
+
+  // 2. Oversized plugin name is truncated and total reply JSON stays <= MAX_DISCOVERY_REPLY_BYTES
+  const hugeName = '超长插件名称测试'.repeat(60);
+  const capped = buildDiscoveryReplyFromManifest(
+    { id: 'com.example.longname', name: hugeName, version: '1.0.0' },
+    8787,
+  );
+  assert.ok(Array.from(capped.name).length <= MAX_DISCOVERY_NAME_CHARS);
+  assert.ok(capped.name.endsWith('…'));
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(capped), 'utf8') <= MAX_DISCOVERY_REPLY_BYTES,
+    'Encoded discovery reply must not exceed MAX_DISCOVERY_REPLY_BYTES',
+  );
+
+  // 3. Cached startup reply (zero per-packet disk reads) + live UDP per-IP rate limiting
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'd3-serve-cache-'));
+  try {
+    fs.writeFileSync(
+      path.join(tmpDir, 'manifest.json'),
+      JSON.stringify({
+        api: 1,
+        id: 'com.example.cached',
+        name: 'Cached Plugin',
+        version: '1.0.0',
+        permissions: { hosts: [], userHosts: false, lan: false },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.js'),
+      'export default { home(){return []}, browse(){return {items:[]}}, detail(){return {id:"1",kind:"movie",title:"1"}}, playback(){return {url:"https://example.com/1.mp4"}} };',
+    );
+
+    const srv = await startDevServer(tmpDir, {
+      host: '127.0.0.1',
+      port: 0,
+      discover: true,
+      discoverPort: 0,
+      allowLoopbackDiscoveryForTesting: true,
+      discoverMaxPerIp: 2,
+      discoverMaxGlobal: 5,
+      discoverRateWindowMs: 5000,
+    });
+    try {
+      // Delete manifest.json after startup: UDP must STILL reply from in-memory cache without touching disk!
+      fs.unlinkSync(path.join(tmpDir, 'manifest.json'));
+
+      const replies = await new Promise((resolve) => {
+        const sock = dgram.createSocket('udp4');
+        const got = [];
+        sock.on('message', (m) => got.push(JSON.parse(m.toString('utf8'))));
+        sock.bind(0, '127.0.0.1', () => {
+          const probe = Buffer.from(DEV_DISCOVERY_PROBE, 'utf8');
+          // Send 5 probes rapidly -> rate limiter caps replies at discoverMaxPerIp (2)
+          for (let i = 0; i < 5; i++) {
+            sock.send(probe, srv.discoverPort, '127.0.0.1');
+          }
+          setTimeout(() => {
+            try { sock.close(); } catch {}
+            resolve(got);
+          }, 300);
+        });
+      });
+
+      assert.equal(replies.length, 2, `Expected exactly 2 rate-limited replies, got ${replies.length}`);
+      assert.equal(replies[0].id, 'com.example.cached');
+      assert.equal(replies[0].name, 'Cached Plugin');
+    } finally {
+      await srv.close();
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('CLI parseArgs and subcommands handle --no-discover without breaking run/check/pack', async () => {
+  // --no-discover BEFORE directory must NOT swallow the directory positional
+  const before = cliParseArgs(['serve', '--no-discover', './my-plugin', '--port', '9000']);
+  assert.deepEqual(before.positionals, ['serve', './my-plugin']);
+  assert.equal(before.flags['no-discover'], true);
+  assert.equal(before.flags.port, '9000');
+
+  // --no-discover AFTER directory
+  const after = cliParseArgs(['serve', './my-plugin', '--port', '9001', '--no-discover', '--host', '127.0.0.1']);
+  assert.deepEqual(after.positionals, ['serve', './my-plugin']);
+  assert.equal(after.flags['no-discover'], true);
+  assert.equal(after.flags.port, '9001');
+  assert.equal(after.flags.host, '127.0.0.1');
+
+  // Existing subcommands argument parsing remains intact
+  const runParsed = cliParseArgs([
+    'run', 'browse', './my-plugin', '--category', 'movies',
+    '--filter', 'year=2025', '--filter', 'genre=scifi', '--config', '{"server":"http://192.168.1.2:8096"}',
+  ]);
+  assert.deepEqual(runParsed.positionals, ['run', 'browse', './my-plugin']);
+  assert.equal(runParsed.flags.category, 'movies');
+  assert.deepEqual(runParsed.flags.filter, ['year=2025', 'genre=scifi']);
+  assert.equal(runParsed.flags.config, '{"server":"http://192.168.1.2:8096"}');
+
+  const packParsed = cliParseArgs(['pack', './my-plugin', '-o', '/tmp/out.d3plugin']);
+  assert.deepEqual(packParsed.positionals, ['pack', './my-plugin']);
+  assert.equal(packParsed.flags.o, '/tmp/out.d3plugin');
+
+  const checkParsed = cliParseArgs(['check', './p1', './p2', '--config', '{}']);
+  assert.deepEqual(checkParsed.positionals, ['check', './p1', './p2']);
+  assert.equal(checkParsed.flags.config, '{}');
+
+  // End-to-end CLI invocation of check & pack & run home
+  const tmpOut = path.join(os.tmpdir(), `d3-cli-pack-${Date.now()}.d3plugin`);
+  try {
+    assert.equal(await cliMain(['check', REF_PLUGIN_DIR]), 0);
+    assert.equal(await cliMain(['pack', REF_PLUGIN_DIR, '-o', tmpOut]), 0);
+    assert.equal(fs.existsSync(tmpOut), true);
+    assert.equal(await cliMain(['run', 'home', REF_PLUGIN_DIR]), 0);
+  } finally {
+    if (fs.existsSync(tmpOut)) fs.unlinkSync(tmpOut);
   }
 });

@@ -9,7 +9,7 @@ import { PluginStorage } from './storage.js';
 
 const BOOLEAN_FLAGS = new Set(['help', 'h', 'no-discover']);
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const positionals = [];
   const flags = {};
   for (let i = 0; i < argv.length; i++) {
