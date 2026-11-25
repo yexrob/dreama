@@ -4,8 +4,10 @@ import { checkPlugin, loadPluginSource, validateMethodResult } from './check.js'
 import { packPluginToFile } from './pack.js';
 import { PluginCallError, QuickJsPluginHost } from './runtime.js';
 import { validateManifest } from './schema.js';
-import { startDevServer } from './serve.js';
+import { startDevServer, listLanIpv4Addresses } from './serve.js';
 import { PluginStorage } from './storage.js';
+
+const BOOLEAN_FLAGS = new Set(['help', 'h', 'no-discover']);
 
 function parseArgs(argv) {
   const positionals = [];
@@ -21,7 +23,7 @@ function parseArgs(argv) {
       } else {
         const k = token.slice(2);
         const next = argv[i + 1];
-        if (next !== undefined && !next.startsWith('-')) {
+        if (!BOOLEAN_FLAGS.has(k) && next !== undefined && !next.startsWith('-')) {
           appendFlag(flags, k, next);
           i += 1;
         } else {
@@ -31,7 +33,7 @@ function parseArgs(argv) {
     } else if (token.startsWith('-') && token.length === 2) {
       const k = token.slice(1);
       const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
+      if (!BOOLEAN_FLAGS.has(k) && next !== undefined && !next.startsWith('-')) {
         appendFlag(flags, k, next);
         i += 1;
       } else {
@@ -95,9 +97,9 @@ Usage:
   d3plugin pack <pluginDir> [-o <output.d3plugin>]
     Packages a plugin directory into a .d3plugin zip and prints its SHA-256.
 
-  d3plugin serve <pluginDir> [--port 8787] [--host 0.0.0.0]
+  d3plugin serve <pluginDir> [--port 8787] [--host 0.0.0.0] [--no-discover]
     Serves live-repacked /index.json, /manifest.json, and /plugin.d3plugin
-    for headset developer mode.
+    for headset developer mode, with LAN UDP auto-discovery enabled by default.
 `);
 }
 
@@ -266,11 +268,36 @@ export async function main(argv) {
       const pluginDir = positionals[1] || '.';
       const port = Number(flags.port ?? 8787);
       const host = String(flags.host ?? '0.0.0.0');
-      const srv = await startDevServer(pluginDir, { port, host });
+      const discover = !flags['no-discover'];
+      const srv = await startDevServer(pluginDir, { port, host, discover });
+      const lanIps = listLanIpv4Addresses();
+      const primaryAddr = lanIps[0] ? `${lanIps[0]}:${srv.port}` : `127.0.0.1:${srv.port}`;
       console.log(`depth3d plugin dev server listening on http://${host}:${srv.port}`);
-      console.log(`  index:    http://127.0.0.1:${srv.port}/index.json`);
-      console.log(`  manifest: http://127.0.0.1:${srv.port}/manifest.json`);
-      console.log(`  package:  http://127.0.0.1:${srv.port}/plugin.d3plugin`);
+      if (lanIps.length > 0) {
+        console.log('LAN addresses (for headset on the same Wi-Fi):');
+        for (const ip of lanIps) {
+          console.log(`  http://${ip}:${srv.port}`);
+        }
+      } else {
+        console.log(`  local:    http://127.0.0.1:${srv.port}`);
+      }
+      console.log(`  index:    http://${primaryAddr}/index.json`);
+      console.log(`  manifest: http://${primaryAddr}/manifest.json`);
+      console.log(`  package:  http://${primaryAddr}/plugin.d3plugin`);
+      if (!discover) {
+        console.log('  discover: disabled (--no-discover)');
+      } else if (srv.discoverEnabled) {
+        console.log(`  discover: UDP port ${srv.discoverPort} (LAN private addresses only)`);
+      } else if (srv.discoverError) {
+        console.warn(`  discover: unavailable (${srv.discoverError.message}); enter address manually`);
+      }
+      console.log('');
+      console.log('Headset entry: 设置 › 播放源与插件 › 插件 › 开发者');
+      console.log(
+        srv.discoverEnabled
+          ? `  会自动发现此服务器，也可手动输入 ${primaryAddr}`
+          : `  请点击「输入电脑地址」并填写 ${primaryAddr}`
+      );
       await new Promise((resolve) => {
         process.on('SIGINT', async () => { await srv.close(); resolve(); });
         process.on('SIGTERM', async () => { await srv.close(); resolve(); });

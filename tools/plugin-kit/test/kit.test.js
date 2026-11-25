@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import dgram from 'node:dgram';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,7 +17,12 @@ import { NetworkPolicy, NetworkPolicyError } from '../src/network-policy.js';
 import { inspectArchiveBuffer, packPluginToBuffer, packPluginToFile, sha256Hex } from '../src/pack.js';
 import { PluginCallError, QuickJsPluginHost } from '../src/runtime.js';
 import { SCHEMA_DIR, validateManifest, validateProtocolType, validateRepository } from '../src/schema.js';
-import { startDevServer } from '../src/serve.js';
+import {
+  DEV_DISCOVERY_PORT,
+  DEV_DISCOVERY_PROBE,
+  isPrivateDiscoveryAddress,
+  startDevServer,
+} from '../src/serve.js';
 import { PluginStorage } from '../src/storage.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1965,5 +1971,96 @@ test('manifest discover accepts mDNS service types and built-in udp:jellyfin/udp
   for (const bad of ['udp:custom', 'udp:1234', 'udp:', 'http://192.168.1.1', 'jellyfin._tcp', 'tcp:jellyfin']) {
     const res = validateManifest(makeWithDiscover(bad));
     assert.equal(res.valid, false, `expected discover='${bad}' to be rejected`);
+  }
+});
+
+test('d3plugin serve UDP discovery answers private probes with {name,id,version,port}, honors --no-discover, and restricts HTTP paths', async () => {
+  assert.notEqual(DEV_DISCOVERY_PORT, 7359, 'UDP discovery port must not occupy Jellyfin/Emby 7359');
+
+  // 1. Strict RFC1918 / IPv6 ULA filter for UDP discovery source addresses
+  for (const allowed of ['192.168.1.20', '10.0.0.5', '172.16.0.1', '172.31.255.254', '::ffff:192.168.1.42', 'fd00::1', 'fc12:3456::1']) {
+    assert.equal(isPrivateDiscoveryAddress(allowed, false), true, `Expected ${allowed} to be accepted`);
+  }
+  for (const blocked of ['127.0.0.1', '::1', '169.254.1.10', 'fe80::1', '8.8.8.8', '1.1.1.1', '100.64.0.1', '198.18.0.1', '224.0.0.1', '2001:4860:4860::8888', '0.0.0.0', '']) {
+    assert.equal(isPrivateDiscoveryAddress(blocked, false), false, `Expected ${blocked} to be rejected`);
+  }
+  assert.equal(isPrivateDiscoveryAddress('127.0.0.1', true), true);
+
+  function sendUdpProbe(port, payload, timeoutMs = 400) {
+    return new Promise((resolve) => {
+      const sock = dgram.createSocket('udp4');
+      let done = false;
+      const finish = (val) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        try { sock.close(); } catch {}
+        resolve(val);
+      };
+      const timer = setTimeout(() => finish(null), timeoutMs);
+      sock.on('message', (msg) => finish(msg.toString('utf8')));
+      sock.send(Buffer.from(payload, 'utf8'), port, '127.0.0.1');
+    });
+  }
+
+  // 2. Production default rejects loopback probes (only private LAN addresses get replies)
+  const prodSrv = await startDevServer(REF_PLUGIN_DIR, {
+    host: '127.0.0.1',
+    port: 0,
+    discover: true,
+    discoverPort: 0,
+    allowLoopbackDiscoveryForTesting: false,
+  });
+  try {
+    assert.equal(prodSrv.discoverEnabled, true);
+    assert.ok(prodSrv.discoverPort > 0);
+    const ignored = await sendUdpProbe(prodSrv.discoverPort, DEV_DISCOVERY_PROBE, 250);
+    assert.equal(ignored, null, 'Loopback probe must be ignored when allowLoopbackDiscoveryForTesting is false');
+
+    // HTTP restricts strictly to /, /index.json, /manifest.json, /plugin.d3plugin, /health
+    for (const forbiddenPath of ['/main.js', '/locales/zh-CN.json', '/../package.json', '/etc/passwd']) {
+      const r = await fetch(`http://127.0.0.1:${prodSrv.port}${forbiddenPath}`);
+      assert.equal(r.status, 404, `Expected 404 for ${forbiddenPath}`);
+    }
+    const health = await fetch(`http://127.0.0.1:${prodSrv.port}/health`);
+    assert.equal(health.status, 200);
+  } finally {
+    await prodSrv.close();
+  }
+
+  // 3. Valid probe returns localized JSON {name, id, version, port}; unknown probe string is ignored
+  const testSrv = await startDevServer(REF_PLUGIN_DIR, {
+    host: '127.0.0.1',
+    port: 0,
+    discover: true,
+    discoverPort: 0,
+    allowLoopbackDiscoveryForTesting: true,
+  });
+  try {
+    const rawReply = await sendUdpProbe(testSrv.discoverPort, DEV_DISCOVERY_PROBE, 1000);
+    assert.ok(rawReply, 'Expected UDP discovery JSON reply');
+    const parsed = JSON.parse(rawReply);
+    assert.equal(parsed.id, 'dev.depth3d.reference');
+    assert.equal(parsed.version, '1.0.0');
+    assert.equal(parsed.port, testSrv.port);
+    assert.ok(parsed.name && !parsed.name.startsWith('$t:'), `Expected localized plugin name, got ${parsed.name}`);
+
+    const wrongProbe = await sendUdpProbe(testSrv.discoverPort, 'who is JellyfinServer?', 250);
+    assert.equal(wrongProbe, null, 'Wrong probe string must be ignored');
+  } finally {
+    await testSrv.close();
+  }
+
+  // 4. discover: false (--no-discover) disables UDP discovery responder completely
+  const noDiscSrv = await startDevServer(REF_PLUGIN_DIR, {
+    host: '127.0.0.1',
+    port: 0,
+    discover: false,
+  });
+  try {
+    assert.equal(noDiscSrv.discoverEnabled, false);
+    assert.equal(noDiscSrv.discoverPort, null);
+  } finally {
+    await noDiscSrv.close();
   }
 });

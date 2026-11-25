@@ -210,20 +210,24 @@ interface Track { id: string, url: string, backupUrls?: string[], mime: string, 
 - 安装时 App 展示：名称、作者、来源地址、要访问的域名、是否访问局域网。更新后权限变多要重新确认。
 
 ## 8. 分发
-- **插件仓库**是一个 JSON 索引，用户在「播放源 › 添加 › 插件仓库」里用手机扫码填入地址：
+- **插件仓库**是一个 JSON 索引，用户在「设置 › 播放源与插件 › 插件 › 添加插件 › 添加插件仓库」里用手机扫码填入地址（仅 HTTPS）：
   ```json
   { "name": "某某的插件仓库", "plugins": [
     { "id": "com.example.jellyfin", "name": "Jellyfin", "version": "1.2.0", "description": "…",
       "icon": "https://…/icon.png", "url": "https://…/jellyfin-1.2.0.d3plugin", "sha256": "…", "minApp": "1.0.0" } ] }
   ```
-- App 下载后校验 `sha256`，再校验包内 manifest 的 `id`、`version` 与索引一致。
-- 也可以直接安装单个 `.d3plugin` 的地址，或从头显存储里选文件（开发用）。
+- App 下载后校验 `sha256`，再校验包内 manifest 的 `id`、`version` 与索引一致，所有安装均经过 `previewPackage` 与同一张确认卡片。
+- **从文件安装**：在「插件 › 添加插件 › 从文件安装」里可安装头显本地 `.d3plugin` 文件（扫描 `Android/data/<包名>/files/plugins/` 与可访问时的 `Download/`，并通过系统文件选择器 `ACTION_OPEN_DOCUMENT` 兼容 Android 11+ 分区存储；来源记录为 `local-file`，列表显示「本地文件」），也可通过手机扫码粘贴单个 `.d3plugin` 的 HTTPS 地址直接下载安装（仅 HTTPS，不允许私网地址）。
 - 官方仓库只收对接用户自有服务（Jellyfin、Emby、SMB、Plex、Alist…）的插件；对接视频网站的插件由第三方仓库分发，App 不内置、不推荐，用户自己添加并自行承担使用责任。
 
 ## 9. 开发与一致性测试
-- `tools/plugin-kit/`：`d3plugin` 命令行（Node），在电脑上用同一份 QuickJS 运行时跑插件：`d3plugin run home`、`d3plugin run playback --item <id>`、`d3plugin pack`、`d3plugin check`（校验 manifest、返回数据的结构、权限外访问）。
+- `tools/plugin-kit/`：`d3plugin` 命令行（Node），在电脑上用同一份 QuickJS 运行时跑插件：`d3plugin run home`、`d3plugin run playback --item <id>`、`d3plugin pack`、`d3plugin check`（校验 manifest、返回数据的结构、权限外访问）、`d3plugin serve <目录>`（实时打包并暴露 `/`, `/index.json`, `/manifest.json`, `/plugin.d3plugin`, `/health`，同时在局域网 UDP 端口 `18787` 应答 `depth3d-plugin-dev-discover-v1` 探测并返回 `{ name, id, version, port }`，仅应答私有地址，可用 `--no-discover` 关闭）。
 - 一致性测试套件：一个参考插件（`plugins/reference/`，返回固定数据、覆盖每个字段和每种错误），App 的单元测试用它验证宿主实现。
-- App 的「播放源 › 插件 › 开发者」里可以开「从电脑加载」：填电脑上 `d3plugin serve` 的地址，改代码后头显里下拉即刷新。
+- App 的「设置 › 播放源与插件 › 插件 › 开发者」提供从电脑加载与调试：
+  - 支持同一 Wi‑Fi 下 UDP 自动发现与手动输入（手机扫码或头显键盘），仅允许局域网私有地址（RFC1918 / IPv6 ULA），明文 HTTP 仅在此路径放开，跨主机重定向一律拒绝；
+  - 安装确认卡片额外标明「开发版 · 来自 <电脑地址>，未经仓库校验」，来源记录为 `dev:<origin>`，插件列表带「开发版」标记且不参与仓库自动更新；与内置或仓库同 `id` 插件互相替换均走显式确认并清除旧实例数据；
+  - 开发者页与插件详情页均提供「重新加载」，支持**同版本号不同 SHA-256** 原地替换并重建运行时，保留已建实例的配置、`ctx.storage` 与 Cookie 并自动刷新首页/媒体库；权限未变或缩小时免确认，权限扩大时须重新确认；电脑离线时保留旧版本；
+  - 开发者页直接展示该插件最近日志（重载后自动滚到最新），且在加载失败（语法错误、manifest 不合法、`init` 抛错）时原样展示技术错误与行号（其余页面仍仅展示中文概述）。
 
 ## 10. 以后的版本可能加（现在不做，但 v1 的结构不挡路）
 WebSocket 与直播弹幕推送、下载到本地、插件间共享的刮削器（TMDB）、原生（APK + AIDL）插件、DRM、插件自带设置页之外的自定义操作按钮（`actions`）。
