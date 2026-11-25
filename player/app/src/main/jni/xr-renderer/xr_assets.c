@@ -1270,7 +1270,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeTriggerPaletteHaptic(JNIEnv* e
     XrCtx* ctx = (XrCtx*)(intptr_t)handle;
     if (ctx != NULL && kind > PALETTE_HAPTIC_NONE && kind <= PALETTE_HAPTIC_LIMIT) {
         pthread_mutex_lock(&ctx->localCmdLock);
-        ctx->localPending.pendingHaptic = kind;
+        ctx->localPending.pendingHaptic = paletteMergeHaptic(ctx->localPending.pendingHaptic, kind);
         pthread_mutex_unlock(&ctx->localCmdLock);
     }
 }

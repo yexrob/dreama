@@ -21,6 +21,8 @@ LOCAL_SRC_FILES := xr_log.c \
                    xr_gamepad.c \
                    xr_screen_ctrl.c \
                    xr_palette.c \
+                   xr_overlay.c \
+                   xr_danmaku.c \
                    xr_shaders.c \
                    xr_session.c \
                    xr_display.c \

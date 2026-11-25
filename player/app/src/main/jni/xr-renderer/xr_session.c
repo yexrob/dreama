@@ -594,10 +594,13 @@ static int initSwapchain(XrCtx* ctx) {
     free(formats);
 
     // Stereo renders left and right eye views side by side in one swapchain.
-    // Local playback always allocates double-wide so SBS/OU or lazy 3D turn-on
-    // works mid-session without tearing down the OpenXR session.
-    int chainWidth = (ctx->stereoMode != DEPTH_MODE_OFF || ctx->localMedia)
-            ? ctx->videoWidth * 2 : ctx->videoWidth;
+    // Local 2D playback starts single-wide to halve video VRAM and upgrades
+    // lazily via ensureVideoSwapchainStereo() if 3D or SBS/OU is enabled later.
+    ctx->swapchainStereo = paletteNeedStereoSwapchain(
+            ctx->localMedia, ctx->stereoMode, ctx->stereoLive, ctx->stereoSourceFormat, 0);
+    ctx->swapchainUpgradeFailed = 0;
+    ctx->swapchainHasFrame = 0;
+    int chainWidth = ctx->swapchainStereo ? ctx->videoWidth * 2 : ctx->videoWidth;
     if (!createArtSwapchain(ctx, chainWidth, ctx->videoHeight, "xrCreateSwapchain",
                             &ctx->swapchain, &ctx->swapchainImages, &ctx->swapchainImageCount)) {
         startStoppedAtLast(ctx, "swapchain");
@@ -606,8 +609,9 @@ static int initSwapchain(XrCtx* ctx) {
         return 0;
     }
 
-    LOGEV("swapchain %dx%d format %lld, %u images (stereo mode %d)", chainWidth, ctx->videoHeight,
-         (long long)ctx->swapchainFormat, ctx->swapchainImageCount, ctx->stereoMode);
+    LOGEV("swapchain %dx%d format %lld, %u images (stereo mode %d, stereoChain %d)",
+          chainWidth, ctx->videoHeight, (long long)ctx->swapchainFormat,
+          ctx->swapchainImageCount, ctx->stereoMode, ctx->swapchainStereo);
 
     // The stream is worth more than the stats, so carry on without it
     createArtSwapchain(ctx, OVERLAY_WIDTH, OVERLAY_HEIGHT, "create overlay swapchain",
@@ -811,6 +815,7 @@ static void destroyCtx(JNIEnv* env, XrCtx* ctx) {
     destroyArtSwapchain(ctx, &ctx->transportSwapchain, &ctx->transportImages);
     destroyArtSwapchain(ctx, &ctx->paletteSwapchain, &ctx->paletteImages);
     destroyArtSwapchain(ctx, &ctx->dimmerSwapchain, &ctx->dimmerImages);
+    danmakuDestroy(ctx);
     destroyArtSwapchain(ctx, &ctx->pointerSwapchain, &ctx->pointerImages);
     destroyArtSwapchain(ctx, &ctx->barSwapchain, &ctx->barImages);
     destroyArtSwapchain(ctx, &ctx->cornerSwapchain, &ctx->cornerImages);
@@ -883,6 +888,42 @@ static void destroyCtx(JNIEnv* env, XrCtx* ctx) {
     free(ctx);
 }
 
+// Render-thread only (outside acquire/release): lazily upgrades a local 2D
+// single-wide video swapchain to double-wide (videoWidth * 2) when 3D or
+// SBS/OU is turned on mid-session. Creates the replacement swapchain BEFORE
+// releasing the old one so allocation failure safely keeps 2D playback intact.
+int ensureVideoSwapchainStereo(XrCtx* ctx) {
+    if (ctx == NULL || ctx->swapchainStereo) {
+        return 1;
+    }
+    if (ctx->swapchainUpgradeFailed) {
+        return 0;
+    }
+    XrSwapchain newChain = XR_NULL_HANDLE;
+    XrSwapchainImageOpenGLESKHR* newImages = NULL;
+    uint32_t newCount = 0;
+    int chainWidth = ctx->videoWidth * 2;
+    if (!createArtSwapchain(ctx, chainWidth, ctx->videoHeight, "upgrade stereo swapchain",
+                            &newChain, &newImages, &newCount)) {
+        // Latch failure once so we never hammer xrCreateSwapchain every frame or hit runtime limits
+        ctx->swapchainUpgradeFailed = 1;
+        LOGW("depth3d: could not upgrade video swapchain to %dx%d, latching 2D fallback",
+             chainWidth, ctx->videoHeight);
+        return 0;
+    }
+    destroyArtSwapchain(ctx, &ctx->swapchain, &ctx->swapchainImages);
+    ctx->swapchain = newChain;
+    ctx->swapchainImages = newImages;
+    ctx->swapchainImageCount = newCount;
+    ctx->swapchainStereo = 1;
+    // Newly created swapchain has no released frame yet; addVideoLayers waits until renderVideoFrame releases
+    ctx->swapchainHasFrame = 0;
+    ctx->warpRedraw = 1;
+    LOGEV("depth3d: upgraded video swapchain to double-wide %dx%d (%u images)",
+          chainWidth, ctx->videoHeight, newCount);
+    return 1;
+}
+
 JNIEXPORT jlong JNICALL
 Java_com_limelight_binding_video_XrRenderer_nativeInit(JNIEnv* env, jobject thiz,
                                                        jobject activity, jint width, jint height,
@@ -894,11 +935,18 @@ Java_com_limelight_binding_video_XrRenderer_nativeInit(JNIEnv* env, jobject thiz
                                                        jboolean perfOverlay, jboolean ambilight,
                                                        jint ambiLevel, jboolean roomLight,
                                                        jint envResTier, jboolean localMedia,
-                                                       jboolean startStereoLive) {
+                                                       jboolean startStereoLive,
+                                                       jint initialSourceFormat) {
     XrCtx* ctx = calloc(1, sizeof(XrCtx));
     pthread_mutex_init(&ctx->localCmdLock, NULL);
     ctx->localCmdLockReady = 1;
+    danmakuInit(ctx);
+    atomic_init(&ctx->depthContentPhiBits, 0);
+    ctx->lastScreenFovDeg = 50.0f;
     ctx->localMedia = localMedia ? 1 : 0;
+    ctx->stereoSourceFormat = (initialSourceFormat >= STEREO_SRC_AUTO
+                               && initialSourceFormat <= STEREO_SRC_OU)
+            ? initialSourceFormat : STEREO_SRC_AUTO;
     ctx->handsEnabled = handTracking;
     // EnvResTier: 0 low, 1 standard, 2 high, 3 ultra
     ctx->envResTier = envResTier;

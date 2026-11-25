@@ -65,6 +65,9 @@ object WallIcons {
     val Keyboard = stroked("keyboard",
         rect(3f, 6f, 18f, 12f, 2.2f),
         "M7 10h.01M10.3 10h.01M13.7 10h.01M17 10h.01M8.5 14h7")
+    val Danmaku = stroked("danmaku",
+        rect(3f, 5f, 18f, 14f, 2.2f),
+        "M6.5 9.5h7M15.5 9.5h2M6.5 14.5h3.5M12.5 14.5h5")
 
     private fun stroked(name: String, vararg paths: String) = build(name, paths, filled = false)
 

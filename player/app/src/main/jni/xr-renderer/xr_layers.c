@@ -82,6 +82,8 @@ typedef struct {
     XrCompositionLayerCylinderKHR glowCylinder;
     XrCompositionLayerQuad video[2];
     XrCompositionLayerCylinderKHR cylinder[2];
+    XrCompositionLayerQuad danmakuQuad[2];
+    XrCompositionLayerCylinderKHR danmakuCyl[2];
     XrCompositionLayerQuad overlay;
     XrCompositionLayerQuad transport;
     XrCompositionLayerCylinderKHR transportCylinder;
@@ -130,6 +132,7 @@ typedef struct {
     // on its own on the rest
     XrCompositionLayerColorScaleBiasKHR fades[FADE_SLOTS][2];
     const XrCompositionLayerBaseHeader* order[FRAME_MAX_LAYERS];
+    int slotKind[FRAME_MAX_LAYERS];
     uint32_t count;
 } FrameLayers;
 
@@ -177,16 +180,18 @@ typedef struct {
     BarFrame bar;
 } FrameView;
 
-// Takes a layer back out of the frame, keeping the order of the rest
-static void dropLayer(FrameLayers* layers, const void* layer) {
-    for (uint32_t i = 0; i < layers->count; i++) {
-        if (layers->order[i] == (const XrCompositionLayerBaseHeader*)layer) {
-            memmove(&layers->order[i], &layers->order[i + 1],
-                    (layers->count - i - 1) * sizeof(layers->order[0]));
-            layers->count--;
-            return;
-        }
+// Maps a pushed FrameLayers pointer to its production drop-ladder slot kind.
+static int classifyLayerSlot(const FrameLayers* layers, const void* layer) {
+    if (layer == &layers->toast) return OVERLAY_SLOT_TOAST;
+    if (layer == &layers->models) return OVERLAY_SLOT_MODELS;
+    if (layer == &layers->cogMark[COG_OPTION_COUNT]) return OVERLAY_SLOT_COG_HOVER;
+    if (layer == &layers->cogButton) return OVERLAY_SLOT_COG_BUTTON;
+    if (layer == &layers->cogClock) return OVERLAY_SLOT_COG_CLOCK;
+    if (layer == &layers->danmakuQuad[0] || layer == &layers->danmakuQuad[1]
+            || layer == &layers->danmakuCyl[0] || layer == &layers->danmakuCyl[1]) {
+        return OVERLAY_SLOT_DANMAKU;
     }
+    return OVERLAY_SLOT_OTHER;
 }
 
 // Adds a layer to the frame. One past the array would be a smashed stack, so a
@@ -201,7 +206,9 @@ static void pushLayer(XrCtx* ctx, FrameLayers* layers, const void* layer) {
         }
         return;
     }
-    layers->order[layers->count++] = (const XrCompositionLayerBaseHeader*)layer;
+    uint32_t idx = layers->count++;
+    layers->order[idx] = (const XrCompositionLayerBaseHeader*)layer;
+    layers->slotKind[idx] = classifyLayerSlot(layers, layer);
 }
 
 // A quad in the given space showing a texW x texH rect of one swapchain
@@ -462,6 +469,10 @@ static void addGlowLayer(XrCtx* ctx, const FrameView* view, FrameLayers* layers)
 // one layer. What was last drawn decides, not the switch, so a press that
 // lands between two frames never shows an eye the draw has not caught up with.
 static void addVideoLayers(XrCtx* ctx, const FrameView* view, FrameLayers* layers) {
+    // Guard against submitting a freshly upgraded swapchain whose first acquire failed
+    if (!ctx->swapchainHasFrame) {
+        return;
+    }
     int viewCount = view->stereo && ctx->drawnEyes == 2 ? 2 : 1;
     for (int eye = 0; eye < viewCount; eye++) {
         XrSwapchainSubImage subImage;
@@ -526,6 +537,69 @@ static void addVideoLayers(XrCtx* ctx, const FrameView* view, FrameLayers* layer
                       view->screenHeight);
             quad->eyeVisibility = visibility;
             quad->subImage = subImage;
+            pushLayer(ctx, layers, quad);
+        }
+    }
+}
+
+// depth3d G4: per-eye danmaku composition layers (0 layers when idle/empty,
+// 1 layer when flat mono, 2 eye-split layers when layered 3D float is active).
+// Placed directly over the video surface and behind the transport bar & palette
+// using the shared G4/G3 overlayComputeSurface() geometry.
+static void addDanmakuLayers(XrCtx* ctx, const FrameView* view, FrameLayers* layers) {
+    if (!ctx->localMedia) {
+        return;
+    }
+    DanmakuState* dm = &ctx->danmaku;
+    int eyeCount = dm->drawnEyes;
+    if (eyeCount <= 0 || dm->drawnTexH <= 0) {
+        return;
+    }
+    if (eyeCount > 2) eyeCount = 2;
+
+    Vec3 head = { ctx->headPos.x, ctx->headPos.y, ctx->headPos.z };
+    float screenDist = screenDistanceFrom(view->screenPose, head);
+    OverlaySurfaceGeom surf;
+    if (!overlayComputeSurface(view->screenPose, view->screenWidth, view->screenHeight,
+                               ctx->screenRadius, view->screenCurved, ctx->cylinderSupported,
+                               view->roomOn, dm->curveMode, dm->customCurvePct,
+                               screenDist, 0.0f, dm->drawnAreaBotFrac, 0.0f, &surf)) {
+        return;
+    }
+
+    for (int eye = 0; eye < eyeCount; eye++) {
+        if (dm->eyeSwapchain[eye] == XR_NULL_HANDLE) {
+            continue;
+        }
+        XrEyeVisibility vis = eyeCount == 1 ? XR_EYE_VISIBILITY_BOTH
+                : (eye == 0 ? XR_EYE_VISIBILITY_LEFT : XR_EYE_VISIBILITY_RIGHT);
+        if (surf.useCylinder) {
+            XrCompositionLayerCylinderKHR* cyl = &layers->danmakuCyl[eye];
+            memset(cyl, 0, sizeof(*cyl));
+            cyl->type = XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR;
+            cyl->next = layers->settingsChain;
+            cyl->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            cyl->eyeVisibility = vis;
+            cyl->subImage.swapchain = dm->eyeSwapchain[eye];
+            cyl->subImage.imageRect.offset.x = 0;
+            cyl->subImage.imageRect.offset.y = 0;
+            cyl->subImage.imageRect.extent.width = DANMAKU_TEX_W;
+            cyl->subImage.imageRect.extent.height = dm->drawnTexH;
+            cyl->subImage.imageArrayIndex = 0;
+            cyl->space = view->space;
+            cyl->pose = surf.axisPose;
+            cyl->radius = surf.radius;
+            cyl->centralAngle = surf.centralAngle;
+            cyl->aspectRatio = surf.aspectRatio;
+            pushLayer(ctx, layers, cyl);
+        }
+        else {
+            XrCompositionLayerQuad* quad = &layers->danmakuQuad[eye];
+            quadLayerRect(quad, layers->settingsChain,
+                          XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+                          dm->eyeSwapchain[eye], 0, 0, DANMAKU_TEX_W, dm->drawnTexH,
+                          view->space, surf.quadPose, surf.quadWidth, surf.quadHeight);
+            quad->eyeVisibility = vis;
             pushLayer(ctx, layers, quad);
         }
     }
@@ -1514,6 +1588,16 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
     // Where the controllers are this frame, before anything draws them
     updateControllerModels(ctx);
 
+    // Lazily upgrade a local 2D single-wide swapchain to double-wide when 3D or
+    // SBS/OU is turned on mid-session, BEFORE acquiring or drawing the frame.
+    int depthGaveUpNow = atomic_load_explicit(&ctx->depthGaveUp, memory_order_relaxed);
+    int wantStereoChain = paletteNeedStereoSwapchain(
+            ctx->localMedia, ctx->stereoMode, ctx->stereoLive, ctx->stereoSourceFormat,
+            depthGaveUpNow);
+    if (wantStereoChain && !ctx->swapchainStereo && ctx->shouldRender) {
+        ensureVideoSwapchainStereo(ctx);
+    }
+
     // A switch of the 3D redraws the frame already latched, since the decoder
     // sends nothing while the picture stands still
     int redraw = ctx->warpRedraw && ctx->everRendered;
@@ -1547,8 +1631,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
     FrameView view;
     view.aspect = paletteVideoHeightOverWidth(ctx->videoWidth, ctx->videoHeight,
                                               ctx->stereoSourceFormat);
-    view.stereo = (ctx->stereoMode != DEPTH_MODE_OFF)
-            || (ctx->localMedia && ctx->stereoSourceFormat != STEREO_SRC_AUTO && ctx->stereoLive);
+    view.stereo = ctx->swapchainStereo && wantStereoChain;
     int roomStyle = roomEffective(ctx);
     view.roomOn = roomStyle > 0;
     view.headLocked = headLocked;
@@ -1582,6 +1665,24 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
     // A panel on its way out keeps the furniture down until it has gone, the
     // way an open one does, so the two never stack up in one frame
     int64_t frameNs = nowNs();
+    // depth3d G4: render instanced per-eye danmaku layers strictly for local playback
+    if (ctx->localMedia && ctx->shouldRender && ctx->everRendered) {
+        Vec3 head = { ctx->headPos.x, ctx->headPos.y, ctx->headPos.z };
+        float curDist = screenDistanceFrom(view.screenPose, head);
+        float curFov = screenFovFromPlacement(view.screenWidth, curDist, ctx->screenRadius,
+                                              view.screenCurved);
+        ctx->lastScreenFovDeg = curFov;
+        float dmDt = 0.0f;
+        if (ctx->lastDanmakuFrameNs != 0 && frameNs > ctx->lastDanmakuFrameNs) {
+            dmDt = (float)(frameNs - ctx->lastDanmakuFrameNs) / 1e9f;
+            if (dmDt > 0.10f) dmDt = 0.10f;
+        }
+        ctx->lastDanmakuFrameNs = frameNs;
+        danmakuRenderEyes(ctx, curFov, curDist, dmDt, frameNs, view.stereo);
+    }
+    else if (ctx->localMedia) {
+        ctx->danmaku.drawnEyes = 0;
+    }
     stepPanelFades(ctx, frameNs);
     stepSplash(ctx, frameNs);
     int splashUp = ctx->splash.phase == SPLASH_UP;
@@ -1634,6 +1735,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
     }
     if (!splashUp && ctx->everRendered && ctx->shouldRender) {
         addVideoLayers(ctx, &view, &layers);
+        addDanmakuLayers(ctx, &view, &layers);
         addOverlayLayer(ctx, &view, &layers);
         addTransportLayer(ctx, &view, &layers);
         addHandleLayer(ctx, &view, &layers);
@@ -1654,41 +1756,34 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
     // Last, so it is in front of everything
     addSplashLayers(ctx, &layers, frameNs);
 
-    // The Room tab at its fullest, with a room, the glow, the stats and the
-    // ray all up, is a layer past the Pico's sixteen, two with the toast, and
-    // the controller models put three more of the tabs past it. A frame over
-    // the limit is refused whole (the count is in the comment at the top).
-    // The toast goes first: it is only ever a few seconds of words, and what
-    // it says is still true without it. Then the controller models: a hand
-    // that goes unseen while a full tab is up still points, and the beam and
-    // the dot are still there to show where. Then the hover ring, which
-    // every tab and the step buttons share: the cursor already shows where the
-    // ray is. Then the cog button, which only says which panel is open while
-    // it is: a press off the panel closes it the way pressing the button
-    // would. Then the clock over the panel, which the stats can show as well.
-    if (layers.count > (uint32_t)ctx->maxLayerCount) {
-        dropLayer(&layers, &layers.toast);
+    // Enforce hard <= 16 composition layer limit (OVERLAY_HARD_MAX_LAYERS) using
+    // the shared host-tested production drop ladder: toast -> models -> cogHover ->
+    // cogButton -> cogClock -> danmaku. Never let xrEndFrame receive > 16 layers.
+    int effectiveLimit = ctx->maxLayerCount;
+    if (effectiveLimit <= 0 || effectiveLimit > OVERLAY_HARD_MAX_LAYERS) {
+        effectiveLimit = OVERLAY_HARD_MAX_LAYERS;
     }
-    if (layers.count > (uint32_t)ctx->maxLayerCount) {
-        dropLayer(&layers, &layers.models);
-    }
-    if (layers.count > (uint32_t)ctx->maxLayerCount) {
-        dropLayer(&layers, &layers.cogMark[COG_OPTION_COUNT]);
-    }
-    if (layers.count > (uint32_t)ctx->maxLayerCount) {
-        dropLayer(&layers, &layers.cogButton);
-    }
-    if (layers.count > (uint32_t)ctx->maxLayerCount) {
-        dropLayer(&layers, &layers.cogClock);
+    int keep[FRAME_MAX_LAYERS];
+    int keptCount = overlayApplyLayerBudget(layers.slotKind, (int)layers.count,
+                                            effectiveLimit, keep);
+    if (keptCount < (int)layers.count) {
+        uint32_t dst = 0;
+        for (uint32_t i = 0; i < layers.count; i++) {
+            if (keep[i]) {
+                layers.order[dst] = layers.order[i];
+                layers.slotKind[dst] = layers.slotKind[i];
+                dst++;
+            }
+        }
+        layers.count = dst;
     }
 
     // Said once and only once, since a frame that crowds the limit is usually
-    // every frame after it. Nothing else is dropped: a missing layer is a
-    // silent bug, where the count in the log points straight at the culprit.
-    if (layers.count >= (uint32_t)ctx->maxLayerCount && !ctx->layerLimitWarned) {
+    // every frame after it.
+    if (layers.count >= (uint32_t)effectiveLimit && !ctx->layerLimitWarned) {
         ctx->layerLimitWarned = 1;
         LOGW("submitted %u composition layers against a limit of %d",
-             layers.count, ctx->maxLayerCount);
+             layers.count, effectiveLimit);
     }
 
     endInfo.layerCount = layers.count;

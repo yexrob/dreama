@@ -17,5 +17,7 @@ extern const char* const ROOM_VERTEX_SRC;
 extern const char* const ROOM_FRAGMENT_SRC;
 extern const char* const MODEL_VERTEX_SRC;
 extern const char* const MODEL_FRAGMENT_SRC;
+extern const char* const DANMAKU_VERTEX_SRC;
+extern const char* const DANMAKU_FRAGMENT_SRC;
 
 #endif

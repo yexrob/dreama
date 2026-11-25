@@ -280,3 +280,44 @@ class PaletteSaveDebouncer {
         const val DEBOUNCE_MS = 250L
     }
 }
+
+/**
+ * Immutable lock-free snapshot of dirty palette settings published by the palette worker so
+ * `Activity.onDestroy()` can commit pending edits via non-blocking `SharedPreferences.Editor.apply()`
+ * in 0 ms without blocking the main thread on the worker HandlerThread.
+ */
+data class PendingPaletteSaveSnapshot(
+    val global: GlobalPaletteSettings?,
+    val videoKey: String?,
+    val video: VideoPaletteOverrides?,
+)
+
+class PalettePendingSaveBuffer {
+    private val ref = java.util.concurrent.atomic.AtomicReference<PendingPaletteSaveSnapshot?>(null)
+
+    fun publish(
+        globalDirty: Boolean,
+        global: GlobalPaletteSettings,
+        videoDirty: Boolean,
+        videoKey: String?,
+        video: VideoPaletteOverrides,
+    ) {
+        if (!globalDirty && !videoDirty) {
+            ref.set(null)
+            return
+        }
+        ref.set(
+            PendingPaletteSaveSnapshot(
+                global = if (globalDirty) global else null,
+                videoKey = if (videoDirty) videoKey else null,
+                video = if (videoDirty) video else null,
+            ),
+        )
+    }
+
+    fun clear() {
+        ref.set(null)
+    }
+
+    fun drainForDestroy(): PendingPaletteSaveSnapshot? = ref.getAndSet(null)
+}

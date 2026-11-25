@@ -191,8 +191,19 @@ int paletteShowLayer(int localMedia, int paletteVisible, int paletteArtReady, fl
 int paletteShowDimmerLayer(int localMedia, int roomOn, int passthrough,
                            int passthroughDim, int dimmerArtReady);
 
-// Whether depth model inference should run (false for native SBS/OU stereo sources)
-int paletteNeedsDepthInference(int stereoMode, int stereoLive, int stereoSourceFormat);
+// Whether depth model inference should run (false for native SBS/OU or after depthGaveUp)
+int paletteNeedsDepthInference(int stereoMode, int stereoLive, int stereoSourceFormat,
+                               int depthGaveUp);
+
+// Whether the video eye-buffer swapchain needs double width (videoWidth * 2).
+// PC streaming keeps the legacy stereoMode != OFF rule; local playback starts
+// single-wide for 2D and upgrades to double-wide only when stereo is active or SBS/OU.
+int paletteNeedStereoSwapchain(int localMedia, int stereoMode, int stereoLive,
+                               int stereoSourceFormat, int depthGaveUp);
+
+// Coalesces multiple palette haptic requests within one frame by priority
+// (LIMIT > DETENT > TICK > NONE) so a weaker tick never clobbers a stronger pulse.
+int paletteMergeHaptic(int currentKind, int incomingKind);
 
 // Aspect-ratio heuristic separating Half-SBS (<=2.55) from Full-SBS (>=2.67) and
 // Full-OU (<=1.20) from Half-OU (>=1.33) for standard 4:3 / 16:9 / 2.39:1 sources.

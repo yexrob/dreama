@@ -272,18 +272,32 @@ class PluginProtocolMapper(
     }
 
     fun mapDanmaku(element: JsonElement): List<DanmakuItem> {
-        requireSchema("DanmakuResult", element)
-        return (element as JsonArray).mapNotNull { el ->
-            val o = el as JsonObject
-            val timeMs = o.optDouble("timeMs")?.takeIf { it.isFinite() && it >= 0.0 }?.toLong() ?: return@mapNotNull null
+        if (element !is JsonArray) {
+            requireSchema("DanmakuResult", element)
+            return emptyList()
+        }
+        val out = ArrayList<DanmakuItem>(minOf(element.size, MAX_DANMAKU_PER_WINDOW))
+        for (el in element) {
+            if (out.size >= MAX_DANMAKU_PER_WINDOW) break
+            val o = el as? JsonObject ?: continue
+            val timeMs = o.optDouble("timeMs")
+                ?.takeIf { it.isFinite() && it >= 0.0 && it <= MAX_DANMAKU_TIME_MS }
+                ?.toLong() ?: continue
+            val textPrim = o["text"] as? JsonPrimitive ?: continue
+            if (!textPrim.isString) continue
+            val text = textPrim.content
+            if (text.isBlank()) continue
             val color = parseDanmakuColor(o["color"])
-            DanmakuItem(
-                timeMs = timeMs,
-                text = (o["text"] as JsonPrimitive).content,
-                color = color,
-                mode = DanmakuMode.fromWire(o.optString("mode")),
+            out.add(
+                DanmakuItem(
+                    timeMs = timeMs,
+                    text = text,
+                    color = color,
+                    mode = DanmakuMode.fromWire(o.optString("mode")),
+                ),
             )
         }
+        return out
     }
 
     fun mapCategories(element: JsonElement): List<Category> {
@@ -589,6 +603,8 @@ class PluginProtocolMapper(
     }
 
     companion object {
+        const val MAX_DANMAKU_PER_WINDOW = 2_000
+        private const val MAX_DANMAKU_TIME_MS = 86_400_000.0 * 7.0
         private val RANGE_REGEX = Regex("\\A\\d+-\\d+\\z")
         private val HEX_COLOR_REGEX = Regex("\\A#?[0-9a-fA-F]{6}([0-9a-fA-F]{2})?\\z")
     }

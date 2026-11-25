@@ -52,6 +52,8 @@
 #include "xr_gamepad.h"
 #include "xr_screen_ctrl.h"
 #include "xr_palette.h"
+#include "xr_overlay.h"
+#include "xr_danmaku.h"
 
 #define TAG "moonlight-xr"
 
@@ -448,7 +450,7 @@ typedef struct XrCompositionLayerSettingsFB {
 // 256 square map, and scaled with the map on each axis.
 #define DEPTH_LOWPASS_RADIUS 11
 
-typedef struct {
+typedef struct XrCtx {
     JavaVM* vm;
     jobject activity;
 
@@ -1440,9 +1442,16 @@ typedef struct {
     int paletteArtReady;
     unsigned char* paletteFlipBuf;
 
-    // depth3d G2: lazy depth-model GL readiness (deferred when local playback starts 3D OFF)
+    // depth3d G2: depth-model GL readiness (pre-warmed behind splash without loading weights)
     int depthModelGlReady;
+    int depthModelGlFailed;
     int depthReadyRendered;
+    // Whether ctx->swapchain is double-wide (videoWidth * 2) for stereo rendering,
+    // whether a mid-session stereo upgrade failed (latched once so we never spam retries),
+    // and whether the active swapchain has had at least one image released.
+    int swapchainStereo;
+    int swapchainUpgradeFailed;
+    int swapchainHasFrame;
 
     // depth3d G2: mutex-guarded pending commands from non-render threads, applied
     // exclusively on the render thread at the start of nativeUpdateInput / nativeEndFrame.
@@ -1478,6 +1487,14 @@ typedef struct {
     XrSwapchainImageOpenGLESKHR* dimmerImages;
     int dimmerArtReady;
     int passthroughDim;
+
+    // depth3d G4 (+ G3 shared overlay depth): GPU danmaku compositor & 64-bin
+    // 98th-percentile foreground content depth published atomically from stage thread
+    DanmakuState danmaku;
+    _Atomic uint32_t depthContentPhiBits;
+    float danmakuContentPhiSmoothed;
+    float lastScreenFovDeg;
+    int64_t lastDanmakuFrameNs;
 
     // Hover state, read by the frame loop to decide which handle to draw
     int hoverKind;
@@ -1755,6 +1772,7 @@ typedef void (*PFNDELETEQUERIESEXT)(GLsizei, const GLuint*);
 // xr_session.c: instance, session, swapchain and lifecycle
 int checkXr(XrResult res, const char* what);
 const char* xrResultName(XrResult res);
+int ensureVideoSwapchainStereo(XrCtx* ctx);
 
 // xr_gl.c: GL setup, the warp passes and the GPU timer
 extern const float VERTEX_DATA[16];

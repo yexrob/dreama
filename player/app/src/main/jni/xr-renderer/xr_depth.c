@@ -561,6 +561,20 @@ Java_com_limelight_binding_video_XrRenderer_nativeUploadDepth(JNIEnv* env, jobje
     // Counted for the splash, which waits for the first
     atomic_fetch_add_explicit(&ctx->depthMapsStaged, 1, memory_order_relaxed);
 
+    // depth3d G4/G3 shared: compute 64-bin 98th-percentile foreground disparity
+    // directly from CPU-resident depthNorm on the background stage thread (< 0.04 ms,
+    // zero GPU overhead & zero render-thread stall) for automatic layered float.
+    if (ctx->localMedia) {
+        float sep = ctx->panelSeparation >= 0.0f ? ctx->panelSeparation : ctx->separationCurrent;
+        float fov = ctx->lastScreenFovDeg > 1.0f ? ctx->lastScreenFovDeg : 50.0f;
+        float botFrac = ctx->danmaku.drawnAreaBotFrac > 0.1f ? ctx->danmaku.drawnAreaBotFrac : 0.5f;
+        float phiDeg = overlayHistogram98Percentile(ctx->depthNorm, w, h, 0.0f, botFrac,
+                                                    conv, sep, fov);
+        uint32_t bits = 0;
+        memcpy(&bits, &phiDeg, sizeof(bits));
+        atomic_store_explicit(&ctx->depthContentPhiBits, bits, memory_order_relaxed);
+    }
+
     // Always the next slot in the rotation, never a function of where the
     // frame loop currently is, which is what keeps this from landing on a slot
     // it could still have a draw in flight against

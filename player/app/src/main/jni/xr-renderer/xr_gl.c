@@ -317,7 +317,22 @@ int initGl(XrCtx* ctx) {
         return 0;
     }
 
-    if (ctx->stereoMode == DEPTH_MODE_MODEL && ctx->stereoLive) {
+    if (ctx->localMedia) {
+        // Pre-warm depth GL shaders, FBOs, PBOs, and shared EGL contexts during
+        // startup while the splash hides initialization (~4 MB, ZERO model file
+        // I/O or inference threads). Eliminates the render-thread GL hitch when
+        // 3D is first enabled mid-playback. Failure degrades gracefully to 2D.
+        if (!ensureDepthModelGl(ctx)) {
+            LOGW("depth3d: depth GL pre-warm failed during startup; AI 3D unavailable");
+            ctx->depthModelGlFailed = 1;
+            atomic_store_explicit(&ctx->depthGaveUp, 1, memory_order_relaxed);
+        }
+        // Danmaku GPU resources (~56-72 MB: 2048x2048 RGBA8 atlas + 2 eye swapchains) are NOT
+        // pre-warmed here so videos with danmaku OFF or no danmaku source allocate 0 VRAM.
+        // Instead, danmakuRenderEyes() runs a 4-stage staggered lazy init (1 stage/frame)
+        // ONLY once an active danmaku source is enabled (dm->enabled == 1).
+    }
+    else if (ctx->stereoMode == DEPTH_MODE_MODEL && ctx->stereoLive) {
         if (!ensureDepthModelGl(ctx)) {
             return 0;
         }
@@ -327,13 +342,18 @@ int initGl(XrCtx* ctx) {
 }
 
 // Initializes GL/EGL depth-model staging and upsample passes once on the render
-// thread. Deferred when local playback starts with 3D OFF so zero model RAM or
-// GL contexts are allocated until the user turns 3D ON in AUTO mode.
+// thread. Pre-warmed behind the startup splash for local media so enabling 3D
+// mid-playback incurs zero shader-compile or context-creation hitch.
 int ensureDepthModelGl(XrCtx* ctx) {
     if (ctx->depthModelGlReady) {
         return 1;
     }
+    if (ctx->depthModelGlFailed
+            || atomic_load_explicit(&ctx->depthGaveUp, memory_order_relaxed)) {
+        return 0;
+    }
     if (!initDepthModel(ctx) || !initUpsample(ctx)) {
+        ctx->depthModelGlFailed = 1;
         return 0;
     }
     ctx->depthModelGlReady = 1;
@@ -403,16 +423,17 @@ void renderVideoFrame(XrCtx* ctx, const float* texMatrix, float separation) {
     // Both eyes warped, unless the 3D is switched off for the session or has
     // only just come back on and is waiting for a fresh map. Native SBS/OU
     // stereo sources bypass the depth model and draw left/right halves directly.
+    int depthGaveUp = atomic_load_explicit(&ctx->depthGaveUp, memory_order_relaxed);
     int nativeStereoSrc = ctx->stereoSourceFormat == STEREO_SRC_SBS
             || ctx->stereoSourceFormat == STEREO_SRC_OU;
     int depthMapReady = ctx->stereoMode == DEPTH_MODE_MODEL
-            ? (ctx->depthModelGlReady
+            ? (ctx->depthModelGlReady && !depthGaveUp
                && atomic_load_explicit(&ctx->depthMapsStaged, memory_order_acquire) > 0)
             : (ctx->stereoMode != DEPTH_MODE_OFF);
-    int warping = nativeStereoSrc
-            ? ctx->stereoLive
+    int warping = ctx->swapchainStereo && (nativeStereoSrc
+            ? 1
             : (ctx->stereoMode != DEPTH_MODE_OFF && ctx->stereoLive
-               && !ctx->stereoWaiting && depthMapReady);
+               && !ctx->stereoWaiting && depthMapReady));
     int upsampling = !nativeStereoSrc && warping
             && ctx->stereoMode == DEPTH_MODE_MODEL && ctx->depthModelGlReady
             && ctx->upsampleEnabled;
@@ -470,6 +491,10 @@ void renderVideoFrame(XrCtx* ctx, const float* texMatrix, float separation) {
     uint32_t imageIndex = 0;
     XrSwapchainImageAcquireInfo acquireInfo = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
     if (!checkXr(xrAcquireSwapchainImage(ctx->swapchain, &acquireInfo, &imageIndex), "acquire image")) {
+        // S3: warpRedraw was cleared at the top of renderVideoFrame; re-arm it so a paused
+        // video (especially right after a stereo swapchain upgrade with swapchainHasFrame == 0)
+        // retries rendering on the next frame instead of remaining black.
+        ctx->warpRedraw = 1;
         // The query opened above must not be left standing on this early out,
         // or the next frame's begin would nest inside it
         if (timing && !ctx->timerPending[ctx->timerSlot]) {
@@ -653,7 +678,8 @@ void renderVideoFrame(XrCtx* ctx, const float* texMatrix, float separation) {
 
     XrSwapchainImageReleaseInfo releaseInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
     xrReleaseSwapchainImage(ctx->swapchain, &releaseInfo);
-    // What the layers show from here on
+    // What the layers show from here on (guarantees swapchain has at least one released image)
+    ctx->swapchainHasFrame = 1;
     ctx->drawnEyes = eyes;
 
     // Close this frame's query and collect whichever earlier one has landed.

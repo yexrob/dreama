@@ -326,8 +326,36 @@ class PluginMediaSource(
             put("fromMs", fromMs.coerceAtLeast(0L))
             put("toMs", toMs.coerceAtLeast(0L))
         }
-        val raw = runtime.invoke("danmaku", arg, itemIdForErrors = itemId)
+        val raw = runtime.invoke(
+            "danmaku",
+            arg,
+            itemIdForErrors = itemId,
+            timeoutMsOverride = DANMAKU_CALL_TIMEOUT_MS,
+        )
         mapper.mapDanmaku(raw)
+    }
+
+    /**
+     * Non-blocking idle-only danmaku fetch for playback windows: returns `null` immediately
+     * when the plugin instance mutex is held by `playback`/refresh/progress instead of queuing
+     * behind or starving high-priority calls, and enforces a bounded ~5 s call timeout.
+     */
+    suspend fun danmakuIfIdle(
+        itemId: String,
+        fromMs: Long,
+        toMs: Long,
+        timeoutMs: Long = DANMAKU_CALL_TIMEOUT_MS,
+    ): List<DanmakuItem>? = guarded {
+        requireCapability(PluginCapability.DANMAKU)
+        val arg = buildJsonObject {
+            put("itemId", itemId)
+            put("fromMs", fromMs.coerceAtLeast(0L))
+            put("toMs", toMs.coerceAtLeast(0L))
+        }
+        when (val res = runtime.invokeIfIdle("danmaku", arg, itemIdForErrors = itemId, timeoutMsOverride = timeoutMs)) {
+            is PluginRuntime.IdleInvokeResult.Busy -> null
+            is PluginRuntime.IdleInvokeResult.Done -> mapper.mapDanmaku(res.value)
+        }
     }
 
     override suspend fun categories(): List<Category> = guarded {
@@ -435,6 +463,7 @@ class PluginMediaSource(
 
     companion object {
         const val MAX_KNOWN_TITLES = 512
+        const val DANMAKU_CALL_TIMEOUT_MS = 5_000L
         fun sourceIdFor(instanceId: String): String = "plugin:$instanceId"
     }
 }

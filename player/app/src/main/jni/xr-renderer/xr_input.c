@@ -828,20 +828,25 @@ void applyPendingLocalCmds(XrCtx* ctx, int allowPlacement) {
         if (cmd.stereoDepthLocal > 0.0f) {
             ctx->depthLocal = cmd.stereoDepthLocal;
         }
-        if (ctx->localMedia && cmd.stereoOn
+        int depthGaveUp = atomic_load_explicit(&ctx->depthGaveUp, memory_order_relaxed);
+        int effectiveOn = cmd.stereoOn;
+        if (ctx->localMedia && ctx->stereoSourceFormat == STEREO_SRC_AUTO && depthGaveUp) {
+            effectiveOn = 0;
+        }
+        if (ctx->localMedia && effectiveOn
                 && ctx->stereoSourceFormat == STEREO_SRC_AUTO
                 && ctx->stereoMode == DEPTH_MODE_OFF) {
             // Promote to DEPTH_MODE_MODEL lazily on first 3D ON in AUTO mode
             ctx->stereoMode = DEPTH_MODE_MODEL;
         }
-        setStereoLive(ctx, cmd.stereoOn, "palette");
+        setStereoLive(ctx, effectiveOn, "palette");
         if (ctx->stereoSourceFormat != STEREO_SRC_AUTO) {
             ctx->stereoWaiting = 0;
         }
         ctx->warpRedraw = 1;
     }
     if (cmd.pendingHaptic > PALETTE_HAPTIC_NONE) {
-        ctx->palettePendingHaptic = cmd.pendingHaptic;
+        ctx->palettePendingHaptic = paletteMergeHaptic(ctx->palettePendingHaptic, cmd.pendingHaptic);
     }
     if (cmd.hasScreenDims && allowPlacement) {
         ScreenPlacementState ps;
@@ -3472,7 +3477,7 @@ static void updateLocalPalettePre(XrCtx* ctx, InputFrame* f, XrPosef* outGrip,
         LOGEV("depth3d: palette opened from control bar (pinned, hands=%d)", handTracking);
     }
     if (out.hapticKind > PALETTE_HAPTIC_NONE) {
-        ctx->palettePendingHaptic = out.hapticKind;
+        ctx->palettePendingHaptic = paletteMergeHaptic(ctx->palettePendingHaptic, out.hapticKind);
     }
     for (int h = 0; h < HAND_COUNT; h++) {
         if (out.suppressRay[h]) {
@@ -3549,7 +3554,7 @@ static void updateLocalPalettePost(XrCtx* ctx, InputFrame* f, int handTracking) 
         swallowTrigger(ctx, out.swallowHand);
     }
     if (out.hapticKind > PALETTE_HAPTIC_NONE) {
-        ctx->palettePendingHaptic = out.hapticKind;
+        ctx->palettePendingHaptic = paletteMergeHaptic(ctx->palettePendingHaptic, out.hapticKind);
     }
     if (out.clickSound) {
         ctx->clickPending = 1;
@@ -3669,7 +3674,16 @@ static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, XrPosef gripPose, i
     screenInputStep(&ctx->screenCtrl, &in, &res);
     applyUiHaptic(ctx, res.hapticEvent, opH, f->now);
     if (ctx->palettePendingHaptic != PALETTE_HAPTIC_NONE) {
-        applyPaletteHaptic(ctx, ctx->palettePendingHaptic, opH, f->now);
+        // Map distinct SCREEN_HAPTIC_* and PALETTE_HAPTIC_* enums onto one unified priority scale
+        int screenPrio = res.hapticEvent == SCREEN_HAPTIC_LIMIT ? 3
+                : (res.hapticEvent == SCREEN_HAPTIC_DETENT ? 2
+                   : (res.hapticEvent == SCREEN_HAPTIC_HINT ? 1 : 0));
+        int palettePrio = ctx->palettePendingHaptic == PALETTE_HAPTIC_LIMIT ? 3
+                : (ctx->palettePendingHaptic == PALETTE_HAPTIC_DETENT ? 2
+                   : (ctx->palettePendingHaptic == PALETTE_HAPTIC_TICK ? 1 : 0));
+        if (palettePrio > screenPrio) {
+            applyPaletteHaptic(ctx, ctx->palettePendingHaptic, opH, f->now);
+        }
         ctx->palettePendingHaptic = PALETTE_HAPTIC_NONE;
     }
 
@@ -4020,8 +4034,9 @@ static void handBack(JNIEnv* env, XrCtx* ctx, float* out, jfloatArray outArr) {
         // Every room keeps its own values, so a room setting says whose it is
         out[IN_SETTING_ROOM] = (float)roomCellForStyle(roomEffective(ctx));
         cogReadouts(ctx, readouts);
-        out[IN_STEREO] = paletteNeedsDepthInference(ctx->stereoMode, ctx->stereoLive,
-                                                    ctx->stereoSourceFormat) ? 1.0f : 0.0f;
+        out[IN_STEREO] = paletteNeedsDepthInference(
+                ctx->stereoMode, ctx->stereoLive, ctx->stereoSourceFormat,
+                atomic_load_explicit(&ctx->depthGaveUp, memory_order_relaxed)) ? 1.0f : 0.0f;
 
         // depth3d G2: quick palette state & one-shot input events
         out[IN_PALETTE_OPEN] = ctx->palette.open ? 1.0f : 0.0f;
@@ -4037,6 +4052,18 @@ static void handBack(JNIEnv* env, XrCtx* ctx, float* out, jfloatArray outArr) {
         out[IN_PALETTE_TAB_STEP] = (float)ctx->paletteTabStepOut;
         out[IN_PALETTE_PAGE_STEP] = (float)ctx->palettePageStepOut;
         out[IN_PALETTE_DIM_FALLBACK] = ctx->palettePose.dimFallback ? 1.0f : 0.0f;
+        out[IN_CONTENT_PHI_CENTI] = roundf(ctx->danmakuContentPhiSmoothed * 100.0f);
+        int unavailMask = 0;
+        if (ctx->depthModelGlFailed
+                || atomic_load_explicit(&ctx->depthGaveUp, memory_order_relaxed)) {
+            unavailMask |= STEREO_UNAVAIL_DEPTH;
+        }
+        if (ctx->swapchainUpgradeFailed) {
+            unavailMask |= STEREO_UNAVAIL_SWAPCHAIN;
+        }
+        out[IN_STEREO_UNAVAILABLE] = (float)unavailMask;
+        out[IN_DANMAKU_UNAVAILABLE] = atomic_load_explicit(
+                &ctx->danmaku.glFailed, memory_order_relaxed) ? 1.0f : 0.0f;
         ctx->paletteClickState = 0;
         ctx->paletteRowStepOut = 0;
         ctx->paletteRowResetOut = 0;

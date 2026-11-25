@@ -165,11 +165,16 @@ class PaletteRenderer {
 
     private fun drawTab3d(c: PaletteController) {
         val s = c.strings
-        drawChipsRow(
-            c, 0, s.row3dStrength,
-            arrayOf(s.strengthOff, s.strengthSoft, s.strengthStandard, s.strengthStrong),
-            c.effectiveStrength.ordinal, enabled = true,
-        )
+        val strengthErr = c.strengthDisabledMessage
+        if (strengthErr != null) {
+            drawDisabledRow(c, 0, s.row3dStrength, strengthErr)
+        } else {
+            drawChipsRow(
+                c, 0, s.row3dStrength,
+                arrayOf(s.strengthOff, s.strengthSoft, s.strengthStandard, s.strengthStrong),
+                c.effectiveStrength.ordinal, enabled = true,
+            )
+        }
         drawChipsRow(
             c, 1, s.row3dSource,
             arrayOf(s.sourceAuto, s.sourceSbs, s.sourceOu),
@@ -314,6 +319,11 @@ class PaletteRenderer {
         if (!c.danmakuSupported) {
             drawInfoRow(0, s.danmakuUnsupportedTitle, primary = true)
             drawInfoRow(1, s.danmakuUnsupportedSub, primary = false)
+            return
+        }
+        if (c.danmakuGlUnavailable) {
+            drawInfoRow(0, s.danmakuGlUnavailableTitle, primary = true)
+            drawInfoRow(1, s.danmakuGlUnavailableSub, primary = false)
             return
         }
         if (c.danmakuLoadFailed) {

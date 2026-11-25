@@ -37,6 +37,10 @@ import com.limelight.R;
 import com.limelight.binding.video.XrRenderer;
 import com.limelight.binding.video.XrShared;
 import com.limelight.binding.video.XrStartFailure;
+import com.limelight.local.danmaku.DanmakuPreviewStrings;
+import com.limelight.local.danmaku.DanmakuSessionManager;
+import com.limelight.local.danmaku.DanmakuXmlParser;
+import com.limelight.local.danmaku.LocalDanmakuPlaybackBridge;
 import com.limelight.local.dlna.CastReceiver;
 import com.limelight.local.dlna.PlayerLink;
 import com.limelight.local.dlna.PlayerState;
@@ -48,6 +52,11 @@ import com.limelight.local.stream.DepthStrength;
 import com.limelight.local.stream.PrefsStore;
 import com.limelight.preferences.PreferenceConfiguration;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -127,6 +136,7 @@ public class LocalPlayerXR extends Activity
     private final PaletteInputMailbox paletteMailbox = new PaletteInputMailbox();
     private final PaletteDrainedInput paletteDrained = new PaletteDrainedInput();
     private final PaletteSaveDebouncer paletteSaveDebouncer = new PaletteSaveDebouncer();
+    private final PalettePendingSaveBuffer palettePendingSaves = new PalettePendingSaveBuffer();
     private final Runnable paletteDrainTask = this::drainPaletteOnWorker;
     private final Runnable paletteFlushSaveTask = this::flushPaletteSavesOnWorker;
     private PaletteController palette;
@@ -137,15 +147,24 @@ public class LocalPlayerXR extends Activity
     private String currentVideoKey = "anonymous";
     private boolean savedSubOverrideApplied;
     private boolean savedAudOverrideApplied;
-    private boolean screenGestureHintChecked;
+    private boolean screenGestureHintQueued;
     private volatile String activeDepthModel;
     private volatile boolean initialStereoLiveForSession = true;
     private volatile boolean initialVideoHasExplicitStereoOn;
+    private volatile StereoSourceFormat savedVideoSourceOverride;
     private volatile StereoSourceFormat activeSourceFormatUi = StereoSourceFormat.AUTO;
+    private volatile boolean depthModelUnavailableUi;
+    private volatile boolean danmakuGlUnavailableUi;
     private volatile boolean paletteOpenUi;
     private volatile boolean danmakuSupportedUi;
     private volatile boolean danmakuOnUi = true;
+    private volatile boolean danmakuMergeDuplicatesUi = true;
+    private DanmakuSessionManager danmakuManager;
+    private LocalDanmakuPlaybackBridge danmakuBridge;
+    private boolean barScrubbing;
+    private float barScrubFraction = Float.NaN;
     private int lastPaletteRowMask = -1;
+    private int lastPaletteTabOnWorker = -1;
     private Tracks latestTracks = Tracks.EMPTY;
     private long fallbackDurationMs;
     private boolean refreshInFlight;
@@ -215,6 +234,39 @@ public class LocalPlayerXR extends Activity
         paletteThread = new HandlerThread("depth3d-palette");
         paletteThread.start();
         paletteHandler = new Handler(paletteThread.getLooper());
+        danmakuManager = new DanmakuSessionManager(
+                this,
+                buildDanmakuPreviewStrings(),
+                this::openNonPluginSidecarXml,
+                supported -> {
+                    danmakuSupportedUi = supported;
+                    postToPaletteWorker(() -> {
+                        if (palette != null) {
+                            palette.setDanmakuSupported(supported);
+                            syncDanmakuPreviewOnWorker();
+                            XrRenderer xr = renderer;
+                            if (xr != null) {
+                                redrawPaletteOnWorker(xr);
+                            }
+                        }
+                    });
+                    main.post(this::tickBar);
+                    return kotlin.Unit.INSTANCE;
+                },
+                failed -> {
+                    postToPaletteWorker(() -> {
+                        if (palette != null) {
+                            palette.setDanmakuLoadFailed(failed);
+                            syncDanmakuPreviewOnWorker();
+                            XrRenderer xr = renderer;
+                            if (xr != null) {
+                                redrawPaletteOnWorker(xr);
+                            }
+                        }
+                    });
+                    return kotlin.Unit.INSTANCE;
+                });
+        danmakuBridge = new LocalDanmakuPlaybackBridge(danmakuManager);
         initPaletteForIntent(getIntent(), false);
 
         trackSelector = createTrackSelector(this);
@@ -304,6 +356,9 @@ public class LocalPlayerXR extends Activity
         refreshInFlight = false;
         wantPlay = true;
         resetTrackSelectorForNewItem();
+        if (danmakuBridge != null) {
+            danmakuBridge.onNewItemLoading();
+        }
         player.setRepeatMode(Player.REPEAT_MODE_OFF);
         player.setWakeMode(C.WAKE_MODE_NETWORK);
         player.setPlayWhenReady(false);
@@ -330,13 +385,26 @@ public class LocalPlayerXR extends Activity
                                         : (media.getStereoHint() == StereoHint.OU
                                                 ? StereoSourceFormat.OU
                                                 : StereoSourceFormat.AUTO);
+                        // Resolve synchronously BEFORE prepare() so onTracksChanged -> startSession
+                        // sees the plugin SBS/OU hint and skips unnecessary depth-model startup.
+                        activeSourceFormatUi = PaletteTrackManager.resolveInitialSourceFormat(
+                                savedVideoSourceOverride, hintFormat);
                         danmakuSupportedUi = supportsDm;
+                        DanmakuSessionManager dm = danmakuManager;
+                        if (dm != null) {
+                            dm.bindPluginSource(
+                                    pluginSession,
+                                    supportsDm,
+                                    media.getResumePositionMs(),
+                                    danmakuMergeDuplicatesUi);
+                        }
                         postToPaletteWorker(() -> {
                             if (palette != null) {
                                 palette.setDanmakuSupported(supportsDm);
                                 palette.seedDefaultSourceFormat(hintFormat);
                                 activeSourceFormatUi = palette.getEffectiveSourceFormat();
                                 updateTransportBarAspect();
+                                syncDanmakuContextOnWorker();
                                 XrRenderer xr = renderer;
                                 if (xr != null) {
                                     applyPaletteStereoOnWorker(xr);
@@ -393,12 +461,23 @@ public class LocalPlayerXR extends Activity
         errorCanRetry = true;
         wantPlay = true;
         resetTrackSelectorForNewItem();
+        if (danmakuBridge != null) {
+            danmakuBridge.onNewItemLoading();
+        }
         // A film of its own loops as it always did; a cast ends, for the phone to send the next
         player.setRepeatMode(castId != 0 ? Player.REPEAT_MODE_OFF : Player.REPEAT_MODE_ONE);
         player.setWakeMode(isHttp(uri) ? C.WAKE_MODE_NETWORK : C.WAKE_MODE_NONE);
         player.setPlayWhenReady(false);
         player.setMediaItem(item.build());
         player.prepare();
+        DanmakuSessionManager dm = danmakuManager;
+        if (dm != null) {
+            if (castId != 0) {
+                dm.bindPluginSource(null, false, startMs, danmakuMergeDuplicatesUi);
+            } else {
+                dm.bindSidecarXmlSource(uri, h, startMs, danmakuMergeDuplicatesUi);
+            }
+        }
     }
 
     // Off the main thread: start() waits on the OpenXR session's init
@@ -477,6 +556,7 @@ public class LocalPlayerXR extends Activity
         XrRenderer r = new XrRenderer();
         r.setLocalMedia(true);
         r.setInitialStereoLive(startStereoLive);
+        r.setInitialSourceFormat(activeSourceFormatUi.getNativeCode());
         r.setInputListener(this);
         r.setSessionListener(this);
         if (!r.start(this, size[0], size[1], prefs)) {
@@ -521,6 +601,10 @@ public class LocalPlayerXR extends Activity
         checkShape = check;
         updateTransportBarAspect();
         final boolean cylOk = r.isCylinderSupported();
+        DanmakuSessionManager dm = danmakuManager;
+        if (dm != null) {
+            dm.attachRenderer(r);
+        }
         postToPaletteWorker(() -> {
             if (paletteRenderer == null) {
                 paletteRenderer = new PaletteRenderer();
@@ -532,6 +616,7 @@ public class LocalPlayerXR extends Activity
             }
             lastPaletteRowMask = -1;
             applyPaletteStereoOnWorker(r);
+            syncDanmakuContextOnWorker();
             redrawPaletteOnWorker(r);
         });
         p.setVideoSurface(r.getInputSurface());
@@ -549,23 +634,39 @@ public class LocalPlayerXR extends Activity
                 r.showNotice(getString(com.limelight.R.string.player_buffering_webdav), title());
             }
         }
-        // Proactive first-time local playback gesture discovery hint (shown once ever)
-        if (!screenGestureHintChecked && globalPaletteStore != null) {
-            screenGestureHintChecked = true;
-            if (!PaletteStore.isScreenGestureHintSeen(globalPaletteStore)) {
-                PaletteStore.markScreenGestureHintSeen(globalPaletteStore);
-                String[] lines = PaletteTrackManager.splitGestureHintForToast(
-                        getString(R.string.vr_hint_screen_gesture));
-                r.showNotice(lines[0], lines[1]);
-            }
-        }
         if (ready && !errored) {
+            tryShowFirstTimeGestureHint(r);
             p.setPlayWhenReady(wantPlay);
             if (wantPlay && PluginHostGuards.isPluginSource(sourceKind) && pluginSession != null) {
                 pluginSession.reportStartAsync(position(), duration());
             }
+            if (danmakuBridge != null) {
+                danmakuBridge.onPlaybackUpdate(
+                        position(), p.getPlaybackState(), p.getPlayWhenReady(), errored,
+                        p.getPlaybackParameters().speed);
+            }
         }
         tickBar();
+    }
+
+    /**
+     * Shows the proactive first-time screen gesture hint once playback is actually ready and
+     * visible on the VR surface, marking it seen ONLY inside the post-upload callback when the
+     * toast is genuinely rendered on screen (G2 follow-up #7).
+     */
+    private void tryShowFirstTimeGestureHint(XrRenderer r) {
+        if (screenGestureHintQueued || r == null || globalPaletteStore == null) {
+            return;
+        }
+        screenGestureHintQueued = true;
+        final PrefsStore store = globalPaletteStore;
+        if (!PaletteStore.isScreenGestureHintSeen(store)) {
+            String[] lines = PaletteTrackManager.splitGestureHintForToast(
+                    getString(R.string.vr_hint_screen_gesture));
+            // Write SharedPreferences off the XR render thread on the palette worker (G2 residual)
+            r.showNotice(lines[0], lines[1],
+                    () -> postToPaletteWorker(() -> PaletteStore.markScreenGestureHintSeen(store)));
+        }
     }
 
     private void handlePlaybackFailure(Throwable error) {
@@ -589,6 +690,9 @@ public class LocalPlayerXR extends Activity
             return;
         }
         refreshInFlight = true;
+        if (danmakuBridge != null) {
+            danmakuBridge.onPluginRefreshStarted();
+        }
         notice(getString(com.limelight.R.string.plugin_player_refreshing), null);
         pluginSession.refreshAsync(resumePos, httpCode, new PluginPlayerSession.RefreshCallback() {
             @Override
@@ -670,14 +774,21 @@ public class LocalPlayerXR extends Activity
                 long d = duration();
                 // A resume point in the last seconds would only loop round to the start
                 boolean nearEnd = castId == 0 && d > 0 && startMs >= d - 5000;
+                long resolvedStartMs = (startMs > 0 && !nearEnd) ? startMs : position();
                 if (startMs > 0 && !nearEnd) {
                     p.seekTo(startMs);
                 }
                 if (surfaceSet) {
+                    tryShowFirstTimeGestureHint(renderer);
                     p.setPlayWhenReady(wantPlay);
                     if (wantPlay && PluginHostGuards.isPluginSource(sourceKind) && pluginSession != null) {
                         pluginSession.reportStartAsync(position(), duration());
                     }
+                }
+                if (danmakuBridge != null) {
+                    float spd = p.getPlaybackParameters().speed;
+                    boolean actuallyPlaying = surfaceSet && wantPlay && !errored;
+                    danmakuBridge.onPlayerReady(resolvedStartMs, actuallyPlaying, spd);
                 }
             } else if (state == Player.STATE_BUFFERING && ready
                     && (PluginHostGuards.isPluginSource(sourceKind) || isHttp(getIntent().getData()))) {
@@ -689,15 +800,24 @@ public class LocalPlayerXR extends Activity
                     pluginSession.reportFinishAsync(d > 0 ? d : position(), d);
                 }
             }
+            if (danmakuBridge != null && ready) {
+                danmakuBridge.onPlaybackUpdate(
+                        position(), state, p.getPlayWhenReady(), errored, p.getPlaybackParameters().speed);
+            }
             tickBar();
         }
 
         @Override
         public void onIsPlayingChanged(boolean isPlaying) {
+            ExoPlayer p = player;
+            if (danmakuBridge != null && p != null) {
+                danmakuBridge.onPlaybackUpdate(
+                        position(), p.getPlaybackState(), p.getPlayWhenReady(), errored,
+                        p.getPlaybackParameters().speed);
+            }
             if (!PluginHostGuards.isPluginSource(sourceKind) || pluginSession == null || !ready) {
                 return;
             }
-            ExoPlayer p = player;
             if (p == null) {
                 return;
             }
@@ -961,6 +1081,9 @@ public class LocalPlayerXR extends Activity
         }
         if (on && p.getPlaybackState() == Player.STATE_ENDED) {
             p.seekTo(0);
+            if (danmakuBridge != null) {
+                danmakuBridge.onUserSeek(0L);
+            }
         }
         if (ready && surfaceSet) {
             p.setPlayWhenReady(on);
@@ -1016,6 +1139,9 @@ public class LocalPlayerXR extends Activity
         } else {
             p.seekTo(clamped);
         }
+        if (danmakuBridge != null) {
+            danmakuBridge.onUserSeek(clamped);
+        }
         tickBar();
     }
 
@@ -1028,18 +1154,71 @@ public class LocalPlayerXR extends Activity
 
     @Override
     public void onVrButton(int button, boolean down) {
-        if (button != 0 || down) {
+        if (button != 0) {
             return;
         }
         final float u = pointerU, v = pointerV;
+        if (down) {
+            main.post(() -> {
+                ExoPlayer p = player;
+                TransportBar b = bar;
+                if (p == null || b == null || errored || !p.isCurrentMediaItemSeekable()) {
+                    return;
+                }
+                float x = b.texX(u, v);
+                if (!Float.isNaN(x)
+                        && !TransportBar.onButton(x)
+                        && !TransportBar.onAdjustButton(x)
+                        && !TransportBar.onDanmakuButton(x, danmakuSupportedUi)) {
+                    float f = TransportBar.trackFraction(x, danmakuSupportedUi);
+                    if (!Float.isNaN(f)) {
+                        barScrubbing = true;
+                        barScrubFraction = f;
+                        if (danmakuBridge != null) {
+                            danmakuBridge.onScrubStart();
+                        }
+                        tickBar();
+                    }
+                }
+            });
+            return;
+        }
         main.post(() -> {
             ExoPlayer p = player;
             TransportBar b = bar;
             if (p == null || b == null) {
+                if (barScrubbing) {
+                    barScrubbing = false;
+                    barScrubFraction = Float.NaN;
+                    if (danmakuBridge != null) {
+                        danmakuBridge.onScrubEnd(null);
+                    }
+                }
                 return;
             }
             pointerMovedMs = System.currentTimeMillis();
             float x = b.texX(u, v);
+            if (barScrubbing) {
+                float f = !Float.isNaN(x) ? TransportBar.trackFraction(x, danmakuSupportedUi) : barScrubFraction;
+                if (Float.isNaN(f)) {
+                    f = barScrubFraction;
+                }
+                barScrubbing = false;
+                barScrubFraction = Float.NaN;
+                long d = duration();
+                if (!Float.isNaN(f) && d > 0 && p.isCurrentMediaItemSeekable()) {
+                    long targetMs = (long) (f * d);
+                    lastKnownPositionMs = targetMs;
+                    p.seekTo(targetMs);
+                    if (danmakuBridge != null) {
+                        danmakuBridge.onScrubEnd(targetMs);
+                    }
+                } else if (danmakuBridge != null) {
+                    danmakuBridge.onScrubEnd(null);
+                }
+                tickBar();
+                return;
+            }
             if (errored) {
                 if (errorCanRetry && TransportBar.onErrorRetry(x)) {
                     retryCurrentPlayback();
@@ -1074,7 +1253,12 @@ public class LocalPlayerXR extends Activity
             if (!Float.isNaN(f)) {
                 long d = duration();
                 if (d > 0 && p.isCurrentMediaItemSeekable()) {
-                    p.seekTo((long) (f * d));
+                    long targetMs = (long) (f * d);
+                    lastKnownPositionMs = targetMs;
+                    p.seekTo(targetMs);
+                    if (danmakuBridge != null) {
+                        danmakuBridge.onUserSeek(targetMs);
+                    }
                 }
             } else {
                 setPlaying(!playing());
@@ -1100,6 +1284,11 @@ public class LocalPlayerXR extends Activity
                 lastKnownPositionMs = curPos;
             }
         }
+        if (danmakuBridge != null) {
+            danmakuBridge.onPlaybackUpdate(
+                    position(), p.getPlaybackState(), p.getPlayWhenReady(), errored,
+                    p.getPlaybackParameters().speed);
+        }
         if (PluginHostGuards.isPluginSource(sourceKind) && pluginSession != null && ready && !errored) {
             if (!refreshInFlight && pluginSession.shouldProactiveRefresh()) {
                 LimeLog.info("depth3d: proactively refreshing expiring plugin stream");
@@ -1114,6 +1303,15 @@ public class LocalPlayerXR extends Activity
         TransportBar b = bar;
         if (r != null && b != null) {
             long since = System.currentTimeMillis() - pointerMovedMs;
+            if (barScrubbing) {
+                float sx = b.texX(pointerU, pointerV);
+                if (!Float.isNaN(sx)) {
+                    float sf = TransportBar.trackFraction(sx, danmakuSupportedUi);
+                    if (!Float.isNaN(sf)) {
+                        barScrubFraction = sf;
+                    }
+                }
+            }
             if (errored) {
                 r.setTransportVisible(true);
                 float x = since < BAR_LINGER_MS ? b.texX(pointerU, pointerV) : Float.NaN;
@@ -1168,6 +1366,9 @@ public class LocalPlayerXR extends Activity
             long clamped = Math.max(0, to);
             lastKnownPositionMs = clamped;
             p.seekTo(clamped);
+            if (danmakuBridge != null) {
+                danmakuBridge.onUserSeek(clamped);
+            }
             pointerMovedMs = System.currentTimeMillis();
             tickBar();
         });
@@ -1210,6 +1411,9 @@ public class LocalPlayerXR extends Activity
             long clamped = Math.max(0, to);
             lastKnownPositionMs = clamped;
             p.seekTo(clamped);
+            if (danmakuBridge != null) {
+                danmakuBridge.onUserSeek(clamped);
+            }
             pointerMovedMs = System.currentTimeMillis();
             tickBar();
         });
@@ -1236,11 +1440,57 @@ public class LocalPlayerXR extends Activity
         postToPaletteWorker(() -> {
             if (palette != null) {
                 palette.syncExternalScreen(fovDeg, distM);
+                syncDanmakuContextOnWorker();
                 if (r != null) {
                     redrawPaletteOnWorker(r);
                 }
             }
         });
+    }
+
+    @Override
+    public void onVrDepthModelUnavailable() {
+        depthModelUnavailableUi = true;
+        final XrRenderer r = renderer;
+        if (r != null) {
+            r.showNotice(getString(R.string.vr_depth_unavailable_toast), null);
+        }
+        postToPaletteWorker(() -> {
+            if (palette != null) {
+                palette.setDepthModelUnavailable(true);
+                syncDanmakuContextOnWorker();
+                if (r != null) {
+                    applyPaletteStereoOnWorker(r);
+                    redrawPaletteOnWorker(r);
+                }
+            }
+        });
+    }
+
+    @Override
+    public void onVrDanmakuUnavailable() {
+        danmakuGlUnavailableUi = true;
+        final XrRenderer r = renderer;
+        if (r != null) {
+            r.showNotice(getString(R.string.vr_danmaku_unavailable_toast), null);
+        }
+        postToPaletteWorker(() -> {
+            if (palette != null) {
+                palette.setDanmakuGlUnavailable(true);
+                syncDanmakuPreviewOnWorker();
+                if (r != null) {
+                    redrawPaletteOnWorker(r);
+                }
+            }
+        });
+    }
+
+    @Override
+    public void onVrContentDepthPhi(float phiDeg) {
+        DanmakuSessionManager dm = danmakuManager;
+        if (dm != null) {
+            dm.offerContentPhiFromRenderThread(phiDeg);
+        }
     }
 
     /**
@@ -1324,6 +1574,19 @@ public class LocalPlayerXR extends Activity
             int envCell = PaletteStore.envCellFor(globalPaletteStore, env);
             r.setLocalEnvironment(envCell, env == PaletteEnvironment.DIM);
         }
+        if (res.getDanmakuRetryRequested()) {
+            DanmakuSessionManager dm = danmakuManager;
+            if (dm != null) {
+                dm.retryFetch();
+            }
+        }
+        int curTab = palette.getActiveTab();
+        boolean tabOrOpenChanged = (wasOpen != paletteOpenUi) || (curTab != lastPaletteTabOnWorker);
+        lastPaletteTabOnWorker = curTab;
+        if (tabOrOpenChanged || res.getDanmakuChanged() || res.getStereoChanged()
+                || res.getSourceFormatChanged() || res.getScreenChanged()) {
+            syncDanmakuContextOnWorker();
+        }
         if (res.getHapticKind() > XrShared.PALETTE_HAPTIC_NONE) {
             r.triggerPaletteHaptic(res.getHapticKind());
         }
@@ -1340,6 +1603,12 @@ public class LocalPlayerXR extends Activity
                 res.getSaveGlobalSettings(),
                 res.getSaveVideoOverrides());
         handleSaveDirectiveOnWorker(saveFlags);
+        palettePendingSaves.publish(
+                paletteSaveDebouncer.getGlobalDirty(),
+                palette.getGlobal(),
+                paletteSaveDebouncer.getVideoDirty(),
+                currentVideoKey,
+                palette.getVideo());
 
         final boolean applySub = res.getSubtitleTrackChanged();
         final boolean applyAud = res.getAudioTrackChanged();
@@ -1384,26 +1653,30 @@ public class LocalPlayerXR extends Activity
     private void flushPaletteSavesOnWorker() {
         int flags = paletteSaveDebouncer.onDebounceTimeout();
         handleSaveDirectiveOnWorker(flags);
+        if (palette != null) {
+            palettePendingSaves.publish(
+                    paletteSaveDebouncer.getGlobalDirty(),
+                    palette.getGlobal(),
+                    paletteSaveDebouncer.getVideoDirty(),
+                    currentVideoKey,
+                    palette.getVideo());
+        }
     }
 
-    private void forceFlushPaletteSavesSync() {
-        Handler h = paletteHandler;
-        if (h == null) {
+    /**
+     * Non-blocking (0 ms wait) flush for onDestroy: drains the latest lock-free dirty snapshot
+     * and commits via SharedPreferences.Editor.apply() without blocking the main thread.
+     */
+    private void flushPendingPaletteSavesOnDestroy() {
+        PendingPaletteSaveSnapshot snap = palettePendingSaves.drainForDestroy();
+        if (snap == null) {
             return;
         }
-        final CountDownLatch latch = new CountDownLatch(1);
-        if (h.post(() -> {
-            try {
-                handleSaveDirectiveOnWorker(paletteSaveDebouncer.onForceFlush());
-            } finally {
-                latch.countDown();
-            }
-        })) {
-            try {
-                latch.await(500, TimeUnit.MILLISECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+        if (snap.getGlobal() != null && globalPaletteStore != null) {
+            PaletteStore.saveGlobal(globalPaletteStore, snap.getGlobal());
+        }
+        if (snap.getVideo() != null && snap.getVideoKey() != null && videoPaletteStore != null) {
+            PaletteStore.saveVideoOverrides(videoPaletteStore, snap.getVideoKey(), snap.getVideo());
         }
     }
 
@@ -1491,7 +1764,11 @@ public class LocalPlayerXR extends Activity
                 getString(R.string.vr_toast_danmaku_off),
                 getString(R.string.vr_screen_size_disabled_in_room),
                 getString(R.string.vr_screen_dist_disabled_in_room),
-                getString(R.string.vr_hint_screen_gesture));
+                getString(R.string.vr_hint_screen_gesture),
+                getString(R.string.vr_depth_unavailable_reason),
+                getString(R.string.vr_palette_danmaku_gl_unavailable_title),
+                getString(R.string.vr_palette_danmaku_gl_unavailable_sub),
+                getString(R.string.vr_danmaku_unavailable_toast));
     }
 
     private TrackLabelStrings buildTrackLabelStrings() {
@@ -1521,17 +1798,24 @@ public class LocalPlayerXR extends Activity
 
         DepthStrength effStrength = video.getStrength() != null
                 ? video.getStrength() : global.getDefaultStrength();
-        StereoSourceFormat effSource = video.getSourceFormat() != null
-                ? video.getSourceFormat() : StereoSourceFormat.AUTO;
+        savedVideoSourceOverride = video.getSourceFormat();
+        StereoSourceFormat effSource = PaletteTrackManager.resolveInitialSourceFormat(
+                savedVideoSourceOverride, StereoSourceFormat.AUTO);
         initialStereoLiveForSession = effStrength != DepthStrength.OFF;
         initialVideoHasExplicitStereoOn = video.getStrength() != null
                 && video.getStrength() != DepthStrength.OFF;
         activeSourceFormatUi = effSource;
         danmakuSupportedUi = danmakuSupported;
         danmakuOnUi = global.getDanmakuOn();
+        danmakuMergeDuplicatesUi = global.getDanmakuMergeDuplicates();
+        DanmakuSessionManager dm = danmakuManager;
+        if (dm != null) {
+            dm.updateSettings(global);
+        }
 
         postToPaletteWorker(() -> {
             handleSaveDirectiveOnWorker(paletteSaveDebouncer.onForceFlush());
+            palettePendingSaves.clear();
             paletteSaveDebouncer.reset();
             paletteMailbox.reset();
             currentVideoKey = key;
@@ -1539,13 +1823,115 @@ public class LocalPlayerXR extends Activity
             savedAudOverrideApplied = false;
             boolean cylOk = palette == null || palette.getCylinderSupported();
             palette = new PaletteController(
-                    global, video, strings, cylOk, danmakuSupported, false);
+                    global, video, strings, cylOk, danmakuSupported, false,
+                    depthModelUnavailableUi, danmakuGlUnavailableUi);
             if (paletteRenderer != null) {
                 paletteRenderer.invalidate();
             }
             lastPaletteRowMask = -1;
+            lastPaletteTabOnWorker = -1;
             updateTransportBarAspect();
+            syncDanmakuContextOnWorker();
         });
+    }
+
+    private DanmakuPreviewStrings buildDanmakuPreviewStrings() {
+        return new DanmakuPreviewStrings(
+                getString(R.string.vr_danmaku_preview_far),
+                getString(R.string.vr_danmaku_preview_mid),
+                getString(R.string.vr_danmaku_preview_near));
+    }
+
+    /**
+     * Opens a local or WebDAV sidecar `.xml` stream strictly for non-plugin sources
+     * (guarded via [PluginHostGuards.isPluginSource] so plugin sources always stay inside
+     * [PluginPlayerSession.fetchDanmaku]).
+     */
+    private InputStream openNonPluginSidecarXml(Uri videoUri, String xmlUrl, Map<String, String> reqHeaders) {
+        if (PluginHostGuards.isPluginSource(sourceKind) || videoUri == null || xmlUrl == null) {
+            return null;
+        }
+        String scheme = videoUri.getScheme() != null ? videoUri.getScheme().toLowerCase(Locale.US) : "";
+        try {
+            if ("file".equals(scheme)) {
+                String path = Uri.parse(xmlUrl).getPath();
+                if (path == null) return null;
+                File xmlFile = new File(path);
+                return (xmlFile.isFile() && xmlFile.canRead()) ? new FileInputStream(xmlFile) : null;
+            }
+            if ("http".equals(scheme) || "https".equals(scheme)) {
+                HttpURLConnection conn = (HttpURLConnection) new URL(xmlUrl).openConnection();
+                conn.setConnectTimeout(3000);
+                conn.setReadTimeout(4000);
+                conn.setInstanceFollowRedirects(true);
+                if (reqHeaders != null) {
+                    for (Map.Entry<String, String> e : reqHeaders.entrySet()) {
+                        conn.setRequestProperty(e.getKey(), e.getValue());
+                    }
+                }
+                int code = conn.getResponseCode();
+                if (code < 200 || code >= 300) {
+                    conn.disconnect();
+                    return null;
+                }
+                return new java.io.FilterInputStream(conn.getInputStream()) {
+                    @Override
+                    public void close() throws java.io.IOException {
+                        try {
+                            super.close();
+                        } finally {
+                            conn.disconnect();
+                        }
+                    }
+                };
+            }
+            if ("content".equals(scheme)) {
+                String path = videoUri.getPath();
+                if (path != null && new File(path).exists()) {
+                    String sidecarPath = DanmakuXmlParser.sidecarXmlUrlFor(path);
+                    if (sidecarPath != null) {
+                        File sidecar = new File(sidecarPath);
+                        if (sidecar.isFile() && sidecar.canRead()) {
+                            return new FileInputStream(sidecar);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LimeLog.info("depth3d: sidecar danmaku XML unavailable (" + e.getClass().getSimpleName() + ")");
+        }
+        return null;
+    }
+
+    private void syncDanmakuContextOnWorker() {
+        DanmakuSessionManager dm = danmakuManager;
+        if (dm == null || palette == null) {
+            return;
+        }
+        GlobalPaletteSettings g = palette.getGlobal();
+        danmakuMergeDuplicatesUi = g.getDanmakuMergeDuplicates();
+        dm.updateSettings(g);
+        int w = sessionW > 0 ? sessionW : 1920;
+        int h = sessionH > 0 ? sessionH : 1080;
+        StereoSourceFormat fmt = palette.getEffectiveSourceFormat();
+        float aspect = PaletteController.effectiveVideoAspect(w, h, fmt);
+        boolean stereoOn = palette.getEffectiveStrength() != DepthStrength.OFF
+                || fmt != StereoSourceFormat.AUTO;
+        dm.updateScreenAndStereo(g.getScreenFovDeg(), aspect, g.getScreenDistM(), stereoOn, fmt);
+        syncDanmakuPreviewOnWorker();
+    }
+
+    private void syncDanmakuPreviewOnWorker() {
+        DanmakuSessionManager dm = danmakuManager;
+        if (dm == null || palette == null) {
+            return;
+        }
+        boolean wantPreview = palette.isOpen()
+                && palette.getActiveTab() == XrShared.PALETTE_TAB_DANMAKU
+                && palette.getDanmakuSupported()
+                && !palette.getDanmakuGlUnavailable()
+                && !palette.getDanmakuLoadFailed();
+        dm.setPreviewRequested(wantPreview);
     }
 
     private void applyPaletteStereoOnWorker(XrRenderer r) {
@@ -1580,6 +1966,7 @@ public class LocalPlayerXR extends Activity
             }
             PaletteActionResult res = palette.toggleDanmakuQuick();
             danmakuOnUi = palette.getGlobal().getDanmakuOn();
+            syncDanmakuContextOnWorker();
             if (res.getSaveGlobalSettings() && globalPaletteStore != null) {
                 PaletteStore.saveGlobal(globalPaletteStore, palette.getGlobal());
             }
@@ -1797,9 +2184,14 @@ public class LocalPlayerXR extends Activity
             gate = gated;
             gated = false;
         }
-        // Flush any deferred palette writes before shutting down the palette worker
+        // Non-blocking flush of any deferred palette writes before shutting down the palette worker
         paletteWorkerClosed = true;
-        forceFlushPaletteSavesSync();
+        flushPendingPaletteSavesOnDestroy();
+        DanmakuSessionManager dm = danmakuManager;
+        danmakuManager = null;
+        if (dm != null) {
+            dm.close();
+        }
         HandlerThread pt = paletteThread;
         paletteThread = null;
         paletteHandler = null;

@@ -382,12 +382,32 @@ static void testDimmerDepthGatingAndStereoAspect(void) {
     CHECK(paletteShowDimmerLayer(1, 0, 1, 0, 1) == 0); // dim off
     CHECK(paletteShowDimmerLayer(1, 0, 1, 1, 0) == 0); // art not ready
 
-    // Depth inference only runs when stereoMode != OFF, stereoLive == 1, and source == AUTO
-    CHECK(paletteNeedsDepthInference(DEPTH_MODE_MODEL, 1, STEREO_SRC_AUTO) == 1);
-    CHECK(paletteNeedsDepthInference(DEPTH_MODE_MODEL, 1, STEREO_SRC_SBS) == 0);
-    CHECK(paletteNeedsDepthInference(DEPTH_MODE_MODEL, 1, STEREO_SRC_OU) == 0);
-    CHECK(paletteNeedsDepthInference(DEPTH_MODE_MODEL, 0, STEREO_SRC_AUTO) == 0);
-    CHECK(paletteNeedsDepthInference(DEPTH_MODE_OFF, 1, STEREO_SRC_AUTO) == 0);
+    // Depth inference only runs when stereoMode != OFF, stereoLive == 1, AUTO, and !depthGaveUp
+    CHECK(paletteNeedsDepthInference(DEPTH_MODE_MODEL, 1, STEREO_SRC_AUTO, 0) == 1);
+    CHECK(paletteNeedsDepthInference(DEPTH_MODE_MODEL, 1, STEREO_SRC_AUTO, 1) == 0);
+    CHECK(paletteNeedsDepthInference(DEPTH_MODE_MODEL, 1, STEREO_SRC_SBS, 0) == 0);
+    CHECK(paletteNeedsDepthInference(DEPTH_MODE_MODEL, 1, STEREO_SRC_OU, 0) == 0);
+    CHECK(paletteNeedsDepthInference(DEPTH_MODE_MODEL, 0, STEREO_SRC_AUTO, 0) == 0);
+    CHECK(paletteNeedsDepthInference(DEPTH_MODE_OFF, 1, STEREO_SRC_AUTO, 0) == 0);
+
+    // Swapchain stereo sizing: local 2D starts single-wide, upgrades on 3D ON or SBS/OU;
+    // PC streaming keeps legacy stereoMode != OFF behavior untouched.
+    CHECK(paletteNeedStereoSwapchain(1, DEPTH_MODE_OFF, 0, STEREO_SRC_AUTO, 0) == 0);
+    CHECK(paletteNeedStereoSwapchain(1, DEPTH_MODE_MODEL, 0, STEREO_SRC_AUTO, 0) == 0);
+    CHECK(paletteNeedStereoSwapchain(1, DEPTH_MODE_MODEL, 1, STEREO_SRC_AUTO, 0) == 1);
+    CHECK(paletteNeedStereoSwapchain(1, DEPTH_MODE_MODEL, 1, STEREO_SRC_AUTO, 1) == 0);
+    CHECK(paletteNeedStereoSwapchain(1, DEPTH_MODE_OFF, 0, STEREO_SRC_SBS, 0) == 1);
+    CHECK(paletteNeedStereoSwapchain(1, DEPTH_MODE_OFF, 0, STEREO_SRC_OU, 1) == 1);
+    CHECK(paletteNeedStereoSwapchain(0, DEPTH_MODE_OFF, 0, STEREO_SRC_AUTO, 0) == 0);
+    CHECK(paletteNeedStereoSwapchain(0, DEPTH_MODE_MODEL, 0, STEREO_SRC_AUTO, 0) == 1);
+
+    // Haptic priority merge: LIMIT > DETENT > TICK > NONE (weaker tick never clobbers detent/limit)
+    CHECK(paletteMergeHaptic(PALETTE_HAPTIC_NONE, PALETTE_HAPTIC_TICK) == PALETTE_HAPTIC_TICK);
+    CHECK(paletteMergeHaptic(PALETTE_HAPTIC_DETENT, PALETTE_HAPTIC_TICK) == PALETTE_HAPTIC_DETENT);
+    CHECK(paletteMergeHaptic(PALETTE_HAPTIC_TICK, PALETTE_HAPTIC_DETENT) == PALETTE_HAPTIC_DETENT);
+    CHECK(paletteMergeHaptic(PALETTE_HAPTIC_DETENT, PALETTE_HAPTIC_LIMIT) == PALETTE_HAPTIC_LIMIT);
+    CHECK(paletteMergeHaptic(PALETTE_HAPTIC_LIMIT, PALETTE_HAPTIC_DETENT) == PALETTE_HAPTIC_LIMIT);
+    CHECK(paletteMergeHaptic(PALETTE_HAPTIC_DETENT, PALETTE_HAPTIC_NONE) == PALETTE_HAPTIC_DETENT);
 
     // Aspect ratio: Full-SBS 3840x1080 -> 16:9 per eye (0.5625), Half-SBS 1920x1080 -> 0.5625
     CHECK_NEAR(paletteVideoHeightOverWidth(3840, 1080, STEREO_SRC_SBS), 9.0f / 16.0f, 1e-4f);

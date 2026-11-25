@@ -14,7 +14,7 @@ TESTS := $(OUT)/test_math $(OUT)/test_depthmap $(OUT)/test_atlas $(OUT)/test_roo
          $(OUT)/test_layout $(OUT)/test_audio $(OUT)/test_rate $(OUT)/test_gate \
          $(OUT)/test_pinch $(OUT)/test_notice $(OUT)/test_glow $(OUT)/test_grade \
          $(OUT)/test_keys $(OUT)/test_controller $(OUT)/test_headaim $(OUT)/test_gamepad \
-         $(OUT)/test_screen_ctrl $(OUT)/test_palette
+         $(OUT)/test_screen_ctrl $(OUT)/test_palette $(OUT)/test_overlay
 
 .PHONY: test clean
 
@@ -119,6 +119,14 @@ $(OUT)/test_palette: test_palette.c check.h $(SRC)/xr_palette.c $(SRC)/xr_palett
                      $(SRC)/xr_math.c $(SRC)/xr_math.h $(SRC)/xr_shared.h
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ test_palette.c $(SRC)/xr_palette.c $(SRC)/xr_math.c -lm
+
+# Shared G4/G3 curved overlay surface geometry, layered-float depth math,
+# 64-bin depth histogram 98th percentile, and §6.5 layer budget accounting
+$(OUT)/test_overlay: test_overlay.c check.h $(SRC)/xr_overlay.c $(SRC)/xr_overlay.h \
+                     $(SRC)/xr_screen_ctrl.c $(SRC)/xr_screen_ctrl.h \
+                     $(SRC)/xr_math.c $(SRC)/xr_math.h $(SRC)/xr_shared.h
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ test_overlay.c $(SRC)/xr_overlay.c $(SRC)/xr_screen_ctrl.c $(SRC)/xr_math.c -lm
 
 # The audio module ships at -O2 and this test prints what its kernels cost, so
 # it is built the way the app builds it

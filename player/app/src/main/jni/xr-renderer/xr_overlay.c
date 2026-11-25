@@ -1,0 +1,682 @@
+// Pure C shared overlay surface geometry, stereoscopic layered-float math,
+// 64-bin depth 98th-percentile histogram, and §6.5 layer budget accounting.
+// Shared directly by G4 (danmaku) and G3 (static subtitles).
+
+#include "xr_overlay.h"
+#include <math.h>
+#include <string.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+static float clampf(float v, float lo, float hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static float degToRad(float d) {
+    return d * ((float)M_PI / 180.0f);
+}
+
+static float radToDeg(float r) {
+    return r * (180.0f / (float)M_PI);
+}
+
+static XrPosef localOffset(XrPosef base, Vec3 local) {
+    Vec3 off = quatRotate(base.orientation, local);
+    XrPosef out;
+    out.orientation = base.orientation;
+    out.position.x = base.position.x + off.x;
+    out.position.y = base.position.y + off.y;
+    out.position.z = base.position.z + off.z;
+    return out;
+}
+
+float overlayDisparityToDistM(float phiDeg, float screenDistM) {
+    float d = screenDistM > 0.25f ? screenDistM : 0.25f;
+    float phi = phiDeg > 0.0f ? phiDeg : 0.0f;
+    float phiRad = degToRad(phi);
+    float invDist = (phiRad / OVERLAY_IPD_M) + (1.0f / d);
+    return invDist > 1e-4f ? (1.0f / invDist) : d;
+}
+
+float overlayMaxPhiAtDistDeg(float screenDistM) {
+    if (screenDistM <= OVERLAY_MIN_EYE_DIST_M + 1e-4f) {
+        return 0.0f;
+    }
+    float maxRad = OVERLAY_IPD_M * ((1.0f / OVERLAY_MIN_EYE_DIST_M) - (1.0f / screenDistM));
+    float maxDeg = radToDeg(maxRad);
+    if (maxDeg < 0.0f) {
+        maxDeg = 0.0f;
+    }
+    if (maxDeg > OVERLAY_MAX_NEAR_PHI_DEG) {
+        maxDeg = OVERLAY_MAX_NEAR_PHI_DEG;
+    }
+    return maxDeg;
+}
+
+void overlayComputeDepthLayers(float contentPhiDeg, int floatAuto,
+                               int floatAutoOffsetSteps, int floatFixedSteps,
+                               float layerSpreadDeg, float screenDistM,
+                               OverlayDepthLayers* out) {
+    if (out == NULL) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    float d = screenDistM > 0.25f ? screenDistM : 3.0f;
+    float maxPhi = overlayMaxPhiAtDistDeg(d);
+    out->maxPhiDeg = maxPhi;
+
+    float farRaw = 0.0f;
+    if (floatAuto) {
+        float c = contentPhiDeg > 0.0f ? contentPhiDeg : 0.0f;
+        int k = floatAutoOffsetSteps;
+        if (k < -2) k = -2;
+        if (k > 6) k = 6;
+        farRaw = c + OVERLAY_AUTO_MARGIN_PHI_DEG + (float)k * OVERLAY_FLOAT_STEP_DEG;
+        if (farRaw < 0.0f) {
+            farRaw = 0.0f;
+        }
+    }
+    else {
+        int k = floatFixedSteps;
+        if (k < 0) k = 0;
+        if (k > 12) k = 12;
+        farRaw = (float)k * OVERLAY_FLOAT_STEP_DEG;
+    }
+
+    float delta = layerSpreadDeg > 0.0f ? layerSpreadDeg : 0.0f;
+    float farPhi = farRaw;
+    // §6.10 ceiling order: compress layer spread delta FIRST, then compress far layer
+    if (farPhi > maxPhi) {
+        farPhi = maxPhi;
+        delta = 0.0f;
+    }
+    else if (farPhi + delta > maxPhi) {
+        delta = maxPhi - farPhi;
+        if (delta < 0.0f) {
+            delta = 0.0f;
+        }
+    }
+
+    out->farPhiDeg = farPhi;
+    out->midPhiDeg = farPhi + delta * 0.5f;
+    out->nearPhiDeg = farPhi + delta;
+    out->appliedDeltaDeg = delta;
+    out->farDistM = overlayDisparityToDistM(out->farPhiDeg, d);
+    out->midDistM = overlayDisparityToDistM(out->midPhiDeg, d);
+    out->nearDistM = overlayDisparityToDistM(out->nearPhiDeg, d);
+}
+
+float overlayResolveContentPhi(int stereoActive, int stereoSourceFormat,
+                               float measuredDepthPhiDeg) {
+    if (stereoSourceFormat == STEREO_SRC_SBS || stereoSourceFormat == STEREO_SRC_OU) {
+        return OVERLAY_NATIVE_3D_CONTENT_PHI_DEG;
+    }
+    if (!stereoActive) {
+        return 0.0f;
+    }
+    return clampf(measuredDepthPhiDeg, 0.0f, OVERLAY_MAX_NEAR_PHI_DEG);
+}
+
+float overlayStepContentDepth(float curPhiDeg, float targetPhiDeg, float dt) {
+    float cur = curPhiDeg > 0.0f ? curPhiDeg : 0.0f;
+    float target = targetPhiDeg > 0.0f ? targetPhiDeg : 0.0f;
+    if (target >= cur) {
+        // Closer foreground: follow immediately so text never sinks behind objects
+        return target;
+    }
+    if (dt <= 0.0f) {
+        return cur;
+    }
+    float maxDrop = OVERLAY_DEPTH_RETREAT_DEG_PER_S * dt;
+    float next = cur - maxDrop;
+    return next < target ? target : next;
+}
+
+float overlayHistogram98Percentile(const float* depthNorm, int w, int h,
+                                   float vTopFrac, float vBotFrac,
+                                   float convergence, float separation,
+                                   float screenFovDeg) {
+    if (depthNorm == NULL || w <= 0 || h <= 0 || separation <= 0.0f || screenFovDeg <= 1.0f) {
+        return 0.0f;
+    }
+    float topF = clampf(vTopFrac, 0.0f, 1.0f);
+    float botF = clampf(vBotFrac, topF, 1.0f);
+    // depthNorm is stored bottom-up (row 0 = bottom of picture, row h-1 = top).
+    int yMin = (int)floorf((1.0f - botF) * (float)h);
+    int yMax = (int)ceilf((1.0f - topF) * (float)h);
+    if (yMin < 0) yMin = 0;
+    if (yMax > h) yMax = h;
+    if (yMin >= yMax) {
+        return 0.0f;
+    }
+
+    int bins[OVERLAY_HIST_BINS];
+    memset(bins, 0, sizeof(bins));
+    int total = 0;
+    for (int y = yMin; y < yMax; y++) {
+        const float* row = depthNorm + (size_t)y * (size_t)w;
+        for (int x = 0; x < w; x++) {
+            float v = clampf(row[x], 0.0f, 1.0f);
+            int b = (int)(v * (float)(OVERLAY_HIST_BINS - 1) + 0.5f);
+            if (b < 0) b = 0;
+            if (b >= OVERLAY_HIST_BINS) b = OVERLAY_HIST_BINS - 1;
+            bins[b]++;
+            total++;
+        }
+    }
+    if (total <= 0) {
+        return 0.0f;
+    }
+    int targetCount = (total * 98 + 99) / 100;
+    int accum = 0;
+    int p98Bin = 0;
+    for (int b = 0; b < OVERLAY_HIST_BINS; b++) {
+        accum += bins[b];
+        if (accum >= targetCount) {
+            p98Bin = b;
+            break;
+        }
+    }
+    float d98 = (float)p98Bin / (float)(OVERLAY_HIST_BINS - 1);
+    float popOutNorm = d98 - convergence;
+    if (popOutNorm <= 0.0f) {
+        return 0.0f;
+    }
+    // Binocular crossed disparity across both eyes = 2 * separation * (d98 - convergence) * fovDeg
+    float phiDeg = 2.0f * separation * popOutNorm * screenFovDeg;
+    return clampf(phiDeg, 0.0f, OVERLAY_MAX_NEAR_PHI_DEG);
+}
+
+float overlayEyeShiftNormU(float phiDeg, float screenFovDeg, int eyeIndex) {
+    if (screenFovDeg <= 1.0f || fabsf(phiDeg) < 1e-5f) {
+        return 0.0f;
+    }
+    float halfShift = (phiDeg * 0.5f) / screenFovDeg;
+    return eyeIndex == 0 ? halfShift : -halfShift;
+}
+
+int overlayComputeSurface(XrPosef screenPose, float screenWidth, float screenHeight,
+                          float screenRadius, int screenCurved, int cylinderSupported,
+                          int roomOn, int curveMode, float customCurvePct,
+                          float screenDistM, float vTopFrac, float vBotFrac,
+                          float popOutM, OverlaySurfaceGeom* out) {
+    if (out == NULL || screenWidth <= 1e-4f || screenHeight <= 1e-4f) {
+        return 0;
+    }
+    memset(out, 0, sizeof(*out));
+    float topF = clampf(vTopFrac, 0.0f, 1.0f);
+    float botF = clampf(vBotFrac, topF, 1.0f);
+    float fracH = botF - topF;
+    if (fracH <= 1e-4f) {
+        return 0;
+    }
+    float pop = popOutM > 0.0f ? popOutM : 0.0f;
+    float d = screenDistM > 0.25f ? screenDistM : 3.0f;
+
+    // Effective drawn screen bounds (accounting for cylinder clamp if curved)
+    float drawnW = screenWidth;
+    float drawnH = screenHeight;
+    float screenHalfAngle = 0.0f;
+    float screenChordZ = 0.0f;
+    if (screenCurved && screenRadius > 1e-4f) {
+        float fit = cylinderFit(screenWidth, screenRadius);
+        drawnW = screenWidth * fit;
+        drawnH = screenHeight * fit;
+        screenHalfAngle = cylinderAngle(screenWidth, screenRadius) * 0.5f;
+        screenChordZ = screenCurvedChordZ(screenRadius, screenHalfAngle);
+    }
+
+    // Center Y of the vertical sub-region [topF, botF] in screen-local coordinates
+    // (+Y is up, screen top = +drawnH/2, screen bottom = -drawnH/2)
+    float regionCenterFracFromTop = 0.5f * (topF + botF);
+    float yCenter = (0.5f - regionCenterFracFromTop) * drawnH;
+    float regionH = drawnH * fracH;
+
+    // Determine effective overlay curvature mode (§6.12):
+    // In a 3D theater room or on headsets without cylinder extension, forced flat.
+    int canCurve = cylinderSupported && !roomOn;
+    float desiredCurve = 0.0f;
+    int followCoaxial = 0;
+    if (canCurve) {
+        if (curveMode == OVERLAY_CURVE_FOLLOW) {
+            followCoaxial = screenCurved && screenRadius > 1e-4f;
+        }
+        else if (curveMode == OVERLAY_CURVE_CUSTOM) {
+            desiredCurve = clampf(customCurvePct / 100.0f, 0.0f, 1.0f);
+        }
+    }
+
+    if (followCoaxial) {
+        // Coaxial cylinder sharing the screen's axis, pulled forward by OVERLAY_PROUD_M + pop
+        float angle = cylinderAngle(screenWidth, screenRadius);
+        float r = screenRadius - (OVERLAY_PROUD_M + pop);
+        if (r < 0.05f) {
+            r = 0.05f;
+        }
+        // Keep angular height identical when pulling closer (scale vertical size with r / screenRadius)
+        float scale = r / screenRadius;
+        float scaledH = regionH * scale;
+        float scaledY = yCenter * scale;
+        float arcW = r * angle;
+        if (scaledH <= 1e-4f || arcW <= 1e-4f) {
+            return 0;
+        }
+        Vec3 axisLocal = { 0.0f, scaledY, screenRadius };
+        out->useCylinder = 1;
+        out->axisPose = localOffset(screenPose, axisLocal);
+        out->radius = r;
+        out->centralAngle = angle;
+        out->aspectRatio = arcW / scaledH;
+        return 1;
+    }
+
+    if (canCurve && desiredCurve > SCREEN_CURVE_EPS) {
+        // Custom overlay curvature (§6.12): radius R_ov = D / c_ov, tangent to the
+        // screen at center OR edges (whichever sits closer to viewer) so overlay NEVER
+        // passes behind the video screen!
+        float ovRadius = d / desiredCurve;
+        float screenAngle = screenCurved && screenRadius > 1e-4f
+                ? cylinderAngle(screenWidth, screenRadius)
+                : 2.0f * atanf(drawnW * 0.5f / d);
+        float ovAngle = clampf(screenAngle, 1e-3f, CYLINDER_MAX_ANGLE);
+        float ovHalfAngle = ovAngle * 0.5f;
+        float ovChordZ = screenCurvedChordZ(ovRadius, ovHalfAngle);
+
+        // Screen surface local Z at center is 0, at edges is +screenChordZ (+Z toward viewer).
+        // After perspective scaling r = ovRadius * (d - zCenter) / d, overlay edge Z is:
+        //   zCenter + ovChordZ * (d - zCenter) / d >= screenChordZ + clearance
+        // Solving directly for zCenter ensures exact edge clearance with zero clipping!
+        float clearance = OVERLAY_PROUD_M + pop;
+        float zCenter = clearance;
+        float denom = 1.0f - (ovChordZ / d);
+        if (denom > 0.1f) {
+            float zEdgeNeeded = (screenChordZ + clearance - ovChordZ) / denom;
+            if (zEdgeNeeded > zCenter) {
+                zCenter = zEdgeNeeded;
+            }
+        }
+        else if (screenChordZ + clearance > zCenter) {
+            zCenter = screenChordZ + clearance;
+        }
+        float scale = (d - zCenter) / d;
+        if (scale < 0.25f) {
+            scale = 0.25f;
+        }
+        float r = ovRadius * scale;
+        if (r < 0.05f) {
+            r = 0.05f;
+        }
+        float arcW = r * ovAngle;
+        float scaledH = regionH * scale;
+        float scaledY = yCenter * scale;
+        // Axis sits +r behind overlay center (which is at local Z = zCenter)
+        Vec3 axisLocal = { 0.0f, scaledY, zCenter + r };
+        out->useCylinder = 1;
+        out->axisPose = localOffset(screenPose, axisLocal);
+        out->radius = r;
+        out->centralAngle = ovAngle;
+        out->aspectRatio = arcW / scaledH;
+        return 1;
+    }
+
+    // Flat quad mode (flat screen, room, !cylinderSupported, or OVERLAY_CURVE_FLAT):
+    // When video screen is curved, place the flat quad on the screen's chord (+screenChordZ)
+    // plus clearance so its edges never sink behind the curved picture (§6.12).
+    float zFront = screenChordZ + OVERLAY_PROUD_M + pop;
+    float scale = (d - zFront) / d;
+    if (scale < 0.25f) {
+        scale = 0.25f;
+    }
+    float chordW = (screenCurved && screenRadius > 1e-4f)
+            ? (2.0f * screenRadius * sinf(screenHalfAngle))
+            : drawnW;
+    // Scale proportionally when popped closer to eye so angular width stays locked to picture
+    float quadW = (screenCurved && screenRadius > 1e-4f)
+            ? chordW * ((d - zFront) / (d - screenChordZ > 0.1f ? (d - screenChordZ) : d))
+            : drawnW * scale;
+    float quadH = regionH * scale;
+    float quadY = yCenter * scale;
+    Vec3 quadLocal = { 0.0f, quadY, zFront };
+    out->useCylinder = 0;
+    out->quadPose = localOffset(screenPose, quadLocal);
+    out->quadWidth = quadW;
+    out->quadHeight = quadH;
+    out->aspectRatio = quadH > 1e-4f ? (quadW / quadH) : 1.0f;
+    return 1;
+}
+
+int overlayCountLocalLayers(const OverlayLayerFlags* f) {
+    if (f == NULL) {
+        return 0;
+    }
+    int total = 0;
+    if (f->roomOrDimmer) total += 1;
+    if (f->glow) total += 1;
+    total += f->videoEyes > 1 ? 2 : (f->videoEyes > 0 ? 1 : 0);
+    total += f->danmakuEyes > 1 ? 2 : (f->danmakuEyes > 0 ? 1 : 0);
+    if (f->subtitle) total += 1;
+    if (f->transportBar) total += 1;
+    if (f->popupCard) total += 1;
+    if (f->palette) total += 1;
+    // §6.5 & §6.7: toast/readout is mutually exclusive with transportBar
+    if (f->toastOrReadout && !f->transportBar) total += 1;
+    if (f->pointerRay) total += 2;
+    if (f->controllerModel) total += 1;
+    return total;
+}
+
+void danmakuSlotTableClear(DanmakuSlotTable* t) {
+    if (t == NULL) {
+        return;
+    }
+    memset(t->uploadedGen, 0, sizeof(t->uploadedGen));
+}
+
+void danmakuSlotTableMarkUploaded(DanmakuSlotTable* t, int slotIndex, uint32_t gen) {
+    if (t == NULL || slotIndex < 0 || slotIndex >= DANMAKU_MAX_SLOTS || gen == 0) {
+        return;
+    }
+    t->uploadedGen[slotIndex] = gen;
+}
+
+int danmakuSlotTableIsReady(const DanmakuSlotTable* t, int slotIndex, uint32_t gen) {
+    if (t == NULL || slotIndex < 0 || slotIndex >= DANMAKU_MAX_SLOTS || gen == 0) {
+        return 0;
+    }
+    return t->uploadedGen[slotIndex] == gen ? 1 : 0;
+}
+
+void danmakuClockReset(DanmakuClockTracker* c) {
+    if (c == NULL) {
+        return;
+    }
+    memset(c, 0, sizeof(*c));
+}
+
+void danmakuClockSetAnchor(DanmakuClockTracker* c, int64_t timelineMs,
+                           int64_t anchorMonoNs, int paused, int hardReset) {
+    if (c == NULL) {
+        return;
+    }
+    double anchorSec = timelineMs > 0 ? ((double)timelineMs / 1000.0) : 0.0;
+    c->anchorTimelineSec = anchorSec;
+    c->anchorMonoNs = anchorMonoNs;
+    c->paused = paused ? 1 : 0;
+    if (!c->initialized || hardReset) {
+        c->currentSec = anchorSec;
+        c->initialized = 1;
+    }
+    else if (c->paused) {
+        // Never step backward when transitioning to pause; freeze at max(current, anchor)
+        if (anchorSec > c->currentSec) {
+            c->currentSec = anchorSec;
+        }
+    }
+}
+
+float danmakuClockSample(DanmakuClockTracker* c, int64_t nowMonoNs, float dtSec) {
+    if (c == NULL || !c->initialized) {
+        return 0.0f;
+    }
+    if (c->paused) {
+        return (float)c->currentSec;
+    }
+    double dt = dtSec > 0.0f ? (double)dtSec : 0.0;
+    if (dt > 0.10) {
+        dt = 0.10;
+    }
+    double elapsedSinceAnchor = 0.0;
+    if (c->anchorMonoNs > 0 && nowMonoNs > c->anchorMonoNs) {
+        elapsedSinceAnchor = (double)(nowMonoNs - c->anchorMonoNs) / 1e9;
+    }
+    double targetSec = c->anchorTimelineSec + elapsedSinceAnchor;
+    // Compare targetSec at nowMonoNs against the end-of-frame predicted time (currentSec + dt)
+    // so steady-state tracking has err == 0 (rate == 1.00) with zero +1-frame lead bias.
+    double predictedSec = c->currentSec + dt;
+    double err = targetSec - predictedSec;
+
+    // Large discontinuity (> 0.5 s, e.g. long pause resume or missed reset): snap forward only
+    if (err > 0.50) {
+        c->currentSec = targetSec;
+        return (float)c->currentSec;
+    }
+    if (err < -0.50) {
+        // Still never regress backward without explicit hardReset (seek/new item)
+        return (float)c->currentSec;
+    }
+
+    // Smooth monotonic catch-up: rate in [0.85, 1.25] eliminates +/-14 ms snapshot jitter
+    // while strictly guaranteeing currentSec never steps backward.
+    double rate = 1.0 + err * 4.0;
+    if (rate < 0.85) rate = 0.85;
+    if (rate > 1.25) rate = 1.25;
+    double nextSec = c->currentSec + dt * rate;
+    if (nextSec < c->currentSec) {
+        nextSec = c->currentSec;
+    }
+    c->currentSec = nextSec;
+    return (float)c->currentSec;
+}
+
+static float overlayPhiForBand(const OverlayDepthLayers* d, int band) {
+    if (band == DANMAKU_LAYER_NEAR) return d->nearPhiDeg;
+    if (band == DANMAKU_LAYER_MID)  return d->midPhiDeg;
+    return d->farPhiDeg;
+}
+
+void danmakuPipelineInit(DanmakuFramePipeline* pipe) {
+    if (pipe == NULL) {
+        return;
+    }
+    memset(pipe, 0, sizeof(*pipe));
+    danmakuSlotTableClear(&pipe->slotTable);
+    danmakuClockReset(&pipe->clockTracker);
+}
+
+int danmakuPipelineStepFrame(DanmakuFramePipeline* pipe,
+                             const DanmakuUploadSlotEvent* uploads, int uploadCount,
+                             const DanmakuSnapshotInput* snapshot,
+                             int64_t frameMonoNs, float dtSec,
+                             DanmakuGpuInstance* outInst, int maxOut,
+                             int* outAnyParallax) {
+    if (outAnyParallax != NULL) {
+        *outAnyParallax = 0;
+    }
+    if (pipe == NULL) {
+        return 0;
+    }
+
+    // 1. Apply drained atlas clear / upload slot-generation landings FIRST so an incoming
+    //    snapshot referencing those newly uploaded slots draws cleanly on the exact same frame.
+    if (uploads != NULL && uploadCount > 0) {
+        for (int i = 0; i < uploadCount; i++) {
+            if (uploads[i].isClear) {
+                danmakuSlotTableClear(&pipe->slotTable);
+            }
+            else {
+                danmakuSlotTableMarkUploaded(&pipe->slotTable,
+                                             uploads[i].slotIndex, uploads[i].slotGen);
+            }
+        }
+    }
+
+    // 2. Absorb latest snapshot (when dirty) and update monotonic anchor clock & depth animation.
+    if (snapshot != NULL && snapshot->hasSnapshot) {
+        float prevFar = pipe->currentDepth.farPhiDeg;
+        float prevMid = pipe->currentDepth.midPhiDeg;
+        float prevNear = pipe->currentDepth.nearPhiDeg;
+
+        pipe->enabled = snapshot->enabled ? 1 : 0;
+        pipe->paused = snapshot->paused ? 1 : 0;
+        int count = snapshot->itemCount;
+        if (count < 0) count = 0;
+        if (count > DANMAKU_MAX_ITEMS) count = DANMAKU_MAX_ITEMS;
+        if (count > 0 && snapshot->items != NULL) {
+            pipe->itemCount = count;
+            memcpy(pipe->items, snapshot->items, (size_t)count * sizeof(DanmakuNativeItem));
+        }
+        else {
+            pipe->itemCount = 0;
+        }
+
+        danmakuClockSetAnchor(&pipe->clockTracker, snapshot->anchorTimelineMs,
+                              snapshot->anchorMonoNs, pipe->paused, snapshot->clockReset);
+        pipe->currentDepth = snapshot->nextDepth;
+
+        if (snapshot->animateDepth && pipe->itemCount > 0) {
+            pipe->depthAnimActive = 1;
+            pipe->depthAnimElapsedS = 0.0f;
+            for (int i = 0; i < pipe->itemCount; i++) {
+                float from = pipe->items[i].layerBand == DANMAKU_LAYER_NEAR ? prevNear
+                        : (pipe->items[i].layerBand == DANMAKU_LAYER_MID ? prevMid : prevFar);
+                pipe->items[i].animFromPhi = from;
+                pipe->items[i].animToPhi = overlayPhiForBand(&pipe->currentDepth,
+                                                             pipe->items[i].layerBand);
+            }
+        }
+        else {
+            pipe->depthAnimActive = 0;
+            pipe->depthAnimElapsedS = 0.0f;
+        }
+    }
+    else if (snapshot != NULL) {
+        pipe->currentDepth = snapshot->nextDepth;
+    }
+
+    if (!pipe->enabled || pipe->itemCount <= 0 || outInst == NULL || maxOut <= 0) {
+        return 0;
+    }
+
+    // 3. Sample anchor-driven monotonic clock (zero snapshot jitter)
+    float clockSec = danmakuClockSample(&pipe->clockTracker, frameMonoNs, dtSec);
+
+    float animT = 1.0f;
+    if (pipe->depthAnimActive) {
+        pipe->depthAnimElapsedS += (dtSec > 0.0f ? dtSec : 0.0f);
+        if (pipe->depthAnimElapsedS >= OVERLAY_DEPTH_ANIM_S) {
+            pipe->depthAnimActive = 0;
+            animT = 1.0f;
+        }
+        else {
+            float t = pipe->depthAnimElapsedS / OVERLAY_DEPTH_ANIM_S;
+            float u = 1.0f - t;
+            animT = 1.0f - u * u * u;
+        }
+    }
+
+    // 4. Pack visible instances — strictly skip any item whose slot generation has not landed!
+    int cap = maxOut < DANMAKU_MAX_ITEMS ? maxOut : DANMAKU_MAX_ITEMS;
+    int visible = 0;
+    int anyParallax = 0;
+    for (int i = 0; i < pipe->itemCount && visible < cap; i++) {
+        const DanmakuNativeItem* it = &pipe->items[i];
+        if (!danmakuSlotTableIsReady(&pipe->slotTable, it->slotIndex, it->slotGen)) {
+            continue;
+        }
+        float elapsed = clockSec - it->spawnTimeSec;
+        if (elapsed < -0.05f || (it->durationSec > 0.0f && elapsed > it->durationSec)) {
+            continue;
+        }
+        if (elapsed < 0.0f) {
+            elapsed = 0.0f;
+        }
+
+        float x = it->x0 + it->velXPerSec * elapsed;
+        if (x + it->w < -0.05f || x > 1.05f) {
+            continue;
+        }
+
+        float alpha = it->baseAlpha;
+        if (it->fadeSec > 0.001f && it->durationSec > 0.0f) {
+            float fadeIn = clampf(elapsed / it->fadeSec, 0.0f, 1.0f);
+            float fadeOut = clampf((it->durationSec - elapsed) / it->fadeSec, 0.0f, 1.0f);
+            alpha *= (fadeIn < fadeOut ? fadeIn : fadeOut);
+        }
+        if (alpha <= 0.004f) {
+            continue;
+        }
+
+        float phi = it->fixedPhiDeg;
+        if (pipe->depthAnimActive) {
+            phi = it->animFromPhi + (it->animToPhi - it->animFromPhi) * animT;
+        }
+        if (phi > pipe->currentDepth.maxPhiDeg) {
+            phi = pipe->currentDepth.maxPhiDeg;
+        }
+        if (phi < 0.0f) {
+            phi = 0.0f;
+        }
+        if (phi > 0.002f) {
+            anyParallax = 1;
+        }
+
+        DanmakuGpuInstance* dst = &outInst[visible++];
+        dst->rect[0] = x;
+        dst->rect[1] = it->y0;
+        dst->rect[2] = it->w;
+        dst->rect[3] = it->h;
+        dst->uv[0] = it->u0;
+        dst->uv[1] = it->v0;
+        dst->uv[2] = it->du;
+        dst->uv[3] = it->dv;
+        dst->colorAlpha[0] = it->r;
+        dst->colorAlpha[1] = it->g;
+        dst->colorAlpha[2] = it->b;
+        dst->colorAlpha[3] = alpha;
+        dst->phiDeg = phi;
+    }
+
+    if (outAnyParallax != NULL) {
+        *outAnyParallax = anyParallax;
+    }
+    return visible;
+}
+
+int overlayApplyLayerBudget(const int* slotKinds, int count, int maxLayers, int* keepOut) {
+    if (slotKinds == NULL || keepOut == NULL || count <= 0) {
+        return 0;
+    }
+    int limit = maxLayers;
+    if (limit <= 0 || limit > OVERLAY_HARD_MAX_LAYERS) {
+        limit = OVERLAY_HARD_MAX_LAYERS;
+    }
+    for (int i = 0; i < count; i++) {
+        keepOut[i] = 1;
+    }
+    int kept = count;
+    if (kept <= limit) {
+        return kept;
+    }
+    static const int DROP_ORDER[] = {
+        OVERLAY_SLOT_TOAST,
+        OVERLAY_SLOT_MODELS,
+        OVERLAY_SLOT_COG_HOVER,
+        OVERLAY_SLOT_COG_BUTTON,
+        OVERLAY_SLOT_COG_CLOCK,
+        OVERLAY_SLOT_DANMAKU
+    };
+    const int numStages = (int)(sizeof(DROP_ORDER) / sizeof(DROP_ORDER[0]));
+    for (int s = 0; s < numStages && kept > limit; s++) {
+        int kind = DROP_ORDER[s];
+        // For danmaku, shed all active danmaku eyes together so stereo never splits half-blind
+        if (kind == OVERLAY_SLOT_DANMAKU) {
+            for (int i = count - 1; i >= 0; i--) {
+                if (keepOut[i] && slotKinds[i] == kind) {
+                    keepOut[i] = 0;
+                    kept--;
+                }
+            }
+        }
+        else {
+            for (int i = count - 1; i >= 0 && kept > limit; i--) {
+                if (keepOut[i] && slotKinds[i] == kind) {
+                    keepOut[i] = 0;
+                    kept--;
+                }
+            }
+        }
+    }
+    return kept;
+}
