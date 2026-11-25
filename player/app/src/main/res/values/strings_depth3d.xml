@@ -724,4 +724,39 @@
     <!-- G2 follow-ups: depth model unavailable notice & palette reason -->
     <string name="vr_depth_unavailable_toast">3D 深度模型初始化失败，已保持 2D 播放</string>
     <string name="vr_depth_unavailable_reason">深度模型不可用，仅支持原生 3D</string>
+
+    <!-- G4: Danmaku 3-band preview & 2D Settings category (§3.8, §6.3, §6.10, §6.12) -->
+    <string name="vr_danmaku_preview_far">弹幕预览 · 远层</string>
+    <string name="vr_danmaku_preview_mid">弹幕预览 · 中层</string>
+    <string name="vr_danmaku_preview_near">弹幕预览 · 近层</string>
+
+    <string name="settings_cat_danmaku">弹幕与字幕</string>
+    <string name="settings_cat_danmaku_sub">默认区域、密度、曲度与字号</string>
+    <string name="settings_danmaku_on_title">默认开启弹幕</string>
+    <string name="settings_danmaku_on_sub">片源支持弹幕或同目录存在同名 XML 弹幕时自动显示</string>
+    <string name="settings_danmaku_area_title">显示区域</string>
+    <string name="settings_danmaku_area_sub">全屏会避开底部字幕安全区，半屏与 1/4 只占画面上方</string>
+    <string name="settings_danmaku_opacity_title">不透明度</string>
+    <string name="settings_danmaku_opacity_sub">与看片调色板里的弹幕不透明度实时同步</string>
+    <string name="settings_danmaku_opacity_pct">%1$d%%</string>
+    <string name="settings_danmaku_size_title">弹幕字号</string>
+    <string name="settings_danmaku_size_sub">按视场角等比缩放，不同屏幕大小下保持一致清晰度</string>
+    <string name="settings_danmaku_speed_title">滚动速度</string>
+    <string name="settings_danmaku_speed_sub">所有滚动弹幕同角速度匀速飘过，不会互相追尾</string>
+    <string name="settings_danmaku_density_title">同屏密度</string>
+    <string name="settings_danmaku_density_sub">稀疏最多 20 条 · 标准 40 条 · 密集 80 条</string>
+    <string name="settings_danmaku_density_sparse">稀疏</string>
+    <string name="settings_danmaku_density_medium">标准</string>
+    <string name="settings_danmaku_density_dense">密集</string>
+    <string name="settings_danmaku_merge_title">合并重复弹幕</string>
+    <string name="settings_danmaku_merge_sub">5 秒内相同文字超过 3 条时合并为一条并带 ×数量</string>
+    <string name="settings_danmaku_curve_title">弹幕曲面</string>
+    <string name="settings_danmaku_curve_sub">默认跟随屏幕曲度；也可切平面或在曲面屏前自定义更平缓的曲度</string>
+    <string name="settings_danmaku_curve_follow">跟随屏幕</string>
+    <string name="settings_danmaku_curve_flat">平面</string>
+    <string name="settings_danmaku_curve_custom">自定义</string>
+    <string name="settings_danmaku_curve_custom_title">弹幕自定义曲度</string>
+    <string name="settings_danmaku_curve_custom_sub">按 5%% 步进调整；曲面屏前会自动前移保持边缘安全距离</string>
+    <string name="settings_sub_size_title">字幕字号</string>
+    <string name="settings_sub_size_sub">文本字幕默认大小，可在看片调色板里随时调整</string>
 </resources>

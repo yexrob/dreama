@@ -659,3 +659,63 @@ const char* const MODEL_FRAGMENT_SRC =
     "void main() {\n"
     "    fragColor = vec4(v_color, 1.0);\n"
     "}\n";
+
+// depth3d G4: instanced danmaku quad pass into per-eye overlay textures.
+// Coordinates a_rect = (x0, y0, w, h) in top-down normalized [0..1] overlay
+// area space. Per-eye crossed disparity shifts left eye right (+u) and right
+// eye left (-u) so text floats cleanly in front of the video surface.
+const char* const DANMAKU_VERTEX_SRC =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "layout(location = 0) in vec2 a_corner;\n"
+    "layout(location = 1) in vec4 a_rect;\n"
+    "layout(location = 2) in vec4 a_uv;\n"
+    "layout(location = 3) in vec4 a_colorAlpha;\n"
+    "layout(location = 4) in float a_phiDeg;\n"
+    "uniform float u_eyeSign;\n"
+    "uniform float u_screenFovDeg;\n"
+    "out vec2 v_uv;\n"
+    "out vec4 v_colorAlpha;\n"
+    "out float v_screenU;\n"
+    "void main() {\n"
+    "    float shiftU = u_eyeSign * (a_phiDeg * 0.5 / max(u_screenFovDeg, 1.0));\n"
+    "    float u = a_rect.x + a_corner.x * a_rect.z + shiftU;\n"
+    "    float v = a_rect.y + a_corner.y * a_rect.w;\n"
+    "    vec2 ndc = vec2(u * 2.0 - 1.0, 1.0 - v * 2.0);\n"
+    "    gl_Position = vec4(ndc, 0.0, 1.0);\n"
+    "    v_uv = vec2(a_uv.x + a_corner.x * a_uv.z, a_uv.y + a_corner.y * a_uv.w);\n"
+    "    v_colorAlpha = a_colorAlpha;\n"
+    "    v_screenU = u;\n"
+    "}\n";
+
+// 2-channel GL_RG8 atlas: R = crisp glyph fill alpha, G = 0.08em #0E0F12 stroke
+// + 1-texel soft shadow alpha. Multiplies per-item RGB color, per-item fade,
+// global opacity, and 1.5 deg horizontal edge feathering in one pass.
+const char* const DANMAKU_FRAGMENT_SRC =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 v_uv;\n"
+    "in vec4 v_colorAlpha;\n"
+    "in float v_screenU;\n"
+    "uniform sampler2D u_atlas;\n"
+    "uniform float u_globalOpacity;\n"
+    "uniform float u_featherU;\n"
+    "out vec4 fragColor;\n"
+    "void main() {\n"
+    "    vec2 rg = texture(u_atlas, v_uv).rg;\n"
+    "    float fillA = rg.r;\n"
+    "    float strokeA = rg.g;\n"
+    "    float outA = clamp(fillA + strokeA * (1.0 - fillA), 0.0, 1.0);\n"
+    "    if (outA < 0.004) {\n"
+    "        discard;\n"
+    "    }\n"
+    "    vec3 strokeCol = vec3(0.0549, 0.0588, 0.0706);\n"
+    "    vec3 rgb = v_colorAlpha.rgb * fillA + strokeCol * (strokeA * (1.0 - fillA));\n"
+    "    float edge = 1.0;\n"
+    "    if (u_featherU > 0.0001) {\n"
+    "        edge = smoothstep(0.0, u_featherU, v_screenU)\n"
+    "             * smoothstep(0.0, u_featherU, 1.0 - v_screenU);\n"
+    "    }\n"
+    "    float mask = v_colorAlpha.a * u_globalOpacity * edge;\n"
+    "    fragColor = vec4(rgb * mask, outA * mask);\n"
+    "}\n";

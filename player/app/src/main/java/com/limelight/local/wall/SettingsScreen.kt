@@ -42,6 +42,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.limelight.BuildConfig
 import com.limelight.R
+import com.limelight.binding.video.ScreenReadout
+import com.limelight.local.DanmakuArea
+import com.limelight.local.DanmakuSpeed
+import com.limelight.local.GlobalPaletteSettings
+import com.limelight.local.PaletteStore
+import com.limelight.local.TextSizeTier
+import com.limelight.local.danmaku.DanmakuCurvatureMode
+import com.limelight.local.danmaku.DanmakuDensity
 import com.limelight.local.dlna.CastReceiver
 import com.limelight.local.stream.AndroidPrefsStore
 import com.limelight.local.stream.BitratePreset
@@ -72,6 +80,7 @@ private enum class SettingsCategory(
     STREAM(R.string.settings_cat_stream, R.string.settings_cat_stream_sub, WallIcons.Computer),
     PLAYBACK_3D(R.string.settings_cat_3d, R.string.settings_cat_3d_sub, WallIcons.Eye),
     SCREEN_ENV(R.string.settings_cat_screen, R.string.settings_cat_screen_sub, WallIcons.Headset),
+    DANMAKU_SUBTITLE(R.string.settings_cat_danmaku, R.string.settings_cat_danmaku_sub, WallIcons.Danmaku),
     CAST(R.string.settings_cat_cast, R.string.settings_cat_cast_sub, WallIcons.Cast),
     INPUT(R.string.settings_cat_input, R.string.settings_cat_input_sub, WallIcons.Gamepad),
     PRIVACY(R.string.settings_cat_privacy, R.string.settings_cat_privacy_sub, WallIcons.Shield),
@@ -91,6 +100,7 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
 
     var selectedCategory by rememberSaveable { mutableStateOf(SettingsCategory.SOURCES) }
     var snapshot by remember { mutableStateOf(StreamSettingsMapper.read(store, isGen1)) }
+    var paletteGlobal by remember { mutableStateOf(PaletteStore.readGlobal(store, isGen1)) }
     val sourcesList by model.sources.collectAsState()
     val installedPlugins by model.installedPlugins.collectAsState()
     val dlna by CastReceiver.status.collectAsState()
@@ -104,6 +114,15 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
 
     fun update(block: () -> Unit) {
         block()
+        snapshot = StreamSettingsMapper.read(store, isGen1)
+        paletteGlobal = PaletteStore.readGlobal(store, isGen1)
+    }
+
+    fun updatePalette(transform: (GlobalPaletteSettings) -> GlobalPaletteSettings) {
+        val fresh = PaletteStore.readGlobal(store, isGen1)
+        val next = transform(fresh)
+        PaletteStore.saveGlobal(store, next)
+        paletteGlobal = PaletteStore.readGlobal(store, isGen1)
         snapshot = StreamSettingsMapper.read(store, isGen1)
     }
 
@@ -564,6 +583,217 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
                                     resetPoseConfirmed = true
                                 },
                                 small = true,
+                            )
+                        }
+                    }
+                }
+
+                SettingsCategory.DANMAKU_SUBTITLE -> {
+                    item("dm-on") {
+                        SettingRow(
+                            title = stringResource(R.string.settings_danmaku_on_title),
+                            sub = stringResource(R.string.settings_danmaku_on_sub),
+                        ) {
+                            WallSwitch(paletteGlobal.danmakuOn) { on ->
+                                updatePalette { it.copy(danmakuOn = on) }
+                            }
+                        }
+                    }
+                    item("dm-area") {
+                        SettingRow(
+                            title = stringResource(R.string.settings_danmaku_area_title),
+                            sub = stringResource(R.string.settings_danmaku_area_sub),
+                        ) {
+                            SegmentedControl(
+                                options = listOf(
+                                    DanmakuArea.FULL to stringResource(R.string.vr_palette_area_full),
+                                    DanmakuArea.HALF to stringResource(R.string.vr_palette_area_half),
+                                    DanmakuArea.QUARTER to stringResource(R.string.vr_palette_area_quarter),
+                                ),
+                                selected = paletteGlobal.danmakuArea,
+                                onSelect = { area -> updatePalette { it.copy(danmakuArea = area) } },
+                            )
+                        }
+                    }
+                    item("dm-opacity") {
+                        SettingRow(
+                            title = stringResource(R.string.settings_danmaku_opacity_title),
+                            sub = stringResource(R.string.settings_danmaku_opacity_sub),
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            ) {
+                                RoundButton(
+                                    WallIcons.Minus,
+                                    onClick = {
+                                        updatePalette {
+                                            it.copy(danmakuOpacityPct = (it.danmakuOpacityPct - 5).coerceIn(20, 100))
+                                        }
+                                    },
+                                    filled = true,
+                                    enabled = paletteGlobal.danmakuOpacityPct > 20,
+                                )
+                                Text(
+                                    stringResource(R.string.settings_danmaku_opacity_pct, paletteGlobal.danmakuOpacityPct),
+                                    style = WallType.Label.copy(fontFeatureSettings = "tnum"),
+                                    modifier = Modifier.width(88.dp),
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                                )
+                                RoundButton(
+                                    WallIcons.Plus,
+                                    onClick = {
+                                        updatePalette {
+                                            it.copy(danmakuOpacityPct = (it.danmakuOpacityPct + 5).coerceIn(20, 100))
+                                        }
+                                    },
+                                    filled = true,
+                                    enabled = paletteGlobal.danmakuOpacityPct < 100,
+                                )
+                            }
+                        }
+                    }
+                    item("dm-size") {
+                        SettingRow(
+                            title = stringResource(R.string.settings_danmaku_size_title),
+                            sub = stringResource(R.string.settings_danmaku_size_sub),
+                        ) {
+                            SegmentedControl(
+                                options = listOf(
+                                    TextSizeTier.SMALL to stringResource(R.string.settings_size_small),
+                                    TextSizeTier.MEDIUM to stringResource(R.string.settings_size_medium),
+                                    TextSizeTier.LARGE to stringResource(R.string.settings_size_large),
+                                ),
+                                selected = paletteGlobal.danmakuSize,
+                                onSelect = { sz -> updatePalette { it.copy(danmakuSize = sz) } },
+                            )
+                        }
+                    }
+                    item("dm-speed") {
+                        SettingRow(
+                            title = stringResource(R.string.settings_danmaku_speed_title),
+                            sub = stringResource(R.string.settings_danmaku_speed_sub),
+                        ) {
+                            SegmentedControl(
+                                options = listOf(
+                                    DanmakuSpeed.SLOW to stringResource(R.string.vr_palette_speed_slow),
+                                    DanmakuSpeed.NORMAL to stringResource(R.string.vr_palette_speed_normal),
+                                    DanmakuSpeed.FAST to stringResource(R.string.vr_palette_speed_fast),
+                                ),
+                                selected = paletteGlobal.danmakuSpeed,
+                                onSelect = { sp -> updatePalette { it.copy(danmakuSpeed = sp) } },
+                            )
+                        }
+                    }
+                    item("dm-density") {
+                        SettingRow(
+                            title = stringResource(R.string.settings_danmaku_density_title),
+                            sub = stringResource(R.string.settings_danmaku_density_sub),
+                        ) {
+                            SegmentedControl(
+                                options = listOf(
+                                    DanmakuDensity.SPARSE to stringResource(R.string.settings_danmaku_density_sparse),
+                                    DanmakuDensity.MEDIUM to stringResource(R.string.settings_danmaku_density_medium),
+                                    DanmakuDensity.DENSE to stringResource(R.string.settings_danmaku_density_dense),
+                                ),
+                                selected = paletteGlobal.danmakuDensity,
+                                onSelect = { d -> updatePalette { it.copy(danmakuDensity = d) } },
+                            )
+                        }
+                    }
+                    item("dm-merge") {
+                        SettingRow(
+                            title = stringResource(R.string.settings_danmaku_merge_title),
+                            sub = stringResource(R.string.settings_danmaku_merge_sub),
+                        ) {
+                            WallSwitch(paletteGlobal.danmakuMergeDuplicates) { m ->
+                                updatePalette { it.copy(danmakuMergeDuplicates = m) }
+                            }
+                        }
+                    }
+                    item("dm-curve") {
+                        SettingRow(
+                            title = stringResource(R.string.settings_danmaku_curve_title),
+                            sub = stringResource(R.string.settings_danmaku_curve_sub),
+                        ) {
+                            SegmentedControl(
+                                options = listOf(
+                                    DanmakuCurvatureMode.FOLLOW_SCREEN to stringResource(R.string.settings_danmaku_curve_follow),
+                                    DanmakuCurvatureMode.FLAT to stringResource(R.string.settings_danmaku_curve_flat),
+                                    DanmakuCurvatureMode.CUSTOM to stringResource(R.string.settings_danmaku_curve_custom),
+                                ),
+                                selected = paletteGlobal.danmakuCurvatureMode,
+                                onSelect = { mode -> updatePalette { it.copy(danmakuCurvatureMode = mode) } },
+                            )
+                        }
+                    }
+                    if (paletteGlobal.danmakuCurvatureMode == DanmakuCurvatureMode.CUSTOM) {
+                        item("dm-curve-custom") {
+                            val customCurve = paletteGlobal.danmakuCustomCurvaturePct
+                            val customLabel = if (customCurve <= 0) {
+                                stringResource(R.string.settings_curved_flat_label)
+                            } else {
+                                stringResource(R.string.settings_curved_percent, customCurve)
+                            }
+                            SettingRow(
+                                title = stringResource(R.string.settings_danmaku_curve_custom_title),
+                                sub = stringResource(R.string.settings_danmaku_curve_custom_sub),
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                ) {
+                                    RoundButton(
+                                        WallIcons.Minus,
+                                        onClick = {
+                                            updatePalette {
+                                                it.copy(
+                                                    danmakuCustomCurvaturePct = ScreenReadout.quantizeCurvature(
+                                                        it.danmakuCustomCurvaturePct - ScreenReadout.CURVATURE_STEP,
+                                                    ),
+                                                )
+                                            }
+                                        },
+                                        filled = true,
+                                        enabled = customCurve > 0,
+                                    )
+                                    Text(
+                                        customLabel,
+                                        style = WallType.Label.copy(fontFeatureSettings = "tnum"),
+                                        modifier = Modifier.width(104.dp),
+                                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                                    )
+                                    RoundButton(
+                                        WallIcons.Plus,
+                                        onClick = {
+                                            updatePalette {
+                                                it.copy(
+                                                    danmakuCustomCurvaturePct = ScreenReadout.quantizeCurvature(
+                                                        it.danmakuCustomCurvaturePct + ScreenReadout.CURVATURE_STEP,
+                                                    ),
+                                                )
+                                            }
+                                        },
+                                        filled = true,
+                                        enabled = customCurve < 100,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    item("sub-size") {
+                        SettingRow(
+                            title = stringResource(R.string.settings_sub_size_title),
+                            sub = stringResource(R.string.settings_sub_size_sub),
+                        ) {
+                            SegmentedControl(
+                                options = listOf(
+                                    TextSizeTier.SMALL to stringResource(R.string.settings_size_small),
+                                    TextSizeTier.MEDIUM to stringResource(R.string.settings_size_medium),
+                                    TextSizeTier.LARGE to stringResource(R.string.settings_size_large),
+                                ),
+                                selected = paletteGlobal.subtitleTextSize,
+                                onSelect = { sz -> updatePalette { it.copy(subtitleTextSize = sz) } },
                             )
                         }
                     }

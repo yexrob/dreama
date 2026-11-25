@@ -3,6 +3,8 @@ package com.limelight.local
 import com.limelight.binding.video.DepthPresets
 import com.limelight.binding.video.ScreenReadout
 import com.limelight.binding.video.XrShared
+import com.limelight.local.danmaku.DanmakuCurvatureMode
+import com.limelight.local.danmaku.DanmakuDensity
 import com.limelight.local.stream.DepthStrength
 import java.util.Locale
 import kotlin.math.abs
@@ -214,6 +216,10 @@ data class GlobalPaletteSettings(
     val danmakuSize: TextSizeTier = TextSizeTier.MEDIUM,
     val danmakuSpeed: DanmakuSpeed = DanmakuSpeed.NORMAL,
     val danmakuBlockMask: Int = 0,
+    val danmakuDensity: DanmakuDensity = DanmakuDensity.MEDIUM,
+    val danmakuMergeDuplicates: Boolean = true,
+    val danmakuCurvatureMode: DanmakuCurvatureMode = DanmakuCurvatureMode.FOLLOW_SCREEN,
+    val danmakuCustomCurvaturePct: Int = 0,
     val subtitleTextSize: TextSizeTier = TextSizeTier.MEDIUM,
     val subtitleBitmapScalePct: Int = 100,
     val subtitlePosDeg: Float = 2.0f,

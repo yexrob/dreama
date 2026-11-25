@@ -52,6 +52,8 @@
 #include "xr_gamepad.h"
 #include "xr_screen_ctrl.h"
 #include "xr_palette.h"
+#include "xr_overlay.h"
+#include "xr_danmaku.h"
 
 #define TAG "moonlight-xr"
 
@@ -448,7 +450,7 @@ typedef struct XrCompositionLayerSettingsFB {
 // 256 square map, and scaled with the map on each axis.
 #define DEPTH_LOWPASS_RADIUS 11
 
-typedef struct {
+typedef struct XrCtx {
     JavaVM* vm;
     jobject activity;
 
@@ -1481,6 +1483,14 @@ typedef struct {
     XrSwapchainImageOpenGLESKHR* dimmerImages;
     int dimmerArtReady;
     int passthroughDim;
+
+    // depth3d G4 (+ G3 shared overlay depth): GPU danmaku compositor & 64-bin
+    // 98th-percentile foreground content depth published atomically from stage thread
+    DanmakuState danmaku;
+    _Atomic uint32_t depthContentPhiBits;
+    float danmakuContentPhiSmoothed;
+    float lastScreenFovDeg;
+    int64_t lastDanmakuFrameNs;
 
     // Hover state, read by the frame loop to decide which handle to draw
     int hoverKind;

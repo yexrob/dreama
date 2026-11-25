@@ -279,6 +279,7 @@ class ScreenReadoutAndPrefsTest {
         assertEquals(XrShared.IN_PALETTE_ROW_RESET + 1, XrShared.IN_PALETTE_TAB_STEP)
         assertEquals(XrShared.IN_PALETTE_TAB_STEP + 1, XrShared.IN_PALETTE_PAGE_STEP)
         assertEquals(XrShared.IN_PALETTE_PAGE_STEP + 1, XrShared.IN_PALETTE_DIM_FALLBACK)
-        assertEquals(XrShared.IN_PALETTE_DIM_FALLBACK + 1, XrShared.IN_SLOTS)
+        assertEquals(XrShared.IN_PALETTE_DIM_FALLBACK + 1, XrShared.IN_CONTENT_PHI_CENTI)
+        assertEquals(XrShared.IN_CONTENT_PHI_CENTI + 1, XrShared.IN_SLOTS)
     }
 }

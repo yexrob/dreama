@@ -3,6 +3,8 @@ package com.limelight.local
 import android.content.Context
 import com.limelight.binding.video.EnvironmentIds
 import com.limelight.binding.video.ScreenReadout
+import com.limelight.local.danmaku.DanmakuCurvatureMode
+import com.limelight.local.danmaku.DanmakuDensity
 import com.limelight.local.stream.AndroidPrefsStore
 import com.limelight.local.stream.DepthStrength
 import com.limelight.local.stream.PrefsStore
@@ -36,6 +38,10 @@ object PaletteStore {
     const val KEY_DANMAKU_SIZE = "vr_danmaku_size"
     const val KEY_DANMAKU_SPEED = "vr_danmaku_speed"
     const val KEY_DANMAKU_BLOCK_MASK = "vr_danmaku_block_mask"
+    const val KEY_DANMAKU_DENSITY = "vr_danmaku_density"
+    const val KEY_DANMAKU_MERGE_DUPLICATES = "vr_danmaku_merge_duplicates"
+    const val KEY_DANMAKU_CURVE_MODE = "vr_danmaku_curve_mode"
+    const val KEY_DANMAKU_CUSTOM_CURVE_PCT = "vr_danmaku_custom_curve_pct"
 
     const val KEY_SUB_TEXT_SIZE = "vr_sub_text_size"
     const val KEY_SUB_BITMAP_SCALE = "vr_sub_bitmap_scale"
@@ -94,6 +100,14 @@ object PaletteStore {
             danmakuSize = TextSizeTier.fromOrdinal(store.getInt(KEY_DANMAKU_SIZE, TextSizeTier.MEDIUM.ordinal)),
             danmakuSpeed = DanmakuSpeed.fromOrdinal(store.getInt(KEY_DANMAKU_SPEED, DanmakuSpeed.NORMAL.ordinal)),
             danmakuBlockMask = store.getInt(KEY_DANMAKU_BLOCK_MASK, 0) and DanmakuBlockFlags.ALL_MASK,
+            danmakuDensity = DanmakuDensity.fromOrdinal(store.getInt(KEY_DANMAKU_DENSITY, DanmakuDensity.MEDIUM.ordinal)),
+            danmakuMergeDuplicates = store.getBoolean(KEY_DANMAKU_MERGE_DUPLICATES, true),
+            danmakuCurvatureMode = DanmakuCurvatureMode.fromOrdinal(
+                store.getInt(KEY_DANMAKU_CURVE_MODE, DanmakuCurvatureMode.FOLLOW_SCREEN.ordinal),
+            ),
+            danmakuCustomCurvaturePct = ScreenReadout.quantizeCurvature(
+                store.getInt(KEY_DANMAKU_CUSTOM_CURVE_PCT, 0),
+            ),
             subtitleTextSize = TextSizeTier.fromOrdinal(store.getInt(KEY_SUB_TEXT_SIZE, TextSizeTier.MEDIUM.ordinal)),
             subtitleBitmapScalePct = store.getInt(KEY_SUB_BITMAP_SCALE, PaletteController.DEFAULT_SUB_BITMAP_SCALE)
                 .coerceIn(70, 150),
@@ -168,6 +182,10 @@ object PaletteStore {
             b.putInt(KEY_DANMAKU_SIZE, settings.danmakuSize.ordinal)
             b.putInt(KEY_DANMAKU_SPEED, settings.danmakuSpeed.ordinal)
             b.putInt(KEY_DANMAKU_BLOCK_MASK, settings.danmakuBlockMask and DanmakuBlockFlags.ALL_MASK)
+            b.putInt(KEY_DANMAKU_DENSITY, settings.danmakuDensity.ordinal)
+            b.putBoolean(KEY_DANMAKU_MERGE_DUPLICATES, settings.danmakuMergeDuplicates)
+            b.putInt(KEY_DANMAKU_CURVE_MODE, settings.danmakuCurvatureMode.ordinal)
+            b.putInt(KEY_DANMAKU_CUSTOM_CURVE_PCT, ScreenReadout.quantizeCurvature(settings.danmakuCustomCurvaturePct))
 
             b.putInt(KEY_SUB_TEXT_SIZE, settings.subtitleTextSize.ordinal)
             b.putInt(KEY_SUB_BITMAP_SCALE, settings.subtitleBitmapScalePct)

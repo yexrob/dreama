@@ -4046,6 +4046,7 @@ static void handBack(JNIEnv* env, XrCtx* ctx, float* out, jfloatArray outArr) {
         out[IN_PALETTE_TAB_STEP] = (float)ctx->paletteTabStepOut;
         out[IN_PALETTE_PAGE_STEP] = (float)ctx->palettePageStepOut;
         out[IN_PALETTE_DIM_FALLBACK] = ctx->palettePose.dimFallback ? 1.0f : 0.0f;
+        out[IN_CONTENT_PHI_CENTI] = roundf(ctx->danmakuContentPhiSmoothed * 100.0f);
         ctx->paletteClickState = 0;
         ctx->paletteRowStepOut = 0;
         ctx->paletteRowResetOut = 0;

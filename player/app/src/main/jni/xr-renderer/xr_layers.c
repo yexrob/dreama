@@ -82,6 +82,8 @@ typedef struct {
     XrCompositionLayerCylinderKHR glowCylinder;
     XrCompositionLayerQuad video[2];
     XrCompositionLayerCylinderKHR cylinder[2];
+    XrCompositionLayerQuad danmakuQuad[2];
+    XrCompositionLayerCylinderKHR danmakuCyl[2];
     XrCompositionLayerQuad overlay;
     XrCompositionLayerQuad transport;
     XrCompositionLayerCylinderKHR transportCylinder;
@@ -526,6 +528,69 @@ static void addVideoLayers(XrCtx* ctx, const FrameView* view, FrameLayers* layer
                       view->screenHeight);
             quad->eyeVisibility = visibility;
             quad->subImage = subImage;
+            pushLayer(ctx, layers, quad);
+        }
+    }
+}
+
+// depth3d G4: per-eye danmaku composition layers (0 layers when idle/empty,
+// 1 layer when flat mono, 2 eye-split layers when layered 3D float is active).
+// Placed directly over the video surface and behind the transport bar & palette
+// using the shared G4/G3 overlayComputeSurface() geometry.
+static void addDanmakuLayers(XrCtx* ctx, const FrameView* view, FrameLayers* layers) {
+    if (!ctx->localMedia) {
+        return;
+    }
+    DanmakuState* dm = &ctx->danmaku;
+    int eyeCount = dm->drawnEyes;
+    if (eyeCount <= 0 || dm->drawnTexH <= 0) {
+        return;
+    }
+    if (eyeCount > 2) eyeCount = 2;
+
+    Vec3 head = { ctx->headPos.x, ctx->headPos.y, ctx->headPos.z };
+    float screenDist = screenDistanceFrom(view->screenPose, head);
+    OverlaySurfaceGeom surf;
+    if (!overlayComputeSurface(view->screenPose, view->screenWidth, view->screenHeight,
+                               ctx->screenRadius, view->screenCurved, ctx->cylinderSupported,
+                               view->roomOn, dm->curveMode, dm->customCurvePct,
+                               screenDist, 0.0f, dm->drawnAreaBotFrac, 0.0f, &surf)) {
+        return;
+    }
+
+    for (int eye = 0; eye < eyeCount; eye++) {
+        if (dm->eyeSwapchain[eye] == XR_NULL_HANDLE) {
+            continue;
+        }
+        XrEyeVisibility vis = eyeCount == 1 ? XR_EYE_VISIBILITY_BOTH
+                : (eye == 0 ? XR_EYE_VISIBILITY_LEFT : XR_EYE_VISIBILITY_RIGHT);
+        if (surf.useCylinder) {
+            XrCompositionLayerCylinderKHR* cyl = &layers->danmakuCyl[eye];
+            memset(cyl, 0, sizeof(*cyl));
+            cyl->type = XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR;
+            cyl->next = layers->settingsChain;
+            cyl->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            cyl->eyeVisibility = vis;
+            cyl->subImage.swapchain = dm->eyeSwapchain[eye];
+            cyl->subImage.imageRect.offset.x = 0;
+            cyl->subImage.imageRect.offset.y = 0;
+            cyl->subImage.imageRect.extent.width = DANMAKU_TEX_W;
+            cyl->subImage.imageRect.extent.height = dm->drawnTexH;
+            cyl->subImage.imageArrayIndex = 0;
+            cyl->space = view->space;
+            cyl->pose = surf.axisPose;
+            cyl->radius = surf.radius;
+            cyl->centralAngle = surf.centralAngle;
+            cyl->aspectRatio = surf.aspectRatio;
+            pushLayer(ctx, layers, cyl);
+        }
+        else {
+            XrCompositionLayerQuad* quad = &layers->danmakuQuad[eye];
+            quadLayerRect(quad, layers->settingsChain,
+                          XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+                          dm->eyeSwapchain[eye], 0, 0, DANMAKU_TEX_W, dm->drawnTexH,
+                          view->space, surf.quadPose, surf.quadWidth, surf.quadHeight);
+            quad->eyeVisibility = vis;
             pushLayer(ctx, layers, quad);
         }
     }
@@ -1591,6 +1656,24 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
     // A panel on its way out keeps the furniture down until it has gone, the
     // way an open one does, so the two never stack up in one frame
     int64_t frameNs = nowNs();
+    // depth3d G4: render instanced per-eye danmaku layers strictly for local playback
+    if (ctx->localMedia && ctx->shouldRender && ctx->everRendered) {
+        Vec3 head = { ctx->headPos.x, ctx->headPos.y, ctx->headPos.z };
+        float curDist = screenDistanceFrom(view.screenPose, head);
+        float curFov = screenFovFromPlacement(view.screenWidth, curDist, ctx->screenRadius,
+                                              view.screenCurved);
+        ctx->lastScreenFovDeg = curFov;
+        float dmDt = 0.0f;
+        if (ctx->lastDanmakuFrameNs != 0 && frameNs > ctx->lastDanmakuFrameNs) {
+            dmDt = (float)(frameNs - ctx->lastDanmakuFrameNs) / 1e9f;
+            if (dmDt > 0.10f) dmDt = 0.10f;
+        }
+        ctx->lastDanmakuFrameNs = frameNs;
+        danmakuRenderEyes(ctx, curFov, curDist, dmDt, view.stereo);
+    }
+    else if (ctx->localMedia) {
+        ctx->danmaku.drawnEyes = 0;
+    }
     stepPanelFades(ctx, frameNs);
     stepSplash(ctx, frameNs);
     int splashUp = ctx->splash.phase == SPLASH_UP;
@@ -1643,6 +1726,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
     }
     if (!splashUp && ctx->everRendered && ctx->shouldRender) {
         addVideoLayers(ctx, &view, &layers);
+        addDanmakuLayers(ctx, &view, &layers);
         addOverlayLayer(ctx, &view, &layers);
         addTransportLayer(ctx, &view, &layers);
         addHandleLayer(ctx, &view, &layers);

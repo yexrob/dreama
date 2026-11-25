@@ -241,6 +241,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     // names them by
     private XrPanels.Toast toast;
     private boolean screenAdjustActive;
+    private float lastReportedContentPhi = -1.0f;
     private final ScreenReadout.ReadoutCache screenReadoutCache = new ScreenReadout.ReadoutCache();
     private String[] screenPresetLabels;
     private String screenInchUnit;
@@ -360,6 +361,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                                       int tabStep, int pageStep) { }
         default void onVrScreenDimensionsSaved(float fovDeg, float distM) { }
         default void onVrDepthModelUnavailable() { }
+        default void onVrContentDepthPhi(float phiDeg) { }
     }
 
     public void setInputListener(InputListener listener) {
@@ -618,6 +620,17 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                                                        float curvature);
     private native void nativeTriggerPaletteHaptic(long ctx, int kind);
     private native boolean nativeEnsureDepthModel(long ctx);
+    // depth3d G4: GPU-accelerated instanced danmaku atlas & snapshot bridge (localMedia only)
+    private native boolean nativeUploadDanmakuAtlasPatch(long ctx, int x, int y, int w, int h,
+                                                         ByteBuffer rgPixels);
+    private native void nativeClearDanmakuAtlas(long ctx);
+    private native void nativeSetDanmakuSnapshot(long ctx, boolean enabled, boolean paused,
+                                                 float clockSec, float areaBotFrac,
+                                                 float globalOpacity, int curveMode,
+                                                 float customCurvePct, boolean floatAuto,
+                                                 int floatAutoOffset, int floatFixedSteps,
+                                                 float layerSpreadDeg, boolean animateDepth,
+                                                 float[] instances, int count);
 
     private final TransportBufferQueue transportQueue =
             new TransportBufferQueue(TRANSPORT_WIDTH * TRANSPORT_HEIGHT * 4);
@@ -769,6 +782,48 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         synchronized (nativeLock) {
             if (nativeCtx != 0 && kind > PALETTE_HAPTIC_NONE) {
                 nativeTriggerPaletteHaptic(nativeCtx, kind);
+            }
+        }
+    }
+
+    /** Enqueues one 2-channel RG8 glyph patch into the native danmaku atlas ring (off render thread). */
+    public boolean uploadDanmakuAtlasPatch(int x, int y, int w, int h, ByteBuffer rgPixels) {
+        if (!localMedia || rgPixels == null) {
+            return false;
+        }
+        synchronized (nativeLock) {
+            return nativeCtx != 0
+                    && nativeUploadDanmakuAtlasPatch(nativeCtx, x, y, w, h, rgPixels);
+        }
+    }
+
+    /** Clears pending atlas uploads and schedules an instant GPU FBO clear of the danmaku atlas. */
+    public void clearDanmakuAtlas() {
+        if (!localMedia) {
+            return;
+        }
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeClearDanmakuAtlas(nativeCtx);
+            }
+        }
+    }
+
+    /** Publishes the latest active danmaku instance snapshot to the native GL compositor. */
+    public void setDanmakuSnapshot(boolean enabled, boolean paused, float clockSec,
+                                   float areaBotFrac, float globalOpacity,
+                                   int curveMode, float customCurvePct,
+                                   boolean floatAuto, int floatAutoOffset, int floatFixedSteps,
+                                   float layerSpreadDeg, boolean animateDepth,
+                                   float[] instances, int count) {
+        if (!localMedia) {
+            return;
+        }
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeSetDanmakuSnapshot(nativeCtx, enabled, paused, clockSec, areaBotFrac,
+                        globalOpacity, curveMode, customCurvePct, floatAuto, floatAutoOffset,
+                        floatFixedSteps, layerSpreadDeg, animateDepth, instances, count);
             }
         }
     }
@@ -1649,6 +1704,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         screenInchUnit = prefsContext.getString(R.string.vr_screen_unit_inch);
         screenReadoutCache.reset();
         screenAdjustActive = false;
+        lastReportedContentPhi = -1.0f;
         cogMarks = new XrPanels.Marks();
         cogClock = new XrPanels.ClockStrip();
         clock = new XrClock(prefsContext);
@@ -1988,6 +2044,11 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                         inputState[IN_PALETTE_ROW_RESET] != 0.0f,
                         (int)inputState[IN_PALETTE_TAB_STEP],
                         (int)inputState[IN_PALETTE_PAGE_STEP]);
+                float contentPhi = inputState[IN_CONTENT_PHI_CENTI] / 100.0f;
+                if (Math.abs(contentPhi - lastReportedContentPhi) >= 0.01f) {
+                    lastReportedContentPhi = contentPhi;
+                    inputListener.onVrContentDepthPhi(contentPhi);
+                }
             }
         }
 

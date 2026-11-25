@@ -813,6 +813,7 @@ static void destroyCtx(JNIEnv* env, XrCtx* ctx) {
     destroyArtSwapchain(ctx, &ctx->transportSwapchain, &ctx->transportImages);
     destroyArtSwapchain(ctx, &ctx->paletteSwapchain, &ctx->paletteImages);
     destroyArtSwapchain(ctx, &ctx->dimmerSwapchain, &ctx->dimmerImages);
+    danmakuDestroy(ctx);
     destroyArtSwapchain(ctx, &ctx->pointerSwapchain, &ctx->pointerImages);
     destroyArtSwapchain(ctx, &ctx->barSwapchain, &ctx->barImages);
     destroyArtSwapchain(ctx, &ctx->cornerSwapchain, &ctx->cornerImages);
@@ -930,6 +931,9 @@ Java_com_limelight_binding_video_XrRenderer_nativeInit(JNIEnv* env, jobject thiz
     XrCtx* ctx = calloc(1, sizeof(XrCtx));
     pthread_mutex_init(&ctx->localCmdLock, NULL);
     ctx->localCmdLockReady = 1;
+    danmakuInit(ctx);
+    atomic_init(&ctx->depthContentPhiBits, 0);
+    ctx->lastScreenFovDeg = 50.0f;
     ctx->localMedia = localMedia ? 1 : 0;
     ctx->stereoSourceFormat = (initialSourceFormat >= STEREO_SRC_AUTO
                                && initialSourceFormat <= STEREO_SRC_OU)
