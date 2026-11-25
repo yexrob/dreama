@@ -8,7 +8,7 @@ import os, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from lib import BASE_CSS
-import pages, vr
+import pages, vr, palette
 
 OUT = os.path.normpath(os.path.join(HERE, '..', 'mockups'))
 os.makedirs(OUT, exist_ok=True)
@@ -22,7 +22,8 @@ PAGES = [
     ('cast', '投屏接收', pages.cast, [('default', '等待投屏'), ('confirm', '首次确认'), ('connecting', '连接中'), ('pin', '电脑配对'), ('nowifi', '没有网络')]),
     ('onboarding', '首次使用引导', pages.onboarding, [('welcome', '欢迎'), ('sources', '片源'), ('mac', '装 Host'), ('controls', '操作')]),
     ('settings', '设置', pages.settings, [('default', '播放与 3D'), ('screen', '屏幕与环境'), ('about', '关于')]),
-    ('vr-player', 'VR 播放中', vr.vr_page, [('menu', '快捷菜单'), ('bar', '控制条'), ('paused', '暂停'), ('toast', '提示'), ('next', '下一集'), ('cast', '投屏请求'), ('buffer', '缓冲'), ('clean', '沉浸'), ('measure', '尺寸标注')]),
+    ('vr-player', 'VR 播放中', vr.vr_page, [('menu', '快捷菜单（旧）'), ('bar', '控制条'), ('paused', '暂停'), ('toast', '提示'), ('next', '下一集'), ('cast', '投屏请求'), ('buffer', '缓冲'), ('clean', '沉浸'), ('measure', '尺寸标注')]),
+    ('vr-palette', 'VR 调色板与弹幕', palette.palette_page, [(s, l) for s, l, _ in palette.STATES]),
 ]
 
 for name, _, fn, _ in PAGES:
@@ -56,7 +57,7 @@ index = ('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta na
          '<p class="lede">2D 面板是 1280 × 720 的窗口，画在一个模拟的透视房间里；VR 播放页是头显视野本身。每页底部可以切换状态，右下角写着这个状态为什么这样做。完整的理由见 ux-spec.md。</p>'
          '<div class="facts"><span>面板 1° ≈ <b>24 px</b></span><span>最小字 <b>24 px</b> · 正文 <b>28 px</b></span>'
          '<span>最小目标 <b>60 px</b> · 主要目标 <b>64 px</b></span><span>线条至少 <b>2 px</b></span>'
-         '<span>播放中图层 <b>≤ 11 / 16</b></span><span>强调色只用于进度和「已开启」</span></div>'
+         '<span>播放中图层 <b>≤ 13 / 16</b></span><span>调色板 <b>20 × 15 cm</b> · 贴图 <b>1024 × 768</b></span><span>弹幕 <b>1.4°</b> · 字幕 <b>1.6°</b></span><span>强调色只用于进度和「已开启」</span></div>'
          f'<div class="grid">{items}</div></div></body></html>')
 open(os.path.join(OUT, 'index.html'), 'w', encoding='utf-8').write(index)
 print('ok', sorted(os.listdir(OUT)))
