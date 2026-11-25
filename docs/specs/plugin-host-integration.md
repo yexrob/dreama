@@ -176,6 +176,7 @@ when (error) {
 | QuickJS VM 堆与栈 | 64 MB 堆 + 512 KB 栈 | **~64.5 MB** | Native 堆；随 `PluginRuntime` 存活，超时或 OOM 重建时释放 |
 | DOM 解析输入字符串 | ≤ 2 MB UTF-8 | **2–8 MB** | JVM/ART 堆；非 Latin-1 UTF-16 `String` 最高 4 MB，`parseXml` 未定义实体转义副本再增至多 4 MB，解析返回即释放 |
 | DOM 序列化输出缓冲（`html` / `outerHtml` / `text` / 转义后 `attrsJson`） | ≤ 8 MB UTF-8 | **16–32 MB** | JVM/ART 堆；`BoundedOutputBuffer` 的 `StringBuilder`（UTF-16 最高 16 MB）+ `toString()` 成品副本 + 桥接传回 QuickJS 的瞬时拷贝，调用返回即释放 |
+| DOM 估算用的字符串去重集合（`IdentityStringSet`） | ≤ 699,050 项（32 MB / 每项至少 48 B），表容量 ≤ 2^20 | **~6 MB** | JVM/ART 堆；4 MB 表 + 扩容时 2 MB 旧表，每个进行中的 `parseHtml` / `parseXml` 一份，流式阶段结束清空后才建终态重算用的那份，解析返回即释放 |
 | CSS 选择器查询记忆表与兄弟表 | ≤ 16 MB 逻辑预算 | **~16 MB** | JVM/ART 堆；单次 `select` / `selectAll` 期间存在，查询返回即释放 |
 | 插件返回值 JSON 序列化缓冲 | ≤ 8 MB UTF-8 | **8–16 MB** | QuickJS + JVM/ART 桥接层瞬时拷贝，单次 `invoke` 返回后释放 |
 | `ctx.fetch` 响应体在途缓冲 | ≤ 16 MB（单响应 ≤ 8 MB，并发 ≤ 4） | **~16 MB** | JVM/ART 堆；调用 `text()` / `json()` / `bytes()` 一次性消费后立即释放 |
