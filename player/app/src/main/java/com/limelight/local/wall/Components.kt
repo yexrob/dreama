@@ -183,26 +183,28 @@ fun WallButton(
 /** The 64 px round button of the nav bar and the back arrow. */
 @Composable
 fun RoundButton(icon: ImageVector, onClick: () -> Unit, modifier: Modifier = Modifier,
-                filled: Boolean = false, selected: Boolean = false) {
+                filled: Boolean = false, selected: Boolean = false, enabled: Boolean = true) {
     val source = remember { MutableInteractionSource() }
     val hovered by rememberRayHover(source)
-    val scale = hoverScale(hovered, 1.06f, 120)
+    val scale = hoverScale(enabled && hovered, 1.06f, 120)
     val bg = when {
+        !enabled -> if (filled) Wall.Fill.copy(alpha = 0.35f) else Color.Transparent
         hovered -> Wall.FillHi
         selected -> Wall.Sel
         filled -> Wall.Fill
         else -> Color.Transparent
     }
+    val interactiveMod = if (enabled) Modifier.ray(source, onClick) else Modifier
     Box(
         modifier
             .graphicsLayer { scaleX = scale; scaleY = scale }
             .size(64.dp)
             .clip(CircleShape)
             .background(bg)
-            .ray(source, onClick),
+            .then(interactiveMod),
         contentAlignment = Alignment.Center,
     ) {
-        Icon(icon, null, Modifier.size(30.dp), tint = Wall.Text)
+        Icon(icon, null, Modifier.size(30.dp), tint = if (enabled) Wall.Text else Wall.Text3)
     }
 }
 

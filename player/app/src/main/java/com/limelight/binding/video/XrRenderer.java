@@ -241,10 +241,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     // names them by
     private XrPanels.Toast toast;
     private boolean screenAdjustActive;
-    private final int[] screenReadoutCache = {
-            Integer.MIN_VALUE, Integer.MIN_VALUE, Integer.MIN_VALUE,
-            Integer.MIN_VALUE, Integer.MIN_VALUE
-    };
+    private final ScreenReadout.ReadoutCache screenReadoutCache = new ScreenReadout.ReadoutCache();
     private String[] screenPresetLabels;
     private String screenInchUnit;
     // The marks on the display tab's cells, drawn on the frame loop when one
@@ -1411,7 +1408,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 prefsContext.getString(R.string.vr_screen_preset_giant)
         };
         screenInchUnit = prefsContext.getString(R.string.vr_screen_unit_inch);
-        Arrays.fill(screenReadoutCache, Integer.MIN_VALUE);
+        screenReadoutCache.reset();
         screenAdjustActive = false;
         cogMarks = new XrPanels.Marks();
         cogClock = new XrPanels.ClockStrip();
@@ -1760,9 +1757,11 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
             PreferenceConfiguration.saveGlobalScreenDimensions(
                     PreferenceManager.getDefaultSharedPreferences(prefsContext), fovDeg, distM);
             if (prefConfig != null) {
-                prefConfig.vrDistance = Math.max(20, Math.min(80, Math.round(distM * 10.0f)));
-                prefConfig.vrScreenSize = Math.max(8, Math.min(80,
-                        Math.round(ScreenReadout.flatWidthMeters(fovDeg, distM) * 10.0f)));
+                prefConfig.vrDistance = Math.max(ScreenReadout.MIN_SCREEN_DIST_DM,
+                        Math.min(ScreenReadout.MAX_SCREEN_DIST_DM, Math.round(distM * 10.0f)));
+                prefConfig.vrScreenSize = Math.max(ScreenReadout.MIN_SCREEN_SIZE_DM,
+                        Math.min(ScreenReadout.MAX_SCREEN_SIZE_DM,
+                                Math.round(ScreenReadout.flatWidthMeters(fovDeg, distM) * 10.0f)));
             }
         }
 
@@ -2188,20 +2187,9 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
             int distCm = (int)inputState[IN_ADJUST_DIST_CM];
             int inches = (int)inputState[IN_ADJUST_INCHES];
             int preset = (int)inputState[IN_ADJUST_PRESET];
-            if (axis != screenReadoutCache[0] || fovTenths != screenReadoutCache[1]
-                    || distCm != screenReadoutCache[2] || inches != screenReadoutCache[3]
-                    || preset != screenReadoutCache[4]) {
-                screenReadoutCache[0] = axis;
-                screenReadoutCache[1] = fovTenths;
-                screenReadoutCache[2] = distCm;
-                screenReadoutCache[3] = inches;
-                screenReadoutCache[4] = preset;
-                String readout = ScreenReadout.formatReadoutText(axis, fovTenths, distCm, inches,
-                        preset, screenPresetLabels, screenInchUnit);
+            if (screenReadoutCache.update(axis, fovTenths, distCm, inches, preset,
+                    screenPresetLabels, screenInchUnit)) {
                 boolean isDist = axis == ADJUST_AXIS_DIST;
-                float progress = isDist
-                        ? ScreenReadout.distNorm(distCm / 100.0f)
-                        : ScreenReadout.sizeNorm(fovTenths / 10.0f);
                 float[] ticks = isDist
                         ? ScreenReadout.DIST_TICK_POSITIONS
                         : ScreenReadout.SIZE_TICK_POSITIONS;
@@ -2209,14 +2197,13 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                         ? ScreenReadout.DIST_TICK_LABELS
                         : ScreenReadout.SIZE_TICK_LABELS;
                 nativeUploadToast(nativeCtx,
-                        toast.drawScreenReadout(readout, progress, ticks, tickLabels),
+                        toast.drawScreenReadout(screenReadoutCache.getText(),
+                                screenReadoutCache.getQuantizedProgress(), ticks, tickLabels),
                         TOAST_SCREEN_READOUT, 0);
             }
             return;
         }
-        if (screenReadoutCache[0] != Integer.MIN_VALUE) {
-            Arrays.fill(screenReadoutCache, Integer.MIN_VALUE);
-        }
+        screenReadoutCache.reset();
         int kind = (int)inputState[IN_TOAST];
         if (kind < 0 || toast == null || prefsContext == null) {
             return;

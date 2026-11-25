@@ -699,9 +699,13 @@ public class PreferenceConfiguration {
      */
     public static void saveGlobalScreenDimensions(SharedPreferences prefs,
                                                   float fovDeg, float distM) {
-        int distDm = Math.max(20, Math.min(80, Math.round(distM * 10.0f)));
+        int distDm = Math.max(com.limelight.binding.video.ScreenReadout.MIN_SCREEN_DIST_DM,
+                Math.min(com.limelight.binding.video.ScreenReadout.MAX_SCREEN_DIST_DM,
+                        Math.round(distM * 10.0f)));
         float flatW = com.limelight.binding.video.ScreenReadout.flatWidthMeters(fovDeg, distM);
-        int sizeDm = Math.max(8, Math.min(80, Math.round(flatW * 10.0f)));
+        int sizeDm = Math.max(com.limelight.binding.video.ScreenReadout.MIN_SCREEN_SIZE_DM,
+                Math.min(com.limelight.binding.video.ScreenReadout.MAX_SCREEN_SIZE_DM,
+                        Math.round(flatW * 10.0f)));
         prefs.edit()
                 .putInt(VR_DISTANCE_PREF_STRING, distDm)
                 .putInt(VR_SCREEN_SIZE_PREF_STRING, sizeDm)

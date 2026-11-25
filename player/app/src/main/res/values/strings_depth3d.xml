@@ -557,4 +557,8 @@
     <string name="vr_seek_backward">快退 %1$d 秒</string>
     <string name="settings_trigger_screen_adjust_title">按住扳机调整屏幕</string>
     <string name="settings_trigger_screen_adjust_sub">看片时按住扳机推摇杆调远近和大小；关闭后改用握键</string>
+    <string name="settings_screen_size_current_sub">当前 %1$d°（约 %2$d 寸）· 进入沉浸模式时的初始视角宽度</string>
+    <string name="settings_screen_dist_current_sub">当前 %1$s · 仅调整纵深，保持视角大小不变</string>
+    <string name="settings_curved_flat_label">平面</string>
+    <string name="settings_curved_percent">%1$d%%</string>
 </resources>

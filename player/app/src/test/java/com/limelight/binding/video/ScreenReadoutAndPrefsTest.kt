@@ -146,10 +146,68 @@ class ScreenReadoutAndPrefsTest {
         assertEquals(50, afterDist.actualScreenDistanceDm)
         assertEquals(62.0f, afterDist.screenFovDeg, 1.5f)
 
-        // In-VR adjust save updates global prefs cleanly
+        // In-VR adjust save updates global prefs cleanly without truncating large FOV @ 8 m (Review #8)
         PreferenceConfiguration.saveGlobalScreenDimensions(store, 50.0f, 3.4f)
         assertEquals(34, store.getInt(PreferenceConfiguration.VR_DISTANCE_PREF_STRING, -1))
         assertEquals(32, store.getInt(PreferenceConfiguration.VR_SCREEN_SIZE_PREF_STRING, -1))
+
+        // 62° @ 8.0 m (~9.61 m = 96 dm) must round-trip as ~62°, NOT truncated to 8 m (~53°)!
+        PreferenceConfiguration.saveGlobalScreenDimensions(store, 62.0f, 8.0f)
+        assertEquals(80, store.getInt(PreferenceConfiguration.VR_DISTANCE_PREF_STRING, -1))
+        assertEquals(96, store.getInt(PreferenceConfiguration.VR_SCREEN_SIZE_PREF_STRING, -1))
+        val after8m = StreamSettingsMapper.read(store, false)
+        assertEquals(62.0f, after8m.screenFovDeg, 0.5f)
+
+        // 90° @ 8.0 m (16.0 m = 160 dm) hits exact unified upper bound
+        PreferenceConfiguration.saveGlobalScreenDimensions(store, 90.0f, 8.0f)
+        assertEquals(160, store.getInt(PreferenceConfiguration.VR_SCREEN_SIZE_PREF_STRING, -1))
+        assertEquals(90.0f, StreamSettingsMapper.read(store, false).screenFovDeg, 0.5f)
+    }
+
+    @Test
+    fun readoutCacheSuppressesPerFrameRedrawAndStringFormatting() {
+        val cache = ScreenReadout.ReadoutCache()
+
+        // First call formats string and requests upload (49.9° -> bucket 21, displays "50°")
+        assertTrue(cache.update(XrShared.ADJUST_AXIS_SIZE, 499, 300, 126, XrShared.SCREEN_PRESET_MEDIUM, presetLabels, "寸"))
+        assertEquals("↔ 中 50° · 3.0 m · 126 寸", cache.text)
+        assertEquals(1, cache.stringFormatCount)
+
+        // Sub-display jitter within same integer deg/0.1m/inch and same 1/64 slider bucket (21):
+        // ZERO string re-format and ZERO texture upload!
+        assertFalse(cache.update(XrShared.ADJUST_AXIS_SIZE, 500, 300, 126, XrShared.SCREEN_PRESET_MEDIUM, presetLabels, "寸"))
+        assertFalse(cache.update(XrShared.ADJUST_AXIS_SIZE, 501, 300, 126, XrShared.SCREEN_PRESET_MEDIUM, presetLabels, "寸"))
+        assertEquals(1, cache.stringFormatCount)
+
+        // Moving across a 1/64 slider bucket (50.4° -> bucket 22, still displays "50°") triggers
+        // upload while still NOT re-formatting the string!
+        assertTrue(cache.update(XrShared.ADJUST_AXIS_SIZE, 504, 300, 126, XrShared.SCREEN_PRESET_MEDIUM, presetLabels, "寸"))
+        assertEquals(1, cache.stringFormatCount)
+
+        // Changing displayed degree/inches formats string once and triggers upload
+        assertTrue(cache.update(XrShared.ADJUST_AXIS_SIZE, 510, 300, 129, XrShared.SCREEN_PRESET_NONE, presetLabels, "寸"))
+        assertEquals("↔ 51° · 3.0 m · 129 寸", cache.text)
+        assertEquals(2, cache.stringFormatCount)
+
+        // Spec §6.12 readout dimensions fit inside toast swapchain
+        assertEquals(960, XrShared.READOUT_TEX_W)
+        assertEquals(112, XrShared.READOUT_TEX_H)
+        assertTrue(XrShared.READOUT_TEX_W <= XrShared.TOAST_TEX_W)
+        assertTrue(XrShared.READOUT_TEX_H <= XrShared.TOAST_TEX_H)
+    }
+
+    @Test
+    fun settingsPresetsMatchAngularAndDistanceSpecValues() {
+        assertEquals(com.limelight.local.stream.ScreenSizePreset.SMALL, com.limelight.local.stream.ScreenSizePreset.fromFovDegOrNull(40f))
+        assertEquals(com.limelight.local.stream.ScreenSizePreset.MEDIUM, com.limelight.local.stream.ScreenSizePreset.fromFovDegOrNull(50f))
+        assertEquals(com.limelight.local.stream.ScreenSizePreset.LARGE, com.limelight.local.stream.ScreenSizePreset.fromFovDegOrNull(62f))
+        assertEquals(com.limelight.local.stream.ScreenSizePreset.GIANT, com.limelight.local.stream.ScreenSizePreset.fromFovDegOrNull(80f))
+        assertNull(com.limelight.local.stream.ScreenSizePreset.fromFovDegOrNull(55f))
+
+        assertEquals(com.limelight.local.stream.ScreenDistancePreset.NEAR, com.limelight.local.stream.ScreenDistancePreset.fromDistanceDmOrNull(20))
+        assertEquals(com.limelight.local.stream.ScreenDistancePreset.MEDIUM, com.limelight.local.stream.ScreenDistancePreset.fromDistanceDmOrNull(30))
+        assertEquals(com.limelight.local.stream.ScreenDistancePreset.FAR, com.limelight.local.stream.ScreenDistancePreset.fromDistanceDmOrNull(50))
+        assertNull(com.limelight.local.stream.ScreenDistancePreset.fromDistanceDmOrNull(37))
     }
 
     private fun layerBudget(
@@ -172,25 +230,28 @@ class ScreenReadoutAndPrefsTest {
 
     @Test
     fun layerBudgetNeverExceedsSpecLimits() {
-        // Pure playback = 6
-        assertEquals(6, layerBudget(
-            inRoom = true, stereo = true, hasDanmaku = true, hasSubtitle = true,
-        ))
-        // Screen adjust hides control bar and shares toast slot = 10
-        assertEquals(10, layerBudget(
-            inRoom = true, stereo = true, hasDanmaku = true, hasSubtitle = true,
-            hasControlBar = true, hasReadout = true, hasToast = true,
-            hasPointer = true, hasController = true,
-        ))
-        // Screen adjust + palette open = 11 (<= 13 design target, <= 16 hardware ceiling)
-        val adjPalette = layerBudget(
-            inRoom = true, stereo = true, hasDanmaku = true, hasSubtitle = true,
-            hasControlBar = true, hasPalette = true, hasReadout = true, hasToast = true,
-            hasPointer = true, hasController = true,
-        )
-        assertEquals(11, adjPalette)
-        assertTrue(adjPalette <= ScreenReadout.LAYER_BUDGET_DESIGN_MAX)
-        assertTrue(adjPalette <= ScreenReadout.LAYER_BUDGET_HARDWARE_MAX)
+        // Both passthrough dimmer (inRoom=false) and 3D room (inRoom=true) count 1 dimmer/room slot per §6.5
+        for (inRoom in listOf(false, true)) {
+            // Pure playback = 6
+            assertEquals(6, layerBudget(
+                inRoom = inRoom, stereo = true, hasDanmaku = true, hasSubtitle = true,
+            ))
+            // Screen adjust hides control bar and shares toast slot = 10
+            assertEquals(10, layerBudget(
+                inRoom = inRoom, stereo = true, hasDanmaku = true, hasSubtitle = true,
+                hasControlBar = true, hasReadout = true, hasToast = true,
+                hasPointer = true, hasController = true,
+            ))
+            // Screen adjust + palette open = 11 (<= 13 design target, <= 16 hardware ceiling)
+            val adjPalette = layerBudget(
+                inRoom = inRoom, stereo = true, hasDanmaku = true, hasSubtitle = true,
+                hasControlBar = true, hasPalette = true, hasReadout = true, hasToast = true,
+                hasPointer = true, hasController = true,
+            )
+            assertEquals(11, adjPalette)
+            assertTrue(adjPalette <= ScreenReadout.LAYER_BUDGET_DESIGN_MAX)
+            assertTrue(adjPalette <= ScreenReadout.LAYER_BUDGET_HARDWARE_MAX)
+        }
     }
 
     @Test

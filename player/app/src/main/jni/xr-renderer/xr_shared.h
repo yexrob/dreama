@@ -101,6 +101,9 @@
 // Hz, and a message of Java's own is a slot in Java's list of them.
 #define TOAST_TEX_W 1024
 #define TOAST_TEX_H 160
+// Screen-adjust readout sub-region inside the toast swapchain (§6.12: 960x112, 24° x 2.8°)
+#define READOUT_TEX_W 960
+#define READOUT_TEX_H 112
 #define TOAST_RATE 0
 #define TOAST_HANDS_LOCKED 1
 #define TOAST_HANDS_UNLOCKED 2

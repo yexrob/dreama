@@ -579,7 +579,8 @@ float cogSliderValue(XrCtx* ctx, int face, int slider) {
         }
     }
     else if (slider == COG_SLIDER_DISTANCE) {
-        float d = sqrtf(p.x * p.x + p.y * p.y + p.z * p.z);
+        Vec3 headRef = { ctx->headPos.x, ctx->headPos.y, ctx->headPos.z };
+        float d = screenDistanceFrom(ctx->screenPose, headRef);
         t = (d - COG_DIST_MIN) / (COG_DIST_MAX - COG_DIST_MIN);
     }
     else if (slider == COG_SLIDER_HEIGHT) {
@@ -599,7 +600,11 @@ float cogSliderValue(XrCtx* ctx, int face, int slider) {
         t = effectiveCurvature(ctx);
     }
     else if (slider == COG_SLIDER_SIZE) {
-        t = (ctx->screenWidth - SCREEN_MIN_WIDTH) / (SCREEN_MAX_WIDTH - SCREEN_MIN_WIDTH);
+        Vec3 headRef = { ctx->headPos.x, ctx->headPos.y, ctx->headPos.z };
+        float d = screenDistanceFrom(ctx->screenPose, headRef);
+        int curved = effectiveCurvature(ctx) > SCREEN_CURVE_EPS && ctx->cylinderSupported;
+        float fovDeg = screenFovFromPlacement(ctx->screenWidth, d, ctx->screenRadius, curved);
+        t = screenSizeNorm(fovDeg);
     }
     else if (slider == COG_SLIDER_AIM_SENSITIVITY) {
         t = lanePlace(ctx->headAimSensitivity, HEAD_AIM_SENSITIVITY_MIN,
@@ -687,27 +692,31 @@ void cogApplySlider(XrCtx* ctx, int face, int slider, float pu) {
     }
 
     if (slider == COG_SLIDER_DISTANCE) {
-        XrVector3f p = ctx->screenPose.position;
-        float d = sqrtf(p.x * p.x + p.y * p.y + p.z * p.z);
+        Vec3 headRef = { ctx->headPos.x, ctx->headPos.y, ctx->headPos.z };
+        Vec3 sp = { ctx->screenPose.position.x, ctx->screenPose.position.y,
+                    ctx->screenPose.position.z };
+        Vec3 off = vecSub(sp, headRef);
+        float d = sqrtf(vecDot(off, off));
         float wanted = COG_DIST_MIN + t * (COG_DIST_MAX - COG_DIST_MIN);
+        float curve = effectiveCurvature(ctx);
+        int curved = curve > SCREEN_CURVE_EPS && ctx->cylinderSupported;
+        float fovDeg = d > 0.05f
+                ? screenFovFromPlacement(ctx->screenWidth, d, ctx->screenRadius, curved)
+                : SCREEN_FOV_DEFAULT_DEG;
         if (d > 0.01f) {
-            // Straight out along the line it already sits on, so only how far
-            // away it is changes
-            float scale = wanted / d;
-            ctx->screenPose.position.x = p.x * scale;
-            ctx->screenPose.position.y = p.y * scale;
-            ctx->screenPose.position.z = p.z * scale;
-            // Keeping the arc the same shape as it moves, same reason as the
-            // resize path
-            ctx->screenRadius *= scale;
+            Vec3 dir = vecNorm(off);
+            ctx->screenPose.position.x = headRef.x + dir.x * wanted;
+            ctx->screenPose.position.y = headRef.y + dir.y * wanted;
+            ctx->screenPose.position.z = headRef.z + dir.z * wanted;
         }
         else {
-            // Sitting on top of the viewer, so there is no line to follow and
-            // straight ahead is the only sensible answer
-            ctx->screenPose.position.x = 0.0f;
-            ctx->screenPose.position.y = 0.0f;
-            ctx->screenPose.position.z = -wanted;
+            ctx->screenPose.position.x = headRef.x;
+            ctx->screenPose.position.y = headRef.y;
+            ctx->screenPose.position.z = headRef.z - wanted;
         }
+        // Preserve angular width and keep R = D / c consistent across distance changes
+        screenPlacementForFov(fovDeg, wanted, curve, ctx->cylinderSupported,
+                              &ctx->screenWidth, &ctx->screenRadius);
     }
     else if (slider == COG_SLIDER_HEIGHT) {
         // Straight up and down, so raising the screen does not also bring it
@@ -753,39 +762,24 @@ void cogApplySlider(XrCtx* ctx, int face, int slider, float pu) {
     }
     else if (slider == COG_SLIDER_CURVE) {
         // Spec §6.12: R = D / c, 5% steps, preserving horizontal angular width
-        XrVector3f p = ctx->screenPose.position;
-        float d = sqrtf(p.x * p.x + p.y * p.y + p.z * p.z);
-        if (d < 0.05f) {
-            d = SCREEN_DIST_DEFAULT_M;
-        }
+        Vec3 headRef = { ctx->headPos.x, ctx->headPos.y, ctx->headPos.z };
+        float d = screenDistanceFrom(ctx->screenPose, headRef);
         int wasCurved = effectiveCurvature(ctx) > SCREEN_CURVE_EPS && ctx->cylinderSupported;
         float fovDeg = screenFovFromPlacement(ctx->screenWidth, d, ctx->screenRadius, wasCurved);
         float newCurve = screenQuantizeCurve(t);
         ctx->panelCurve = newCurve;
-        if (newCurve > SCREEN_CURVE_EPS && ctx->cylinderSupported) {
-            ctx->screenRadius = screenCurvatureRadius(d, newCurve);
-            ctx->screenWidth = screenCurvedArcWidth(fovDeg, d, newCurve);
-        }
-        else {
-            ctx->screenRadius = d * 4.0f;
-            ctx->screenWidth = screenFlatWidth(fovDeg, d);
-        }
+        screenPlacementForFov(fovDeg, d, newCurve, ctx->cylinderSupported,
+                              &ctx->screenWidth, &ctx->screenRadius);
     }
     else if (slider == COG_SLIDER_SIZE) {
-        float wanted = SCREEN_MIN_WIDTH + t * (SCREEN_MAX_WIDTH - SCREEN_MIN_WIDTH);
+        // Unified angular FOV clamp [30, 90] deg + R = D / c so curved screens
+        // never wrap past 90 deg and agree with trigger+stick adjust
+        Vec3 headRef = { ctx->headPos.x, ctx->headPos.y, ctx->headPos.z };
+        float d = screenDistanceFrom(ctx->screenPose, headRef);
+        float fovDeg = SCREEN_FOV_MIN_DEG + t * (SCREEN_FOV_MAX_DEG - SCREEN_FOV_MIN_DEG);
         float curve = effectiveCurvature(ctx);
-        if (curve > SCREEN_CURVE_EPS && ctx->cylinderSupported) {
-            // Under R = D / c, changing size keeps distance and curvature radius unchanged
-            XrVector3f p = ctx->screenPose.position;
-            float d = sqrtf(p.x * p.x + p.y * p.y + p.z * p.z);
-            if (d < 0.05f) {
-                d = SCREEN_DIST_DEFAULT_M;
-            }
-            ctx->screenRadius = screenCurvatureRadius(d, curve);
-        }
-        // Centre and facing untouched, so it grows about the middle rather
-        // than away from a corner
-        ctx->screenWidth = wanted;
+        screenPlacementForFov(fovDeg, d, curve, ctx->cylinderSupported,
+                              &ctx->screenWidth, &ctx->screenRadius);
     }
 }
 

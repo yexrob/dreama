@@ -172,11 +172,11 @@ enum class DepthQualityMode {
     QUALITY,
 }
 
-enum class ScreenSizePreset(val decimeters: Int) {
-    SMALL(22),
-    MEDIUM(30),
-    LARGE(40),
-    GIANT(54);
+enum class ScreenSizePreset(val decimeters: Int, val fovDeg: Float) {
+    SMALL(22, 40f),
+    MEDIUM(30, 50f),
+    LARGE(40, 62f),
+    GIANT(54, 80f);
 
     companion object {
         fun fromDecimeters(value: Int): ScreenSizePreset = when {
@@ -185,19 +185,31 @@ enum class ScreenSizePreset(val decimeters: Int) {
             value <= 47 -> LARGE
             else -> GIANT
         }
+
+        /** Matches a §6.12 angular preset within ±1.5°, or null for custom FOV. */
+        fun fromFovDegOrNull(fovDeg: Float): ScreenSizePreset? =
+            entries.firstOrNull { kotlin.math.abs(fovDeg - it.fovDeg) <= 1.5f }
     }
 }
 
-enum class ScreenDistancePreset(val decimeters: Int) {
-    NEAR(20),
-    MEDIUM(30),
-    FAR(45);
+enum class ScreenDistancePreset(val decimeters: Int, val meters: Float) {
+    NEAR(20, 2.0f),
+    MEDIUM(30, 3.0f),
+    FAR(45, 5.0f);
 
     companion object {
         fun fromDecimeters(value: Int): ScreenDistancePreset = when {
             value <= 24 -> NEAR
             value <= 37 -> MEDIUM
             else -> FAR
+        }
+
+        /** Matches a §6.12 distance preset (2 / 3 / 5 m, plus legacy 4.5 m FAR), or null for custom. */
+        fun fromDistanceDmOrNull(dm: Int): ScreenDistancePreset? = when {
+            dm in 19..21 -> NEAR
+            dm in 29..31 -> MEDIUM
+            dm in 45..51 -> FAR
+            else -> null
         }
     }
 }
@@ -617,23 +629,29 @@ object StreamSettingsMapper {
 
     /** Sets horizontal screen FOV (30°..90°) keeping current distance unchanged (§6.12). */
     fun setScreenFovDeg(store: PrefsStore, fovDeg: Float) {
-        val distDm = store.getInt(KEY_SCREEN_DISTANCE, 30).coerceIn(20, 80)
+        val distDm = store.getInt(KEY_SCREEN_DISTANCE, 30)
+            .coerceIn(ScreenReadout.MIN_SCREEN_DIST_DM, ScreenReadout.MAX_SCREEN_DIST_DM)
         val distM = distDm / 10f
         val clampedFov = ScreenReadout.clampFov(fovDeg)
-        val flatWidthDm = (ScreenReadout.flatWidthMeters(clampedFov, distM) * 10f).roundToInt().coerceIn(8, 80)
+        val flatWidthDm = (ScreenReadout.flatWidthMeters(clampedFov, distM) * 10f).roundToInt()
+            .coerceIn(ScreenReadout.MIN_SCREEN_SIZE_DM, ScreenReadout.MAX_SCREEN_SIZE_DM)
         store.putInt(KEY_SCREEN_SIZE, flatWidthDm)
     }
 
     /** Sets viewing distance (2.0..8.0 m) while keeping angular FOV constant (§6.12). */
     fun setScreenDistanceMeters(store: PrefsStore, meters: Float) {
-        val prevDistDm = store.getInt(KEY_SCREEN_DISTANCE, 30).coerceIn(10, 80)
-        val prevSizeDm = store.getInt(KEY_SCREEN_SIZE, 30).coerceIn(8, 80)
+        val prevDistDm = store.getInt(KEY_SCREEN_DISTANCE, 30)
+            .coerceIn(10, ScreenReadout.MAX_SCREEN_DIST_DM)
+        val prevSizeDm = store.getInt(KEY_SCREEN_SIZE, 30)
+            .coerceIn(ScreenReadout.MIN_SCREEN_SIZE_DM, ScreenReadout.MAX_SCREEN_SIZE_DM)
         val fovDeg = ScreenReadout.clampFov(
             ScreenReadout.fovDegFromFlatWidth(prevSizeDm / 10f, prevDistDm / 10f),
         )
         val newDistM = ScreenReadout.clampDist(meters)
-        val newDistDm = (newDistM * 10f).roundToInt().coerceIn(20, 80)
-        val newSizeDm = (ScreenReadout.flatWidthMeters(fovDeg, newDistM) * 10f).roundToInt().coerceIn(8, 80)
+        val newDistDm = (newDistM * 10f).roundToInt()
+            .coerceIn(ScreenReadout.MIN_SCREEN_DIST_DM, ScreenReadout.MAX_SCREEN_DIST_DM)
+        val newSizeDm = (ScreenReadout.flatWidthMeters(fovDeg, newDistM) * 10f).roundToInt()
+            .coerceIn(ScreenReadout.MIN_SCREEN_SIZE_DM, ScreenReadout.MAX_SCREEN_SIZE_DM)
         store.putInt(KEY_SCREEN_DISTANCE, newDistDm)
         store.putInt(KEY_SCREEN_SIZE, newSizeDm)
     }

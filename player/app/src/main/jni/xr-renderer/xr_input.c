@@ -745,17 +745,29 @@ int updatePlacement(XrCtx* ctx, float distance, float quadWidth, float curvature
         ctx->screenPose.position.z = -distance;
         // Spec §6.12: R = D / c keeping horizontal angular width invariant
         float fovDeg = screenFovFromFlatWidth(quadWidth, distance);
-        if (curvature > SCREEN_CURVE_EPS && ctx->cylinderSupported) {
-            ctx->screenRadius = screenCurvatureRadius(distance, curvature);
-            ctx->screenWidth = screenCurvedArcWidth(fovDeg, distance, curvature);
-        }
-        else {
-            ctx->screenWidth = quadWidth;
-            ctx->screenRadius = distance > 0.05f ? distance * 4.0f : 4.0f;
-        }
+        screenPlacementForFov(fovDeg, distance, curvature, ctx->cylinderSupported,
+                              &ctx->screenWidth, &ctx->screenRadius);
         ctx->placementValid = 1;
+        ctx->poseNeedsCurveMigration = 0;
         ctx->grabMode = GRAB_NONE;
         ctx->poseDirty = 1;
+    }
+    else if (ctx->poseNeedsCurveMigration) {
+        ctx->poseNeedsCurveMigration = 0;
+        Vec3 headRef = { ctx->headPos.x, ctx->headPos.y, ctx->headPos.z };
+        float newW = ctx->screenWidth;
+        float newR = ctx->screenRadius;
+        screenMigratePoseGeometry(ctx->screenPose, headRef, ctx->screenWidth,
+                                  ctx->screenRadius, curvature, ctx->cylinderSupported,
+                                  &newW, &newR);
+        if (fabsf(newW - ctx->screenWidth) > 1e-3f
+                || fabsf(newR - ctx->screenRadius) > 1e-3f) {
+            LOGI("depth3d: migrated legacy screen pose (w %.2f -> %.2f m, r %.2f -> %.2f m)",
+                 ctx->screenWidth, newW, ctx->screenRadius, newR);
+            ctx->screenWidth = newW;
+            ctx->screenRadius = newR;
+            ctx->poseDirty = 1;
+        }
     }
 
     ctx->lastDistance = distance;
@@ -918,8 +930,9 @@ static void applyGrab(XrCtx* ctx, XrPosef* aims, const int* valid, const float* 
         ctx->gripEdge[h] = ctx->grabDown[h] && !wasDown;
     }
 
-    // GRAB_SPHERE is owned by local-playback screen control (updateLocalMediaInput)
-    if (ctx->grabMode == GRAB_SPHERE) {
+    // Mutual exclusion: GRAB_SPHERE and local screen adjustment own the screen,
+    // so applyGrab must never start a bar/corner grab while either is active.
+    if (!screenAllowExternalGrab(ctx->grabMode, &ctx->screenCtrl)) {
         return;
     }
 
@@ -993,6 +1006,9 @@ static void applyGrab(XrCtx* ctx, XrPosef* aims, const int* valid, const float* 
         ctx->grabWidth = ctx->screenWidth;
         ctx->grabHeight = height;
         ctx->grabRadius = ctx->screenRadius;
+        ctx->grabHeadPos.x = ctx->headPos.x;
+        ctx->grabHeadPos.y = ctx->headPos.y;
+        ctx->grabHeadPos.z = ctx->headPos.z;
 
         if (hover == HOVER_BAR) {
             ctx->grabMode = GRAB_MOVE;
@@ -1112,21 +1128,13 @@ static void applyGrab(XrCtx* ctx, XrPosef* aims, const int* valid, const float* 
         return;
     }
 
-    float width = ctx->grabWidth * scale;
-    if (width < SCREEN_MIN_WIDTH) width = SCREEN_MIN_WIDTH;
-    if (width > SCREEN_MAX_WIDTH) width = SCREEN_MAX_WIDTH;
-
+    float d = screenDistanceFrom(ctx->grabScreen, ctx->grabHeadPos);
     float curve = effectiveCurvature(ctx);
-    if (curve > SCREEN_CURVE_EPS && ctx->cylinderSupported) {
-        XrVector3f p = ctx->grabScreen.position;
-        float d = sqrtf(p.x * p.x + p.y * p.y + p.z * p.z);
-        if (d < 0.05f) d = SCREEN_DIST_DEFAULT_M;
-        ctx->screenRadius = screenCurvatureRadius(d, curve);
-    }
-    else {
-        ctx->screenRadius = ctx->grabRadius * (width / ctx->grabWidth);
-    }
-    ctx->screenWidth = width;
+    float startFov = screenFovFromPlacement(ctx->grabWidth, d, ctx->grabRadius, curved);
+    float targetFlatW = screenFlatWidth(startFov, d) * scale;
+    float targetFov = screenFovFromFlatWidth(targetFlatW, d);
+    screenPlacementForFov(targetFov, d, curve, ctx->cylinderSupported,
+                          &ctx->screenWidth, &ctx->screenRadius);
 
     // The centre stays where it was, so the screen grows evenly about the spot
     // it was placed on rather than walking off towards one corner
@@ -3279,22 +3287,14 @@ static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, int* outSuppressLef
     int modalOpen = ctx->pickerOpen || ctx->cogOpen || ctx->exitConfirmOpen
             || ctx->reportOpen || ctx->hintOpen;
     in.paletteOpen = (ctx->cogOpen || ctx->pickerOpen || ctx->exitConfirmOpen) ? 1 : 0;
+    in.externalGrabActive = screenIsExternalGrabBusy(ctx->grabMode);
 
-    if (modalOpen) {
-        in.target = SCREEN_TARGET_CONTROL;
-    }
-    else if (f->hover == HOVER_SCREEN) {
-        float videoAspect = (float)ctx->videoWidth / (float)(ctx->videoHeight > 0 ? ctx->videoHeight : 1);
-        int onBar = ctx->transportVisible && f->hand >= 0
-                && screenTransportBarHit(f->hitU[f->hand], f->hitV[f->hand], videoAspect);
-        in.target = onBar ? SCREEN_TARGET_CONTROL : SCREEN_TARGET_SCREEN;
-    }
-    else if (f->hover != HOVER_NONE && f->hover != HOVER_HALO) {
-        in.target = SCREEN_TARGET_CONTROL;
-    }
-    else {
-        in.target = SCREEN_TARGET_NONE;
-    }
+    float videoAspect = (float)ctx->videoWidth / (float)(ctx->videoHeight > 0 ? ctx->videoHeight : 1);
+    float hitU = (f->hand >= 0 && f->hand < SRC_COUNT) ? f->hitU[f->hand] : -1.0f;
+    float hitV = (f->hand >= 0 && f->hand < SRC_COUNT) ? f->hitV[f->hand] : -1.0f;
+    in.target = screenClassifyLocalTarget(modalOpen, f->hover,
+                                          ctx->transportVisible && f->hand >= 0,
+                                          hitU, hitV, videoAspect);
 
     int pointingHands = (f->hand >= 0 && f->hand < HAND_COUNT && ctx->usingHands[f->hand])
             || f->hand == SRC_GAZE
@@ -3359,11 +3359,9 @@ static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, int* outSuppressLef
     Vec3 head = { ctx->headPos.x, ctx->headPos.y, ctx->headPos.z };
     Vec3 sp = { ctx->screenPose.position.x, ctx->screenPose.position.y,
                 ctx->screenPose.position.z };
-    Vec3 diff = vecSub(sp, head);
-    float dist = sqrtf(vecDot(diff, diff));
-    if (dist < 0.1f) {
-        dist = SCREEN_DIST_DEFAULT_M;
-    }
+    // Hold the head position snapshotted at adjust start so leaning does not fight distance D
+    Vec3 distRef = ctx->screenCtrl.adjustActive ? ctx->adjustRefHeadPos : head;
+    float dist = screenDistanceFrom(ctx->screenPose, distRef);
     in.curDistM = dist;
     in.curFovDeg = screenFovFromPlacement(ctx->screenWidth, dist, ctx->screenRadius, f->curved);
 
@@ -3376,6 +3374,9 @@ static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, int* outSuppressLef
         ctx->adjustSnapWidth = ctx->screenWidth;
         ctx->adjustSnapRadius = ctx->screenRadius;
         ctx->adjustSnapValid = 1;
+        ctx->adjustRefHeadPos = head;
+        Vec3 diff = vecSub(sp, head);
+        ctx->adjustDirVec = vecDot(diff, diff) > 1e-4f ? vecNorm(diff) : fwdLocal;
         if (ctx->grabMode == GRAB_SPHERE) {
             ctx->grabMode = GRAB_NONE;
         }
@@ -3396,20 +3397,12 @@ static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, int* outSuppressLef
         LOGEV("depth3d: screen adjust undone by B");
     }
     else if (res.adjustActive || res.adjustSaved) {
-        Vec3 dirVec = vecDot(diff, diff) > 1e-4f ? vecNorm(diff) : fwdLocal;
-        ctx->screenPose.position.x = head.x + dirVec.x * res.distM;
-        ctx->screenPose.position.y = head.y + dirVec.y * res.distM;
-        ctx->screenPose.position.z = head.z + dirVec.z * res.distM;
+        ctx->screenPose.position.x = ctx->adjustRefHeadPos.x + ctx->adjustDirVec.x * res.distM;
+        ctx->screenPose.position.y = ctx->adjustRefHeadPos.y + ctx->adjustDirVec.y * res.distM;
+        ctx->screenPose.position.z = ctx->adjustRefHeadPos.z + ctx->adjustDirVec.z * res.distM;
         float curve = f->roomOn ? 0.0f : effectiveCurvature(ctx);
-        int curvedNow = !f->roomOn && curve > SCREEN_CURVE_EPS && ctx->cylinderSupported;
-        if (curvedNow) {
-            ctx->screenRadius = screenCurvatureRadius(res.distM, curve);
-            ctx->screenWidth = screenCurvedArcWidth(res.fovDeg, res.distM, curve);
-        }
-        else {
-            ctx->screenRadius = res.distM * 4.0f;
-            ctx->screenWidth = screenFlatWidth(res.fovDeg, res.distM);
-        }
+        screenPlacementForFov(res.fovDeg, res.distM, curve, ctx->cylinderSupported,
+                              &ctx->screenWidth, &ctx->screenRadius);
         f->screenPose = ctx->screenPose;
         f->height = ctx->screenWidth * (float)ctx->videoHeight / (float)ctx->videoWidth;
         f->radius = ctx->screenRadius;
@@ -3423,7 +3416,7 @@ static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, int* outSuppressLef
         }
     }
 
-    // Grip-on-screen sphere drag (preserves distance from viewer)
+    // Grip-on-screen sphere drag (preserves distance from snapshotted viewer head)
     if (res.sphereDragActive && (ctx->grabMode == GRAB_NONE || ctx->grabMode == GRAB_SPHERE)) {
         int gh = ctx->grabDown[HAND_RIGHT] ? HAND_RIGHT : HAND_LEFT;
         if (f->aimValid[gh]) {
@@ -3432,11 +3425,12 @@ static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, int* outSuppressLef
                 ctx->grabHand = gh;
                 ctx->grabAim = f->aimPoses[gh];
                 ctx->grabScreen = ctx->screenPose;
+                ctx->grabHeadPos = head;
                 ctx->grabPitch = screenPitch(ctx);
                 ctx->grabRoll = screenRoll(ctx);
             }
             ctx->screenPose = screenSphereDrag(ctx->grabScreen, ctx->grabAim,
-                                               f->aimPoses[ctx->grabHand], head,
+                                               f->aimPoses[ctx->grabHand], ctx->grabHeadPos,
                                                ctx->grabPitch, ctx->grabRoll);
             f->screenPose = ctx->screenPose;
             f->bar = barFrame(ctx);
@@ -3491,7 +3485,7 @@ static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, int* outSuppressLef
 
     // Only clicks that began on a control (e.g. visible TransportBar) pass
     // VR_BUTTON_LEFT to Java; screen clicks use IN_LOCAL_PLAY_PAUSE instead.
-    *outSuppressLeft = (ctx->screenCtrl.trigState != SCREEN_HOLD_CONTROL) ? 1 : 0;
+    *outSuppressLeft = screenShouldSuppressLeft(&ctx->screenCtrl, in.externalGrabActive);
 }
 
 // The parts of a chord as the log names them
@@ -3867,7 +3861,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
     else if (ctx->hintOpen) {
         updateHandHint(ctx, &f);
     }
-    else {
+    else if (!(ctx->localMedia && ctx->screenCtrl.adjustActive)) {
         updateFurniture(ctx, &f);
     }
     dismissKeyboard(ctx, &f);
@@ -3887,7 +3881,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
     f.bar = barFrame(ctx);
 
     int suppressLeftButton = 0;
-    if (ctx->localMedia && (ctx->grabMode == GRAB_NONE || ctx->grabMode == GRAB_SPHERE)) {
+    if (ctx->localMedia) {
         updateLocalMediaInput(ctx, &f, &suppressLeftButton);
     }
 
@@ -4022,6 +4016,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeSetScreenPose(JNIEnv* env, job
     ctx->screenWidth = p[7];
     ctx->screenRadius = p[8];
     ctx->placementValid = 1;
+    ctx->poseNeedsCurveMigration = 1;
     ctx->sliderSeen = 0;
     LOGI("restored screen placement %.2f %.2f %.2f, %.2f m wide",
          p[0], p[1], p[2], p[7]);

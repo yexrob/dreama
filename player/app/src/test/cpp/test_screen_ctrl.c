@@ -94,6 +94,51 @@ static void testCurvatureFormulaAndAngularInvariance(void) {
             }
         }
     }
+
+    // Unified screenPlacementForFov (Review #7 & #8):
+    // 2 m, 100% curvature, oversized target FOV clamps to 90 deg (never wraps 229 deg!)
+    float w2, r2;
+    screenPlacementForFov(160.0f, 2.0f, 1.0f, 1, &w2, &r2);
+    CHECK_NEAR(r2, 2.0f, 1e-4);
+    CHECK_NEAR(cylinderAngle(w2, r2), (float)M_PI * 0.5f, 1e-3); // exact 90 deg arc
+    CHECK_NEAR(screenFovFromPlacement(w2, 2.0f, r2, 1), 90.0f, 0.05);
+
+    // 8 m @ 62 deg and 90 deg flat are NEVER truncated to 8 m (SCREEN_MAX_WIDTH = 16 m)
+    float w8_62, r8_62, w8_90, r8_90;
+    screenPlacementForFov(62.0f, 8.0f, 0.0f, 1, &w8_62, &r8_62);
+    CHECK_NEAR(w8_62, screenFlatWidth(62.0f, 8.0f), 1e-3);
+    CHECK(w8_62 > 9.5f && w8_62 <= SCREEN_MAX_WIDTH);
+    screenPlacementForFov(90.0f, 8.0f, 0.0f, 1, &w8_90, &r8_90);
+    CHECK_NEAR(w8_90, 16.0f, 1e-3);
+
+    // Legacy pose migration (Review #9):
+    // Old formula stored R = D * (1 + 3*(1-c)) = 7.95 m at D=3 m, c=0.45, W=3.0 m.
+    // Migrating recomputes R = D/c = 6.667 m while preserving exact angular FOV.
+    XrPosef legacyPose = { { 0.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, -3.0f } };
+    Vec3 origin = { 0.0f, 0.0f, 0.0f };
+    float oldR = 3.0f * (1.0f + 3.0f * (1.0f - 0.45f));
+    float oldW = 3.0f;
+    float oldFov = screenFovFromPlacement(oldW, 3.0f, oldR, 1);
+    float migW = 0.0f, migR = 0.0f;
+    screenMigratePoseGeometry(legacyPose, origin, oldW, oldR, 0.45f, 1, &migW, &migR);
+    CHECK_NEAR(migR, 3.0f / 0.45f, 1e-3);
+    CHECK_NEAR(screenFovFromPlacement(migW, 3.0f, migR, 1), oldFov, 0.05);
+    // Already-migrated pose is stable (idempotent)
+    float migW2 = 0.0f, migR2 = 0.0f;
+    screenMigratePoseGeometry(legacyPose, origin, migW, migR, 0.45f, 1, &migW2, &migR2);
+    CHECK_NEAR(migW2, migW, 1e-4);
+    CHECK_NEAR(migR2, migR, 1e-4);
+
+    // Unified viewer distance reference (Review #10): non-origin head position
+    XrPosef offPose = { { 0.0f, 0.0f, 0.0f, 1.0f }, { 0.3f, 0.2f, -3.5f } };
+    Vec3 leanedHead = { 0.3f, 0.2f, -0.5f };
+    CHECK_NEAR(screenDistanceFrom(offPose, leanedHead), 3.0f, 1e-4);
+
+    // Exact §6.12 readout dimensions fit inside toast swapchain (Review #12)
+    CHECK(READOUT_TEX_W == 960 && READOUT_TEX_H == 112);
+    CHECK(READOUT_TEX_W <= TOAST_TEX_W && READOUT_TEX_H <= TOAST_TEX_H);
+    CHECK_NEAR(SCREEN_READOUT_FOV_W_DEG, 24.0f, 1e-5);
+    CHECK_NEAR(SCREEN_READOUT_FOV_H_DEG, 2.8f, 1e-5);
 }
 
 static void testCurvedTransportStripAndHit(void) {
@@ -154,44 +199,65 @@ static void testSphereDragPreservesDistance(void) {
 }
 
 static void testLayerBudgetPerSpec65(void) {
-    // 1. Pure playback: room/dim(1) + stereo video(2) + danmaku(2) + subtitle(1) = 6
-    LayerBudgetScene s;
-    memset(&s, 0, sizeof(s));
-    s.inRoom = 1; s.stereo = 1; s.hasDanmaku = 1; s.hasSubtitle = 1;
-    int cPlay = screenLayerBudgetCount(&s);
-    CHECK(cPlay == 6);
-    CHECK(screenLayerBudgetOk(cPlay, LAYER_BUDGET_DESIGN_MAX));
+    // Shared xr_layers.c predicates (Review #13):
+    // Control bar hidden during local screen adjust; PC streaming unaffected
+    CHECK(screenShowTransportLayer(1, 0, 1, 0, 1) == 1);
+    CHECK(screenShowTransportLayer(1, 1, 1, 0, 1) == 0);
+    CHECK(screenShowTransportLayer(0, 1, 0, 1, 1) == 1);
+    // Bar area suppressed during local screen adjust
+    CHECK(screenShowBarArea(1, 0, 0, 1) == 1);
+    CHECK(screenShowBarArea(1, 1, 0, 1) == 0);
+    // Readout & notice toast are mutually exclusive on the single toast slot
+    CHECK(screenShowReadoutLayer(1, 1, 1, TOAST_SCREEN_READOUT) == 1);
+    CHECK(screenShowNoticeToastLayer(1, 1, 1, TOAST_SCREEN_READOUT, 1, 1) == 0);
+    CHECK(screenShowReadoutLayer(1, 0, 1, TOAST_SCREEN_READOUT) == 0);
+    CHECK(screenShowNoticeToastLayer(1, 0, 1, TOAST_SCREEN_HINT, 1, 1) == 1);
 
-    // 2. Control bar shown: +bar(1) + ray/dot(2) + controller(1) = 10
-    s.hasControlBar = 1; s.hasPointer = 1; s.hasController = 1;
-    int cBar = screenLayerBudgetCount(&s);
-    CHECK(cBar == 10);
-    CHECK(screenLayerBudgetOk(cBar, LAYER_BUDGET_DESIGN_MAX));
+    // Every §6.5 state counts dimmer/room = 1 regardless of inRoom=0 (passthrough dimmer) or inRoom=1 (3D room)
+    for (int inRoom = 0; inRoom <= 1; inRoom++) {
+        // 1. Immersive playback: dimmer/room(1) + stereo(2) + danmaku(2) + subtitle(1) = 6
+        LayerBudgetScene s;
+        memset(&s, 0, sizeof(s));
+        s.inRoom = inRoom; s.stereo = 1; s.hasDanmaku = 1; s.hasSubtitle = 1;
+        CHECK(screenLayerBudgetCount(&s) == 6);
 
-    // 3. Palette open (replaces control bar): 10
-    s.hasControlBar = 0; s.hasPalette = 1;
-    int cPal = screenLayerBudgetCount(&s);
-    CHECK(cPal == 10);
-    CHECK(screenLayerBudgetOk(cPal, LAYER_BUDGET_DESIGN_MAX));
+        // 2. Toast / buffering: 7
+        s.hasToast = 1;
+        CHECK(screenLayerBudgetCount(&s) == 7);
+        s.hasToast = 0; s.hasCard = 1;
+        CHECK(screenLayerBudgetCount(&s) == 7);
+        s.hasCard = 0;
 
-    // 4. Screen adjust (hides control bar, reuses toast slot for readout): 10
-    s.hasPalette = 0; s.hasControlBar = 1; s.hasReadout = 1;
-    int cAdj = screenLayerBudgetCount(&s);
-    CHECK(cAdj == 10);
-    CHECK(screenLayerBudgetOk(cAdj, LAYER_BUDGET_DESIGN_MAX));
+        // 3. Control bar shown: +bar(1) + ray/dot(2) + controller(1) = 10
+        s.hasControlBar = 1; s.hasPointer = 1; s.hasController = 1;
+        CHECK(screenLayerBudgetCount(&s) == 10);
 
-    // 5. Screen adjust + palette open + toast queued (shares slot with readout): 11
-    s.hasPalette = 1; s.hasToast = 1;
-    int cAdjPal = screenLayerBudgetCount(&s);
-    CHECK(cAdjPal == 11);
-    CHECK(screenLayerBudgetOk(cAdjPal, LAYER_BUDGET_DESIGN_MAX));
+        // 4. Palette open: 10; Palette + control bar: 11; + card: 12; + glow: 13
+        s.hasControlBar = 0; s.hasPalette = 1;
+        CHECK(screenLayerBudgetCount(&s) == 10);
+        s.hasControlBar = 1;
+        CHECK(screenLayerBudgetCount(&s) == 11);
+        s.hasCard = 1;
+        CHECK(screenLayerBudgetCount(&s) == 12);
+        s.hasGlow = 1;
+        int cMaxBar = screenLayerBudgetCount(&s);
+        CHECK(cMaxBar == 13);
+        CHECK(screenLayerBudgetOk(cMaxBar, LAYER_BUDGET_DESIGN_MAX));
+        CHECK(screenLayerBudgetOk(cMaxBar, LAYER_BUDGET_HARDWARE_MAX));
 
-    // 6. Worst-case simultaneous (with glow + card): <= 13 and strictly <= 16
-    s.hasGlow = 1; s.hasCard = 1;
-    int cMax = screenLayerBudgetCount(&s);
-    CHECK(cMax == 13);
-    CHECK(screenLayerBudgetOk(cMax, LAYER_BUDGET_DESIGN_MAX));
-    CHECK(screenLayerBudgetOk(cMax, LAYER_BUDGET_HARDWARE_MAX));
+        // 5. Screen adjust (hides control bar via shared predicate, reuses toast slot):
+        //    base 6 + readout 1 + pointer 2 + controller 1 = 10; + palette = 11; + glow = 12
+        s.hasGlow = 0; s.hasCard = 0; s.hasPalette = 0;
+        s.hasControlBar = 1; s.hasReadout = 1; s.hasToast = 1;
+        CHECK(screenLayerBudgetCount(&s) == 10);
+        s.hasPalette = 1;
+        CHECK(screenLayerBudgetCount(&s) == 11);
+        s.hasGlow = 1; s.hasCard = 1;
+        int cMaxAdj = screenLayerBudgetCount(&s);
+        CHECK(cMaxAdj == 13);
+        CHECK(screenLayerBudgetOk(cMaxAdj, LAYER_BUDGET_DESIGN_MAX));
+        CHECK(screenLayerBudgetOk(cMaxAdj, LAYER_BUDGET_HARDWARE_MAX));
+    }
 }
 
 // Rule 1 & Rule 2: trigger on control never adjusts; quick release on screen toggles play/pause
@@ -511,27 +577,99 @@ static void testRules9And10And12(void) {
     CHECK(res.fovDeg > 50.0f);
 
     // Rule 10 priority 1: B during adjust undoes adjust and restores pre-adjust values
-    // even while palette is also open!
+    // even while palette is also open! AND still-deflected stick must NOT seek (Review #1).
     f.nowNs = MS(1100);
     f.btnB = 1;
     screenInputStep(&st, &f, &res);
     CHECK(res.bAction == SCREEN_B_UNDO_ADJUST);
     CHECK(res.adjustUndone == 1);
     CHECK(res.adjustActive == 0);
+    CHECK(res.seekDeltaSec == 0);
     CHECK_NEAR(res.fovDeg, 50.0f, 1e-4);
     CHECK_NEAR(res.distM, 3.0f, 1e-4);
 
-    // Still holding trigger after B undo must NOT re-enter adjust or pause on release
-    f.nowNs = MS(1150);
+    // Still holding trigger & stick deflected after B undo must NOT re-enter adjust,
+    // must NOT seek (even past 400 ms / 1200 ms), and must NOT pause on release
+    f.nowNs = MS(1550);
     f.btnB = 0;
     f.rStickX = 1.0f;
     screenInputStep(&st, &f, &res);
     CHECK(res.adjustActive == 0);
-    f.nowNs = MS(1200);
+    CHECK(res.seekDeltaSec == 0);
+    f.nowNs = MS(2300);
+    screenInputStep(&st, &f, &res);
+    CHECK(res.seekDeltaSec == 0);
+    f.nowNs = MS(2350);
     f.triggerDown = 0;
     f.rStickX = 0.0f;
     screenInputStep(&st, &f, &res);
     CHECK(res.playPause == 0);
+    CHECK(res.seekDeltaSec == 0);
+
+    // Review #1: Releasing trigger while stick is STILL deflected must NOT fire seek!
+    screenInputInit(&st);
+    f = baseFrame(MS(1000), 0.05f);
+    f.triggerDown = 1;
+    screenInputStep(&st, &f, &res);
+    f.nowNs = MS(1050);
+    f.rStickX = 0.95f;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.adjustActive == 1);
+    // Release trigger while X is STILL 0.95 -> saves, zero seek!
+    f.nowNs = MS(1100);
+    f.triggerDown = 0;
+    f.rStickX = 0.95f;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.adjustSaved == 1);
+    CHECK(res.adjustActive == 0);
+    CHECK(res.seekDeltaSec == 0);
+    // Holding deflected for 1.5 s still produces ZERO seek until stick returns to deadzone
+    f.nowNs = MS(1600);
+    screenInputStep(&st, &f, &res);
+    CHECK(res.seekDeltaSec == 0);
+    f.nowNs = MS(2500);
+    screenInputStep(&st, &f, &res);
+    CHECK(res.seekDeltaSec == 0);
+    // Return to deadzone, then push right -> normal +10 s seek resumes
+    f.nowNs = MS(2550);
+    f.rStickX = 0.0f;
+    screenInputStep(&st, &f, &res);
+    f.nowNs = MS(2600);
+    f.rStickX = 0.95f;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.seekDeltaSec == 10);
+
+    // Review #1 (Y -> X roll): releasing grip while pushing Y and rolling straight
+    // to X without centering must ALSO produce zero seek until both axes center!
+    screenInputInit(&st);
+    f = baseFrame(MS(1000), 0.05f);
+    f.gripDown = 1;
+    screenInputStep(&st, &f, &res);
+    f.nowNs = MS(1050);
+    f.rStickY = 0.95f;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.adjustActive == 1);
+    f.nowNs = MS(1100);
+    f.gripDown = 0;
+    f.rStickY = 0.95f;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.adjustSaved == 1);
+    CHECK(res.seekDeltaSec == 0);
+    // Roll stick directly from Y=0.95 to X=0.95 without passing through deadzone
+    f.nowNs = MS(1150);
+    f.rStickY = 0.4f;
+    f.rStickX = 0.95f;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.seekDeltaSec == 0);
+    // Center both axes, then push X -> seeks normally
+    f.nowNs = MS(1200);
+    f.rStickX = 0.0f;
+    f.rStickY = 0.0f;
+    screenInputStep(&st, &f, &res);
+    f.nowNs = MS(1250);
+    f.rStickX = 0.95f;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.seekDeltaSec == 10);
 
     // Rule 10 priority 2: B with card + palette open closes card first
     f = baseFrame(MS(2000), 0.016f);
@@ -569,12 +707,14 @@ static void testRules9And10And12(void) {
     screenInputStep(&st, &f, &res);
     CHECK(res.bAction == SCREEN_B_EXIT_CONFIRM);
 
-    // Rule 12: setting "按住扳机调整屏幕" OFF -> trigger is click only, grip still adjusts
+    // Rule 12 (Review #3): setting "按住扳机调整屏幕" OFF disables Rules 3-7 on trigger,
+    // while Rule 2 (< 350 ms release + stick stayed in deadzone) STILL applies!
     screenInputInit(&st);
     f = baseFrame(MS(1000), 0.1f);
     f.triggerAdjustEnabled = 0;
     f.triggerDown = 1;
     screenInputStep(&st, &f, &res);
+    // Long hold (500 ms) + stick push -> no adjust, no hint, AND no playPause on release!
     f.nowNs = MS(1500);
     f.rStickX = 1.0f;
     screenInputStep(&st, &f, &res);
@@ -584,20 +724,38 @@ static void testRules9And10And12(void) {
     f.triggerDown = 0;
     f.rStickX = 0.0f;
     screenInputStep(&st, &f, &res);
+    CHECK(res.playPause == 0);
+
+    // Long hold (400 ms) without stick push when OFF -> still NO playPause (Rule 2)
+    f.nowNs = MS(1700);
+    f.triggerDown = 1;
+    screenInputStep(&st, &f, &res);
+    f.nowNs = MS(2100);
+    f.triggerDown = 0;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.playPause == 0);
+
+    // Short click (< 350 ms, stick in deadzone) when OFF -> toggles playPause!
+    f.nowNs = MS(2200);
+    f.triggerDown = 1;
+    screenInputStep(&st, &f, &res);
+    f.nowNs = MS(2400);
+    f.triggerDown = 0;
+    screenInputStep(&st, &f, &res);
     CHECK(res.playPause == 1);
 
     // Grip + stick STILL works when triggerAdjustEnabled == 0
-    f.nowNs = MS(2000);
+    f.nowNs = MS(2500);
     f.gripDown = 1;
     screenInputStep(&st, &f, &res);
     CHECK(res.sphereDragActive == 1);
-    f.nowNs = MS(2100);
+    f.nowNs = MS(2600);
     f.rStickY = 1.0f;
     screenInputStep(&st, &f, &res);
     CHECK(res.adjustStarted == 1);
     CHECK(res.adjustActive == 1);
     CHECK(res.sphereDragActive == 0);
-    f.nowNs = MS(2200);
+    f.nowNs = MS(2700);
     f.gripDown = 0;
     f.rStickY = 0.0f;
     screenInputStep(&st, &f, &res);
@@ -766,19 +924,40 @@ static void testHandTrackingAdjust(void) {
     screenInputStep(&st, &f, &res);
     CHECK(res.adjustAxis == ADJUST_AXIS_SIZE);
 
-    // Move another 8 cm right -> +8 deg (50 -> 58 deg)
+    // Move another 8 cm right -> +8 deg (50 -> 58 deg) while accidental forward drift is ignored
     f.nowNs = MS(2500);
     f.handPos.x = 0.10f;
+    f.handPos.z = -0.35f; // orthogonal drift during SIZE lock must NOT change distance
     screenInputStep(&st, &f, &res);
     CHECK_NEAR(res.fovDeg, 58.0f, 0.2);
+    CHECK_NEAR(res.distM, 3.0f, 1e-3);
     CHECK(res.hapticEvent == SCREEN_HAPTIC_NONE);
 
-    // Release saves
-    f.nowNs = MS(2600);
+    // Review #11: pausing hand along locked axis for 300 ms releases axis lock
+    // so user can switch to DIST within the SAME pinch without losing 58 deg!
+    f.nowNs = MS(2810); // 310 ms pause with hand still at x = 0.10
+    screenInputStep(&st, &f, &res);
+    CHECK(res.adjustAxis == ADJUST_AXIS_NONE);
+    CHECK_NEAR(res.fovDeg, 58.0f, 0.2);
+
+    // Now push forward 2 cm -> locks DIST; then push 4.5 cm more -> scales distance while keeping 58 deg
+    f.nowNs = MS(2860);
+    f.handPos.z = -0.37f;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.adjustAxis == ADJUST_AXIS_DIST);
+    f.nowNs = MS(2960);
+    f.handPos.z = -0.415f;
+    screenInputStep(&st, &f, &res);
+    CHECK_NEAR(res.fovDeg, 58.0f, 0.2);
+    CHECK_NEAR(res.distM, 3.0f * powf(1.05f, 3.0f), 0.05);
+
+    // Release saves BOTH adjusted FOV and adjusted distance
+    f.nowNs = MS(3010);
     f.triggerDown = 0;
     screenInputStep(&st, &f, &res);
     CHECK(res.adjustSaved == 1);
     CHECK_NEAR(res.fovDeg, 58.0f, 0.2);
+    CHECK_NEAR(res.distM, 3.0f * powf(1.05f, 3.0f), 0.05);
 
     // Hand forward push -> distance scales x1.05 per 1.5 cm
     screenInputInit(&st);
@@ -820,25 +999,42 @@ static void testSection64MatrixButtonsAndLeftStick(void) {
     CHECK(res.paletteTabStep == 0);
     CHECK(res.palettePageStep == 0);
 
-    // 2. PALETTE_HOVER_ROW: A=clickControl, RStickClick=paletteRowReset, LStickX=tabStep
+    // 2. PALETTE_HOVER_ROW (Review #4): A=play/pause in EVERY non-adjust column!
     screenInputInit(&st);
     f = baseFrame(MS(2000), 0.016f);
     f.paletteOpen = 1;
     f.target = SCREEN_TARGET_PALETTE_ROW;
     f.btnA = 1; f.rStickClick = 1; f.lStickX = 0.9f;
     screenInputStep(&st, &f, &res);
-    CHECK(res.clickControl == 1);
-    CHECK(res.playPause == 0);
+    CHECK(res.playPause == 1);
+    CHECK(res.clickControl == 0);
     CHECK(res.paletteRowReset == 1);
     CHECK(res.paletteTabStep == 1);
 
-    // 3. PALETTE_HOVER_OTHER: RStickClick=none, RStickX=none, LStickY=pageStep
+    // A button also toggles play/pause over CONTROL (TransportBar/modal) and CARD
+    screenInputInit(&st);
+    f = baseFrame(MS(2500), 0.016f);
+    f.target = SCREEN_TARGET_CONTROL;
+    f.btnA = 1;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.playPause == 1);
+
+    screenInputInit(&st);
+    f = baseFrame(MS(2600), 0.016f);
+    f.cardKind = SCREEN_CARD_NEXT_EP;
+    f.target = SCREEN_TARGET_CARD;
+    f.btnA = 1;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.playPause == 1);
+
+    // 3. PALETTE_HOVER_OTHER: A=play/pause, RStickClick=none, RStickX=none, LStickY=pageStep
     screenInputInit(&st);
     f = baseFrame(MS(3000), 0.016f);
     f.paletteOpen = 1;
     f.target = SCREEN_TARGET_PALETTE_OTHER;
-    f.rStickClick = 1; f.rStickX = 0.9f; f.lStickY = -0.9f;
+    f.btnA = 1; f.rStickClick = 1; f.rStickX = 0.9f; f.lStickY = -0.9f;
     screenInputStep(&st, &f, &res);
+    CHECK(res.playPause == 1);
     CHECK(res.paletteRowReset == 0);
     CHECK(res.paletteRowStep == 0);
     CHECK(res.seekDeltaSec == 0);
@@ -863,7 +1059,7 @@ static void testSection64MatrixButtonsAndLeftStick(void) {
     CHECK(res.paletteRowReset == 0);
     CHECK(res.paletteTabStep == 0);
 
-    // 5. In 3D cinema room: trigger on screen never enters adjust, click still toggles play/pause
+    // 5. In 3D cinema room (Review #3): long hold NEVER pauses, short click (<350 ms) pauses
     screenInputInit(&st);
     f = baseFrame(MS(5000), 0.05f);
     f.inRoom = 1;
@@ -878,7 +1074,113 @@ static void testSection64MatrixButtonsAndLeftStick(void) {
     f.triggerDown = 0;
     f.rStickX = 0.0f;
     screenInputStep(&st, &f, &res);
+    CHECK(res.playPause == 0);
+
+    // Short click in room -> toggles play/pause
+    f.nowNs = MS(5600);
+    f.triggerDown = 1;
+    screenInputStep(&st, &f, &res);
+    f.nowNs = MS(5800);
+    f.triggerDown = 0;
+    screenInputStep(&st, &f, &res);
     CHECK(res.playPause == 1);
+}
+
+// Review #5 & #14: updateLocalMediaInput glue helpers (target classification,
+// suppressLeft lifecycle, A-over-modal, and applyGrab <-> screenAdjust mutual exclusion)
+static void testLocalMediaGlueAndMutualExclusion(void) {
+    float aspect = 16.0f / 9.0f;
+
+    // Target classification across all HOVER_* cases
+    CHECK(screenClassifyLocalTarget(1, HOVER_SCREEN, 0, 0.5f, 0.5f, aspect) == SCREEN_TARGET_CONTROL);
+    CHECK(screenClassifyLocalTarget(0, HOVER_SCREEN, 0, 0.5f, 0.90f, aspect) == SCREEN_TARGET_SCREEN);
+    CHECK(screenClassifyLocalTarget(0, HOVER_SCREEN, 1, 0.5f, 0.50f, aspect) == SCREEN_TARGET_SCREEN);
+    CHECK(screenClassifyLocalTarget(0, HOVER_SCREEN, 1, 0.5f, 0.90f, aspect) == SCREEN_TARGET_CONTROL);
+    CHECK(screenClassifyLocalTarget(0, HOVER_BAR, 0, 0.5f, 0.5f, aspect) == SCREEN_TARGET_CONTROL);
+    CHECK(screenClassifyLocalTarget(0, HOVER_CORNER, 0, 0.5f, 0.5f, aspect) == SCREEN_TARGET_CONTROL);
+    CHECK(screenClassifyLocalTarget(0, HOVER_COGPANEL, 0, 0.5f, 0.5f, aspect) == SCREEN_TARGET_CONTROL);
+    CHECK(screenClassifyLocalTarget(0, HOVER_NONE, 1, 0.5f, 0.90f, aspect) == SCREEN_TARGET_NONE);
+    CHECK(screenClassifyLocalTarget(0, HOVER_HALO, 1, 0.5f, 0.90f, aspect) == SCREEN_TARGET_NONE);
+
+    // suppressLeft lifecycle: clicking visible TransportBar passes left-down then left-up, no playPause
+    ScreenInputState st;
+    ScreenInputResult res;
+    screenInputInit(&st);
+    ScreenInputFrame f = baseFrame(MS(1000), 0.016f);
+    f.target = screenClassifyLocalTarget(0, HOVER_SCREEN, 1, 0.5f, 0.90f, aspect);
+    CHECK(f.target == SCREEN_TARGET_CONTROL);
+    f.triggerDown = 1;
+    screenInputStep(&st, &f, &res);
+    CHECK(screenShouldSuppressLeft(&st, 0) == 0); // left button DOWN goes to Java TransportBar
+    CHECK(res.playPause == 0);
+    f.nowNs = MS(1100);
+    f.triggerDown = 0;
+    screenInputStep(&st, &f, &res);
+    CHECK(screenShouldSuppressLeft(&st, 0) == 1); // left button UP delivered via mask drop
+    CHECK(res.playPause == 0);
+
+    // Clicking bare screen suppresses VR_BUTTON_LEFT on EVERY frame and fires IN_LOCAL_PLAY_PAUSE once
+    f = baseFrame(MS(2000), 0.016f);
+    f.target = screenClassifyLocalTarget(0, HOVER_SCREEN, 1, 0.5f, 0.50f, aspect);
+    CHECK(f.target == SCREEN_TARGET_SCREEN);
+    f.triggerDown = 1;
+    screenInputStep(&st, &f, &res);
+    CHECK(screenShouldSuppressLeft(&st, 0) == 1);
+    f.nowNs = MS(2100);
+    f.triggerDown = 0;
+    screenInputStep(&st, &f, &res);
+    CHECK(screenShouldSuppressLeft(&st, 0) == 1);
+    CHECK(res.playPause == 1);
+
+    // A button while cog/picker modal is open (modalOpen=1 -> target=CONTROL) STILL toggles playPause
+    f = baseFrame(MS(2500), 0.016f);
+    f.target = screenClassifyLocalTarget(1, HOVER_COGPANEL, 0, 0.5f, 0.5f, aspect);
+    f.paletteOpen = 1;
+    f.btnA = 1;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.playPause == 1);
+
+    // Mutual exclusion #5 (direction A): while adjusting screen, applyGrab is blocked
+    screenInputInit(&st);
+    CHECK(screenAllowExternalGrab(GRAB_NONE, &st) == 1);
+    CHECK(screenAllowExternalGrab(GRAB_SPHERE, &st) == 0);
+    f = baseFrame(MS(3000), 0.05f);
+    f.triggerDown = 1;
+    screenInputStep(&st, &f, &res);
+    f.nowNs = MS(3050);
+    f.rStickX = 0.9f;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.adjustActive == 1);
+    CHECK(screenAllowExternalGrab(GRAB_NONE, &st) == 0); // cannot start GRAB_MOVE / GRAB_RESIZE mid-adjust!
+
+    // Mutual exclusion #5 (direction B): during GRAB_RESIZE / GRAB_MOVE, adjust never starts
+    // and releasing the grab's trigger/grip produces zero stale adjustSaved or playPause
+    screenInputInit(&st);
+    CHECK(screenIsExternalGrabBusy(GRAB_NONE) == 0);
+    CHECK(screenIsExternalGrabBusy(GRAB_SPHERE) == 0);
+    CHECK(screenIsExternalGrabBusy(GRAB_MOVE) == 1);
+    CHECK(screenIsExternalGrabBusy(GRAB_RESIZE) == 1);
+
+    f = baseFrame(MS(4000), 0.05f);
+    f.externalGrabActive = 1;
+    f.triggerDown = 1;
+    f.gripDown = 1;
+    f.rStickX = 1.0f;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.adjustActive == 0);
+    CHECK(res.playPause == 0);
+    CHECK(screenShouldSuppressLeft(&st, 1) == 1);
+
+    // Grab ends and trigger/grip release on next frame -> zero stale save or pause!
+    f.nowNs = MS(4100);
+    f.externalGrabActive = 0;
+    f.triggerDown = 0;
+    f.gripDown = 0;
+    f.rStickX = 0.0f;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.adjustSaved == 0);
+    CHECK(res.playPause == 0);
+    CHECK(res.adjustActive == 0);
 }
 
 int main(void) {
@@ -896,5 +1198,6 @@ int main(void) {
     testDetentsSnapAndLimits();
     testHandTrackingAdjust();
     testSection64MatrixButtonsAndLeftStick();
+    testLocalMediaGlueAndMutualExclusion();
     return checksDone("xr_screen_ctrl");
 }

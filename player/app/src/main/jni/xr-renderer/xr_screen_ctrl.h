@@ -1,19 +1,31 @@
-// Screen manipulation, continuous curvature geometry, and local-playback input
-// decision state machine (ux-spec.md §6.4, §6.5, §6.12).
+// Screen manipulation, continuous curvature geometry, layer-budget predicates,
+// and local-playback input decision state machine (ux-spec.md §6.4, §6.5, §6.12).
 // Pure C with no GL, Android, or OpenXR runtime calls so host unit tests
-// exercise every rule, boundary, and table cell deterministically.
+// exercise every rule, boundary, glue function, and table cell deterministically.
 
 #ifndef XR_SCREEN_CTRL_H
 #define XR_SCREEN_CTRL_H
 
 #include <stdint.h>
-#include "xr_math.h"
-#include "xr_shared.h"
+#include "xr_layout.h"
 
 // ============================================================================
 // Tunable interaction & geometry constants (待头显验证)
 // Centralized here so headset tuning touches one place.
 // ============================================================================
+
+// Unified screen physical width bounds (metres).
+// Max 16.0 m matches 90 deg flat width at 8.0 m (2 * 8 * tan(45 deg)) so VR
+// screen adjust, corner resize, cog slider, pose restore, and 2D prefs all
+// share the exact same upper bound without truncating 62 deg @ 8 m.
+#define SCREEN_MIN_WIDTH          0.25f
+#define SCREEN_MAX_WIDTH          16.0f
+
+// Grab modes shared between applyGrab (xr_input.c) and glue guards
+#define GRAB_NONE   0
+#define GRAB_MOVE   1
+#define GRAB_RESIZE 2
+#define GRAB_SPHERE 3
 
 // Screen size (horizontal angular width, degrees) and detents (§6.12)
 #define SCREEN_FOV_MIN_DEG        30.0f
@@ -48,11 +60,15 @@
 #define SCREEN_DIST_SNAP_FRAC     0.04f
 
 // Hand-tracking pinch-adjust parameters (§6.4, 待头显验证)
-#define SCREEN_HAND_DRIFT_MAX_DEG 1.5f
-#define SCREEN_HAND_DEADZONE_M    0.015f
-#define SCREEN_HAND_DIST_STEP_M   0.015f
-#define SCREEN_HAND_DIST_FACTOR   1.05f
-#define SCREEN_HAND_FOV_DEG_PER_M 100.0f
+#define SCREEN_HAND_DRIFT_MAX_DEG   1.5f
+#define SCREEN_HAND_DEADZONE_M      0.015f
+#define SCREEN_HAND_DIST_STEP_M     0.015f
+#define SCREEN_HAND_DIST_FACTOR     1.05f
+#define SCREEN_HAND_FOV_DEG_PER_M   100.0f
+// Pause stillness window along the locked axis that releases hand axis lock
+// so the user can switch between distance and size within a single pinch
+#define SCREEN_HAND_UNLOCK_PAUSE_NS 300000000LL
+#define SCREEN_HAND_UNLOCK_STILL_M  0.010f
 
 // Stick seek cadence & double-B exit window (§6.4, repeat cadence 待头显验证)
 #define SCREEN_SEEK_STEP_SEC      10
@@ -71,9 +87,10 @@
 #define SCREEN_HAPTIC_LIMIT_GAP_MS 60
 
 // Screen-adjust readout placement in head space (§6.1, §6.12, 待头显验证)
-// 24 deg wide, 18 deg below gaze at TOAST_DISTANCE_M (0.80 m)
+// Exact spec §6.12: 24 deg x 2.8 deg, 960 x 112 px, 18 deg below gaze at 0.80 m
 #define SCREEN_READOUT_DIST_M      0.80f
 #define SCREEN_READOUT_FOV_W_DEG   24.0f
+#define SCREEN_READOUT_FOV_H_DEG   2.8f
 #define SCREEN_READOUT_DROP_DEG    18.0f
 
 // Diagonal inches constant for 16:9 picture: cos(atan(9/16)) = 0.8716 (§6.12)
@@ -142,19 +159,21 @@ typedef struct {
     float aspectRatio;
 } CurvedStrip;
 
-// Layer-budget scenario flags matching ux-spec.md §6.5
+// Layer-budget scenario flags matching ux-spec.md §6.5.
+// Per §6.5, the dimmer/room slot is always active (1 layer: passthrough dimmer
+// OR 3D cinema room) in every playback state.
 typedef struct {
-    int inRoom;
-    int stereo;
-    int hasDanmaku;
-    int hasSubtitle;
-    int hasControlBar;
-    int hasPalette;
-    int hasReadout;
-    int hasToast;
-    int hasCard;
+    int inRoom;          // 1 = 3D room layer; 0 = passthrough/void dimmer layer (still 1 slot per §6.5)
+    int stereo;          // 1 = 2 eyes, 0 = 1 mono eye
+    int hasDanmaku;      // 2 layers (L/R parallax) when active (G4)
+    int hasSubtitle;     // 1 shared layer when active (G3)
+    int hasControlBar;   // 1 layer when visible and NOT adjusting screen
+    int hasPalette;      // 1 layer when palette open (G2)
+    int hasReadout;      // 1 layer while adjusting screen (shares toast slot, hides control bar)
+    int hasToast;        // 1 layer when toast showing (shares readout slot)
+    int hasCard;         // 1 layer when popup card showing
     int hasPointer;      // ray + dot = 2 layers
-    int hasController;   // controller model = 1 layer
+    int hasController;   // controller model = 1 layer (0 in hand tracking)
     int hasGlow;         // ambilight glow behind picture = 1 layer
 } LayerBudgetScene;
 
@@ -168,6 +187,7 @@ typedef struct {
     int triggerAdjustEnabled;
     int inRoom;
     int isHandTracking;
+    int externalGrabActive; // 1 while bar-move (GRAB_MOVE) or corner-resize (GRAB_RESIZE) is active
     int triggerDown;
     int gripDown;
     float rStickX;
@@ -220,6 +240,8 @@ typedef struct {
     Vec3 handOrigin;
     float handAxisOriginFov;
     float handAxisOriginDist;
+    Vec3 handStillAnchor;
+    int64_t handStillSinceNs;
 
     int64_t detentHoldUntilNs;
     int detentHoldAxis;
@@ -232,6 +254,7 @@ typedef struct {
     int limitHitAxis;
     int limitHitDir;
 
+    int stickPostAdjustLock;
     int stickXIntent;
     int stickXDir;
     int64_t stickXStartNs;
@@ -288,6 +311,9 @@ int screenSizePresetIndex(float fovDeg);
 float screenSizeNorm(float fovDeg);
 float screenDistNorm(float distM);
 
+// Distance from viewer reference point to screen centre (fallback SCREEN_DIST_DEFAULT_M)
+float screenDistanceFrom(XrPosef screenPose, Vec3 refPos);
+
 // Continuous curvature radius R = D / c (0 when flat, c <= SCREEN_CURVE_EPS)
 float screenCurvatureRadius(float distM, float curve);
 // Cylinder arc width that preserves horizontal angular width fovDeg from viewer
@@ -296,6 +322,18 @@ float screenCurvedArcWidth(float fovDeg, float distM, float curve);
 float screenFovFromPlacement(float width, float distM, float radius, int curved);
 // Quantize continuous curvature [0..1] to 5% steps (0, 0.05, ..., 1.0)
 float screenQuantizeCurve(float curve);
+
+// Unified placement helper shared by adjust, corner resize, cog sliders, and updatePlacement:
+// clamps horizontal FOV to [30, 90] deg and computes width + radius (R = D / c when curved).
+void screenPlacementForFov(float fovDeg, float distM, float curve, int cylinderSupported,
+                           float* outWidth, float* outRadius);
+
+// Migrates a saved pose (potentially from the legacy R = D*(1+3*(1-c)) formula) to R = D / c
+// while preserving the horizontal angular width the viewer originally saw.
+void screenMigratePoseGeometry(XrPosef screenPose, Vec3 refPos,
+                               float storedWidth, float storedRadius,
+                               float curve, int cylinderSupported,
+                               float* outWidth, float* outRadius);
 
 // Coaxial curved strip geometry for bottom-aligned overlays (transport bar)
 int screenCurvedStrip(XrPosef screenPose, float screenWidth, float screenHeight,
@@ -312,9 +350,28 @@ int screenTransportBarHit(float u, float v, float videoAspect);
 XrPosef screenSphereDrag(XrPosef grabScreen, XrPosef grabAim, XrPosef curAim,
                          Vec3 headPos, float grabPitch, float grabRoll);
 
-// Layer budget counter matching ux-spec.md §6.5
+// ---- Shared xr_layers.c visibility predicates & §6.5 layer budget ----
+
+int screenShowTransportLayer(int localMedia, int screenAdjustActive,
+                             int transportVisible, int barArea, int hasContent);
+int screenShowBarArea(int localMedia, int screenAdjustActive,
+                      int modalOrFading, int hoverInBarArea);
+int screenShowReadoutLayer(int localMedia, int screenAdjustActive,
+                           int toastArtReady, int toastDrawnKind);
+int screenShowNoticeToastLayer(int localMedia, int screenAdjustActive,
+                               int toastArtReady, int toastDrawnKind,
+                               int noticeShowing, int noticeMatches);
+
 int screenLayerBudgetCount(const LayerBudgetScene* scene);
 int screenLayerBudgetOk(int count, int maxLimit);
+
+// ---- Shared xr_input.c glue helpers (tested directly on host) ----
+
+int screenClassifyLocalTarget(int modalOpen, int hoverKind, int transportVisible,
+                              float hitU, float hitV, float videoAspect);
+int screenShouldSuppressLeft(const ScreenInputState* st, int externalGrabActive);
+int screenAllowExternalGrab(int grabMode, const ScreenInputState* st);
+int screenIsExternalGrabBusy(int grabMode);
 
 // ---- Pure local-playback input state machine ----
 

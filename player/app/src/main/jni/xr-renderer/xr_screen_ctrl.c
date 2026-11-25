@@ -1,5 +1,5 @@
-// Screen manipulation, continuous curvature geometry, and local-playback input
-// decision state machine (ux-spec.md §6.4, §6.5, §6.12).
+// Screen manipulation, continuous curvature geometry, layer-budget predicates,
+// and local-playback input decision state machine (ux-spec.md §6.4, §6.5, §6.12).
 #include "xr_screen_ctrl.h"
 
 #include <math.h>
@@ -64,6 +64,13 @@ float screenDistNorm(float distM) {
                   0.0f, 1.0f);
 }
 
+float screenDistanceFrom(XrPosef screenPose, Vec3 refPos) {
+    Vec3 sp = { screenPose.position.x, screenPose.position.y, screenPose.position.z };
+    Vec3 diff = vecSub(sp, refPos);
+    float d = sqrtf(vecDot(diff, diff));
+    return d >= 0.1f ? d : SCREEN_DIST_DEFAULT_M;
+}
+
 float screenQuantizeCurve(float curve) {
     float c = clampf(curve, 0.0f, 1.0f);
     int pct = (int)roundf(c * 20.0f) * 5;
@@ -111,6 +118,44 @@ float screenFovFromPlacement(float width, float distM, float radius, int curved)
     float x = radius * sinf(beta);
     float zFromViewer = distM - radius * (1.0f - cosf(beta));
     return 2.0f * atan2f(x, zFromViewer) * 180.0f / (float)M_PI;
+}
+
+void screenPlacementForFov(float fovDeg, float distM, float curve, int cylinderSupported,
+                           float* outWidth, float* outRadius) {
+    float fov = screenClampFov(fovDeg);
+    float d = distM > 0.05f ? distM : SCREEN_DIST_DEFAULT_M;
+    float width;
+    float radius;
+    if (curve > SCREEN_CURVE_EPS && cylinderSupported) {
+        radius = screenCurvatureRadius(d, curve);
+        width = screenCurvedArcWidth(fov, d, curve);
+    }
+    else {
+        radius = d * 4.0f;
+        width = screenFlatWidth(fov, d);
+    }
+    if (width < SCREEN_MIN_WIDTH) {
+        width = SCREEN_MIN_WIDTH;
+    }
+    if (width > SCREEN_MAX_WIDTH) {
+        width = SCREEN_MAX_WIDTH;
+    }
+    if (outWidth != NULL) {
+        *outWidth = width;
+    }
+    if (outRadius != NULL) {
+        *outRadius = radius;
+    }
+}
+
+void screenMigratePoseGeometry(XrPosef screenPose, Vec3 refPos,
+                               float storedWidth, float storedRadius,
+                               float curve, int cylinderSupported,
+                               float* outWidth, float* outRadius) {
+    float d = screenDistanceFrom(screenPose, refPos);
+    int oldCurved = curve > SCREEN_CURVE_EPS && cylinderSupported && storedRadius > 1e-4f;
+    float fovDeg = screenFovFromPlacement(storedWidth, d, storedRadius, oldCurved);
+    screenPlacementForFov(fovDeg, d, curve, cylinderSupported, outWidth, outRadius);
 }
 
 static XrPosef localOffsetPose(XrPosef base, Vec3 local) {
@@ -217,15 +262,56 @@ XrPosef screenSphereDrag(XrPosef grabScreen, XrPosef grabAim, XrPosef curAim,
     return next;
 }
 
+// ============================================================================
+// Shared xr_layers.c visibility predicates & §6.5 layer budget counter
+// ============================================================================
+
+int screenShowTransportLayer(int localMedia, int screenAdjustActive,
+                             int transportVisible, int barArea, int hasContent) {
+    if (!hasContent) {
+        return 0;
+    }
+    if (localMedia && screenAdjustActive) {
+        return 0;
+    }
+    return localMedia ? (transportVisible ? 1 : 0) : ((transportVisible || barArea) ? 1 : 0);
+}
+
+int screenShowBarArea(int localMedia, int screenAdjustActive,
+                      int modalOrFading, int hoverInBarArea) {
+    if (modalOrFading) {
+        return 0;
+    }
+    if (localMedia && screenAdjustActive) {
+        return 0;
+    }
+    return hoverInBarArea ? 1 : 0;
+}
+
+int screenShowReadoutLayer(int localMedia, int screenAdjustActive,
+                           int toastArtReady, int toastDrawnKind) {
+    return (localMedia && screenAdjustActive && toastArtReady
+            && toastDrawnKind == TOAST_SCREEN_READOUT) ? 1 : 0;
+}
+
+int screenShowNoticeToastLayer(int localMedia, int screenAdjustActive,
+                               int toastArtReady, int toastDrawnKind,
+                               int noticeShowing, int noticeMatches) {
+    if (screenShowReadoutLayer(localMedia, screenAdjustActive, toastArtReady, toastDrawnKind)) {
+        return 0;
+    }
+    return (toastArtReady && toastDrawnKind != TOAST_SCREEN_READOUT
+            && noticeShowing && noticeMatches) ? 1 : 0;
+}
+
 int screenLayerBudgetCount(const LayerBudgetScene* s) {
     if (s == NULL) {
         return 0;
     }
     int count = 0;
-    // Environment: room projection layer (or dimmer) + optional ambilight glow
-    if (s->inRoom) {
-        count += 1;
-    }
+    // §6.5: dimmer (passthrough/void) OR 3D room layer is always 1 slot in every state
+    count += 1;
+    // Optional ambilight glow behind the picture
     if (s->hasGlow) {
         count += 1;
     }
@@ -239,19 +325,24 @@ int screenLayerBudgetCount(const LayerBudgetScene* s) {
     if (s->hasSubtitle) {
         count += 1;
     }
-    // Control bar (hidden during screen adjust)
-    if (s->hasControlBar && !s->hasReadout) {
+    // Control bar: uses the exact same predicate xr_layers.c uses (hidden during adjust)
+    if (screenShowTransportLayer(1, s->hasReadout, s->hasControlBar, 0, s->hasControlBar)) {
         count += 1;
     }
-    // Palette
+    // Palette (G2)
     if (s->hasPalette) {
         count += 1;
     }
-    // Readout & Toast share a single slot (1 layer at most)
-    if (s->hasReadout || s->hasToast) {
+    // Readout & Toast share a single slot (uses the exact same predicates as xr_layers.c)
+    int readoutLayer = screenShowReadoutLayer(1, s->hasReadout, s->hasReadout,
+                                              s->hasReadout ? TOAST_SCREEN_READOUT : -1);
+    int toastLayer = screenShowNoticeToastLayer(1, s->hasReadout, s->hasToast,
+                                                s->hasToast ? TOAST_SCREEN_HINT : -1,
+                                                s->hasToast, 1);
+    if (readoutLayer || toastLayer) {
         count += 1;
     }
-    // Card (error / cast / next-episode)
+    // Popup card (error / cast / next-episode / buffering)
     if (s->hasCard) {
         count += 1;
     }
@@ -268,6 +359,46 @@ int screenLayerBudgetCount(const LayerBudgetScene* s) {
 
 int screenLayerBudgetOk(int count, int maxLimit) {
     return count >= 0 && count <= maxLimit;
+}
+
+// ============================================================================
+// Shared xr_input.c glue helpers (tested directly on host)
+// ============================================================================
+
+int screenClassifyLocalTarget(int modalOpen, int hoverKind, int transportVisible,
+                              float hitU, float hitV, float videoAspect) {
+    if (modalOpen) {
+        return SCREEN_TARGET_CONTROL;
+    }
+    if (hoverKind == HOVER_SCREEN) {
+        int onBar = transportVisible && screenTransportBarHit(hitU, hitV, videoAspect);
+        return onBar ? SCREEN_TARGET_CONTROL : SCREEN_TARGET_SCREEN;
+    }
+    if (hoverKind != HOVER_NONE && hoverKind != HOVER_HALO) {
+        return SCREEN_TARGET_CONTROL;
+    }
+    return SCREEN_TARGET_NONE;
+}
+
+int screenShouldSuppressLeft(const ScreenInputState* st, int externalGrabActive) {
+    if (st == NULL || externalGrabActive) {
+        return 1;
+    }
+    return st->trigState != SCREEN_HOLD_CONTROL ? 1 : 0;
+}
+
+int screenAllowExternalGrab(int grabMode, const ScreenInputState* st) {
+    if (grabMode == GRAB_SPHERE) {
+        return 0;
+    }
+    if (st != NULL && st->adjustActive) {
+        return 0;
+    }
+    return 1;
+}
+
+int screenIsExternalGrabBusy(int grabMode) {
+    return (grabMode == GRAB_MOVE || grabMode == GRAB_RESIZE) ? 1 : 0;
 }
 
 // ============================================================================
@@ -337,14 +468,27 @@ static void startAdjust(ScreenInputState* st, const ScreenInputFrame* in,
     st->hasLastDetent = 0;
     st->limitHitAxis = ADJUST_AXIS_NONE;
     st->limitHitDir = 0;
+    st->stickPostAdjustLock = 0;
     st->stickXIntent = SCREEN_STICK_INTENT_NONE;
     st->stickXDir = 0;
     if (byHand) {
         st->handOrigin = in->handPos;
         st->handAxisOriginFov = st->adjustFovDeg;
         st->handAxisOriginDist = st->adjustDistM;
+        st->handStillAnchor = in->handPos;
+        st->handStillSinceNs = in->nowNs;
     }
     out->adjustStarted = 1;
+}
+
+static void lockStickAfterAdjust(ScreenInputState* st) {
+    // Keep right stick inert (NOOP) until BOTH X and Y return inside deadzone,
+    // so releasing trigger/grip or pressing B while deflected never fires seek.
+    st->stickPostAdjustLock = 1;
+    st->stickXIntent = SCREEN_STICK_INTENT_NOOP;
+    st->stickXDir = 0;
+    st->lStickXLatched = 1;
+    st->lStickYDir = 0;
 }
 
 static void finishAdjustSave(ScreenInputState* st, ScreenInputResult* out) {
@@ -358,6 +502,7 @@ static void finishAdjustSave(ScreenInputState* st, ScreenInputResult* out) {
     st->hasLastDetent = 0;
     st->limitHitAxis = ADJUST_AXIS_NONE;
     st->limitHitDir = 0;
+    lockStickAfterAdjust(st);
     out->adjustSaved = 1;
 }
 
@@ -372,6 +517,7 @@ static void cancelAdjustUndo(ScreenInputState* st, ScreenInputResult* out) {
     st->hasLastDetent = 0;
     st->limitHitAxis = ADJUST_AXIS_NONE;
     st->limitHitDir = 0;
+    lockStickAfterAdjust(st);
     out->adjustUndone = 1;
 }
 
@@ -554,8 +700,39 @@ static void stepHandAdjust(ScreenInputState* st, const ScreenInputFrame* in,
         st->handOrigin = in->handPos;
         st->handAxisOriginFov = st->adjustFovDeg;
         st->handAxisOriginDist = st->adjustDistM;
+        st->handStillAnchor = in->handPos;
+        st->handStillSinceNs = in->nowNs;
         st->detentHoldUntilNs = 0;
         return;
+    }
+
+    // §6.4 hand-tracking axis lock matches controller stick: pausing along the
+    // locked axis (or returning to its deadzone) releases the lock and
+    // re-anchors the hand so the user can switch axes within the same pinch.
+    if (st->detentHoldUntilNs == 0) {
+        Vec3 stillDelta = vecSub(in->handPos, st->handStillAnchor);
+        float lockedMove = st->adjustAxis == ADJUST_AXIS_SIZE
+                ? fabsf(vecDot(stillDelta, in->headRight))
+                : fabsf(vecDot(stillDelta, in->headForward));
+        if (lockedMove >= SCREEN_HAND_UNLOCK_STILL_M) {
+            st->handStillAnchor = in->handPos;
+            st->handStillSinceNs = in->nowNs;
+        }
+        else if (in->nowNs - st->handStillSinceNs >= SCREEN_HAND_UNLOCK_PAUSE_NS) {
+            st->adjustAxis = ADJUST_AXIS_NONE;
+            st->handOrigin = in->handPos;
+            st->handAxisOriginFov = st->adjustFovDeg;
+            st->handAxisOriginDist = st->adjustDistM;
+            st->handStillAnchor = in->handPos;
+            st->handStillSinceNs = in->nowNs;
+            st->detentHoldUntilNs = 0;
+            st->detentHoldDir = 0;
+            return;
+        }
+    }
+    else {
+        st->handStillAnchor = in->handPos;
+        st->handStillSinceNs = in->nowNs;
     }
 
     if (st->adjustAxis == ADJUST_AXIS_SIZE) {
@@ -576,6 +753,8 @@ static void stepHandAdjust(ScreenInputState* st, const ScreenInputFrame* in,
                 // Re-anchor smoothly so screen doesn't jump after 300 ms visual pause
                 st->handOrigin = in->handPos;
                 st->handAxisOriginFov = st->detentHoldValue;
+                st->handStillAnchor = in->handPos;
+                st->handStillSinceNs = in->nowNs;
                 st->adjustFovDeg = st->detentHoldValue;
                 return;
             }
@@ -606,6 +785,8 @@ static void stepHandAdjust(ScreenInputState* st, const ScreenInputFrame* in,
                 st->detentHoldUntilNs = 0;
                 st->handOrigin = in->handPos;
                 st->handAxisOriginDist = st->detentHoldValue;
+                st->handStillAnchor = in->handPos;
+                st->handStillSinceNs = in->nowNs;
                 st->adjustDistM = st->detentHoldValue;
                 return;
             }
@@ -635,6 +816,29 @@ void screenInputStep(ScreenInputState* st, const ScreenInputFrame* in,
     if (!st->adjustActive) {
         st->adjustFovDeg = screenClampFov(in->curFovDeg);
         st->adjustDistM = screenClampDist(in->curDistM);
+    }
+
+    // Mutual exclusion with external bar-move / corner-resize grab: never start
+    // screen adjust or fire stale trigger/grip releases when an external grab
+    // finishes; keep previous edges synced every frame.
+    if (in->externalGrabActive) {
+        if (st->adjustActive) {
+            cancelAdjustUndo(st, out);
+        }
+        st->trigState = in->triggerDown ? SCREEN_HOLD_CANCELLED : SCREEN_HOLD_IDLE;
+        st->gripState = in->gripDown ? SCREEN_GRIP_CANCELLED : SCREEN_GRIP_IDLE;
+        out->fovDeg = st->adjustFovDeg;
+        out->distM = st->adjustDistM;
+        out->diagonalInches = screenDiagonalInches(out->fovDeg, out->distM);
+        out->sizePresetIdx = screenSizePresetIndex(out->fovDeg);
+        st->prevTrigger = in->triggerDown ? 1 : 0;
+        st->prevGrip = in->gripDown ? 1 : 0;
+        st->prevA = in->btnA ? 1 : 0;
+        st->prevB = in->btnB ? 1 : 0;
+        st->prevY = in->btnY ? 1 : 0;
+        st->prevMenu = in->btnMenu ? 1 : 0;
+        st->prevRStickClick = in->rStickClick ? 1 : 0;
+        return;
     }
 
     int trigEdge = in->triggerDown && !st->prevTrigger;
@@ -762,13 +966,11 @@ void screenInputStep(ScreenInputState* st, const ScreenInputFrame* in,
             finishAdjustSave(st, out);
         }
         else if (st->trigState == SCREEN_HOLD_ON_SCREEN && in->target == SCREEN_TARGET_SCREEN) {
-            if (!in->triggerAdjustEnabled || in->inRoom) {
-                // Rule 12 / room: trigger on screen is click only
-                out->playPause = 1;
-            }
-            else if ((in->nowNs - st->trigDownNs) < SCREEN_CLICK_HOLD_NS
-                     && !st->trigStickLeftDz) {
-                // Rule 2: release within 350 ms and stick stayed in deadzone
+            // Rule 2 applies universally (including when triggerAdjustEnabled == 0
+            // per Rule 12 or in a 3D room): click requires < 350 ms release AND
+            // stick staying inside deadzone.
+            if ((in->nowNs - st->trigDownNs) < SCREEN_CLICK_HOLD_NS
+                    && !st->trigStickLeftDz) {
                 out->playPause = 1;
             }
         }
@@ -816,12 +1018,8 @@ void screenInputStep(ScreenInputState* st, const ScreenInputFrame* in,
     else {
         // 5. Non-adjust buttons (A, Y, Menu, Right stick click, Left stick, Right stick X)
         if (aEdge) {
-            if (isControlTarget(in->target)) {
-                out->clickControl = 1;
-            }
-            else if (in->cardKind == SCREEN_CARD_NONE) {
-                out->playPause = 1;
-            }
+            // §6.4: A toggles play/pause in every column except "adjusting"
+            out->playPause = 1;
         }
         if (yEdge) {
             out->yToggleDanmaku = 1;
@@ -866,10 +1064,19 @@ void screenInputStep(ScreenInputState* st, const ScreenInputFrame* in,
         }
 
         // Right stick X outside adjust (Rule 8: intent locked until return to deadzone;
-        // Rule 11: right stick Y has no action outside adjust)
+        // Rule 11: right stick Y has no action outside adjust).
+        // After adjust ends (save or B-undo), stay locked in NOOP until BOTH axes
+        // return inside deadzone so a still-deflected stick never fires seek.
         float arx = fabsf(rx);
         float ary = fabsf(ry);
-        if (arx <= SCREEN_STICK_DEADZONE) {
+        if (st->stickPostAdjustLock) {
+            if (rStickMax <= SCREEN_STICK_DEADZONE) {
+                st->stickPostAdjustLock = 0;
+                st->stickXIntent = SCREEN_STICK_INTENT_NONE;
+                st->stickXDir = 0;
+            }
+        }
+        else if (arx <= SCREEN_STICK_DEADZONE) {
             st->stickXIntent = SCREEN_STICK_INTENT_NONE;
             st->stickXDir = 0;
         }

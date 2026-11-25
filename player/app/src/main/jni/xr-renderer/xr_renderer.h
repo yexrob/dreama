@@ -137,17 +137,9 @@ static inline int64_t nowNs(void) {
 #define VR_BUTTON_RIGHT  0x2
 #define VR_BUTTON_MIDDLE 0x4
 
-// Grab thresholds for the grip, and the range a resize is allowed to reach
-#define SCREEN_MIN_WIDTH 0.8f
-#define SCREEN_MAX_WIDTH 8.0f
-
-// What the ray is over, and the handles' sizes and hover zones, are in
-// xr_layout.h with the hover test that reads them
-
-#define GRAB_NONE   0
-#define GRAB_MOVE   1
-#define GRAB_RESIZE 2
-#define GRAB_SPHERE 3
+// Screen width bounds (SCREEN_MIN_WIDTH, SCREEN_MAX_WIDTH) and GRAB_* modes
+// live in xr_screen_ctrl.h so native renderer and host unit tests share one
+// source of truth.
 
 // Widened along with the grid so a cell stays about the size it was at three
 // columns: five of them now
@@ -1405,6 +1397,11 @@ typedef struct {
     float adjustSnapRadius;
     int adjustSnapValid;
     int screenAdjustActive;
+    Vec3 adjustRefHeadPos;
+    Vec3 adjustDirVec;
+    Vec3 grabHeadPos;
+    int poseNeedsCurveMigration;
+    unsigned char* readoutFlipBuf;
     int64_t uiHapticSecondAtNs;
     int64_t uiHapticSecondDurNs;
     float uiHapticSecondAmp;

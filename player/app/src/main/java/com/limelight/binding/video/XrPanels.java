@@ -1146,6 +1146,9 @@ final class XrPanels {
         private final Bitmap bitmap = Bitmap.createBitmap(TOAST_TEX_W, TOAST_TEX_H,
                 Bitmap.Config.ARGB_8888);
         private final Canvas canvas = new Canvas(bitmap);
+        private final Bitmap readoutBitmap = Bitmap.createBitmap(READOUT_TEX_W, READOUT_TEX_H,
+                Bitmap.Config.ARGB_8888);
+        private final Canvas readoutCanvas = new Canvas(readoutBitmap);
         private final Paint sheet = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint border = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint line = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -1156,10 +1159,13 @@ final class XrPanels {
         private final Paint tickPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint tickText = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint thumbPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final RectF pillRect = new RectF(1.0f, 1.0f, TOAST_TEX_W - 1.0f, TOAST_TEX_H - 1.0f);
+        private final RectF readoutPillRect = new RectF(
+                1.0f, 1.0f, READOUT_TEX_W - 1.0f, READOUT_TEX_H - 1.0f);
         private final RectF trackRect = new RectF();
         private final RectF fillRect = new RectF();
         private final ByteBuffer pixels = ByteBuffer.allocateDirect(TOAST_TEX_W * TOAST_TEX_H * 4);
+        private final ByteBuffer readoutPixels = ByteBuffer.allocateDirect(
+                READOUT_TEX_W * READOUT_TEX_H * 4);
 
         private static final float DETAIL_SIZE = 32.0f;
         private static final float DETAIL_SIZE_MIN = 22.0f;
@@ -1176,60 +1182,62 @@ final class XrPanels {
             detail.setTextSize(DETAIL_SIZE);
             detail.setTextAlign(Paint.Align.CENTER);
             readoutText.setColor(0xFFECECEE);
-            readoutText.setTextSize(38.0f);
+            readoutText.setTextSize(32.0f);
             readoutText.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
             readoutText.setTextAlign(Paint.Align.CENTER);
             trackBg.setColor(0x3DFFFFFF);
             trackFill.setColor(0xFF7FD7FF);
             tickPaint.setColor(0x88FFFFFF);
             tickText.setColor(0x99ECECEE);
-            tickText.setTextSize(20.0f);
+            tickText.setTextSize(17.0f);
             tickText.setTextAlign(Paint.Align.CENTER);
             thumbPaint.setColor(Color.WHITE);
         }
 
-        // Draws the screen-adjust readout pill reusing the toast swapchain (§6.12).
-        // Zero per-frame allocations; only called when displayed values change.
+        // Draws the screen-adjust readout pill at exact spec dimensions (960x112,
+        // uploaded into the 960x112 sub-region of toastSwapchain; §6.12).
+        // Zero per-frame allocations; only called when formatted text or quantized
+        // slider bucket changes.
         ByteBuffer drawScreenReadout(String text, float progress, float[] ticks,
                                      String[] tickLabels) {
-            canvas.drawColor(0, PorterDuff.Mode.CLEAR);
-            canvas.drawRoundRect(pillRect, 36.0f, 36.0f, sheet);
-            canvas.drawRoundRect(pillRect, 36.0f, 36.0f, border);
+            readoutCanvas.drawColor(0, PorterDuff.Mode.CLEAR);
+            readoutCanvas.drawRoundRect(readoutPillRect, 28.0f, 28.0f, sheet);
+            readoutCanvas.drawRoundRect(readoutPillRect, 28.0f, 28.0f, border);
 
-            float mid = TOAST_TEX_W * 0.5f;
-            float room = TOAST_TEX_W - 80.0f;
-            canvas.drawText(fit(text, readoutText, room), mid, 60.0f, readoutText);
+            float mid = READOUT_TEX_W * 0.5f;
+            float room = READOUT_TEX_W - 64.0f;
+            readoutCanvas.drawText(fit(text, readoutText, room), mid, 42.0f, readoutText);
 
-            float trackL = 72.0f;
-            float trackR = TOAST_TEX_W - 72.0f;
-            float trackY = 104.0f;
-            float trackHalfH = 4.0f;
+            float trackL = 56.0f;
+            float trackR = READOUT_TEX_W - 56.0f;
+            float trackY = 74.0f;
+            float trackHalfH = 3.5f;
             float clamped = Math.max(0.0f, Math.min(1.0f, progress));
             float thumbX = trackL + clamped * (trackR - trackL);
 
             trackRect.set(trackL, trackY - trackHalfH, trackR, trackY + trackHalfH);
-            canvas.drawRoundRect(trackRect, trackHalfH, trackHalfH, trackBg);
+            readoutCanvas.drawRoundRect(trackRect, trackHalfH, trackHalfH, trackBg);
 
             fillRect.set(trackL, trackY - trackHalfH, thumbX, trackY + trackHalfH);
-            canvas.drawRoundRect(fillRect, trackHalfH, trackHalfH, trackFill);
+            readoutCanvas.drawRoundRect(fillRect, trackHalfH, trackHalfH, trackFill);
 
             if (ticks != null) {
                 for (int i = 0; i < ticks.length; i++) {
                     float tx = trackL + Math.max(0.0f, Math.min(1.0f, ticks[i])) * (trackR - trackL);
-                    canvas.drawRect(tx - 1.5f, trackY - 10.0f, tx + 1.5f, trackY + 10.0f, tickPaint);
+                    readoutCanvas.drawRect(tx - 1.5f, trackY - 7.0f, tx + 1.5f, trackY + 7.0f, tickPaint);
                     if (tickLabels != null && i < tickLabels.length && tickLabels[i] != null) {
-                        canvas.drawText(tickLabels[i], tx, 142.0f, tickText);
+                        readoutCanvas.drawText(tickLabels[i], tx, 102.0f, tickText);
                     }
                 }
             }
 
-            canvas.drawCircle(thumbX, trackY, 11.0f, trackFill);
-            canvas.drawCircle(thumbX, trackY, 7.0f, thumbPaint);
+            readoutCanvas.drawCircle(thumbX, trackY, 8.5f, trackFill);
+            readoutCanvas.drawCircle(thumbX, trackY, 5.5f, thumbPaint);
 
-            pixels.rewind();
-            bitmap.copyPixelsToBuffer(pixels);
-            pixels.rewind();
-            return pixels;
+            readoutPixels.rewind();
+            readoutBitmap.copyPixelsToBuffer(readoutPixels);
+            readoutPixels.rewind();
+            return readoutPixels;
         }
 
         // A second line that is a path is cut from the middle rather than the
