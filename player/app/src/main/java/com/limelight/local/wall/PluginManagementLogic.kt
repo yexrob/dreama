@@ -17,6 +17,7 @@ import com.limelight.local.plugin.PluginRepoEntity
 import com.limelight.local.plugin.PluginRepoIndex
 import com.limelight.local.plugin.PluginRepositoryClient
 import com.limelight.local.plugin.PluginSourceMismatchException
+import com.limelight.local.plugin.PluginStore
 import com.limelight.local.plugin.RepoPluginEntry
 import com.limelight.local.plugin.SemVer
 import com.limelight.local.stream.PhoneFormField
@@ -24,12 +25,15 @@ import com.limelight.local.stream.PhoneFormFieldKind
 import com.limelight.local.stream.PhoneFormOption
 import com.limelight.local.stream.StringLookup
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import java.net.URI
 import java.util.Locale
+import java.util.UUID
 
 /** Validation + serialization result for a dynamic manifest config form. */
 sealed interface ConfigFormResult {
@@ -245,13 +249,18 @@ object PluginInstanceAuthenticator {
         displayName: String,
         config: Map<String, JsonElement>,
         dnsResolver: ((String) -> List<java.net.InetAddress>)? = null,
+        onInstanceCreated: (String) -> Unit = {},
+        onInstanceSettled: (String) -> Unit = {},
     ): PluginInstanceEntity {
-        val created = packageManager.createInstance(
-            pluginId = manifest.id,
-            displayName = displayName,
-            config = config,
-        )
+        val instanceId = UUID.randomUUID().toString()
+        onInstanceCreated(instanceId)
         try {
+            val created = packageManager.createInstance(
+                pluginId = manifest.id,
+                displayName = displayName,
+                config = config,
+                instanceId = instanceId,
+            )
             val source = packageManager.openSource(created.instanceId, dnsResolver = dnsResolver)
             when (manifest.auth) {
                 PluginAuthMode.FORM -> source.loginForm()
@@ -259,12 +268,15 @@ object PluginInstanceAuthenticator {
                 PluginAuthMode.QR, PluginAuthMode.DEVICE -> Unit
             }
             return created
-        } catch (e: CancellationException) {
-            runCatching { packageManager.deleteInstance(created.instanceId) }
-            throw e
         } catch (e: Throwable) {
-            runCatching { packageManager.deleteInstance(created.instanceId) }
+            withContext(NonCancellable) {
+                runCatching { packageManager.deleteInstance(instanceId) }
+            }
             throw e
+        } finally {
+            withContext(NonCancellable) {
+                onInstanceSettled(instanceId)
+            }
         }
     }
 
@@ -275,8 +287,12 @@ object PluginInstanceAuthenticator {
         displayName: String,
         config: Map<String, JsonElement>,
         dnsResolver: ((String) -> List<java.net.InetAddress>)? = null,
+        store: PluginStore? = null,
+        prevDisplayName: String? = null,
     ): PluginInstanceEntity {
+        val prevInst = runCatching { store?.getInstance(instanceId) }.getOrNull()
         val prevConfig = runCatching { packageManager.getInstanceConfig(instanceId) }.getOrNull()
+        val restoreDisplayName = prevInst?.displayName ?: prevDisplayName
         val updated = packageManager.updateInstanceConfig(
             instanceId = instanceId,
             displayName = displayName,
@@ -290,13 +306,52 @@ object PluginInstanceAuthenticator {
                 PluginAuthMode.QR, PluginAuthMode.DEVICE -> Unit
             }
             return updated
-        } catch (e: CancellationException) {
-            if (prevConfig != null) {
-                runCatching { packageManager.updateInstanceConfig(instanceId, config = prevConfig) }
+        } catch (e: Throwable) {
+            withContext(NonCancellable) {
+                if (prevConfig != null) {
+                    runCatching {
+                        packageManager.updateInstanceConfig(
+                            instanceId = instanceId,
+                            displayName = restoreDisplayName,
+                            config = prevConfig,
+                        )
+                    }
+                    if (prevInst != null && store != null) {
+                        runCatching {
+                            store.updateInstanceAuth(
+                                instanceId = instanceId,
+                                authState = prevInst.authState,
+                                authUserJson = prevInst.authUserJson,
+                                updatedAt = System.currentTimeMillis(),
+                            )
+                        }
+                    }
+                    // Restore runtime bound to the previous working config
+                    runCatching {
+                        packageManager.openSource(instanceId, dnsResolver = dnsResolver)
+                    }
+                }
             }
             throw e
-        } catch (e: Throwable) {
-            throw e
+        }
+    }
+
+    /**
+     * Runs a form submission body (FORM/NONE/QR/DEVICE) while guaranteeing [setBusy] resets to
+     * `false` on EVERY exit path (success, QR/DEVICE transition, validation error, network error,
+     * timeout, and cancellation) inside [NonCancellable].
+     */
+    suspend fun <T> runWithBusyReset(
+        setBusy: suspend (Boolean) -> Unit,
+        block: suspend () -> T,
+    ): T {
+        setBusy(true)
+        return try {
+            block()
+        } finally {
+            withContext(NonCancellable) {
+                setBusy(false)
+            }
         }
     }
 }

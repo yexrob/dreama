@@ -7,10 +7,12 @@ import androidx.lifecycle.viewModelScope
 import com.limelight.LimeLog
 import com.limelight.local.WebDav
 import com.limelight.local.media.Item
+import com.limelight.local.media.ItemKind
 import com.limelight.local.media.ItemNotFoundException
 import com.limelight.local.media.LocalVideoSource
 import com.limelight.local.media.MediaSource
 import com.limelight.local.media.Shelf
+import com.limelight.local.media.SourceKind
 import com.limelight.local.media.WallDatabase
 import com.limelight.local.media.WatchProgress
 import com.limelight.local.media.WebDavSource
@@ -24,15 +26,22 @@ import com.limelight.local.plugin.PluginRepoIndex
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 sealed interface Load<out T> {
     data object Loading : Load<Nothing>
@@ -88,7 +97,18 @@ class WallModel(app: Application) : AndroidViewModel(app) {
     val continueWatching: StateFlow<Load<List<Resume>>> = combine(
         WallDatabase.get(app).progress().recent(40), sources,
     ) { rows, srcs -> rows to srcs }
-        .mapLatest { (rows, srcs) -> Load.Ready(resolve(rows, srcs)) }
+        .flatMapLatest { (rows, srcs) ->
+            val progressDao = WallDatabase.get(app).progress()
+            ContinueWatchingResolver.resolveFlow(
+                rows = rows,
+                sources = srcs,
+                cachedItems = snapshotCachedShelfItems(),
+                runForSource = { kind, block -> pluginManager.runWithConcurrencyLimit(kind, block) },
+                onItemNotFound = { p ->
+                    withContext(Dispatchers.IO) { progressDao.delete(p.sourceId, p.itemId) }
+                },
+            ).map { Load.Ready(it) }
+        }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), Load.Loading)
 
     val streaming = com.limelight.local.stream.StreamingController(app) {
@@ -103,11 +123,12 @@ class WallModel(app: Application) : AndroidViewModel(app) {
             combine(
                 pluginHost.database.pluginPackages().observeAll(),
                 pluginHost.database.pluginInstances().observeAll(),
+                pluginHost.pendingInstanceIds,
                 pluginHost.changes,
-            ) { pkgs, insts, _ -> pkgs to insts }
-                .collect { (pkgs, insts) ->
+            ) { pkgs, insts, pendingIds, _ -> Triple(pkgs, insts, pendingIds) }
+                .collect { (pkgs, insts, pendingIds) ->
                     refreshPluginRepos()
-                    val reconciled = pluginManager.reconcile(pkgs, insts)
+                    val reconciled = pluginManager.reconcile(pkgs, insts, pendingIds)
                     reconciled.removedSourceIds.forEach { shelves.remove(it) }
                     pluginSources.value = reconciled.sources
                     reconciled.sources.forEach { src ->
@@ -156,6 +177,11 @@ class WallModel(app: Application) : AndroidViewModel(app) {
 
     fun pluginIdForSource(source: MediaSource): String? = pluginManager.pluginIdForSource(source)
 
+    fun needsPermissionReconfirm(source: MediaSource): Boolean {
+        val pluginId = pluginIdForSource(source) ?: return false
+        return installedPlugins.value.firstOrNull { it.pluginId == pluginId }?.needsPermissionReconfirm == true
+    }
+
     fun pluginDisplayName(pluginId: String): String {
         val entity = installedPlugins.value.firstOrNull { it.pluginId == pluginId } ?: return pluginId
         return runCatching { pluginHost.localizeManifest(entity).name }.getOrDefault(entity.name)
@@ -165,7 +191,7 @@ class WallModel(app: Application) : AndroidViewModel(app) {
         val pluginId = pluginIdForSource(source) ?: return null
         val name = pluginDisplayName(pluginId)
         withContext(Dispatchers.IO) {
-            pluginHost.packageManager.setPluginEnabled(pluginId, false)
+            pluginHost.packageManager().setPluginEnabled(pluginId, false)
         }
         pluginHost.notifyChanged()
         return name
@@ -187,7 +213,7 @@ class WallModel(app: Application) : AndroidViewModel(app) {
 
     suspend fun syncPluginRepo(url: String): PluginRepoIndex {
         val index = withContext(Dispatchers.IO) {
-            pluginHost.packageManager.syncRepository(url.trim())
+            pluginHost.packageManager().syncRepository(url.trim())
         }
         refreshPluginRepos()
         pluginHost.notifyChanged()
@@ -204,14 +230,14 @@ class WallModel(app: Application) : AndroidViewModel(app) {
 
     suspend fun setPluginEnabled(pluginId: String, enabled: Boolean) {
         withContext(Dispatchers.IO) {
-            pluginHost.packageManager.setPluginEnabled(pluginId, enabled)
+            pluginHost.packageManager().setPluginEnabled(pluginId, enabled)
         }
         pluginHost.notifyChanged()
     }
 
     suspend fun confirmPluginPermissions(pluginId: String) {
         withContext(Dispatchers.IO) {
-            pluginHost.packageManager.confirmPermissions(pluginId)
+            pluginHost.packageManager().confirmPermissions(pluginId)
         }
         pluginHost.notifyChanged()
     }
@@ -219,14 +245,14 @@ class WallModel(app: Application) : AndroidViewModel(app) {
     suspend fun uninstallPlugin(entity: InstalledPluginEntity) {
         val strings = com.limelight.local.stream.AndroidStringLookup(getApplication())
         withContext(Dispatchers.IO) {
-            PluginInstallGuard.uninstallIfAllowed(pluginHost.packageManager, entity, strings)
+            PluginInstallGuard.uninstallIfAllowed(pluginHost.packageManager(), entity, strings)
         }
         pluginHost.notifyChanged()
     }
 
     suspend fun deletePluginInstance(instanceId: String) {
         withContext(Dispatchers.IO) {
-            pluginHost.packageManager.deleteInstance(instanceId)
+            pluginHost.packageManager().deleteInstance(instanceId)
         }
         shelves.remove(PluginMediaSource.sourceIdFor(instanceId))
         pluginHost.notifyChanged()
@@ -234,8 +260,9 @@ class WallModel(app: Application) : AndroidViewModel(app) {
 
     suspend fun renamePluginInstance(instanceId: String, newName: String) {
         withContext(Dispatchers.IO) {
-            val cfg = pluginHost.packageManager.getInstanceConfig(instanceId)
-            pluginHost.packageManager.updateInstanceConfig(
+            val pm = pluginHost.packageManager()
+            val cfg = pm.getInstanceConfig(instanceId)
+            pm.updateInstanceConfig(
                 instanceId = instanceId,
                 displayName = newName.trim(),
                 config = cfg,
@@ -251,6 +278,12 @@ class WallModel(app: Application) : AndroidViewModel(app) {
         WallDatabase.get(getApplication()).progress().recent(200).mapLatest { rows ->
             rows.asSequence().filter { it.sourceId == sourceId }.associateBy { it.itemId }
         }
+
+    suspend fun clearProgress(sourceId: String, itemId: String) {
+        withContext(Dispatchers.IO) {
+            WallDatabase.get(getApplication()).progress().delete(sourceId, itemId)
+        }
+    }
 
     /**
      * Saves a WebDAV server after checking that it answers, so a wrong
@@ -269,28 +302,178 @@ class WallModel(app: Application) : AndroidViewModel(app) {
 
     fun savedWebDav(): WebDav.Server? = WebDav.load(getApplication())
 
-    // Newest first; an item whose source is gone or whose file was deleted is
-    // dropped rather than shown as a card that cannot play. ItemNotFound cleans
-    // up the stale WatchProgress row per plugin-host-integration.md §3.2.
-    private suspend fun resolve(rows: List<WatchProgress>, srcs: List<MediaSource>): List<Resume> {
-        val progressDao = WallDatabase.get(getApplication()).progress()
-        return rows.filter { it.resumable }.mapNotNull { p ->
-            val src = srcs.firstOrNull { it.source.id == p.sourceId } ?: return@mapNotNull null
-            try {
-                val item = pluginManager.runWithConcurrencyLimit(src.source.kind) {
-                    src.detail(p.itemId)
+    private fun snapshotCachedShelfItems(): Map<Pair<String, String>, Item> {
+        val out = HashMap<Pair<String, String>, Item>()
+        for ((sourceId, load) in shelves) {
+            val list = (load as? Load.Ready)?.value ?: continue
+            for (shelf in list) {
+                for (item in shelf.items) {
+                    out[sourceId to item.id] = item
                 }
-                Resume(src, item, p)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: ItemNotFoundException) {
-                runCatching {
-                    withContext(Dispatchers.IO) { progressDao.delete(p.sourceId, p.itemId) }
-                }
-                null
-            } catch (_: Exception) {
-                null
             }
-        }.take(12)
+        }
+        return out
+    }
+}
+
+/**
+ * Two-phase parallel resolver for 继续观看 (#4):
+ * 1. Emits immediate cards from [WatchProgress] (reusing any already-loaded shelf item metadata
+ *    when cached, or title/duration from Room) so Home never spins waiting on offline/slow plugins.
+ * 2. Resolves `src.detail(itemId)` concurrently per source with a per-item timeout
+ *    ([perItemTimeoutMs]), bounded for plugins via [runForSource], deleting stale rows on
+ *    [ItemNotFoundException], and stopping as soon as the top [limit] non-dropped items settle.
+ *
+ * Note: `WatchProgress` (WallDatabase v2) stores `title` and `durationMs` without an artwork
+ * column; cover art is reused from in-memory shelf cache when present and otherwise enriched
+ * asynchronously from `detail()`.
+ */
+object ContinueWatchingResolver {
+    const val DEFAULT_LIMIT = 12
+    const val DEFAULT_PER_ITEM_TIMEOUT_MS = 3_500L
+
+    private sealed interface EntryState {
+        data class Pending(val resume: Resume) : EntryState
+        data class Resolved(val resume: Resume) : EntryState
+        data class Fallback(val resume: Resume) : EntryState
+        data object Dropped : EntryState
+    }
+
+    fun resolveFlow(
+        rows: List<WatchProgress>,
+        sources: List<MediaSource>,
+        cachedItems: Map<Pair<String, String>, Item> = emptyMap(),
+        runForSource: suspend (SourceKind, suspend () -> Item) -> Item = { _, block -> block() },
+        onItemNotFound: suspend (WatchProgress) -> Unit = {},
+        perItemTimeoutMs: Long = DEFAULT_PER_ITEM_TIMEOUT_MS,
+        limit: Int = DEFAULT_LIMIT,
+    ): Flow<List<Resume>> = channelFlow {
+        val srcById = sources.associateBy { it.source.id }
+        val candidates = rows.mapNotNull { p ->
+            if (!p.resumable) return@mapNotNull null
+            val src = srcById[p.sourceId] ?: return@mapNotNull null
+            src to p
+        }
+        if (candidates.isEmpty()) {
+            send(emptyList())
+            return@channelFlow
+        }
+
+        val stateMutex = Mutex()
+        val states = Array<EntryState>(candidates.size) { idx ->
+            val (src, p) = candidates[idx]
+            val cached = cachedItems[p.sourceId to p.itemId]
+            val initialItem = cached ?: Item(
+                id = p.itemId,
+                kind = ItemKind.VIDEO,
+                title = p.title.ifBlank { p.itemId },
+                durationMs = p.durationMs.takeIf { it > 0L },
+            )
+            EntryState.Pending(Resume(src, initialItem, p))
+        }
+
+        fun visibleLocked(): List<Resume> {
+            val out = ArrayList<Resume>(limit)
+            for (st in states) {
+                if (out.size >= limit) break
+                when (st) {
+                    is EntryState.Pending -> out += st.resume
+                    is EntryState.Resolved -> out += st.resume
+                    is EntryState.Fallback -> out += st.resume
+                    EntryState.Dropped -> Unit
+                }
+            }
+            return out
+        }
+
+        fun settledBeforeLocked(index: Int): Int {
+            var count = 0
+            for (i in 0 until index) {
+                when (states[i]) {
+                    is EntryState.Resolved, is EntryState.Fallback -> count++
+                    is EntryState.Pending, EntryState.Dropped -> Unit
+                }
+            }
+            return count
+        }
+
+        fun topSettledLocked(): Boolean {
+            var kept = 0
+            for (st in states) {
+                when (st) {
+                    is EntryState.Pending -> return false
+                    is EntryState.Resolved, is EntryState.Fallback -> {
+                        kept++
+                        if (kept >= limit) return true
+                    }
+                    EntryState.Dropped -> Unit
+                }
+            }
+            return true
+        }
+
+        // Phase 1: emit immediate cards from WatchProgress + shelf cache with zero network wait
+        var lastSent = stateMutex.withLock { visibleLocked() }
+        send(lastSent)
+
+        // Phase 2: resolve details concurrently per source with per-item timeout; stop once top [limit] settle
+        val indicesBySource = LinkedHashMap<String, MutableList<Int>>()
+        candidates.forEachIndexed { idx, (src, _) ->
+            indicesBySource.getOrPut(src.source.id) { ArrayList() }.add(idx)
+        }
+
+        val workersJob = Job(coroutineContext[Job])
+        val workers = indicesBySource.values.map { indices ->
+            launch(workersJob) {
+                for (idx in indices) {
+                    val skip = stateMutex.withLock {
+                        topSettledLocked() || settledBeforeLocked(idx) >= limit
+                    }
+                    if (skip) break
+                    val (src, p) = candidates[idx]
+                    val outcome: EntryState = try {
+                        val detailed = withTimeoutOrNull(perItemTimeoutMs) {
+                            runForSource(src.source.kind) { src.detail(p.itemId) }
+                        }
+                        if (detailed != null) {
+                            EntryState.Resolved(Resume(src, detailed, p))
+                        } else {
+                            val prev = (states[idx] as? EntryState.Pending)?.resume
+                                ?: Resume(src, Item(p.itemId, ItemKind.VIDEO, p.title.ifBlank { p.itemId }), p)
+                            EntryState.Fallback(prev)
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: ItemNotFoundException) {
+                        runCatching { onItemNotFound(p) }
+                        EntryState.Dropped
+                    } catch (_: Exception) {
+                        val prev = (states[idx] as? EntryState.Pending)?.resume
+                            ?: Resume(src, Item(p.itemId, ItemKind.VIDEO, p.title.ifBlank { p.itemId }), p)
+                        EntryState.Fallback(prev)
+                    }
+
+                    var toEmit: List<Resume>? = null
+                    var allTopDone = false
+                    stateMutex.withLock {
+                        states[idx] = outcome
+                        val nowVisible = visibleLocked()
+                        if (nowVisible != lastSent) {
+                            lastSent = nowVisible
+                            toEmit = nowVisible
+                        }
+                        allTopDone = topSettledLocked()
+                    }
+                    if (toEmit != null) {
+                        send(toEmit!!)
+                    }
+                    if (allTopDone) {
+                        workersJob.cancel()
+                        break
+                    }
+                }
+            }
+        }
+        workers.forEach { it.join() }
     }
 }

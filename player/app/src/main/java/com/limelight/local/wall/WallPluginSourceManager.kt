@@ -109,6 +109,7 @@ class WallPluginSourceManager(
     suspend fun reconcile(
         packages: List<InstalledPluginEntity>,
         instances: List<PluginInstanceEntity>,
+        pendingInstanceIds: Set<String> = emptySet(),
     ): ReconcileResult = reconcileMutex.withLock {
         val pkgsById = packages.associateBy { it.pluginId }
         val desired = ArrayList<Pair<String, InstanceSignature>>()
@@ -116,6 +117,7 @@ class WallPluginSourceManager(
 
         for (inst in instances) {
             instanceToPluginId[inst.instanceId] = inst.pluginId
+            if (inst.instanceId in pendingInstanceIds) continue
             val pkg = pkgsById[inst.pluginId] ?: continue
             if (!pkg.enabled || !inst.enabled) continue
             val sourceId = PluginMediaSource.sourceIdFor(inst.instanceId)

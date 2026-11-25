@@ -234,7 +234,11 @@ private fun ShelfRow(src: MediaSource, shelf: Shelf, nav: WallNav) {
 
 @Composable
 private fun FailedRow(src: MediaSource, error: Throwable, model: WallModel, nav: WallNav) {
-    val presentation = rememberErrorPresentation(error, src)
+    val presentation = rememberErrorPresentation(
+        error = error,
+        source = src,
+        needsPermissionReconfirm = model.needsPermissionReconfirm(src),
+    )
     Row(
         Modifier.padding(start = Wall.Margin, end = Wall.Margin, top = 44.dp),
         verticalAlignment = Alignment.CenterVertically,

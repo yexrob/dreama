@@ -167,7 +167,7 @@ fun LibraryScreen(model: WallModel, nav: WallNav) {
             }
             Box(Modifier.offset(488.dp, 240.dp).width(728.dp)) {
                 CompositionLocalProvider(LocalMediaSource provides selected) {
-                    FolderPane(selected, listing, nav)
+                    FolderPane(selected, listing, model, nav)
                 }
             }
         }
@@ -176,10 +176,10 @@ fun LibraryScreen(model: WallModel, nav: WallNav) {
 }
 
 @Composable
-private fun FolderPane(src: MediaSource, listing: Listing, nav: WallNav) {
+private fun FolderPane(src: MediaSource, listing: Listing, model: WallModel, nav: WallNav) {
     val error = listing.error
     when {
-        error != null && listing.items.isEmpty() -> SourceProblem(src, error, nav) { retry(listing) }
+        error != null && listing.items.isEmpty() -> SourceProblem(src, error, model, nav) { retry(listing) }
         listing.items.isEmpty() && listing.next != null -> LazyVerticalGrid(GridCells.Fixed(3),
             horizontalArrangement = Arrangement.spacedBy(24.dp), verticalArrangement = Arrangement.spacedBy(24.dp),
             userScrollEnabled = false) {
@@ -202,8 +202,12 @@ private fun FolderPane(src: MediaSource, listing: Listing, nav: WallNav) {
 
 /** Says what happened and gives one thing to do about it; no error codes (library.html, offline, §3.2). */
 @Composable
-private fun SourceProblem(src: MediaSource, error: Throwable, nav: WallNav, retry: () -> Unit) {
-    val presentation = rememberErrorPresentation(error, src)
+private fun SourceProblem(src: MediaSource, error: Throwable, model: WallModel, nav: WallNav, retry: () -> Unit) {
+    val presentation = rememberErrorPresentation(
+        error = error,
+        source = src,
+        needsPermissionReconfirm = model.needsPermissionReconfirm(src),
+    )
     Column(Modifier.width(660.dp)) {
         Icon(WallIcons.Alert, null, Modifier.size(48.dp), tint = if (presentation.danger) Wall.Danger else Wall.Text2)
         Text(
@@ -263,7 +267,7 @@ fun GridScreen(model: WallModel, nav: WallNav, page: Page.Grid) {
             when {
                 src == null -> Box(Modifier.offset(64.dp, 160.dp)) { Notice(stringResource(R.string.library_source_missing)) }
                 error != null && listing.items.isEmpty() -> Box(Modifier.offset(64.dp, 160.dp)) {
-                    SourceProblem(src, error, nav) { retry(listing) }
+                    SourceProblem(src, error, model, nav) { retry(listing) }
                 }
                 listing.items.isEmpty() && listing.next != null -> Row(Modifier.offset(64.dp, 128.dp),
                     horizontalArrangement = Arrangement.spacedBy(24.dp)) {

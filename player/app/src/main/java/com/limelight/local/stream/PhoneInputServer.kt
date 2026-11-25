@@ -627,6 +627,7 @@ class PhoneFormServer(
     private val requestDeadlineMs: Long = 3_000L,
     private val onProgress: (PhoneFormProgress) -> Unit = {},
     private val onLockedOut: () -> Unit = {},
+    private val onAcceptedFlushed: () -> Unit = {},
     private val onSubmitted: (Map<String, String>) -> PhoneSubmitResult,
 ) : Closeable {
     private val closed = AtomicBoolean(false)
@@ -809,24 +810,12 @@ class PhoneFormServer(
                     isCodePath -> submittedCode.isNotEmpty() && PhoneInputServer.constantTimeEquals(submittedCode, code)
                     else -> false
                 }
-                if (!authorized) {
-                    val tries = failedAttempts.incrementAndGet()
-                    if (tries >= PhoneInputServer.MAX_FAILED_ATTEMPTS) {
-                        LimeLog.warning("depth3d: phone form locked out after $tries failed attempts")
-                        writeHtml(out, 403, "Forbidden", renderFormHtml(hiddenToken = null, preserved = emptyMap(), error = copy.errLockedOut))
-                        close()
-                        onLockedOut()
-                    } else {
-                        writeHtml(out, 403, "Forbidden", renderFormHtml(hiddenToken = null, preserved = emptyMap(), error = copy.errWrongCode))
-                    }
-                    return
-                }
 
-                val keepToken = if (isQrPath) submittedToken else null
+                // Extract ONLY non-password fields upfront so a wrong verification code preserves
+                // what the user typed without ever echoing passwords (#14).
                 val values = LinkedHashMap<String, String>()
                 val safeNonSecret = LinkedHashMap<String, String>()
                 var missingRequired = false
-
                 for (field in fields) {
                     val raw = when (field.kind) {
                         PhoneFormFieldKind.TOGGLE -> if (params["f_${field.key}"] == "true") "true" else "false"
@@ -842,6 +831,21 @@ class PhoneFormServer(
                     }
                 }
 
+                if (!authorized) {
+                    val tries = failedAttempts.incrementAndGet()
+                    if (tries >= PhoneInputServer.MAX_FAILED_ATTEMPTS) {
+                        LimeLog.warning("depth3d: phone form locked out after $tries failed attempts")
+                        writeHtml(out, 403, "Forbidden", renderFormHtml(hiddenToken = null, preserved = emptyMap(), error = copy.errLockedOut))
+                        close()
+                        onLockedOut()
+                    } else {
+                        writeHtml(out, 403, "Forbidden", renderFormHtml(hiddenToken = null, preserved = safeNonSecret, error = copy.errWrongCode))
+                    }
+                    return
+                }
+
+                val keepToken = if (isQrPath) submittedToken else null
+
                 if (missingRequired) {
                     writeHtml(out, 400, "Bad Request", renderFormHtml(hiddenToken = keepToken, preserved = safeNonSecret, error = copy.errRequired))
                     return
@@ -854,6 +858,7 @@ class PhoneFormServer(
                             it.kind != PhoneFormFieldKind.PASSWORD && !safeNonSecret[it.key].isNullOrBlank()
                         }?.let { safeNonSecret[it.key] }.orEmpty()
                         writeHtml(out, 200, "OK", renderDoneHtml(summary))
+                        runCatching { onAcceptedFlushed() }
                     }
                     is PhoneSubmitResult.Rejected -> {
                         // Re-render with ONLY non-password fields preserved; passwords are always blank

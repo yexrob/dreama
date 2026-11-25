@@ -34,6 +34,13 @@ data class SeriesPlayTarget(
     val isResume: Boolean,
 )
 
+/** Cross-season default selection resolved when opening a Series detail screen (#5). */
+data class SeriesInitialResolution(
+    val seasonId: String,
+    val seasonNumber: Int?,
+    val target: SeriesPlayTarget?,
+)
+
 /**
  * Pure, JVM-testable helper logic for movie & series detail screens (`movie.html` & `series.html`):
  * - Classifying series vs movie layout
@@ -132,6 +139,261 @@ object DetailStateLogic {
             resumePositionMs = 0L,
             isResume = false,
         )
+    }
+
+    /**
+     * Resolves the initial default season tab and primary CTA target across ALL seasons of a
+     * series (#5):
+     * 1. Inspects local [WatchProgress] (newest `updatedAt` first) to find the most recently
+     *    watched episode belonging to this series (preloaded episodes -> `detail(epId).parentId`
+     *    fast path -> season episode list scan fallback).
+     * 2. If that episode is [WatchState.InProgress]: selects its season and resumes that episode.
+     * 3. If that episode is [WatchState.Watched]: advances to the next episode in the same season,
+     *    or rolls over to episode 1 of the NEXT season if it was the last episode of its season
+     *    (keeping `isResume = true` so the primary CTA reads "继续播放 · 第 (X+1) 季第 1 集" and
+     *    matches the default selected season tab).
+     * 4. If no watch record exists for any season: selects the first season and delegates to
+     *    [pickPlayTarget] (which falls back to S1E1).
+     */
+    suspend fun resolveInitialSeriesSeasonAndTarget(
+        source: MediaSource,
+        seasons: List<Item>,
+        localProgress: Map<String, WatchProgress>,
+        loadSeasonEpisodes: suspend (seasonId: String) -> List<Item>,
+        loadMoreInSeason: (suspend (seasonId: String) -> List<Item>)? = null,
+    ): SeriesInitialResolution? {
+        if (seasons.isEmpty()) return null
+
+        fun seasonNumberAt(idx: Int): Int = seasons[idx].index?.takeIf { it > 0 } ?: (idx + 1)
+
+        val seasonIndexById = seasons.withIndex().associate { (i, s) -> s.id to i }
+        val localSorted = localProgress.values.sortedByDescending { it.updatedAt }
+
+        var matchedSeasonIdx: Int? = null
+        var matchedEpisodeId: String? = null
+        var matchedProgress: WatchProgress? = null
+
+        if (localSorted.isNotEmpty()) {
+            // Fast path 1: check preloaded episodes already attached to season items
+            var bestTs = Long.MIN_VALUE
+            for ((sIdx, season) in seasons.withIndex()) {
+                for (ep in season.episodes) {
+                    val prog = localProgress[ep.id] ?: continue
+                    if (prog.updatedAt > bestTs) {
+                        bestTs = prog.updatedAt
+                        matchedSeasonIdx = sIdx
+                        matchedEpisodeId = ep.id
+                        matchedProgress = prog
+                    }
+                }
+            }
+
+            // Fast path 2: inspect `detail(epId).parentId` on the newest local progress entries
+            if (matchedSeasonIdx == null) {
+                for (entry in localSorted.take(8)) {
+                    val detailItem = try {
+                        source.detail(entry.itemId)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        null
+                    }
+                    val idx = detailItem?.parentId?.let { seasonIndexById[it] }
+                    if (idx != null) {
+                        matchedSeasonIdx = idx
+                        matchedEpisodeId = entry.itemId
+                        matchedProgress = entry
+                        break
+                    }
+                }
+            }
+
+            // Fallback path: scan seasons' episodes to locate the most recently watched episode
+            if (matchedSeasonIdx == null) {
+                var fallbackTs = Long.MIN_VALUE
+                for ((sIdx, season) in seasons.withIndex()) {
+                    val eps = try {
+                        loadSeasonEpisodes(season.id)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
+                    for (ep in eps) {
+                        val prog = localProgress[ep.id] ?: continue
+                        if (prog.updatedAt > fallbackTs) {
+                            fallbackTs = prog.updatedAt
+                            matchedSeasonIdx = sIdx
+                            matchedEpisodeId = ep.id
+                            matchedProgress = prog
+                        }
+                    }
+                }
+            }
+        }
+
+        if (matchedSeasonIdx == null || matchedEpisodeId == null) {
+            val firstSeason = seasons.first()
+            val eps = try {
+                loadSeasonEpisodes(firstSeason.id)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                emptyList()
+            }
+            return SeriesInitialResolution(
+                seasonId = firstSeason.id,
+                seasonNumber = seasonNumberAt(0),
+                target = pickPlayTarget(seasonNumberAt(0), eps, localProgress),
+            )
+        }
+
+        val sIdx = matchedSeasonIdx
+        val season = seasons[sIdx]
+        val seasonNum = seasonNumberAt(sIdx)
+        var episodes = try {
+            loadSeasonEpisodes(season.id)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            emptyList()
+        }
+        var epIdx = episodes.indexOfFirst { it.id == matchedEpisodeId }
+        while (epIdx < 0 && loadMoreInSeason != null) {
+            val expanded = try {
+                loadMoreInSeason(season.id)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                break
+            }
+            if (expanded.size <= episodes.size) break
+            episodes = expanded
+            epIdx = episodes.indexOfFirst { it.id == matchedEpisodeId }
+        }
+        if (epIdx < 0) {
+            return SeriesInitialResolution(
+                seasonId = season.id,
+                seasonNumber = seasonNum,
+                target = pickPlayTarget(seasonNum, episodes, localProgress),
+            )
+        }
+
+        val ep = episodes[epIdx]
+        val watchState = computeWatchState(ep, matchedProgress)
+        return when (watchState) {
+            is WatchState.InProgress -> SeriesInitialResolution(
+                seasonId = season.id,
+                seasonNumber = seasonNum,
+                target = SeriesPlayTarget(
+                    seasonNumber = seasonNum,
+                    episodeNumber = ep.index?.takeIf { it > 0 } ?: (epIdx + 1),
+                    episode = ep,
+                    resumePositionMs = watchState.positionMs,
+                    isResume = true,
+                ),
+            )
+            WatchState.Watched -> {
+                if (epIdx == episodes.lastIndex && loadMoreInSeason != null) {
+                    val expanded = try {
+                        loadMoreInSeason(season.id)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        episodes
+                    }
+                    if (expanded.size > episodes.size) {
+                        episodes = expanded
+                    }
+                }
+                if (epIdx + 1 < episodes.size) {
+                    val nextEp = episodes[epIdx + 1]
+                    SeriesInitialResolution(
+                        seasonId = season.id,
+                        seasonNumber = seasonNum,
+                        target = SeriesPlayTarget(
+                            seasonNumber = seasonNum,
+                            episodeNumber = nextEp.index?.takeIf { it > 0 } ?: (epIdx + 2),
+                            episode = nextEp,
+                            resumePositionMs = 0L,
+                            isResume = true,
+                        ),
+                    )
+                } else if (sIdx + 1 < seasons.size) {
+                    val nextSeasonIdx = sIdx + 1
+                    val nextSeason = seasons[nextSeasonIdx]
+                    val nextSeasonNum = seasonNumberAt(nextSeasonIdx)
+                    val nextSeasonEps = try {
+                        loadSeasonEpisodes(nextSeason.id)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
+                    val nextEp = nextSeasonEps.firstOrNull()
+                    SeriesInitialResolution(
+                        seasonId = nextSeason.id,
+                        seasonNumber = nextSeasonNum,
+                        target = nextEp?.let {
+                            SeriesPlayTarget(
+                                seasonNumber = nextSeasonNum,
+                                episodeNumber = it.index?.takeIf { n -> n > 0 } ?: 1,
+                                episode = it,
+                                resumePositionMs = 0L,
+                                isResume = true,
+                            )
+                        },
+                    )
+                } else {
+                    val firstSeason = seasons.first()
+                    val firstEps = if (sIdx == 0) episodes else try {
+                        loadSeasonEpisodes(firstSeason.id)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
+                    val firstEp = firstEps.firstOrNull()
+                    SeriesInitialResolution(
+                        seasonId = firstSeason.id,
+                        seasonNumber = seasonNumberAt(0),
+                        target = firstEp?.let {
+                            SeriesPlayTarget(
+                                seasonNumber = seasonNumberAt(0),
+                                episodeNumber = it.index?.takeIf { n -> n > 0 } ?: 1,
+                                episode = it,
+                                resumePositionMs = 0L,
+                                isResume = false,
+                            )
+                        },
+                    )
+                }
+            }
+            WatchState.Unwatched -> SeriesInitialResolution(
+                seasonId = season.id,
+                seasonNumber = seasonNum,
+                target = pickPlayTarget(seasonNum, episodes, localProgress),
+            )
+        }
+    }
+
+    /**
+     * Applies a mark-played / unmark-played toggle (#16):
+     * - When marking played (`nextPlayed == true`): invokes [clearLocalProgress] and clears
+     *   in-memory `progressMs` so the CTA immediately switches from 「继续播放」 to 「播放」.
+     * - When unmarking played (`nextPlayed == false`): does NOT restore previously deleted progress.
+     */
+    suspend fun applyPlayedToggle(
+        item: Item,
+        nextPlayed: Boolean,
+        setRemotePlayed: suspend (Boolean) -> Unit,
+        clearLocalProgress: suspend () -> Unit,
+    ): Item {
+        setRemotePlayed(nextPlayed)
+        if (nextPlayed) {
+            clearLocalProgress()
+        }
+        return item.copy(played = nextPlayed, progressMs = null)
     }
 
     /**
@@ -260,8 +522,9 @@ class SeasonEpisodeLoader(
     private val source: MediaSource,
     private val seasonId: String,
     preloadedEpisodes: List<Item> = emptyList(),
+    private val isPreloadedOnly: Boolean = false,
 ) {
-    var state: SeasonEpisodePageState = if (preloadedEpisodes.isNotEmpty()) {
+    var state: SeasonEpisodePageState = if (isPreloadedOnly || preloadedEpisodes.isNotEmpty()) {
         SeasonEpisodePageState(
             items = preloadedEpisodes,
             nextPage = null,
@@ -313,6 +576,53 @@ class SeasonEpisodeLoader(
     }
 
     fun resetForRetry() {
-        state = SeasonEpisodePageState()
+        if (!isPreloadedOnly) {
+            state = SeasonEpisodePageState()
+        }
+    }
+}
+
+/**
+ * Coordinates per-season [SeasonEpisodeLoader] instances for a Series / multi-part detail screen (#8):
+ * - Never creates loaders or sends `browse()` while `loadingDetail == true`.
+ * - For seasonless multi-part items (`hasSeasons == false`), replaces the loader whenever
+ *   [preloadedEpisodes] changes and marks it `isPreloadedOnly = true` so no bogus `browse()` is sent.
+ */
+class SeriesLoaderCoordinator(
+    private val source: MediaSource,
+) {
+    private val loaders = LinkedHashMap<String, SeasonEpisodeLoader>()
+    private var lastDirectEpisodeIds: List<String>? = null
+
+    fun loaderFor(
+        seasonId: String,
+        hasSeasons: Boolean,
+        loadingDetail: Boolean,
+        preloadedEpisodes: List<Item>,
+    ): SeasonEpisodeLoader? {
+        if (loadingDetail) return null
+        if (!hasSeasons) {
+            val ids = preloadedEpisodes.map { it.id }
+            val existing = loaders[seasonId]
+            if (existing == null || lastDirectEpisodeIds != ids) {
+                lastDirectEpisodeIds = ids
+                val fresh = SeasonEpisodeLoader(
+                    source = source,
+                    seasonId = seasonId,
+                    preloadedEpisodes = preloadedEpisodes,
+                    isPreloadedOnly = true,
+                )
+                loaders[seasonId] = fresh
+                return fresh
+            }
+            return existing
+        }
+        return loaders.getOrPut(seasonId) { SeasonEpisodeLoader(source, seasonId) }
+    }
+
+    fun existingLoader(seasonId: String): SeasonEpisodeLoader? = loaders[seasonId]
+
+    fun reset(seasonId: String) {
+        loaders[seasonId]?.resetForRetry()
     }
 }

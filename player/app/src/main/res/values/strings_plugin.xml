@@ -80,6 +80,7 @@
     <string name="series_play_ep">播放 · 第 %1$d 集</string>
     <string name="series_episode_watched">已看完</string>
     <string name="series_episodes_empty">这一季暂无可播放剧集。</string>
+    <string name="series_episodes_page_error_retry">加载失败，点此重试</string>
 
     <!-- Phone input: plugin repository URL & multi-field form mode -->
     <string name="phone_html_repo_page_title">depth3d · 添加插件仓库</string>

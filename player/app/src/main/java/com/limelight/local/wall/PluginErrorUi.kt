@@ -86,6 +86,7 @@ object SourceErrorDispatcher {
         sourceName: String,
         strings: StringLookup,
         inPlaybackContext: Boolean = false,
+        needsPermissionReconfirm: Boolean = false,
     ): SourceErrorPresentation = when (error) {
         is SourceNeedsAuthException -> SourceErrorPresentation(
             message = safeUserMessage(error.message, strings.get(R.string.plugin_error_needs_auth)),
@@ -108,7 +109,7 @@ object SourceErrorDispatcher {
 
         is SourceNeedsSetupException -> {
             val msg = safeUserMessage(error.message, strings.get(R.string.plugin_error_needs_setup))
-            val isPermReconfirm = msg.contains("权限") && sourceKind == SourceKind.PLUGIN
+            val isPermReconfirm = needsPermissionReconfirm && sourceKind == SourceKind.PLUGIN
             val primary = when (sourceKind) {
                 SourceKind.LOCAL -> SourceErrorAction(
                     kind = SourceErrorActionKind.REQUEST_STORAGE,
@@ -263,16 +264,25 @@ fun rememberErrorPresentation(
     error: Throwable,
     source: MediaSource,
     inPlaybackContext: Boolean = false,
+    needsPermissionReconfirm: Boolean = false,
 ): SourceErrorPresentation {
     val context = LocalContext.current
     val strings = remember(context) { AndroidStringLookup(context) }
-    return remember(error, source.source.id, source.source.kind, source.source.name, inPlaybackContext) {
+    return remember(
+        error,
+        source.source.id,
+        source.source.kind,
+        source.source.name,
+        inPlaybackContext,
+        needsPermissionReconfirm,
+    ) {
         SourceErrorDispatcher.dispatch(
             error = error,
             sourceKind = source.source.kind,
             sourceName = source.source.name,
             strings = strings,
             inPlaybackContext = inPlaybackContext,
+            needsPermissionReconfirm = needsPermissionReconfirm,
         )
     }
 }

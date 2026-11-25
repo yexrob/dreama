@@ -141,6 +141,7 @@ fun DetailScreen(model: WallModel, nav: WallNav, page: Page.Detail) {
                     sourceKind = pluginSrc.source.kind,
                     sourceName = pluginSrc.source.name,
                     strings = strings,
+                    needsPermissionReconfirm = model.needsPermissionReconfirm(pluginSrc),
                 ).message
             } finally {
                 favoriteBusy = false
@@ -152,26 +153,33 @@ fun DetailScreen(model: WallModel, nav: WallNav, page: Page.Detail) {
         val pluginSrc = src as? PluginMediaSource ?: return
         if (playedBusy) return
         val prev = item.played == true
+        val prevProgressMs = item.progressMs
         val next = !prev
         playedBusy = true
         actionNotice = null
-        detailed = item.copy(played = next)
+        detailed = item.copy(played = next, progressMs = if (next) null else prevProgressMs)
         scope.launch {
             try {
-                pluginSrc.setPlayed(item.id, next)
+                detailed = DetailStateLogic.applyPlayedToggle(
+                    item = item,
+                    nextPlayed = next,
+                    setRemotePlayed = { played -> pluginSrc.setPlayed(item.id, played) },
+                    clearLocalProgress = { model.clearProgress(pluginSrc.source.id, item.id) },
+                )
                 actionNotice = context.getString(
                     if (next) R.string.detail_played_marked else R.string.detail_played_unmarked,
                 )
             } catch (e: CancellationException) {
-                detailed = item.copy(played = prev)
+                detailed = item.copy(played = prev, progressMs = prevProgressMs)
                 throw e
             } catch (e: Exception) {
-                detailed = item.copy(played = prev)
+                detailed = item.copy(played = prev, progressMs = prevProgressMs)
                 actionNotice = SourceErrorDispatcher.dispatch(
                     error = e,
                     sourceKind = pluginSrc.source.kind,
                     sourceName = pluginSrc.source.name,
                     strings = strings,
+                    needsPermissionReconfirm = model.needsPermissionReconfirm(pluginSrc),
                 ).message
             } finally {
                 playedBusy = false
@@ -403,7 +411,11 @@ private fun MovieDetailContent(
             }
 
             if (detailError != null && source != null) {
-                val presentation = rememberErrorPresentation(detailError, source)
+                val presentation = rememberErrorPresentation(
+                    error = detailError,
+                    source = source,
+                    needsPermissionReconfirm = model.needsPermissionReconfirm(source),
+                )
                 Row(
                     Modifier.padding(top = 20.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -486,23 +498,76 @@ private fun SeriesDetailContent(
 ) {
     val seasons = item.seasons
     val hasSeasons = seasons.isNotEmpty()
-    val localProgress by remember(source?.source?.id) {
+    val scope = rememberCoroutineScope()
+    val localProgressNullable by remember(source?.source?.id) {
         model.progressMapForSource(source?.source?.id.orEmpty())
-    }.collectAsState(emptyMap())
+    }.collectAsState(null)
+    val localProgress = localProgressNullable.orEmpty()
 
-    var selectedSeasonId by remember(item.id, seasons.size) {
+    var selectedSeasonId by remember(item.id) {
         mutableStateOf(seasons.firstOrNull()?.id ?: SERIES_DIRECT_SEASON_ID)
     }
-    LaunchedEffect(seasons) {
-        if (seasons.isNotEmpty() && seasons.none { it.id == selectedSeasonId }) {
-            selectedSeasonId = seasons.first().id
-        }
-    }
+    var userSelectedSeason by remember(item.id) { mutableStateOf(false) }
+    var initialResolution by remember(item.id) { mutableStateOf<SeriesInitialResolution?>(null) }
 
-    // Cache one SeasonEpisodeLoader per season so switching back is instant while new seasons load lazily
-    val loaders = remember(source?.source?.id, item.id) { mutableStateMapOf<String, SeasonEpisodeLoader>() }
+    // Cache one SeasonEpisodeLoader per season via SeriesLoaderCoordinator (#8):
+    // never creates a loader or triggers browse() before detail() completes, and replaces
+    // the direct-episodes loader whenever preloaded item.episodes updates.
+    val coordinator = remember(source?.source?.id, item.id) {
+        source?.let { SeriesLoaderCoordinator(it) }
+    }
     val pageStates = remember(source?.source?.id, item.id) { mutableStateMapOf<String, SeasonEpisodePageState>() }
     var episodeRetryToken by remember(item.id) { mutableIntStateOf(0) }
+
+    suspend fun ensureSeasonEpisodesLoaded(seasonId: String): List<Item> {
+        val coord = coordinator ?: return emptyList()
+        val loader = coord.loaderFor(
+            seasonId = seasonId,
+            hasSeasons = true,
+            loadingDetail = false,
+            preloadedEpisodes = emptyList(),
+        ) ?: return emptyList()
+        pageStates[seasonId] = loader.state
+        if (!loader.state.loadedOnce && loader.state.nextPage != null) {
+            pageStates[seasonId] = loader.state.copy(loading = true, error = null)
+            pageStates[seasonId] = loader.loadNextPage()
+        }
+        return loader.state.items
+    }
+
+    suspend fun loadMoreSeasonEpisodes(seasonId: String): List<Item> {
+        val loader = coordinator?.existingLoader(seasonId) ?: return emptyList()
+        if (loader.state.nextPage == null || loader.state.loading) return loader.state.items
+        pageStates[seasonId] = loader.state.copy(loading = true, error = null)
+        pageStates[seasonId] = loader.loadNextPage()
+        return loader.state.items
+    }
+
+    // Cross-season initial default season & play target (#5): resolves across ALL seasons
+    // using local WatchProgress once detail() and Room progress have loaded.
+    LaunchedEffect(source?.source?.id, item.id, seasons, loadingDetail, localProgressNullable) {
+        if (source == null || loadingDetail) return@LaunchedEffect
+        if (!hasSeasons) {
+            selectedSeasonId = SERIES_DIRECT_SEASON_ID
+            initialResolution = null
+            return@LaunchedEffect
+        }
+        val progressMap = localProgressNullable ?: return@LaunchedEffect
+        if (seasons.none { it.id == selectedSeasonId }) {
+            selectedSeasonId = seasons.first().id
+        }
+        val resolved = DetailStateLogic.resolveInitialSeriesSeasonAndTarget(
+            source = source,
+            seasons = seasons,
+            localProgress = progressMap,
+            loadSeasonEpisodes = { sid -> ensureSeasonEpisodesLoaded(sid) },
+            loadMoreInSeason = { sid -> loadMoreSeasonEpisodes(sid) },
+        )
+        initialResolution = resolved
+        if (resolved != null && !userSelectedSeason) {
+            selectedSeasonId = resolved.seasonId
+        }
+    }
 
     val activeSeasonIndex = remember(seasons, selectedSeasonId) {
         seasons.indexOfFirst { it.id == selectedSeasonId }.takeIf { it >= 0 }
@@ -513,13 +578,17 @@ private fun SeriesDetailContent(
         }
     }
 
-    LaunchedEffect(source?.source?.id, selectedSeasonId, item.episodes.size, episodeRetryToken) {
-        if (source == null) return@LaunchedEffect
-        val key = selectedSeasonId
-        val loader = loaders.getOrPut(key) {
-            val preloaded = if (!hasSeasons) item.episodes else emptyList()
-            SeasonEpisodeLoader(source, key, preloaded)
-        }
+    val directEpisodeIds = remember(item.episodes) { item.episodes.map { it.id } }
+    LaunchedEffect(source?.source?.id, selectedSeasonId, hasSeasons, loadingDetail, directEpisodeIds, episodeRetryToken) {
+        val coord = coordinator ?: return@LaunchedEffect
+        if (loadingDetail) return@LaunchedEffect
+        val key = if (hasSeasons) selectedSeasonId else SERIES_DIRECT_SEASON_ID
+        val loader = coord.loaderFor(
+            seasonId = key,
+            hasSeasons = hasSeasons,
+            loadingDetail = false,
+            preloadedEpisodes = if (!hasSeasons) item.episodes else emptyList(),
+        ) ?: return@LaunchedEffect
         pageStates[key] = loader.state
         if (!loader.state.loadedOnce && loader.state.nextPage != null) {
             pageStates[key] = loader.state.copy(loading = true, error = null)
@@ -527,19 +596,25 @@ private fun SeriesDetailContent(
         }
     }
 
-    val activeState = pageStates[selectedSeasonId] ?: SeasonEpisodePageState(loading = source != null)
+    val activeKey = if (hasSeasons) selectedSeasonId else SERIES_DIRECT_SEASON_ID
+    val activeState = pageStates[activeKey] ?: SeasonEpisodePageState(loading = source != null)
     val episodes = activeState.items
 
-    val playTarget = remember(activeSeasonNumber, episodes, localProgress) {
-        DetailStateLogic.pickPlayTarget(activeSeasonNumber, episodes, localProgress)
+    val playTarget = remember(activeKey, activeSeasonNumber, episodes, localProgress, initialResolution) {
+        val res = initialResolution
+        if (hasSeasons && res != null && res.seasonId == activeKey && res.target != null) {
+            res.target
+        } else {
+            DetailStateLogic.pickPlayTarget(activeSeasonNumber, episodes, localProgress)
+        }
     }
     val episodeRowState = rememberLazyListState()
 
     // Auto-scroll to the next episode with 1 watched episode to its left (series.html)
     var scrolledSeasonKey by remember(item.id) { mutableStateOf<String?>(null) }
-    LaunchedEffect(selectedSeasonId, episodes.isNotEmpty(), playTarget?.episode?.id) {
-        if (episodes.isNotEmpty() && scrolledSeasonKey != selectedSeasonId) {
-            scrolledSeasonKey = selectedSeasonId
+    LaunchedEffect(activeKey, episodes.isNotEmpty(), playTarget?.episode?.id) {
+        if (episodes.isNotEmpty() && scrolledSeasonKey != activeKey) {
+            scrolledSeasonKey = activeKey
             val targetIdx = DetailStateLogic.initialScrollIndex(episodes, playTarget?.episode?.id)
             if (targetIdx > 0) {
                 episodeRowState.scrollToItem(targetIdx)
@@ -557,18 +632,18 @@ private fun SeriesDetailContent(
             total > 0 && last >= total - 3
         }
     }
-    LaunchedEffect(selectedSeasonId, source?.source?.id) {
+    LaunchedEffect(activeKey, source?.source?.id) {
         snapshotFlow {
-            val st = pageStates[selectedSeasonId]
-            if (nearEnd && st != null && st.nextPage != null && !st.loading && st.items.isNotEmpty()) {
+            val st = pageStates[activeKey]
+            if (nearEnd && st != null && st.nextPage != null && !st.loading && st.error == null && st.items.isNotEmpty()) {
                 st.items.size
             } else {
                 -1
             }
         }.filter { it >= 0 }.collect {
-            val loader = loaders[selectedSeasonId] ?: return@collect
-            pageStates[selectedSeasonId] = loader.state.copy(loading = true, error = null)
-            pageStates[selectedSeasonId] = loader.loadNextPage()
+            val loader = coordinator?.existingLoader(activeKey) ?: return@collect
+            pageStates[activeKey] = loader.state.copy(loading = true, error = null)
+            pageStates[activeKey] = loader.loadNextPage()
         }
     }
 
@@ -684,7 +759,11 @@ private fun SeriesDetailContent(
             }
 
             if (detailError != null && source != null) {
-                val presentation = rememberErrorPresentation(detailError, source)
+                val presentation = rememberErrorPresentation(
+                    error = detailError,
+                    source = source,
+                    needsPermissionReconfirm = model.needsPermissionReconfirm(source),
+                )
                 Row(
                     Modifier.padding(top = 16.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -723,6 +802,7 @@ private fun SeriesDetailContent(
                         selected = season.id == selectedSeasonId,
                         onClick = {
                             if (selectedSeasonId != season.id) {
+                                userSelectedSeason = true
                                 selectedSeasonId = season.id
                             }
                         },
@@ -745,7 +825,11 @@ private fun SeriesDetailContent(
             when {
                 source == null -> Unit
                 epErr != null && episodes.isEmpty() -> {
-                    val presentation = rememberErrorPresentation(epErr, source)
+                    val presentation = rememberErrorPresentation(
+                        error = epErr,
+                        source = source,
+                        needsPermissionReconfirm = model.needsPermissionReconfirm(source),
+                    )
                     Row(
                         Modifier.padding(horizontal = Wall.Margin, vertical = 28.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -757,8 +841,8 @@ private fun SeriesDetailContent(
                             source = source,
                             nav = nav,
                             onRetry = {
-                                loaders[selectedSeasonId]?.resetForRetry()
-                                pageStates.remove(selectedSeasonId)
+                                coordinator?.reset(activeKey)
+                                pageStates.remove(activeKey)
                                 episodeRetryToken++
                             },
                             small = true,
@@ -826,9 +910,50 @@ private fun SeriesDetailContent(
                                     Skeleton(Modifier.size(140.dp, 26.dp), 12.dp)
                                 }
                             }
+                        } else if (epErr != null && episodes.isNotEmpty()) {
+                            item("load-more-error") {
+                                EpisodePageRetryCard(
+                                    label = stringResource(R.string.series_episodes_page_error_retry),
+                                    onClick = {
+                                        val loader = coordinator?.existingLoader(activeKey) ?: return@EpisodePageRetryCard
+                                        scope.launch {
+                                            pageStates[activeKey] = loader.state.copy(loading = true, error = null)
+                                            pageStates[activeKey] = loader.loadNextPage()
+                                        }
+                                    },
+                                )
+                            }
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun EpisodePageRetryCard(
+    label: String,
+    onClick: () -> Unit,
+) {
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by rememberRayHover(interaction)
+    Column(Modifier.width(264.dp).ray(interaction, onClick)) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .aspectRatio(16f / 9f)
+                .clip(EpisodeCardShape)
+                .background(if (hovered) Wall.FillHi else Wall.Surface),
+            contentAlignment = Alignment.Center,
+        ) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.padding(horizontal = 16.dp),
+            ) {
+                Icon(WallIcons.Refresh, null, Modifier.size(30.dp), tint = Wall.Danger)
+                Text(label, style = WallType.Caption, color = Wall.Text, maxLines = 2)
             }
         }
     }

@@ -129,8 +129,8 @@ class PluginWallStage1Test {
             rootDir = tempFolder.newFolder("plugins"),
             store = store,
             secretBox = SoftwareAesSecretBox(),
-            appVersion = PluginHost.normalizePluginAppVersion("12.1-xr0.4.3"),
-            deviceInfo = DeviceInfo.detect(PluginHost.normalizePluginAppVersion("12.1-xr0.4.3")),
+            appVersion = PLUGIN_HOST_VERSION,
+            deviceInfo = DeviceInfo.detect(PLUGIN_HOST_VERSION),
         )
     }
 
@@ -349,10 +349,11 @@ class PluginWallStage1Test {
         assertEquals(SourceErrorActionKind.CHECK_SETTINGS, setupWebDav.primary.kind)
 
         val setupPluginPerm = SourceErrorDispatcher.dispatch(
-            SourceNeedsSetupException("插件更新后申请了更多权限，请先重新确认后再使用。"),
+            SourceNeedsSetupException("插件更新后需要重新确认后再使用。"),
             SourceKind.PLUGIN,
             "Jellyfin",
             strings,
+            needsPermissionReconfirm = true,
         )
         assertEquals(SourceErrorActionKind.PLUGIN_SETUP, setupPluginPerm.primary.kind)
         assertTrue(setupPluginPerm.primary.label.contains("权限"))
@@ -445,9 +446,8 @@ class PluginWallStage1Test {
     }
 
     @Test
-    fun normalizePluginAppVersionProducesValidSemVer() {
-        assertEquals("1.0.0", PluginHost.normalizePluginAppVersion("12.1-xr0.4.3"))
-        assertEquals("1.0.0", PluginHost.normalizePluginAppVersion(null))
-        assertEquals("2.3.4", PluginHost.normalizePluginAppVersion("2.3.4"))
+    fun pluginHostVersionConstantIsExplicitValidSemVer() {
+        assertEquals("1.0.0", PLUGIN_HOST_VERSION)
+        assertNotNull(com.limelight.local.plugin.SemVer.parse(PLUGIN_HOST_VERSION))
     }
 }

@@ -111,6 +111,7 @@ public class LocalPlayerXR extends Activity
     private boolean held;
     private long castId;
     private long startMs;
+    private long lastKnownPositionMs;
     // The current item has been ready once; the session's surface is on the player
     private boolean ready;
     private boolean surfaceSet;
@@ -158,10 +159,7 @@ public class LocalPlayerXR extends Activity
         CastReceiver.hold(this);
         held = true;
 
-        DefaultTrackSelector trackSelector = new DefaultTrackSelector(this);
-        trackSelector.setParameters(trackSelector.buildUponParameters()
-                .setPreferredTextLanguage("zh")
-                .setSelectUndeterminedTextLanguage(true));
+        DefaultTrackSelector trackSelector = createTrackSelector(this);
 
         if (pluginMode) {
             // Plugin sources NEVER use DefaultHttpDataSource: every manifest, segment,
@@ -194,12 +192,29 @@ public class LocalPlayerXR extends Activity
         } else {
             load(getIntent());
         }
+        guardCastAttachment(sourceKind, castId);
         PlayerLink.attach(this, castId);
         main.post(barTick);
 
         final boolean cast = castId != 0;
         final String logLabel = pluginMode ? ("plugin:" + pluginArgs.getItemId()) : String.valueOf(uri);
         new Thread(() -> startSession(uri, cast, pluginMode, logLabel), "depth3d-start").start();
+    }
+
+    /** Creates the shared track selector preferring Chinese subtitle tracks across all sources. */
+    static DefaultTrackSelector createTrackSelector(Context context) {
+        DefaultTrackSelector trackSelector = new DefaultTrackSelector(context);
+        trackSelector.setParameters(trackSelector.buildUponParameters()
+                .setPreferredTextLanguage("zh")
+                .setSelectUndeterminedTextLanguage(true));
+        return trackSelector;
+    }
+
+    /** Enforces §1.4/§2.4: plugin playback may never attach to an active DLNA cast session. */
+    static void guardCastAttachment(SourceKind kind, long activeCastId) {
+        if (activeCastId != 0) {
+            PluginHostGuards.requireNonPluginCast(kind, null, null);
+        }
     }
 
     private void loadPlugin(PluginLaunchArgs args) {
@@ -209,6 +224,7 @@ public class LocalPlayerXR extends Activity
         }
         castId = 0;
         startMs = args.getStartMs();
+        lastKnownPositionMs = startMs;
         fallbackDurationMs = args.getDurationMs() != null ? args.getDurationMs() : 0L;
         ready = false;
         errored = false;
@@ -263,6 +279,7 @@ public class LocalPlayerXR extends Activity
         Uri uri = in.getData();
         castId = in.getLongExtra(EXTRA_CAST_ID, 0);
         startMs = in.getLongExtra(EXTRA_START_MS, 0);
+        lastKnownPositionMs = startMs;
         fallbackDurationMs = in.getLongExtra(EXTRA_DURATION_MS, 0);
         String auth = in.getStringExtra(EXTRA_AUTH);
         Map<String, String> h = Collections.emptyMap();
@@ -484,12 +501,19 @@ public class LocalPlayerXR extends Activity
         if (p == null) {
             return;
         }
+        long resumePos = PluginPlayerLaunch.computeRetryPositionMs(position(), lastKnownPositionMs, startMs);
         if (PluginHostGuards.isPluginSource(sourceKind)) {
-            loadPlugin(PluginPlayerLaunch.parseIntent(getIntent()));
+            PluginLaunchArgs parsed = PluginPlayerLaunch.parseIntent(getIntent());
+            loadPlugin(parsed != null ? PluginPlayerLaunch.withResumePosition(parsed, resumePos) : null);
         } else {
+            startMs = resumePos;
+            lastKnownPositionMs = resumePos;
             errored = false;
             errorReason = null;
             wantPlay = true;
+            if (resumePos > 0) {
+                p.seekTo(resumePos);
+            }
             p.prepare();
             if (ready && surfaceSet) {
                 p.setPlayWhenReady(true);
@@ -580,11 +604,16 @@ public class LocalPlayerXR extends Activity
 
         @Override
         public void onPlayerError(PlaybackException e) {
+            long curPos = position();
+            if (curPos > 0) {
+                lastKnownPositionMs = curPos;
+            }
             if (PluginHostGuards.isPluginSource(sourceKind) && pluginSession != null) {
                 Integer httpCode = PluginPlayerSession.extractHttpStatusCode(e);
+                long resumePos = PluginPlayerLaunch.computeRetryPositionMs(curPos, lastKnownPositionMs, startMs);
                 if (!refreshInFlight && pluginSession.canAttemptAutoRefresh(httpCode)) {
                     LimeLog.info("depth3d: refreshing plugin stream after HTTP " + httpCode);
-                    triggerPluginRefresh(position(), httpCode, e);
+                    triggerPluginRefresh(resumePos, httpCode, e);
                     return;
                 }
                 LimeLog.warning("depth3d: plugin playback error: " + e.getErrorCodeName());
@@ -676,6 +705,7 @@ public class LocalPlayerXR extends Activity
             load(intent);
         }
         if (old != next) {
+            guardCastAttachment(sourceKind, castId);
             PlayerLink.attach(this, castId);
         }
         checkShape = surfaceSet;
@@ -827,10 +857,12 @@ public class LocalPlayerXR extends Activity
         if (p == null) {
             return;
         }
+        long clamped = Math.max(0, ms);
+        lastKnownPositionMs = clamped;
         if (!ready) {
-            startMs = ms;
+            startMs = clamped;
         } else {
-            p.seekTo(Math.max(0, ms));
+            p.seekTo(clamped);
         }
         tickBar();
     }
@@ -889,10 +921,17 @@ public class LocalPlayerXR extends Activity
         }
         report();
         boolean on = playing();
+        if (ready && !errored && !refreshInFlight) {
+            long curPos = position();
+            if (curPos > 0) {
+                lastKnownPositionMs = curPos;
+            }
+        }
         if (PluginHostGuards.isPluginSource(sourceKind) && pluginSession != null && ready && !errored) {
             if (!refreshInFlight && pluginSession.shouldProactiveRefresh()) {
                 LimeLog.info("depth3d: proactively refreshing expiring plugin stream");
-                triggerPluginRefresh(position(), null, null);
+                long resumePos = PluginPlayerLaunch.computeRetryPositionMs(position(), lastKnownPositionMs, startMs);
+                triggerPluginRefresh(resumePos, null, null);
             }
             if (on) {
                 pluginSession.reportPeriodicIfDueAsync(position(), duration());
@@ -944,7 +983,9 @@ public class LocalPlayerXR extends Activity
             if (d > 0) {
                 to = Math.min(d - 1000, to);
             }
-            p.seekTo(Math.max(0, to));
+            long clamped = Math.max(0, to);
+            lastKnownPositionMs = clamped;
+            p.seekTo(clamped);
             pointerMovedMs = System.currentTimeMillis();
             tickBar();
         });

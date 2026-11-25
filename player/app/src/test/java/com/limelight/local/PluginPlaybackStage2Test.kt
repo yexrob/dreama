@@ -117,7 +117,7 @@ class PluginPlaybackStage2Test {
                   url: base + "/video-" + playbackCallCount + ".mp4",
                   headers: { "X-Secret-Token": "tok-" + playbackCallCount },
                   durationMs: 3600000,
-                  expiresAt: Date.now() + 120000,
+                  expiresAt: Date.now() + 120000 * playbackCallCount,
                   session: "sess-" + playbackCallCount,
                   qualities: [
                     { id: "1080p", label: "1080p", selected: true },
@@ -202,13 +202,14 @@ class PluginPlaybackStage2Test {
             // expected
         }
         try {
-            PluginPlayerLaunch.guardNonPluginCastOrExternalOpen(SourceKind.PLUGIN)
-            fail("Expected UnsupportedOperationException for plugin cast/external open")
+            LocalPlayerXR.guardCastAttachment(SourceKind.PLUGIN, 42L)
+            fail("Expected UnsupportedOperationException for plugin cast attachment")
         } catch (_: UnsupportedOperationException) {
             // expected
         }
-        // Non-plugin sources pass cleanly
-        PluginPlayerLaunch.guardNonPluginCastOrExternalOpen(SourceKind.LOCAL)
+        // Non-plugin sources and non-cast plugin playback pass cleanly
+        LocalPlayerXR.guardCastAttachment(SourceKind.LOCAL, 42L)
+        LocalPlayerXR.guardCastAttachment(SourceKind.PLUGIN, 0L)
         PluginHostGuards.requireNonPluginFrameProbe(SourceKind.WEBDAV, null, null)
     }
 
@@ -302,7 +303,7 @@ class PluginPlaybackStage2Test {
         // Mark playback ready resets error counter; test proactive expiresAt refresh
         session.markPlaybackReady()
         assertFalse(session.shouldProactiveRefresh())
-        clock.addAndGet(130_000L)
+        clock.addAndGet(190_000L)
         assertTrue(session.shouldProactiveRefresh())
         val refreshedExpired = session.refreshIfExpiredOrFailed(currentPositionMs = 150_000L, httpStatusCode = null)
         assertNotNull(refreshedExpired)

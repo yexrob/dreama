@@ -109,11 +109,25 @@ object PluginPlayerLaunch {
         )
     }
 
-    /** Enforces §1.4/§2.4: plugin items may never be forwarded to DLNA/AirPlay/external-open. */
+    /**
+     * Computes the resume position when the user clicks Retry after a mid-playback failure:
+     * prefers the player's current position if > 0, then the last observed playback position
+     * before failure, and finally falls back to the initial start position.
+     */
     @JvmStatic
-    fun guardNonPluginCastOrExternalOpen(sourceKind: SourceKind?) {
-        PluginHostGuards.requireNonPluginCast(sourceKind)
+    fun computeRetryPositionMs(
+        currentPlayerPosMs: Long,
+        lastKnownPositionMs: Long,
+        fallbackStartMs: Long,
+    ): Long = when {
+        currentPlayerPosMs > 0L -> currentPlayerPosMs
+        lastKnownPositionMs > 0L -> lastKnownPositionMs
+        else -> fallbackStartMs.coerceAtLeast(0L)
     }
+
+    @JvmStatic
+    fun withResumePosition(args: PluginLaunchArgs, resumePositionMs: Long): PluginLaunchArgs =
+        args.copy(startMs = resumePositionMs.coerceAtLeast(0L))
 }
 
 /**
@@ -170,7 +184,8 @@ class PluginPlayerSession(
 
     private val scope = CoroutineScope(SupervisorJob() + ioDispatcher)
     private val closed = AtomicBoolean(false)
-    private val consecutiveErrorRefreshes = AtomicInteger(0)
+    private val consecutiveRefreshes = AtomicInteger(0)
+    private val proactiveRefreshExhausted = AtomicBoolean(false)
     private val startReported = AtomicBoolean(false)
     private val finishReported = AtomicBoolean(false)
     private val stopReported = AtomicBoolean(false)
@@ -217,7 +232,8 @@ class PluginPlayerSession(
         this.activeItemId = itemId
         this.activeSessionId = session.info.sessionId
         this.fallbackDurationMs = session.info.durationMs ?: fallbackDurationMs
-        this.consecutiveErrorRefreshes.set(0)
+        this.consecutiveRefreshes.set(0)
+        this.proactiveRefreshExhausted.set(false)
         this.startReported.set(false)
         this.finishReported.set(false)
         this.stopReported.set(false)
@@ -260,16 +276,25 @@ class PluginPlayerSession(
     }
 
     fun markPlaybackReady() {
-        consecutiveErrorRefreshes.set(0)
+        // Only reset the refresh counter if the newly ready stream is NOT already inside the
+        // expiry window; otherwise a short-TTL / already-expired URL would reset on every ready
+        // callback and loop indefinitely.
+        if (controller?.isExpired(clockMs()) != true) {
+            consecutiveRefreshes.set(0)
+            proactiveRefreshExhausted.set(false)
+        }
     }
 
-    fun shouldProactiveRefresh(): Boolean = controller?.isExpired(clockMs()) == true
+    fun shouldProactiveRefresh(): Boolean {
+        if (proactiveRefreshExhausted.get()) return false
+        return controller?.isExpired(clockMs()) == true
+    }
 
     fun canAttemptAutoRefresh(httpStatusCode: Int?): Boolean {
         val ctrl = controller ?: return false
         val isAuthOrGone = httpStatusCode == 401 || httpStatusCode == 403 || httpStatusCode == 410
         if (!isAuthOrGone && !ctrl.isExpired(clockMs())) return false
-        return consecutiveErrorRefreshes.get() < MAX_CONSECUTIVE_ERROR_REFRESHES
+        return consecutiveRefreshes.get() < MAX_CONSECUTIVE_ERROR_REFRESHES
     }
 
     suspend fun refreshIfExpiredOrFailed(
@@ -279,16 +304,28 @@ class PluginPlayerSession(
         val ctrl = controller ?: return null
         val src = activeSource ?: return null
         val isHttpTriggered = httpStatusCode == 401 || httpStatusCode == 403 || httpStatusCode == 410
-        if (isHttpTriggered) {
-            if (consecutiveErrorRefreshes.incrementAndGet() > MAX_CONSECUTIVE_ERROR_REFRESHES) {
-                return null
+        if (!isHttpTriggered && !ctrl.isExpired(clockMs())) {
+            return null
+        }
+        val attempt = consecutiveRefreshes.incrementAndGet()
+        if (attempt > MAX_CONSECUTIVE_ERROR_REFRESHES) {
+            if (!isHttpTriggered) {
+                proactiveRefreshExhausted.set(true)
+                throw SourceUnavailableException("播放地址已过期且多次刷新仍失败，请稍后重试。")
             }
+            return null
         }
         val refreshed = ctrl.refreshIfExpiredOrFailed(
             currentPositionMs = currentPositionMs.coerceAtLeast(0L),
             httpStatusCode = httpStatusCode,
             fallbackDurationMs = fallbackDurationMs,
         ) ?: return null
+        // Guard against servers returning an already-expired or <=60s TTL URL on refresh:
+        // stop immediately and surface an error instead of re-entering a 200ms refresh loop.
+        if (ctrl.isExpired(clockMs())) {
+            proactiveRefreshExhausted.set(true)
+            throw SourceUnavailableException("播放地址刷新后仍已过期，请稍后重试。")
+        }
         val exoMediaSource = ctrl.createMediaSource(refreshed)
         activeSessionId = refreshed.info.sessionId
         fallbackDurationMs = refreshed.info.durationMs ?: fallbackDurationMs

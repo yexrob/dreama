@@ -61,8 +61,11 @@ import com.limelight.local.stream.PhoneFormServer
 import com.limelight.local.stream.PhoneSubmitResult
 import com.limelight.local.stream.QrCodeMatrix
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -70,10 +73,25 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonElement
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicReference
 
 private sealed interface InteractiveAuthStep {
     data class Qr(val tempInstanceId: String, val start: QrLoginStart, val status: LoginPollStatus) : InteractiveAuthStep
     data class Device(val tempInstanceId: String, val start: DeviceLoginStart, val status: LoginPollStatus) : InteractiveAuthStep
+}
+
+private data class EditRollbackBackup(
+    val instanceId: String,
+    val prevDisplayName: String?,
+    val prevConfig: Map<String, JsonElement>,
+    val prevAuthState: String?,
+    val prevAuthUserJson: String?,
+)
+
+private sealed interface FormSubmitOutcome {
+    data class Accepted(val onAfterFlushed: () -> Unit) : FormSubmitOutcome
+    data class Rejected(val message: String) : FormSubmitOutcome
 }
 
 /**
@@ -135,7 +153,7 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
     LaunchedEffect(page.instanceId, manifest.id) {
         if (page.instanceId != null) {
             val loaded = withContext(Dispatchers.IO) {
-                runCatching { model.pluginHost.packageManager.getInstanceConfig(page.instanceId) }.getOrDefault(emptyMap())
+                runCatching { model.pluginHost.packageManager().getInstanceConfig(page.instanceId) }.getOrDefault(emptyMap())
             }
             existingConfig = loaded
             fieldValues.clear()
@@ -158,18 +176,53 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
     var errorText by remember(page) { mutableStateOf<String?>(null) }
     var authStep by remember(page) { mutableStateOf<InteractiveAuthStep?>(null) }
     var activeJob by remember { mutableStateOf<Job?>(null) }
-    var tempInstanceToRollback by remember { mutableStateOf<String?>(null) }
+    val tempInstanceToRollback = remember(page) { AtomicReference<String?>(null) }
+    val editBackupToRollback = remember(page) { AtomicReference<EditRollbackBackup?>(null) }
 
-    // Cancel any active auth/poll coroutine and rollback temporary instance if user leaves
+    fun rollbackOrphanInBackground(orphanId: String) {
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            withContext(NonCancellable) {
+                runCatching { model.pluginHost.packageManager().deleteInstance(orphanId) }
+                model.pluginHost.unmarkInstancePending(orphanId)
+            }
+        }
+    }
+
+    fun rollbackEditBackupInBackground(backup: EditRollbackBackup) {
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            withContext(NonCancellable) {
+                runCatching {
+                    val pm = model.pluginHost.packageManager()
+                    pm.updateInstanceConfig(
+                        instanceId = backup.instanceId,
+                        displayName = backup.prevDisplayName,
+                        config = backup.prevConfig,
+                    )
+                    if (backup.prevAuthState != null) {
+                        model.pluginHost.store.updateInstanceAuth(
+                            instanceId = backup.instanceId,
+                            authState = backup.prevAuthState,
+                            authUserJson = backup.prevAuthUserJson,
+                            updatedAt = System.currentTimeMillis(),
+                        )
+                    }
+                    pm.openSource(backup.instanceId)
+                }
+            }
+        }
+    }
+
+    // Cancel any active auth/poll coroutine and rollback temporary instance / unfinished edit on exit
     DisposableEffect(Unit) {
         onDispose {
             activeJob?.cancel()
-            val orphan = tempInstanceToRollback
+            val orphan = tempInstanceToRollback.getAndSet(null)
             if (orphan != null && !isEditing) {
-                tempInstanceToRollback = null
-                kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
-                    runCatching { model.pluginHost.packageManager.deleteInstance(orphan) }
-                }
+                rollbackOrphanInBackground(orphan)
+            }
+            val editBackup = editBackupToRollback.getAndSet(null)
+            if (editBackup != null && isEditing) {
+                rollbackEditBackupInBackground(editBackup)
             }
         }
     }
@@ -178,7 +231,7 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
         activeJob?.cancel()
         activeJob = scope.launch {
             try {
-                val source = withContext(Dispatchers.IO) { model.pluginHost.packageManager.openSource(instanceId) }
+                val source = withContext(Dispatchers.IO) { model.pluginHost.packageManager().openSource(instanceId) }
                 val stateToken = when (step) {
                     is InteractiveAuthStep.Qr -> step.start.state
                     is InteractiveAuthStep.Device -> step.start.state
@@ -194,8 +247,11 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
                             }
                         }
                         LoginPollStatus.DONE -> {
-                            tempInstanceToRollback = null
+                            tempInstanceToRollback.set(null)
+                            editBackupToRollback.set(null)
+                            model.pluginHost.unmarkInstancePending(instanceId)
                             authStep = null
+                            busy = false
                             model.pluginHost.notifyChanged()
                             val display = existingInst?.displayName ?: fieldValues[PluginConfigFormCodec.DISPLAY_NAME_KEY].orEmpty()
                             nav.toast(
@@ -224,7 +280,7 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
         }
     }
 
-    suspend fun submitValues(submitted: Map<String, String>): String? {
+    suspend fun submitValues(submitted: Map<String, String>): FormSubmitOutcome {
         // Keep non-password values visible even if validation/auth fails; clear passwords on failure
         val validation = PluginConfigFormCodec.validateAndSerialize(
             manifest = manifest,
@@ -234,64 +290,125 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
             isEditingExisting = isEditing,
         )
         if (validation is ConfigFormResult.Invalid) {
-            return validation.message
+            return FormSubmitOutcome.Rejected(validation.message)
         }
         val valid = validation as ConfigFormResult.Valid
 
         return try {
+            val pm = withContext(Dispatchers.IO) { model.pluginHost.packageManager() }
             if (manifest.auth == PluginAuthMode.QR || manifest.auth == PluginAuthMode.DEVICE) {
-                val inst = withContext(Dispatchers.IO) {
-                    if (isEditing && page.instanceId != null) {
-                        model.pluginHost.packageManager.updateInstanceConfig(
-                            instanceId = page.instanceId,
-                            displayName = valid.displayName,
-                            config = valid.config,
-                        )
-                    } else {
-                        model.pluginHost.packageManager.createInstance(
-                            pluginId = manifest.id,
-                            displayName = valid.displayName,
-                            config = valid.config,
+                val targetId = if (isEditing && page.instanceId != null) {
+                    page.instanceId
+                } else {
+                    UUID.randomUUID().toString()
+                }
+                if (isEditing && page.instanceId != null) {
+                    val prevInst = withContext(Dispatchers.IO) {
+                        runCatching { model.pluginHost.store.getInstance(targetId) }.getOrNull()
+                    }
+                    val prevCfg = withContext(Dispatchers.IO) {
+                        runCatching { pm.getInstanceConfig(targetId) }.getOrNull()
+                    }
+                    if (prevCfg != null) {
+                        editBackupToRollback.set(
+                            EditRollbackBackup(
+                                instanceId = targetId,
+                                prevDisplayName = prevInst?.displayName ?: existingInst?.displayName,
+                                prevConfig = prevCfg,
+                                prevAuthState = prevInst?.authState,
+                                prevAuthUserJson = prevInst?.authUserJson,
+                            ),
                         )
                     }
+                } else {
+                    tempInstanceToRollback.set(targetId)
+                    model.pluginHost.markInstancePending(targetId)
                 }
-                if (!isEditing) {
-                    tempInstanceToRollback = inst.instanceId
-                }
-                val source = withContext(Dispatchers.IO) { model.pluginHost.packageManager.openSource(inst.instanceId) }
-                val step = withContext(Dispatchers.IO) {
-                    if (manifest.auth == PluginAuthMode.QR) {
-                        InteractiveAuthStep.Qr(inst.instanceId, source.loginQrStart(), LoginPollStatus.PENDING)
-                    } else {
-                        InteractiveAuthStep.Device(inst.instanceId, source.loginDeviceStart(), LoginPollStatus.PENDING)
+
+                try {
+                    val inst = withContext(Dispatchers.IO) {
+                        if (isEditing && page.instanceId != null) {
+                            pm.updateInstanceConfig(
+                                instanceId = targetId,
+                                displayName = valid.displayName,
+                                config = valid.config,
+                            )
+                        } else {
+                            pm.createInstance(
+                                pluginId = manifest.id,
+                                displayName = valid.displayName,
+                                config = valid.config,
+                                instanceId = targetId,
+                            )
+                        }
                     }
+                    val source = withContext(Dispatchers.IO) { pm.openSource(inst.instanceId) }
+                    val step = withContext(Dispatchers.IO) {
+                        if (manifest.auth == PluginAuthMode.QR) {
+                            InteractiveAuthStep.Qr(inst.instanceId, source.loginQrStart(), LoginPollStatus.PENDING)
+                        } else {
+                            InteractiveAuthStep.Device(inst.instanceId, source.loginDeviceStart(), LoginPollStatus.PENDING)
+                        }
+                    }
+                    FormSubmitOutcome.Accepted {
+                        busy = false
+                        authStep = step
+                        startQrOrDevicePolling(inst.instanceId, step)
+                    }
+                } catch (t: Throwable) {
+                    withContext(NonCancellable) {
+                        if (!isEditing) {
+                            tempInstanceToRollback.compareAndSet(targetId, null)
+                            runCatching { pm.deleteInstance(targetId) }
+                            model.pluginHost.unmarkInstancePending(targetId)
+                        } else {
+                            val backup = editBackupToRollback.getAndSet(null)
+                            if (backup != null) {
+                                runCatching {
+                                    pm.updateInstanceConfig(
+                                        instanceId = backup.instanceId,
+                                        displayName = backup.prevDisplayName,
+                                        config = backup.prevConfig,
+                                    )
+                                    pm.openSource(backup.instanceId)
+                                }
+                            }
+                        }
+                    }
+                    throw t
                 }
-                withContext(Dispatchers.Main.immediate) {
-                    authStep = step
-                    startQrOrDevicePolling(inst.instanceId, step)
-                }
-                null
             } else {
                 val savedInst = withContext(Dispatchers.IO) {
                     if (isEditing && page.instanceId != null) {
                         PluginInstanceAuthenticator.updateAndAuthenticateFormOrNone(
-                            packageManager = model.pluginHost.packageManager,
+                            packageManager = pm,
                             manifest = manifest,
                             instanceId = page.instanceId,
                             displayName = valid.displayName,
                             config = valid.config,
+                            store = model.pluginHost.store,
+                            prevDisplayName = existingInst?.displayName,
                         )
                     } else {
                         PluginInstanceAuthenticator.createAndAuthenticateFormOrNone(
-                            packageManager = model.pluginHost.packageManager,
+                            packageManager = pm,
                             manifest = manifest,
                             displayName = valid.displayName,
                             config = valid.config,
+                            onInstanceCreated = { id ->
+                                tempInstanceToRollback.set(id)
+                                model.pluginHost.markInstancePending(id)
+                            },
+                            onInstanceSettled = { id ->
+                                tempInstanceToRollback.compareAndSet(id, null)
+                                model.pluginHost.unmarkInstancePending(id)
+                            },
                         )
                     }
                 }
                 model.pluginHost.notifyChanged()
-                withContext(Dispatchers.Main.immediate) {
+                FormSubmitOutcome.Accepted {
+                    busy = false
                     nav.toast(
                         context.getString(
                             if (isEditing) R.string.sources_updated_toast else R.string.sources_saved_toast,
@@ -300,7 +417,6 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
                     )
                     nav.openLibrarySelecting(PluginMediaSource.sourceIdFor(savedInst.instanceId))
                 }
-                null
             }
         } catch (e: CancellationException) {
             throw e
@@ -310,7 +426,9 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
                 fieldValues.clear()
                 fieldValues.putAll(cleaned)
             }
-            SourceErrorDispatcher.dispatch(e, SourceKind.PLUGIN, manifest.name, strings).message
+            FormSubmitOutcome.Rejected(
+                SourceErrorDispatcher.dispatch(e, SourceKind.PLUGIN, manifest.name, strings).message,
+            )
         }
     }
 
@@ -328,6 +446,7 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
                 strings = strings,
             )
             val copy = PhoneFormCopy.from(context, manifest.name)
+            val pendingPostFlush = AtomicReference<(() -> Unit)?>(null)
             val server = try {
                 PhoneFormServer(
                     copy = copy,
@@ -340,6 +459,14 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
                         scope.launch(Dispatchers.Main.immediate) {
                             phoneLockedOut = true
                             serverInfo = null
+                        }
+                    },
+                    onAcceptedFlushed = {
+                        // Navigate or switch to QR/Device auth strictly AFTER the 200 OK HTML
+                        // finishes flushing to the phone so page teardown never cuts off the response (#18).
+                        val action = pendingPostFlush.getAndSet(null)
+                        if (action != null) {
+                            scope.launch(Dispatchers.Main.immediate) { action() }
                         }
                     },
                     onSubmitted = { valuesFromPhone ->
@@ -359,18 +486,35 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
                                         context.getString(R.string.plugin_form_verifying),
                                     )
                                 }
-                                val err = withTimeoutOrNull(30_000L) {
-                                    submitValues(valuesFromPhone)
-                                } ?: context.getString(R.string.plugin_error_unavailable)
-                                withContext(Dispatchers.Main.immediate) {
-                                    busy = false
-                                    errorText = err
+                                var errMsg: String? = null
+                                try {
+                                    val outcome = withTimeoutOrNull(30_000L) {
+                                        submitValues(valuesFromPhone)
+                                    }
+                                    when (outcome) {
+                                        is FormSubmitOutcome.Accepted -> {
+                                            pendingPostFlush.set(outcome.onAfterFlushed)
+                                            errMsg = null
+                                        }
+                                        is FormSubmitOutcome.Rejected -> {
+                                            errMsg = outcome.message
+                                        }
+                                        null -> {
+                                            errMsg = context.getString(R.string.plugin_error_unavailable)
+                                        }
+                                    }
+                                } finally {
+                                    withContext(NonCancellable + Dispatchers.Main.immediate) {
+                                        busy = false
+                                        errorText = errMsg
+                                    }
                                 }
-                                if (err == null) PhoneSubmitResult.Accepted
-                                else PhoneSubmitResult.Rejected(err)
+                                if (errMsg == null) PhoneSubmitResult.Accepted
+                                else PhoneSubmitResult.Rejected(errMsg!!)
                             }
                         } catch (_: InterruptedException) {
                             Thread.currentThread().interrupt()
+                            scope.launch(Dispatchers.Main.immediate) { busy = false }
                             PhoneSubmitResult.Rejected(context.getString(R.string.action_cancel))
                         }
                     },
@@ -423,7 +567,7 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
                         }
                         scope.launch {
                             try {
-                                val src = withContext(Dispatchers.IO) { model.pluginHost.packageManager.openSource(instId) }
+                                val src = withContext(Dispatchers.IO) { model.pluginHost.packageManager().openSource(instId) }
                                 val nextStep = withContext(Dispatchers.IO) {
                                     if (curAuth is InteractiveAuthStep.Qr) {
                                         InteractiveAuthStep.Qr(instId, src.loginQrStart(), LoginPollStatus.PENDING)
@@ -441,12 +585,14 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
                     onCancel = {
                         activeJob?.cancel()
                         authStep = null
-                        val orphan = tempInstanceToRollback
+                        busy = false
+                        val orphan = tempInstanceToRollback.getAndSet(null)
                         if (orphan != null && !isEditing) {
-                            tempInstanceToRollback = null
-                            scope.launch(Dispatchers.IO) {
-                                runCatching { model.pluginHost.packageManager.deleteInstance(orphan) }
-                            }
+                            rollbackOrphanInBackground(orphan)
+                        }
+                        val editBackup = editBackupToRollback.getAndSet(null)
+                        if (editBackup != null && isEditing) {
+                            rollbackEditBackupInBackground(editBackup)
                         }
                     },
                 )
@@ -630,10 +776,18 @@ fun PluginFormScreen(model: WallModel, nav: WallNav, page: Page.PluginForm) {
                                     errorText = null
                                     val snapshot = fieldValues.toMap()
                                     activeJob = scope.launch {
-                                        try {
-                                            errorText = submitValues(snapshot)
-                                        } finally {
-                                            busy = false
+                                        PluginInstanceAuthenticator.runWithBusyReset(
+                                            setBusy = { b -> withContext(Dispatchers.Main.immediate) { busy = b } },
+                                        ) {
+                                            when (val outcome = submitValues(snapshot)) {
+                                                is FormSubmitOutcome.Accepted -> {
+                                                    errorText = null
+                                                    outcome.onAfterFlushed()
+                                                }
+                                                is FormSubmitOutcome.Rejected -> {
+                                                    errorText = outcome.message
+                                                }
+                                            }
                                         }
                                     }
                                 },

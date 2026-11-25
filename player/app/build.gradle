@@ -218,8 +218,9 @@ abstract class PackBuiltinPlugins extends DefaultTask {
             }
         }
 
-        // Write standard DEFLATE zip with known CRC/size on each Local File Header (no data descriptor)
-        // so both PluginPackageArchive.inspect and tools/plugin-kit inspectArchiveBuffer verify cleanly.
+        // Write standard DEFLATED zip via ZipOutputStream (writes standard data descriptors
+        // when size/CRC are computed on the fly; both PluginPackageArchive.inspect and
+        // tools/plugin-kit inspectArchiveBuffer validate LFH + data descriptor + CD 1-to-1).
         outZip.withOutputStream { fos ->
             def zos = new java.util.zip.ZipOutputStream(fos)
             zos.setLevel(java.util.zip.Deflater.BEST_COMPRESSION)

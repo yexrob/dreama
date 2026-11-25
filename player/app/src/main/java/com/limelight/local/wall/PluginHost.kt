@@ -1,7 +1,6 @@
 package com.limelight.local.wall
 
 import android.content.Context
-import com.limelight.BuildConfig
 import com.limelight.LimeLog
 import com.limelight.local.media.WallDatabase
 import com.limelight.local.plugin.AndroidKeystoreSecretBox
@@ -22,12 +21,16 @@ import com.limelight.local.plugin.PluginStore
 import com.limelight.local.plugin.RoomPluginStore
 import com.limelight.local.plugin.SecretBox
 import com.limelight.local.plugin.SemVer
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -37,6 +40,19 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.logging.Handler
 import java.util.logging.LogRecord
 import java.util.logging.Logger
+
+/**
+ * SemVer host version advertised to plugins via `ctx.device.appVersion` and checked against
+ * `manifest.minApp`. Intentionally decoupled from Android's marketing `BuildConfig.VERSION_NAME`
+ * (which may not be strict SemVer).
+ *
+ * When to increment:
+ * - Patch (`1.0.x`): bug fixes in host/UI behavior with no new plugin-facing contract.
+ * - Minor (`1.x.0`): backward-compatible additions to host capabilities or manifest support
+ *   (e.g. a new built-in `config[].discover` protocol or optional UI capability).
+ * - Major (`x.0.0`): breaking changes to plugin host integration.
+ */
+const val PLUGIN_HOST_VERSION: String = "1.0.0"
 
 /**
  * Result of synchronizing bundled `.d3plugin` assets into [PluginPackageManager].
@@ -103,12 +119,35 @@ object BuiltInPluginInstaller {
                     else -> {
                         val oldVer = SemVer.parse(existing.version)
                         val newVer = SemVer.parse(manifest.version)
-                        if (oldVer != null && newVer != null && newVer > oldVer) {
+                        val actualSha = PluginRepositoryClient.sha256Hex(bytes)
+                        val isNewerVersion = oldVer != null && newVer != null && newVer > oldVer
+                        val isSameVersionDifferentContent =
+                            oldVer != null && newVer != null && newVer == oldVer &&
+                                !actualSha.equals(existing.sha256, ignoreCase = true)
+                        if (isNewerVersion) {
                             val res = packageManager.installFromBytes(bytes, sourceUrl = srcUrl)
                             if (res.needsPermissionReconfirm) {
                                 packageManager.confirmPermissions(manifest.id)
                             }
                             upgraded += manifest.id
+                        } else if (isSameVersionDifferentContent) {
+                            // Built-in package content changed at the same SemVer (e.g. manifest/asset
+                            // update in an APK rebuild). Temporarily clear existing SemVer marker so
+                            // PluginPackageManager performs an in-place same-source update without
+                            // wiping user instances, and restore existing metadata on any error.
+                            store.upsertPackage(existing.copy(version = "refreshing"))
+                            try {
+                                val res = packageManager.installFromBytes(bytes, sourceUrl = srcUrl)
+                                if (res.needsPermissionReconfirm) {
+                                    packageManager.confirmPermissions(manifest.id)
+                                }
+                                upgraded += manifest.id
+                            } catch (t: Throwable) {
+                                withContext(NonCancellable) {
+                                    runCatching { store.upsertPackage(existing) }
+                                }
+                                throw t
+                            }
                         } else {
                             skipped += manifest.id
                         }
@@ -220,20 +259,53 @@ class PluginHost private constructor(
     val database: WallDatabase,
     val store: PluginStore,
     val repoClient: PluginRepositoryClient,
-    val packageManager: PluginPackageManager,
     val logBuffer: PluginLogBuffer,
     private val localeTag: String,
+    private val secretBoxFactory: () -> SecretBox,
+    private val detectDeviceInfo: (String) -> DeviceInfo,
+    private val packagesRootDir: File,
+    private val loadAssets: (Context) -> List<ByteArray>,
+    ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val scope = CoroutineScope(SupervisorJob() + ioDispatcher)
+    private val packageManagerDeferred = CompletableDeferred<PluginPackageManager>()
     private val builtInDone = CompletableDeferred<BuiltInSyncReport>()
     private val _changes = MutableStateFlow(0L)
     val changes: StateFlow<Long> get() = _changes
 
-    private fun startBuiltInSync() {
+    private val _pendingInstanceIds = MutableStateFlow<Set<String>>(emptySet())
+    val pendingInstanceIds: StateFlow<Set<String>> get() = _pendingInstanceIds
+
+    private fun startBackgroundInit() {
         scope.launch {
+            val pm = try {
+                val deviceInfo = detectDeviceInfo(PLUGIN_HOST_VERSION)
+                PluginPackageManager(
+                    rootDir = packagesRootDir,
+                    store = store,
+                    secretBox = secretBoxFactory(),
+                    repoClient = repoClient,
+                    appVersion = PLUGIN_HOST_VERSION,
+                    deviceInfo = deviceInfo,
+                    androidContext = appContext,
+                )
+            } catch (e: CancellationException) {
+                packageManagerDeferred.cancel(e)
+                builtInDone.cancel(e)
+                throw e
+            } catch (t: Throwable) {
+                packageManagerDeferred.completeExceptionally(t)
+                builtInDone.complete(BuiltInSyncReport(failed = listOf(t.javaClass.simpleName)))
+                return@launch
+            }
+            packageManagerDeferred.complete(pm)
+
             val report = try {
-                val blobs = loadBuiltInAssets(appContext)
-                BuiltInPluginInstaller.syncPackages(packageManager, store, blobs)
+                val blobs = loadAssets(appContext)
+                BuiltInPluginInstaller.syncPackages(pm, store, blobs)
+            } catch (e: CancellationException) {
+                builtInDone.cancel(e)
+                throw e
             } catch (e: Exception) {
                 LimeLog.warning("depth3d: built-in plugin sync error: ${e.javaClass.simpleName}")
                 BuiltInSyncReport(failed = listOf(e.javaClass.simpleName))
@@ -246,14 +318,25 @@ class PluginHost private constructor(
         }
     }
 
+    /** Suspends until background [DeviceInfo.detect] + [PluginPackageManager] init completes. */
+    suspend fun packageManager(): PluginPackageManager = packageManagerDeferred.await()
+
     suspend fun awaitBuiltInReady(): BuiltInSyncReport = builtInDone.await()
+
+    fun markInstancePending(instanceId: String) {
+        _pendingInstanceIds.update { it + instanceId }
+    }
+
+    fun unmarkInstancePending(instanceId: String) {
+        _pendingInstanceIds.update { it - instanceId }
+    }
 
     fun notifyChanged() {
         _changes.value = _changes.value + 1L
     }
 
     suspend fun openSource(instanceId: String): PluginMediaSource =
-        withContext(Dispatchers.IO) { packageManager.openSource(instanceId) }
+        withContext(Dispatchers.IO) { packageManager().openSource(instanceId) }
 
     suspend fun openSourceBySourceId(sourceId: String): PluginMediaSource? {
         if (!sourceId.startsWith(PLUGIN_SOURCE_PREFIX)) return null
@@ -300,18 +383,6 @@ class PluginHost private constructor(
                 val db = WallDatabase.get(app)
                 val store = RoomPluginStore(db)
                 val repoClient = PluginRepositoryClient()
-                val appVersion = normalizePluginAppVersion(BuildConfig.VERSION_NAME)
-                val deviceInfo = DeviceInfo.detect(appVersion)
-                val secretBox: SecretBox = AndroidKeystoreSecretBox()
-                val packageManager = PluginPackageManager(
-                    rootDir = File(app.filesDir, "plugins"),
-                    store = store,
-                    secretBox = secretBox,
-                    repoClient = repoClient,
-                    appVersion = appVersion,
-                    deviceInfo = deviceInfo,
-                    androidContext = app,
-                )
                 val logBuffer = PluginLogBuffer()
                 hookPluginLogs(logBuffer)
                 val localeTag = Locale.getDefault().toLanguageTag().ifBlank { "zh-CN" }
@@ -320,21 +391,41 @@ class PluginHost private constructor(
                     database = db,
                     store = store,
                     repoClient = repoClient,
-                    packageManager = packageManager,
                     logBuffer = logBuffer,
                     localeTag = localeTag,
+                    secretBoxFactory = { AndroidKeystoreSecretBox() },
+                    detectDeviceInfo = { ver -> DeviceInfo.detect(ver) },
+                    packagesRootDir = File(app.filesDir, "plugins"),
+                    loadAssets = { ctx -> loadBuiltInAssets(ctx) },
                 ).also { host ->
                     instance = host
-                    host.startBuiltInSync()
+                    host.startBackgroundInit()
                 }
             }
         }
 
-        fun normalizePluginAppVersion(versionName: String?): String {
-            val raw = versionName?.trim().orEmpty()
-            if (SemVer.parse(raw) != null) return raw
-            return "1.0.0"
-        }
+        internal fun createForTesting(
+            context: Context,
+            database: WallDatabase,
+            store: PluginStore,
+            packagesRootDir: File,
+            secretBoxFactory: () -> SecretBox,
+            detectDeviceInfo: (String) -> DeviceInfo,
+            loadAssets: (Context) -> List<ByteArray> = { emptyList() },
+            ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+        ): PluginHost = PluginHost(
+            appContext = context.applicationContext,
+            database = database,
+            store = store,
+            repoClient = PluginRepositoryClient(),
+            logBuffer = PluginLogBuffer(),
+            localeTag = "zh-CN",
+            secretBoxFactory = secretBoxFactory,
+            detectDeviceInfo = detectDeviceInfo,
+            packagesRootDir = packagesRootDir,
+            loadAssets = loadAssets,
+            ioDispatcher = ioDispatcher,
+        ).also { it.startBackgroundInit() }
 
         private fun loadBuiltInAssets(context: Context): List<ByteArray> {
             val names = try {

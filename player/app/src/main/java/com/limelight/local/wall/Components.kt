@@ -63,6 +63,10 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.limelight.local.media.Artwork
 import com.limelight.local.media.Artworks
 import com.limelight.local.media.MediaSource
@@ -319,6 +323,24 @@ fun Notice(text: String, icon: ImageVector = WallIcons.Alert, danger: Boolean = 
  * active [PluginMediaSource]'s NetworkPolicy and cached in [Artworks]'s single
  * shared LRU cache — never passed to [Artworks.load].
  */
+internal suspend fun loadPluginArtBitmap(
+    art: Artwork,
+    maxEdgePx: Int,
+    cacheKey: String,
+    ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    loader: suspend (Artwork, Int) -> Bitmap?,
+): Bitmap? = withContext(ioDispatcher) {
+    try {
+        loader(art, maxEdgePx)?.also { bmp ->
+            Artworks.putCachedByKey(cacheKey, bmp)
+        }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        null
+    }
+}
+
 @Composable
 fun rememberArt(
     art: Artwork?,
@@ -348,11 +370,12 @@ fun rememberArt(
         if (art != null && value == null) {
             value = if (isPluginArt) {
                 if (pluginSource != null && pluginCacheKey != null) {
-                    runCatching {
-                        PluginImages.loadBitmap(pluginSource, art, maxEdgePx = size.px)
-                    }.getOrNull()?.also { bmp ->
-                        Artworks.putCachedByKey(pluginCacheKey, bmp)
-                    }
+                    loadPluginArtBitmap(
+                        art = art,
+                        maxEdgePx = size.px,
+                        cacheKey = pluginCacheKey,
+                        loader = { a, px -> PluginImages.loadBitmap(pluginSource, a, maxEdgePx = px) },
+                    )
                 } else {
                     null
                 }
