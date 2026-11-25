@@ -163,9 +163,12 @@ class HoverFreezeBuffer<T>(initialValue: T) {
         private set
     private var buffered: T? = null
     private var hovered: Boolean = false
-    private var currentKey: String = ""
+    private var currentKey: String? = null
 
     fun onQueryChanged(key: String, immediateValue: T): T {
+        if (key == currentKey) {
+            return onUpdate(key, immediateValue)
+        }
         currentKey = key
         buffered = null
         displayed = immediateValue

@@ -13,9 +13,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicLong
@@ -30,15 +28,21 @@ import java.util.concurrent.atomic.AtomicLong
  *    land together sorted by configured source order (result rows before status rows);
  *    every source finishing afterward is strictly appended at the end — already-visible
  *    rows NEVER reorder or shift upward.
- * 3. **Independent isolation**: each source runs concurrently (bounded by [maxConcurrentSources])
- *    under its own `withTimeoutOrNull(sourceTimeoutMs)` (default 10 s); one source failing,
- *    timing out, or needing auth never impacts any other source.
+ * 3. **Unconstrained concurrent queries with strict per-source wall timeout**: all searchable
+ *    sources run concurrently under independent `withTimeoutOrNull(sourceTimeoutMs)` (default 10 s);
+ *    one source failing, timing out, or needing auth never blocks or delays any other source.
  * 4. **In-place retry / post-login refresh**: retrying a failed/needs-auth row updates that
- *    exact row index in place without moving rows above it.
- * 5. **Local kind fallback & item deduplication**: passes `kind` to plugins AND filters locally
- *    with [SearchKindFilter.matches] while deduplicating item IDs per source page.
- * 6. **5-minute in-memory cache**: re-running the same `(normalizedQuery, kindFilter, sourceId)`
- *    within [cacheTtlMs] reuses cached results with zero network wait.
+ *    exact row index in place — even when retry yields zero items, the row remains in place
+ *    showing 「没找到」 so rows below NEVER jump upward.
+ * 5. **Local kind fallback, auto-paging & item deduplication**: passes `kind` to plugins AND
+ *    filters locally with [SearchKindFilter.matches]. If page 1 is filtered empty or underfilled
+ *    while `nextCursor != null`, automatically fetches up to [maxAutoFilterPages] (3) additional
+ *    pages within the same 10 s per-source budget before declaring `Empty`.
+ * 6. **3 s pending tail delay**: 「还在搜：…」 only becomes visible once a source remains pending
+ *    beyond [pendingTailDelayMs] (default 3 000 ms).
+ * 7. **5-minute synchronous in-memory cache**: re-running `(normalizedQuery, kindFilter, sourceId)`
+ *    within [cacheTtlMs] reuses cached results with zero network wait; [invalidateSourceCache] and
+ *    [clearCache] operate synchronously under [cacheLock].
  */
 class SearchAggregator(
     private val scope: CoroutineScope,
@@ -46,10 +50,12 @@ class SearchAggregator(
     private val clockMs: () -> Long = System::currentTimeMillis,
     private val initialBatchWindowMs: Long = SearchConfig.INITIAL_BATCH_MS,
     private val sourceTimeoutMs: Long = SearchConfig.SOURCE_TIMEOUT_MS,
-    private val maxConcurrentSources: Int = SearchConfig.MAX_CONCURRENT_SOURCES,
+    private val pendingTailDelayMs: Long = SearchConfig.PENDING_TAIL_DELAY_MS,
     private val cacheTtlMs: Long = SearchConfig.CACHE_TTL_MS,
     private val maxCacheEntries: Int = SearchConfig.MAX_CACHE_ENTRIES,
     private val suggestTimeoutMs: Long = SearchConfig.SUGGEST_TIMEOUT_MS,
+    private val minFilteredItems: Int = SearchConfig.MIN_FILTERED_ITEMS_BEFORE_STOP,
+    private val maxAutoFilterPages: Int = SearchConfig.MAX_FILTER_AUTO_PAGES,
 ) {
     private data class CacheKey(
         val query: String,
@@ -68,14 +74,15 @@ class SearchAggregator(
 
     private val generationSeq = AtomicLong(0L)
     private val stateMutex = Mutex()
-    private val cacheMutex = Mutex()
-    private val semaphore = Semaphore(permits = maxConcurrentSources.coerceAtLeast(1))
+    private val cacheLock = Any()
     private val cache = object : LinkedHashMap<CacheKey, CacheEntry>(32, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<CacheKey, CacheEntry>?): Boolean =
             size > maxCacheEntries
     }
 
     private var activeSessionJob: Job? = null
+    private var activeSessionScope: CoroutineScope? = null
+    private val activeRetryJobs = LinkedHashMap<String, Job>()
     private var activeFallbackSuggestJob: Job? = null
     private var activeSourcesById: Map<String, SearchableSource> = emptyMap()
     private var activeSourceOrder: Map<String, Int> = emptyMap()
@@ -89,6 +96,7 @@ class SearchAggregator(
     private var activeBatchBuffer: LinkedHashMap<String, SearchRowStatus> = LinkedHashMap()
     private var activeInitialBatchSettled: Boolean = false
     private var activeShowInitialSkeleton: Boolean = false
+    private var activeShowPendingTail: Boolean = false
     private var activeAvailableKinds: LinkedHashSet<SearchKindFilter> = linkedSetOf(SearchKindFilter.ALL)
     private var activeFallbackSuggestions: List<String> = emptyList()
     private var lastKnownKindsByQuery: Pair<String, Set<SearchKindFilter>>? = null
@@ -110,6 +118,8 @@ class SearchAggregator(
         val gen = generationSeq.incrementAndGet()
         activeSessionJob?.cancel()
         activeFallbackSuggestJob?.cancel()
+        activeRetryJobs.values.forEach { it.cancel() }
+        activeRetryJobs.clear()
 
         // Emit an immediate in-progress snapshot for [gen] synchronously so UI & callers
         // never observe the previous generation's settled state between launch and runSession.
@@ -128,9 +138,10 @@ class SearchAggregator(
             },
         )
 
-        val sessionJob = Job(scope.coroutineContext[Job])
+        val sessionJob = SupervisorJob(scope.coroutineContext[Job])
+        val sessionScope = CoroutineScope(scope.coroutineContext + sessionJob)
         activeSessionJob = sessionJob
-        val sessionScope = CoroutineScope(scope.coroutineContext + SupervisorJob(sessionJob))
+        activeSessionScope = sessionScope
 
         sessionScope.launch {
             runSession(
@@ -148,7 +159,8 @@ class SearchAggregator(
 
     /**
      * Retries a single source IN PLACE (after user taps 「重试」 or returns from 「登录」).
-     * Never moves rows above it; expands into a results row at the exact same index.
+     * Never moves rows above or below it; even if retry yields zero items, keeps that exact
+     * row index showing `SearchRowStatus.Empty` so lower rows never jump upward.
      */
     fun retrySource(
         sourceId: String,
@@ -157,69 +169,70 @@ class SearchAggregator(
         val gen = generationSeq.get()
         if (gen == 0L) return
         val sessionJob = activeSessionJob ?: return
+        val sessionScope = activeSessionScope ?: return
         if (!sessionJob.isActive) return
-        val sessionScope = CoroutineScope(scope.coroutineContext + SupervisorJob(sessionJob))
 
-        sessionScope.launch {
-            val prep = stateMutex.withLock {
-                if (generationSeq.get() != gen) return@withLock null
-                val resolved = updatedSource ?: activeSourcesById[sourceId] ?: return@withLock null
-                if (updatedSource != null) {
-                    activeSourcesById = activeSourcesById + (sourceId to updatedSource)
-                }
-                val idx = activeVisibleRows.indexOfFirst { it.sourceId == sourceId }
-                if (idx >= 0) {
-                    activeVisibleRows[idx] = activeVisibleRows[idx].copy(
-                        displayName = resolved.displayName,
-                        typeLabel = resolved.typeLabel,
-                        mediaSource = resolved.mediaSource,
-                        refreshingInPlace = true,
-                    )
-                } else {
-                    activeEmptyIds.remove(sourceId)
-                    activePendingIds.add(sourceId)
-                }
-                emitStateLocked(gen)
-                Triple(resolved, activeQueryNormalized, activeKindFilter)
-            } ?: return@launch
-            val (targetSrc, query, filter) = prep
+        // Replace any previous in-flight retry for the same source without allocating a leaked SupervisorJob
+        activeRetryJobs.remove(sourceId)?.cancel()
 
-            cacheMutex.withLock {
-                cache.remove(CacheKey(query, filter, sourceId))
-            }
-
-            val (outcome, discoveredKinds) = executeSingleSource(
-                source = targetSrc,
-                query = query,
-                kindFilter = filter,
-                respectKnownNeedsAuth = false,
-            )
-
-            var shouldFetchFallback = false
-            stateMutex.withLock {
-                if (generationSeq.get() != gen) return@withLock
-                activePendingIds.remove(sourceId)
-                activeAvailableKinds.addAll(discoveredKinds)
-                lastKnownKindsByQuery = query to LinkedHashSet(activeAvailableKinds)
-
-                if (outcome is SearchRowStatus.Results || outcome is SearchRowStatus.Empty) {
-                    cacheMutex.withLock {
-                        cache[CacheKey(query, filter, sourceId)] = CacheEntry(
-                            status = outcome,
-                            availableKinds = discoveredKinds,
-                            storedAtMs = clockMs(),
+        val retryJob = sessionScope.launch {
+            try {
+                val prep = stateMutex.withLock {
+                    if (generationSeq.get() != gen) return@withLock null
+                    val resolved = updatedSource ?: activeSourcesById[sourceId] ?: return@withLock null
+                    if (updatedSource != null) {
+                        activeSourcesById = activeSourcesById + (sourceId to updatedSource)
+                    }
+                    val idx = activeVisibleRows.indexOfFirst { it.sourceId == sourceId }
+                    if (idx >= 0) {
+                        activeVisibleRows[idx] = activeVisibleRows[idx].copy(
+                            displayName = resolved.displayName,
+                            typeLabel = resolved.typeLabel,
+                            mediaSource = resolved.mediaSource,
+                            refreshingInPlace = true,
                         )
+                    } else {
+                        activeEmptyIds.remove(sourceId)
+                        activePendingIds.add(sourceId)
                     }
+                    emitStateLocked(gen)
+                    Triple(resolved, activeQueryNormalized, activeKindFilter)
+                } ?: return@launch
+                val (targetSrc, query, filter) = prep
+
+                synchronized(cacheLock) {
+                    cache.remove(CacheKey(query, filter, sourceId))
                 }
 
-                val idx = activeVisibleRows.indexOfFirst { it.sourceId == sourceId }
-                when (outcome) {
-                    is SearchRowStatus.Empty -> {
-                        if (idx >= 0) activeVisibleRows.removeAt(idx)
-                        activeEmptyIds.add(sourceId)
+                val (outcome, discoveredKinds) = executeSingleSource(
+                    source = targetSrc,
+                    query = query,
+                    kindFilter = filter,
+                    respectKnownNeedsAuth = false,
+                )
+
+                var shouldFetchFallback = false
+                stateMutex.withLock {
+                    if (generationSeq.get() != gen) return@withLock
+                    activePendingIds.remove(sourceId)
+                    activeAvailableKinds.addAll(discoveredKinds)
+                    lastKnownKindsByQuery = query to LinkedHashSet(activeAvailableKinds)
+
+                    if (outcome is SearchRowStatus.Results || outcome is SearchRowStatus.Empty) {
+                        synchronized(cacheLock) {
+                            cache[CacheKey(query, filter, sourceId)] = CacheEntry(
+                                status = outcome,
+                                availableKinds = discoveredKinds,
+                                storedAtMs = clockMs(),
+                            )
+                        }
                     }
-                    else -> {
-                        val row = SearchSourceRow(
+
+                    val idx = activeVisibleRows.indexOfFirst { it.sourceId == sourceId }
+                    if (idx >= 0) {
+                        // Preserve exact row slot even on Empty so rows beneath never shift upward
+                        activeEmptyIds.remove(sourceId)
+                        activeVisibleRows[idx] = SearchSourceRow(
                             sourceId = targetSrc.sourceId,
                             displayName = targetSrc.displayName,
                             typeLabel = targetSrc.typeLabel,
@@ -227,22 +240,39 @@ class SearchAggregator(
                             mediaSource = targetSrc.mediaSource,
                             status = outcome,
                             refreshingInPlace = false,
+                            arrivedAfterBatch = activeVisibleRows[idx].arrivedAfterBatch,
                         )
-                        if (idx >= 0) {
-                            activeVisibleRows[idx] = row
-                        } else {
-                            activeVisibleRows.add(row)
-                        }
+                    } else if (outcome is SearchRowStatus.Empty) {
+                        activeEmptyIds.add(sourceId)
+                    } else {
+                        activeVisibleRows.add(
+                            SearchSourceRow(
+                                sourceId = targetSrc.sourceId,
+                                displayName = targetSrc.displayName,
+                                typeLabel = targetSrc.typeLabel,
+                                sourceKind = targetSrc.sourceKind,
+                                mediaSource = targetSrc.mediaSource,
+                                status = outcome,
+                                refreshingInPlace = false,
+                                arrivedAfterBatch = true,
+                            ),
+                        )
                     }
+                    emitStateLocked(gen)
+                    shouldFetchFallback = _state.value.isTrueNoResult
                 }
-                emitStateLocked(gen)
-                shouldFetchFallback = _state.value.isTrueNoResult
-            }
 
-            if (shouldFetchFallback) {
-                launchNoResultSuggestions(gen, query)
+                if (shouldFetchFallback) {
+                    launchNoResultSuggestions(gen, query)
+                }
+            } finally {
+                val current = activeRetryJobs[sourceId]
+                if (current == coroutineContext[Job]) {
+                    activeRetryJobs.remove(sourceId)
+                }
             }
         }
+        activeRetryJobs[sourceId] = retryJob
     }
 
     /** Cancels all active search work and resets state back to idle. */
@@ -250,6 +280,8 @@ class SearchAggregator(
         generationSeq.incrementAndGet()
         activeSessionJob?.cancel()
         activeSessionJob = null
+        activeSessionScope = null
+        activeRetryJobs.clear()
         activeFallbackSuggestJob?.cancel()
         activeFallbackSuggestJob = null
         _state.value = AggregatedSearchState()
@@ -260,23 +292,23 @@ class SearchAggregator(
         generationSeq.incrementAndGet()
         activeSessionJob?.cancel()
         activeSessionJob = null
+        activeSessionScope = null
+        activeRetryJobs.clear()
         activeFallbackSuggestJob?.cancel()
         activeFallbackSuggestJob = null
     }
 
-    /** Clears the 5-minute in-memory cache (e.g., when a plugin is reloaded or deleted). */
-    suspend fun clearCache() {
-        cacheMutex.withLock { cache.clear() }
+    /** Synchronously clears the 5-minute in-memory cache (e.g., when a plugin is reloaded or deleted). */
+    fun clearCache() {
+        synchronized(cacheLock) { cache.clear() }
     }
 
     /** Synchronously drops cached entries for one source (e.g., after re-authentication). */
     fun invalidateSourceCache(sourceId: String) {
-        scope.launch {
-            cacheMutex.withLock {
-                val iter = cache.keys.iterator()
-                while (iter.hasNext()) {
-                    if (iter.next().sourceId == sourceId) iter.remove()
-                }
+        synchronized(cacheLock) {
+            val iter = cache.keys.iterator()
+            while (iter.hasNext()) {
+                if (iter.next().sourceId == sourceId) iter.remove()
             }
         }
     }
@@ -293,7 +325,7 @@ class SearchAggregator(
         val now = clockMs()
         val cachedOutcomes = LinkedHashMap<String, CacheEntry>()
         if (!bypassCache) {
-            cacheMutex.withLock {
+            synchronized(cacheLock) {
                 for (src in sources) {
                     if (src.knownNeedsAuth) continue
                     val key = CacheKey(query, kindFilter, src.sourceId)
@@ -324,6 +356,7 @@ class SearchAggregator(
             activeBatchBuffer = LinkedHashMap()
             activeInitialBatchSettled = false
             activeShowInitialSkeleton = false
+            activeShowPendingTail = false
             activeFallbackSuggestions = emptyList()
 
             // Preserve discovered available kinds across kind-filter switches on the same query
@@ -381,7 +414,17 @@ class SearchAggregator(
             }
         }
 
-        // Launch independent per-source concurrent search tasks
+        // Launch the 3 s 「还在搜」 tail line reveal timer (§3.9.4)
+        sessionScope.launch {
+            delay(pendingTailDelayMs)
+            stateMutex.withLock {
+                if (generationSeq.get() != gen || activePendingIds.isEmpty()) return@withLock
+                activeShowPendingTail = true
+                emitStateLocked(gen)
+            }
+        }
+
+        // Launch independent per-source concurrent search tasks (all sources simultaneously)
         for (src in toQuery) {
             sessionScope.launch {
                 val (status, discoveredKinds) = executeSingleSource(
@@ -392,7 +435,7 @@ class SearchAggregator(
                 )
 
                 if (status is SearchRowStatus.Results || status is SearchRowStatus.Empty) {
-                    cacheMutex.withLock {
+                    synchronized(cacheLock) {
                         cache[CacheKey(query, kindFilter, src.sourceId)] = CacheEntry(
                             status = status,
                             availableKinds = discoveredKinds,
@@ -438,33 +481,63 @@ class SearchAggregator(
             return SearchRowStatus.NeedsAuth() to emptySet()
         }
         return try {
-            val rawPage = semaphore.withPermit {
-                withTimeoutOrNull(sourceTimeoutMs) {
-                    withContext(ioDispatcher) {
-                        source.search(query = query, cursor = null, kind = kindFilter.toPluginKind())
-                    }
-                }
-            }
-            if (rawPage == null) {
-                val sec = ((sourceTimeoutMs + 999L) / 1000L).toInt().coerceAtLeast(1)
-                SearchRowStatus.TimedOut(sec) to emptySet()
-            } else {
-                val deduped = deduplicateItems(rawPage.items)
+            val outcome = withTimeoutOrNull(sourceTimeoutMs) {
+                val seenIds = LinkedHashSet<String>()
+                val seenCursors = HashSet<String>()
                 val discoveredKinds = LinkedHashSet<SearchKindFilter>()
-                for (item in deduped) {
-                    discoveredKinds.addAll(SearchKindFilter.filtersMatching(item))
+                val collected = ArrayList<Item>()
+                var cursor: String? = null
+                var autoExtraPages = 0
+                var finalNextCursor: String? = null
+
+                while (true) {
+                    val page = withContext(ioDispatcher) {
+                        source.search(query = query, cursor = cursor, kind = kindFilter.toPluginKind())
+                    }
+                    val pageDeduped = deduplicateItems(page.items)
+                    for (item in pageDeduped) {
+                        discoveredKinds.addAll(SearchKindFilter.filtersMatching(item))
+                        if (kindFilter.matches(item) && seenIds.add(item.id)) {
+                            collected += item
+                        }
+                    }
+
+                    val rawNext = page.nextCursor?.takeIf { it.isNotEmpty() }
+                    val validNext = if (rawNext != null && rawNext != cursor && seenCursors.add(rawNext)) {
+                        rawNext
+                    } else {
+                        null
+                    }
+                    finalNextCursor = validNext
+
+                    val pluginIgnoredKind = pageDeduped.any { !kindFilter.matches(it) }
+                    val needMore = kindFilter != SearchKindFilter.ALL &&
+                        (pluginIgnoredKind || collected.isEmpty()) &&
+                        collected.size < minFilteredItems &&
+                        validNext != null &&
+                        autoExtraPages < maxAutoFilterPages
+
+                    if (!needMore) break
+                    cursor = validNext
+                    autoExtraPages++
                 }
-                val filtered = deduped.filter { kindFilter.matches(it) }
-                val status = if (filtered.isEmpty()) {
+
+                val status = if (collected.isEmpty()) {
                     SearchRowStatus.Empty
                 } else {
                     SearchRowStatus.Results(
-                        items = filtered,
-                        nextCursor = rawPage.nextCursor?.takeIf { it.isNotEmpty() },
-                        hasMore = !rawPage.nextCursor.isNullOrEmpty() || filtered.size > SearchConfig.ROW_PREVIEW_LIMIT,
+                        items = collected.toList(),
+                        nextCursor = finalNextCursor,
+                        hasMore = finalNextCursor != null || collected.size > SearchConfig.ROW_PREVIEW_LIMIT,
                     )
                 }
-                status to discoveredKinds
+                status to discoveredKinds.toSet()
+            }
+            if (outcome == null) {
+                val sec = ((sourceTimeoutMs + 999L) / 1000L).toInt().coerceAtLeast(1)
+                SearchRowStatus.TimedOut(sec) to emptySet()
+            } else {
+                outcome
             }
         } catch (ce: CancellationException) {
             throw ce
@@ -500,6 +573,7 @@ class SearchAggregator(
                     sourceKind = src.sourceKind,
                     mediaSource = src.mediaSource,
                     status = status,
+                    arrivedAfterBatch = false,
                 )
                 else -> statusRows += SearchSourceRow(
                     sourceId = src.sourceId,
@@ -508,6 +582,7 @@ class SearchAggregator(
                     sourceKind = src.sourceKind,
                     mediaSource = src.mediaSource,
                     status = status,
+                    arrivedAfterBatch = false,
                 )
             }
         }
@@ -534,6 +609,7 @@ class SearchAggregator(
                             sourceKind = src.sourceKind,
                             mediaSource = src.mediaSource,
                             status = status,
+                            arrivedAfterBatch = true,
                         ),
                     )
                 }
@@ -592,6 +668,7 @@ class SearchAggregator(
             nonSearchableSourceNames = activeNonSearchableNames.toList(),
             initialBatchSettled = activeInitialBatchSettled,
             showInitialSkeleton = activeShowInitialSkeleton,
+            showPendingTail = activeShowPendingTail && pendingNames.isNotEmpty(),
             visibleRows = activeVisibleRows.toList(),
             pendingSourceNames = pendingNames,
             emptySourceNames = emptyNames,

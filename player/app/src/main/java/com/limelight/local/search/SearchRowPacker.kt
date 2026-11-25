@@ -4,7 +4,6 @@ import com.limelight.local.media.Item
 import com.limelight.local.media.ItemKind
 import com.limelight.local.media.MediaSource
 import com.limelight.local.media.Shelf
-import com.limelight.local.media.ShelfStyle
 import com.limelight.local.media.WatchProgress
 import com.limelight.local.wall.Load
 
@@ -84,15 +83,19 @@ data class IdleWatchedEntry(
         }
 }
 
-/** One entry in the idle screen's 「最近添加」 strip or local typing catalog. */
+/** One entry in the local typing catalog for instant direct-hit suggestions. */
 data class LocalCatalogEntry(
     val source: MediaSource,
     val item: Item,
 )
 
 /**
- * Builds the idle screen's 「最近看过」, 「最近添加」, and local typing catalog strictly from
- * local Room watch history and already-loaded home shelves — zero network requests (`ux-spec.md` §3.9.3).
+ * Builds the idle screen's 「最近看过」 and local typing catalog strictly from local Room
+ * watch history and already-loaded home shelves — zero network requests (`ux-spec.md` §3.9.3).
+ *
+ * Note: Protocol v1 `Item`/`Shelf` does not define an `addedAt` field or a dedicated
+ * "recently added" shelf style, so the idle screen omits 「最近添加」 instead of guessing
+ * from localized shelf titles.
  */
 object SearchIdleDataBuilder {
     fun buildRecentWatched(
@@ -126,54 +129,6 @@ object SearchIdleDataBuilder {
                 )
             }
             out += IdleWatchedEntry(source = src, item = item, progress = p)
-        }
-        return out
-    }
-
-    fun buildRecentAdded(
-        sources: List<MediaSource>,
-        shelves: Map<String, Load<List<Shelf>>>,
-        limit: Int = SearchConfig.MAX_IDLE_RECENT_ADDED,
-    ): List<LocalCatalogEntry> {
-        if (sources.isEmpty()) return emptyList()
-        // Collect per-source non-continue, non-folder candidates, prioritizing shelves with
-        // "最近" / POSTER style, then interleave round-robin across sources so every source shows up.
-        val perSourceQueues = ArrayList<ArrayDeque<LocalCatalogEntry>>()
-        for (src in sources) {
-            val loaded = (shelves[src.source.id] as? Load.Ready)?.value ?: continue
-            val orderedShelves = loaded
-                .filter { it.style != ShelfStyle.CONTINUE && it.items.isNotEmpty() }
-                .sortedByDescending { sh ->
-                    var score = 0
-                    if (sh.category.title.contains("最近") || sh.category.id.contains("latest", ignoreCase = true) ||
-                        sh.category.id.contains("recent", ignoreCase = true)
-                    ) score += 2
-                    if (sh.style == ShelfStyle.POSTER || sh.style == ShelfStyle.THUMB) score += 1
-                    score
-                }
-            val q = ArrayDeque<LocalCatalogEntry>()
-            val seenInSource = HashSet<String>()
-            for (sh in orderedShelves) {
-                for (item in sh.items) {
-                    if (item.isFolder) continue
-                    if (seenInSource.add(item.id)) {
-                        q.addLast(LocalCatalogEntry(src, item))
-                    }
-                }
-            }
-            if (q.isNotEmpty()) perSourceQueues += q
-        }
-
-        val out = ArrayList<LocalCatalogEntry>(limit)
-        while (out.size < limit) {
-            var addedAny = false
-            for (q in perSourceQueues) {
-                if (out.size >= limit) break
-                val next = q.removeFirstOrNull() ?: continue
-                out += next
-                addedAny = true
-            }
-            if (!addedAny) break
         }
         return out
     }

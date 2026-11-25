@@ -3,6 +3,7 @@ package com.limelight.local.wall
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
@@ -48,11 +49,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -91,6 +92,7 @@ import com.limelight.local.media.Artworks
 import com.limelight.local.media.Item
 import com.limelight.local.media.ItemKind
 import com.limelight.local.media.MediaSource
+import com.limelight.local.media.WatchProgress
 import com.limelight.local.search.AggregatedSearchState
 import com.limelight.local.search.ExpandedSourcePaginator
 import com.limelight.local.search.ExpandedSourceState
@@ -101,7 +103,9 @@ import com.limelight.local.search.PackedSearchItem
 import com.limelight.local.search.SearchCardShape
 import com.limelight.local.search.SearchConfig
 import com.limelight.local.search.SearchIdleDataBuilder
+import com.limelight.local.search.SearchItemAction
 import com.limelight.local.search.SearchKindFilter
+import com.limelight.local.search.SearchNavigationPolicy
 import com.limelight.local.search.SearchQueryNormalizer
 import com.limelight.local.search.SearchRowPacker
 import com.limelight.local.search.SearchRowStatus
@@ -110,16 +114,28 @@ import com.limelight.local.search.SearchSourceRow
 import com.limelight.local.search.SearchSuggestionEngine
 import com.limelight.local.search.SearchableSource
 import com.limelight.local.search.SuggestionRow
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
+import java.io.Closeable
 import kotlin.math.ceil
 
 /**
  * UI state retained inside [WallNav.keep] while navigating from Search into Detail or Login
- * so returning via Back lands on the exact same query, filter, expanded view, and scroll offset.
+ * so returning via Back lands on the exact same query, filter, expanded view, and scroll offsets
+ * (vertical + per-row horizontal).
+ *
+ * Implements [Closeable] so [WallNav] automatically cancels [paginatorScope] when leaving
+ * `Page.Search`, while keeping it alive across `ExpandedSourceView -> DetailScreen -> Back`.
  */
-private class SearchUiHolder {
+private class SearchUiHolder : Closeable {
+    val paginatorScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
     var draftText by mutableStateOf("")
+    var savedDraftText by mutableStateOf("")
     var isEditing by mutableStateOf(false)
     var kindFilter by mutableStateOf(SearchKindFilter.ALL)
     var undoHistorySnapshot by mutableStateOf<List<String>?>(null)
@@ -128,12 +144,25 @@ private class SearchUiHolder {
     val idleListState = LazyListState()
     var resultsListState by mutableStateOf(LazyListState())
     var expandedListState by mutableStateOf(LazyListState())
+    private val rowListStates = HashMap<String, LazyListState>()
+
+    fun rowListState(sourceId: String): LazyListState =
+        rowListStates.getOrPut(sourceId) { LazyListState() }
+
+    fun clearRowListStates() {
+        rowListStates.clear()
+    }
 
     fun closeExpanded() {
         expandedPaginator?.cancel()
         expandedPaginator = null
         expandedMediaSource = null
         expandedListState = LazyListState()
+    }
+
+    override fun close() {
+        closeExpanded()
+        paginatorScope.cancel()
     }
 }
 
@@ -145,7 +174,6 @@ private class SearchUiHolder {
 @Composable
 fun SearchScreen(model: WallModel, nav: WallNav) {
     val holder = nav.keep(Page.Search, "ui") { SearchUiHolder() }
-    val scope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
     val keyboardController = LocalSoftwareKeyboardController.current
     val genericPluginLabel = stringResource(R.string.search_source_generic_label)
@@ -155,29 +183,32 @@ fun SearchScreen(model: WallModel, nav: WallNav) {
     val pluginInstances by model.pluginInstances.collectAsState()
     val history by model.searchHistory.entries.collectAsState()
     val recentProgress by model.recentWatchProgress.collectAsState()
+    val progressMap by model.recentWatchProgressMap.collectAsState()
     val aggState by model.searchAggregator.state.collectAsState()
 
-    val shelfSnapshot = model.shelves.toMap()
-    val partition = remember(allSources, pluginInstances, shelfSnapshot, genericPluginLabel) {
-        SearchSourceClassifier.partition(
-            sources = allSources,
-            pluginInstances = pluginInstances,
-            shelves = shelfSnapshot,
-            genericPluginLabel = genericPluginLabel,
-        )
+    val partition by remember(allSources, pluginInstances, genericPluginLabel) {
+        derivedStateOf {
+            SearchSourceClassifier.partition(
+                sources = allSources,
+                pluginInstances = pluginInstances,
+                shelves = model.shelves,
+                genericPluginLabel = genericPluginLabel,
+            )
+        }
     }
     val searchableSources = partition.searchable
     val nonSearchableNames = partition.nonSearchableNames
     val hasSearchableSources = searchableSources.isNotEmpty()
 
-    val recentWatched = remember(recentProgress, allSources, shelfSnapshot) {
-        SearchIdleDataBuilder.buildRecentWatched(recentProgress, allSources, shelfSnapshot)
+    val recentWatched by remember(recentProgress, allSources) {
+        derivedStateOf {
+            SearchIdleDataBuilder.buildRecentWatched(recentProgress, allSources, model.shelves)
+        }
     }
-    val recentAdded = remember(allSources, shelfSnapshot) {
-        SearchIdleDataBuilder.buildRecentAdded(allSources, shelfSnapshot)
-    }
-    val localCatalog = remember(allSources, shelfSnapshot, recentWatched) {
-        SearchIdleDataBuilder.buildLocalCatalog(allSources, shelfSnapshot, recentWatched)
+    val localCatalog by remember(allSources, recentWatched) {
+        derivedStateOf {
+            SearchIdleDataBuilder.buildLocalCatalog(allSources, model.shelves, recentWatched)
+        }
     }
 
     // Returning from post-login flow re-searches ONLY that source in place (§3.9.3)
@@ -192,12 +223,17 @@ fun SearchScreen(model: WallModel, nav: WallNav) {
         }
     }
 
-    fun exitEditing(restoreSubmittedQuery: Boolean) {
+    fun exitEditing(restoreSubmittedQuery: Boolean, clearSavedDraft: Boolean = false) {
         holder.isEditing = false
         focusManager.clearFocus(force = true)
         keyboardController?.hide()
-        if (restoreSubmittedQuery && aggState.hasActiveQuery) {
-            holder.draftText = aggState.query
+        if (aggState.hasActiveQuery) {
+            if (restoreSubmittedQuery) {
+                holder.draftText = aggState.query
+            }
+        } else {
+            holder.savedDraftText = if (clearSavedDraft) "" else holder.draftText
+            holder.draftText = ""
         }
     }
 
@@ -205,7 +241,9 @@ fun SearchScreen(model: WallModel, nav: WallNav) {
         val norm = SearchQueryNormalizer.normalize(raw)
         if (norm.isEmpty() || !hasSearchableSources) return
         holder.closeExpanded()
+        holder.clearRowListStates()
         holder.undoHistorySnapshot = null
+        holder.savedDraftText = ""
         holder.draftText = norm
         holder.kindFilter = filter
         holder.isEditing = false
@@ -223,6 +261,7 @@ fun SearchScreen(model: WallModel, nav: WallNav) {
 
     fun switchAggregatedKind(newFilter: SearchKindFilter) {
         if (!aggState.hasActiveQuery || holder.kindFilter == newFilter) return
+        holder.clearRowListStates()
         holder.kindFilter = newFilter
         model.searchAggregator.search(
             rawQuery = aggState.query,
@@ -238,7 +277,7 @@ fun SearchScreen(model: WallModel, nav: WallNav) {
         holder.closeExpanded()
         holder.expandedMediaSource = row.mediaSource
         holder.expandedPaginator = ExpandedSourcePaginator(
-            scope = scope,
+            scope = holder.paginatorScope,
             source = src,
             query = aggState.query,
             initialKindFilter = aggState.kindFilter,
@@ -249,7 +288,13 @@ fun SearchScreen(model: WallModel, nav: WallNav) {
 
     fun openResultItem(mediaSource: MediaSource?, item: Item) {
         val src = mediaSource ?: return
-        nav.item(src, item)
+        val localProgress = progressMap[src.source.id to item.id]
+        when (val action = SearchNavigationPolicy.resolveClickAction(src, item, localProgress)) {
+            is SearchItemAction.OpenFolder -> nav.category(action.source, action.item.id, action.item.title, action.item.childCount)
+            is SearchItemAction.PlayDirect -> nav.play(action.source, action.item, action.startMs)
+            is SearchItemAction.OpenEpisodeInSeries -> nav.openSearchEpisode(action.source, action.item)
+            is SearchItemAction.OpenDetail -> nav.detail(action.source, action.item)
+        }
     }
 
     fun handleBack() {
@@ -269,6 +314,7 @@ fun SearchScreen(model: WallModel, nav: WallNav) {
         ExpandedSourceView(
             paginator = activePaginator,
             mediaSource = holder.expandedMediaSource,
+            progressMap = progressMap,
             listState = holder.expandedListState,
             onBack = { holder.closeExpanded() },
             onItemClick = { item -> openResultItem(holder.expandedMediaSource, item) },
@@ -290,16 +336,16 @@ fun SearchScreen(model: WallModel, nav: WallNav) {
             ),
             onEnterEdit = {
                 if (hasSearchableSources) {
-                    holder.undoHistorySnapshot = null
+                    if (!aggState.hasActiveQuery && holder.draftText.isEmpty() && holder.savedDraftText.isNotEmpty()) {
+                        holder.draftText = holder.savedDraftText
+                    }
                     holder.isEditing = true
                 }
             },
             onTextChange = { holder.draftText = it },
             onClear = {
                 holder.draftText = ""
-                holder.kindFilter = SearchKindFilter.ALL
-                holder.undoHistorySnapshot = null
-                model.searchAggregator.resetToIdle()
+                holder.savedDraftText = ""
                 if (hasSearchableSources) {
                     holder.isEditing = true
                 }
@@ -328,8 +374,12 @@ fun SearchScreen(model: WallModel, nav: WallNav) {
                     onSubmitQuery = { submitSearch(it) },
                     onFillQuery = { holder.draftText = it },
                     onDirectHit = { entry ->
-                        exitEditing(restoreSubmittedQuery = false)
-                        nav.item(entry.source, entry.item)
+                        val termToRecord = entry.item.title.ifBlank { holder.draftText }
+                        if (termToRecord.isNotBlank()) {
+                            model.searchHistory.record(termToRecord)
+                        }
+                        exitEditing(restoreSubmittedQuery = true, clearSavedDraft = true)
+                        openResultItem(entry.source, entry.item)
                     },
                 )
             }
@@ -340,7 +390,6 @@ fun SearchScreen(model: WallModel, nav: WallNav) {
                     history = history,
                     undoSnapshot = holder.undoHistorySnapshot,
                     recentWatched = recentWatched,
-                    recentAdded = recentAdded,
                     onSelectHistory = { submitSearch(it) },
                     onClearHistory = {
                         holder.undoHistorySnapshot = model.searchHistory.clearWithUndoSnapshot()
@@ -355,11 +404,15 @@ fun SearchScreen(model: WallModel, nav: WallNav) {
                         if (entry.isResumable) {
                             nav.play(entry.source, entry.item, entry.progress.positionMs)
                         } else {
-                            nav.item(entry.source, entry.item)
+                            openResultItem(entry.source, entry.item)
                         }
                     },
-                    onClickAdded = { entry -> nav.item(entry.source, entry.item) },
-                    onPromptFocus = { holder.isEditing = true },
+                    onPromptFocus = {
+                        if (holder.draftText.isEmpty() && holder.savedDraftText.isNotEmpty()) {
+                            holder.draftText = holder.savedDraftText
+                        }
+                        holder.isEditing = true
+                    },
                 )
             }
 
@@ -395,6 +448,8 @@ fun SearchScreen(model: WallModel, nav: WallNav) {
                         AggregatedResultsList(
                             state = aggState,
                             listState = holder.resultsListState,
+                            rowListStateFor = holder::rowListState,
+                            progressMap = progressMap,
                             listSep = listSep,
                             onExpandSource = ::openExpandedSource,
                             onItemClick = ::openResultItem,
@@ -637,16 +692,14 @@ private fun SearchIdleView(
     history: List<String>,
     undoSnapshot: List<String>?,
     recentWatched: List<IdleWatchedEntry>,
-    recentAdded: List<LocalCatalogEntry>,
     onSelectHistory: (String) -> Unit,
     onClearHistory: () -> Unit,
     onUndoClearHistory: () -> Unit,
     onClickWatched: (IdleWatchedEntry) -> Unit,
-    onClickAdded: (LocalCatalogEntry) -> Unit,
     onPromptFocus: () -> Unit,
 ) {
     val showHistorySection = history.isNotEmpty() || undoSnapshot != null
-    val allEmpty = !showHistorySection && recentWatched.isEmpty() && recentAdded.isEmpty()
+    val allEmpty = !showHistorySection && recentWatched.isEmpty()
 
     if (allEmpty) {
         Box(
@@ -755,40 +808,6 @@ private fun SearchIdleView(
                         ) { _, entry ->
                             CompositionLocalProvider(LocalMediaSource provides entry.source) {
                                 IdleWatchedCard(entry = entry, onClick = { onClickWatched(entry) })
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (recentAdded.isNotEmpty()) {
-            item("idle-added") {
-                Column(Modifier.padding(top = if (showHistorySection || recentWatched.isNotEmpty()) 36.dp else 8.dp)) {
-                    Text(
-                        stringResource(R.string.search_idle_recent_added),
-                        style = WallType.Head,
-                        modifier = Modifier.padding(horizontal = Wall.Margin),
-                    )
-                    Spacer(Modifier.height(14.dp))
-                    val rowState = remember { LazyListState() }
-                    LazyRow(
-                        state = rowState,
-                        flingBehavior = rememberSnapFlingBehavior(rowState),
-                        contentPadding = PaddingValues(horizontal = Wall.Margin),
-                        horizontalArrangement = Arrangement.spacedBy(24.dp),
-                    ) {
-                        itemsIndexed(
-                            recentAdded,
-                            key = { idx, e -> "a:${e.source.source.id}/$idx/${e.item.id}" },
-                        ) { _, entry ->
-                            CompositionLocalProvider(LocalMediaSource provides entry.source) {
-                                SearchResultCard(
-                                    item = entry.item,
-                                    shape = SearchCardShape.forItem(entry.item),
-                                    metaOverride = entry.source.source.name,
-                                    onClick = { onClickAdded(entry) },
-                                )
                             }
                         }
                     }
@@ -1209,9 +1228,24 @@ private fun SearchStatusCounter(
 // ---------------------------------------------------------------------------
 
 @Composable
+private fun PostBatchFadeIn(enabled: Boolean, content: @Composable () -> Unit) {
+    val alpha = remember { Animatable(if (enabled) 0f else 1f) }
+    LaunchedEffect(enabled) {
+        if (enabled && alpha.value < 1f) {
+            alpha.animateTo(1f, tween(200))
+        }
+    }
+    Box(Modifier.graphicsLayer { this.alpha = alpha.value }) {
+        content()
+    }
+}
+
+@Composable
 private fun AggregatedResultsList(
     state: AggregatedSearchState,
     listState: LazyListState,
+    rowListStateFor: (String) -> LazyListState,
+    progressMap: Map<Pair<String, String>, WatchProgress>,
     listSep: String,
     onExpandSource: (SearchSourceRow) -> Unit,
     onItemClick: (MediaSource?, Item) -> Unit,
@@ -1225,12 +1259,19 @@ private fun AggregatedResultsList(
     ) {
         if (state.visibleRows.isEmpty() && state.showInitialSkeleton && !state.allSettled) {
             item("initial-skeleton") {
-                Column(Modifier.padding(start = Wall.Margin, top = 8.dp, bottom = 20.dp)) {
-                    SearchSkeletonBox(Modifier.size(220.dp, 34.dp), 10.dp)
-                    Spacer(Modifier.height(18.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-                        repeat(5) {
-                            SearchSkeletonBox(Modifier.size(128.dp, 192.dp), Wall.RadiusPoster)
+                Column(
+                    Modifier.padding(start = Wall.Margin, top = 8.dp, bottom = 20.dp),
+                    verticalArrangement = Arrangement.spacedBy(28.dp),
+                ) {
+                    repeat(2) {
+                        Column {
+                            SearchSkeletonBox(Modifier.size(160.dp, 28.dp), 10.dp)
+                            Spacer(Modifier.height(18.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                                repeat(5) {
+                                    SearchSkeletonBox(Modifier.size(128.dp, 192.dp), Wall.RadiusPoster)
+                                }
+                            }
                         }
                     }
                 }
@@ -1239,92 +1280,106 @@ private fun AggregatedResultsList(
 
         itemsIndexed(state.visibleRows, key = { _, row -> "src:${row.sourceId}" }) { index, row ->
             val topGap = if (index == 0) 0.dp else 18.dp
-            if (row.refreshingInPlace) {
-                Box(Modifier.padding(top = topGap)) {
-                    SearchStatusLine(
-                        icon = null,
-                        busyDot = true,
-                        text = stringResource(R.string.search_err_retrying, row.displayName),
-                        danger = false,
-                        action = {},
-                    )
-                }
-            } else {
-                when (val st = row.status) {
-                    is SearchRowStatus.Results -> {
-                        SearchResultsSourceSection(
-                            row = row,
-                            results = st,
-                            modifier = Modifier.padding(top = topGap),
-                            onExpand = { onExpandSource(row) },
-                            onItemClick = { item -> onItemClick(row.mediaSource, item) },
+            PostBatchFadeIn(enabled = row.arrivedAfterBatch) {
+                if (row.refreshingInPlace) {
+                    Box(Modifier.padding(top = topGap)) {
+                        SearchStatusLine(
+                            icon = null,
+                            busyDot = true,
+                            text = stringResource(R.string.search_err_retrying, row.displayName),
+                            danger = false,
+                            action = {},
                         )
                     }
-                    is SearchRowStatus.NeedsAuth -> {
-                        Box(Modifier.padding(top = topGap)) {
-                            SearchStatusLine(
-                                icon = WallIcons.User,
-                                text = stringResource(R.string.search_err_needs_auth, row.displayName),
-                                danger = false,
-                                action = {
-                                    WallButton(
-                                        text = stringResource(R.string.search_err_action_login),
-                                        onClick = { onLoginSource(row) },
-                                        small = true,
-                                    )
-                                },
+                } else {
+                    when (val st = row.status) {
+                        is SearchRowStatus.Results -> {
+                            SearchResultsSourceSection(
+                                row = row,
+                                results = st,
+                                rowListState = rowListStateFor(row.sourceId),
+                                progressMap = progressMap,
+                                modifier = Modifier.padding(top = topGap),
+                                onExpand = { onExpandSource(row) },
+                                onItemClick = { item -> onItemClick(row.mediaSource, item) },
                             )
                         }
-                    }
-                    is SearchRowStatus.Failed -> {
-                        Box(Modifier.padding(top = topGap)) {
-                            SearchStatusLine(
-                                icon = WallIcons.Alert,
-                                text = stringResource(R.string.search_err_unavailable, row.displayName),
-                                danger = true,
-                                action = {
-                                    WallButton(
-                                        text = stringResource(R.string.action_retry),
-                                        onClick = { onRetrySource(row) },
-                                        icon = WallIcons.Refresh,
-                                        small = true,
-                                    )
-                                },
-                            )
+                        is SearchRowStatus.Empty -> {
+                            Box(Modifier.padding(top = topGap)) {
+                                SearchStatusLine(
+                                    icon = WallIcons.Search,
+                                    text = stringResource(R.string.search_err_empty_after_retry, row.displayName),
+                                    danger = false,
+                                    action = {},
+                                )
+                            }
                         }
-                    }
-                    is SearchRowStatus.TimedOut -> {
-                        Box(Modifier.padding(top = topGap)) {
-                            SearchStatusLine(
-                                icon = WallIcons.Alert,
-                                text = stringResource(R.string.search_err_timeout, row.displayName, st.timeoutSec),
-                                danger = true,
-                                action = {
-                                    WallButton(
-                                        text = stringResource(R.string.action_retry),
-                                        onClick = { onRetrySource(row) },
-                                        icon = WallIcons.Refresh,
-                                        small = true,
-                                    )
-                                },
-                            )
+                        is SearchRowStatus.NeedsAuth -> {
+                            Box(Modifier.padding(top = topGap)) {
+                                SearchStatusLine(
+                                    icon = WallIcons.User,
+                                    text = stringResource(R.string.search_err_needs_auth, row.displayName),
+                                    danger = false,
+                                    action = {
+                                        WallButton(
+                                            text = stringResource(R.string.search_err_action_login),
+                                            onClick = { onLoginSource(row) },
+                                            small = true,
+                                        )
+                                    },
+                                )
+                            }
                         }
-                    }
-                    is SearchRowStatus.RateLimited -> {
-                        Box(Modifier.padding(top = topGap)) {
-                            SearchRateLimitedLine(
-                                displayName = row.displayName,
-                                availableAtMs = st.availableAtMs,
-                                onRetry = { onRetrySource(row) },
-                            )
+                        is SearchRowStatus.Failed -> {
+                            Box(Modifier.padding(top = topGap)) {
+                                SearchStatusLine(
+                                    icon = WallIcons.Alert,
+                                    text = stringResource(R.string.search_err_unavailable, row.displayName),
+                                    danger = true,
+                                    action = {
+                                        WallButton(
+                                            text = stringResource(R.string.action_retry),
+                                            onClick = { onRetrySource(row) },
+                                            icon = WallIcons.Refresh,
+                                            small = true,
+                                        )
+                                    },
+                                )
+                            }
                         }
+                        is SearchRowStatus.TimedOut -> {
+                            Box(Modifier.padding(top = topGap)) {
+                                SearchStatusLine(
+                                    icon = WallIcons.Alert,
+                                    text = stringResource(R.string.search_err_timeout, row.displayName, st.timeoutSec),
+                                    danger = true,
+                                    action = {
+                                        WallButton(
+                                            text = stringResource(R.string.action_retry),
+                                            onClick = { onRetrySource(row) },
+                                            icon = WallIcons.Refresh,
+                                            small = true,
+                                        )
+                                    },
+                                )
+                            }
+                        }
+                        is SearchRowStatus.RateLimited -> {
+                            Box(Modifier.padding(top = topGap)) {
+                                SearchRateLimitedLine(
+                                    displayName = row.displayName,
+                                    availableAtMs = st.availableAtMs,
+                                    onRetry = { onRetrySource(row) },
+                                )
+                            }
+                        }
+                        SearchRowStatus.Waiting -> Unit
                     }
-                    SearchRowStatus.Waiting, SearchRowStatus.Empty -> Unit
                 }
             }
         }
 
-        if (state.pendingSourceNames.isNotEmpty()) {
+        if (state.showPendingTail && state.pendingSourceNames.isNotEmpty()) {
             item("tail-pending") {
                 SearchTailLine(
                     text = stringResource(
@@ -1336,27 +1391,24 @@ private fun AggregatedResultsList(
             }
         }
 
-        if (state.allSettled && state.emptySourceNames.isNotEmpty() && !state.isTrueNoResult) {
-            item("tail-empty") {
-                SearchTailLine(
-                    text = stringResource(
-                        R.string.search_tail_not_found_in,
-                        state.emptySourceNames.joinToString(listSep),
-                    ),
-                    busy = false,
-                )
-            }
-        }
-
-        if (state.allSettled && state.nonSearchableSourceNames.isNotEmpty()) {
-            item("tail-unsupported") {
-                SearchTailLine(
-                    text = stringResource(
-                        R.string.search_tail_unsupported,
-                        state.nonSearchableSourceNames.joinToString(listSep),
-                    ),
-                    busy = false,
-                )
+        if (state.allSettled && !state.isTrueNoResult &&
+            (state.emptySourceNames.isNotEmpty() || state.nonSearchableSourceNames.isNotEmpty())
+        ) {
+            item("tail-summary") {
+                val emptyPart = if (state.emptySourceNames.isNotEmpty()) {
+                    stringResource(R.string.search_tail_not_found_in, state.emptySourceNames.joinToString(listSep))
+                } else {
+                    null
+                }
+                val unsupportedPart = if (state.nonSearchableSourceNames.isNotEmpty()) {
+                    stringResource(R.string.search_tail_unsupported, state.nonSearchableSourceNames.joinToString(listSep))
+                } else {
+                    null
+                }
+                val mergedTail = listOfNotNull(emptyPart, unsupportedPart).joinToString("  ")
+                if (mergedTail.isNotEmpty()) {
+                    SearchTailLine(text = mergedTail, busy = false)
+                }
             }
         }
     }
@@ -1366,6 +1418,8 @@ private fun AggregatedResultsList(
 private fun SearchResultsSourceSection(
     row: SearchSourceRow,
     results: SearchRowStatus.Results,
+    rowListState: LazyListState,
+    progressMap: Map<Pair<String, String>, WatchProgress>,
     modifier: Modifier = Modifier,
     onExpand: () -> Unit,
     onItemClick: (Item) -> Unit,
@@ -1405,7 +1459,6 @@ private fun SearchResultsSourceSection(
 
         Spacer(Modifier.height(4.dp))
 
-        val rowListState = remember(row.sourceId) { LazyListState() }
         CompositionLocalProvider(LocalMediaSource provides row.mediaSource) {
             LazyRow(
                 state = rowListState,
@@ -1420,6 +1473,7 @@ private fun SearchResultsSourceSection(
                     SearchResultCard(
                         item = item,
                         shape = SearchCardShape.forItem(item),
+                        localProgress = progressMap[row.sourceId to item.id],
                         onClick = { onItemClick(item) },
                     )
                 }
@@ -1489,21 +1543,21 @@ private fun SearchRateLimitedLine(
     }
     val remainingSec = ceil(((availableAtMs - nowMs).coerceAtLeast(0L)) / 1000.0).toInt()
     val canRetry = remainingSec <= 0
+    val statusText = when {
+        canRetry -> stringResource(R.string.search_err_rate_limited_ready, displayName)
+        remainingSec >= 60 -> {
+            val mins = ceil(remainingSec / 60.0).toInt().coerceAtLeast(1)
+            stringResource(R.string.search_err_rate_limited_min, displayName, mins)
+        }
+        else -> stringResource(R.string.search_err_rate_limited, displayName, remainingSec)
+    }
     SearchStatusLine(
         icon = WallIcons.Alert,
-        text = if (canRetry) {
-            stringResource(R.string.search_err_rate_limited_ready, displayName)
-        } else {
-            stringResource(R.string.search_err_rate_limited, displayName, remainingSec)
-        },
+        text = statusText,
         danger = true,
         action = {
             WallButton(
-                text = if (canRetry) {
-                    stringResource(R.string.action_retry)
-                } else {
-                    stringResource(R.string.action_retry_countdown, remainingSec)
-                },
+                text = stringResource(R.string.action_retry),
                 onClick = onRetry,
                 icon = if (canRetry) WallIcons.Refresh else null,
                 small = true,
@@ -1619,6 +1673,7 @@ private fun SearchNoResultView(
 private fun ExpandedSourceView(
     paginator: ExpandedSourcePaginator,
     mediaSource: MediaSource?,
+    progressMap: Map<Pair<String, String>, WatchProgress>,
     listState: LazyListState,
     onBack: () -> Unit,
     onItemClick: (Item) -> Unit,
@@ -1632,7 +1687,7 @@ private fun ExpandedSourceView(
             val info = listState.layoutInfo
             val lastIdx = info.visibleItemsInfo.lastOrNull()?.index ?: -1
             val total = info.totalItemsCount
-            Triple(lastIdx, total, state.items.size)
+            Triple(lastIdx, total, state.loadedPages)
         }
             .distinctUntilChanged()
             .collect { (lastIdx, total, _) ->
@@ -1725,6 +1780,7 @@ private fun ExpandedSourceView(
                                 SearchResultCard(
                                     item = entry.item,
                                     shape = entry.shape,
+                                    localProgress = progressMap[state.sourceId to entry.item.id],
                                     onClick = { onItemClick(entry.item) },
                                 )
                             }
@@ -1752,9 +1808,10 @@ private fun ExpandedSourceView(
 
                     if (state.pageError != null) {
                         item("exp-error") {
+                            val failedPage = state.failedPageNumber ?: (state.loadedPages + 1)
                             SearchStatusLine(
                                 icon = WallIcons.Alert,
-                                text = stringResource(R.string.search_expanded_page_error),
+                                text = stringResource(R.string.search_expanded_page_error, failedPage),
                                 danger = true,
                                 action = {
                                     WallButton(
@@ -1766,10 +1823,10 @@ private fun ExpandedSourceView(
                                 },
                             )
                         }
-                    } else if (state.reachedEnd && state.items.isNotEmpty() && state.loadedPages > 1) {
+                    } else if (state.reachedEnd && state.items.isNotEmpty()) {
                         item("exp-end") {
                             SearchTailLine(
-                                text = stringResource(R.string.search_expanded_end_no_more),
+                                text = stringResource(R.string.search_expanded_end_no_more, state.items.size),
                                 busy = false,
                             )
                         }
@@ -1789,6 +1846,7 @@ private fun SearchResultCard(
     item: Item,
     shape: SearchCardShape,
     onClick: () -> Unit,
+    localProgress: WatchProgress? = null,
     metaOverride: String? = null,
 ) {
     val src = remember { MutableInteractionSource() }
@@ -1797,16 +1855,14 @@ private fun SearchResultCard(
     val cardShape = RoundedCornerShape(Wall.RadiusPoster)
     val widthDp = shape.widthDp.dp
 
-    val progressFraction = remember(item.progressMs, item.durationMs, item.played) {
-        val pos = item.progressMs ?: 0L
-        val dur = item.durationMs ?: 0L
-        if (item.played != true && pos > 10_000L && dur > 0L && pos < dur * 0.95) {
-            (pos.toFloat() / dur.toFloat()).coerceIn(0.02f, 1f)
-        } else {
-            null
-        }
+    val watchState = remember(item, localProgress) {
+        DetailStateLogic.computeWatchState(item, localProgress)
     }
-    val metaText = metaOverride ?: formatSearchItemMeta(item, progressFraction != null)
+    val inProgress = watchState as? WatchState.InProgress
+    val progressFraction = inProgress?.fraction
+    val isDirectPlayVideo = (item.kind == ItemKind.VIDEO || item.kind == ItemKind.LIVE) &&
+        item.episodes.isEmpty() && item.seasons.isEmpty()
+    val metaText = metaOverride ?: formatSearchItemMeta(item, inProgress)
 
     Column(Modifier.width(widthDp).ray(src, onClick)) {
         val boxMod = Modifier
@@ -1849,6 +1905,19 @@ private fun SearchResultCard(
                                 .clip(RoundedCornerShape(3.dp))
                                 .background(Wall.Accent),
                         )
+                    }
+                }
+                androidx.compose.animation.AnimatedVisibility(
+                    hovered && isDirectPlayVideo,
+                    Modifier.align(Alignment.Center),
+                    enter = fadeIn(tween(140)),
+                    exit = fadeOut(tween(140)),
+                ) {
+                    Box(
+                        Modifier.size(56.dp).clip(CircleShape).background(Color(0xEBECECEE)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(WallIcons.Play, null, Modifier.size(24.dp).offset(x = 2.dp), tint = Wall.Bg)
                     }
                 }
             }
@@ -1957,12 +2026,9 @@ private fun SearchSkeletonBox(modifier: Modifier, radius: Dp = 12.dp) {
 }
 
 @Composable
-private fun formatSearchItemMeta(item: Item, hasProgress: Boolean): String {
-    if (hasProgress) {
-        val dur = item.durationMs ?: 0L
-        val pos = item.progressMs ?: 0L
-        val rem = (dur - pos).coerceAtLeast(1L)
-        return stringResource(R.string.home_continue_left_min, minutesLeft(rem))
+private fun formatSearchItemMeta(item: Item, inProgress: WatchState.InProgress?): String {
+    if (inProgress != null) {
+        return stringResource(R.string.home_continue_left_min, minutesLeft(inProgress.remainingMs.coerceAtLeast(1L)))
     }
     return when (item.kind) {
         ItemKind.FOLDER -> {

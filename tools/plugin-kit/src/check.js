@@ -341,15 +341,44 @@ export async function checkPlugin(targetPath, opts = {}) {
             }
           }
 
-          // 3. Pagination cursor progression if page 1 returns next
+          // 3. Pagination progression: follow up to 3 subsequent pages, checking schema,
+          //    page-2 duplicate content (ignored cursor), and cursor cycles of any length.
           if (!sErrs.length && sr?.next) {
-            const sr2 = await host.invoke('search', { query: probeQuery, cursor: sr.next });
-            const s2Errs = validateMethodResult('search', sr2, manifest, host.networkPolicy);
-            if (s2Errs.length) {
-              errors.push(...s2Errs.map((e) => `search(page2): ${e}`));
-            } else if (sr2.next === sr.next) {
-              errors.push(`search() pagination returned repeated cursor '${sr2.next}' (infinite loop risk)`);
-            } else {
+            const page1Ids = new Set(
+              (sr.items || []).map((it) => it?.id).filter((id) => typeof id === 'string' && id.length > 0),
+            );
+            const seenCursors = new Set([sr.next]);
+            let curCursor = sr.next;
+            let paginationOk = true;
+            const maxExtraPages = 3;
+            for (let pageIdx = 2; pageIdx <= 1 + maxExtraPages && curCursor; pageIdx++) {
+              const srNext = await host.invoke('search', { query: probeQuery, cursor: curCursor });
+              const snErrs = validateMethodResult('search', srNext, manifest, host.networkPolicy);
+              if (snErrs.length) {
+                errors.push(...snErrs.map((e) => `search(page${pageIdx}): ${e}`));
+                paginationOk = false;
+                break;
+              }
+              if (pageIdx === 2 && page1Ids.size > 0 && Array.isArray(srNext.items) && srNext.items.length > 0) {
+                const page2Ids = srNext.items.map((it) => it?.id).filter((id) => typeof id === 'string' && id.length > 0);
+                if (page2Ids.length > 0 && page2Ids.every((id) => page1Ids.has(id))) {
+                  errors.push('search() page 2 duplicated page 1 items (plugin appears to ignore cursor)');
+                  paginationOk = false;
+                  break;
+                }
+              }
+              const nextCursor = srNext?.next || null;
+              if (nextCursor) {
+                if (seenCursors.has(nextCursor)) {
+                  errors.push(`search() pagination cursor cycle detected at '${nextCursor}' (infinite loop risk)`);
+                  paginationOk = false;
+                  break;
+                }
+                seenCursors.add(nextCursor);
+              }
+              curCursor = nextCursor;
+            }
+            if (paginationOk) {
               checks.push('search() pagination cursor progression');
             }
           }

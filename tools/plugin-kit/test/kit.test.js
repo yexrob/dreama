@@ -2447,21 +2447,60 @@ test('Task H: d3plugin check validates search empty query, pagination, unsupport
         browse() { return { items: [], next: null }; },
         detail() { return { id: '1', kind: 'movie', title: 'T' }; },
         playback() { return { url: 'https://cdn.example.com/v.mp4' }; },
-        search(ctx, { query = '' } = {}) {
+        search(ctx, { query = '', cursor = null } = {}) {
           if (!String(query).trim()) return { items: [], next: null };
-          return { items: [{ id: '1', kind: 'movie', title: 'Loop' }], next: 'stuck' };
+          const id = cursor ? '2' : '1';
+          return { items: [{ id, kind: 'movie', title: 'Loop ' + id }], next: 'stuck' };
         },
       };`,
     );
     const loopRep = await checkPlugin(loopCursorDir);
     assert.equal(loopRep.ok, false);
-    assert.ok(loopRep.errors.some((e) => e.includes('repeated cursor')));
+    assert.ok(loopRep.errors.some((e) => e.includes('cursor cycle')));
+
+    // 6. Plugin ignoring cursor (page 2 duplicates page 1 items) fails check
+    const dupPageDir = writePlugin(
+      'duppage',
+      `export default {
+        home() { return []; },
+        browse() { return { items: [], next: null }; },
+        detail() { return { id: '1', kind: 'movie', title: 'T' }; },
+        playback() { return { url: 'https://cdn.example.com/v.mp4' }; },
+        search(ctx, { query = '', cursor = null } = {}) {
+          if (!String(query).trim()) return { items: [], next: null };
+          return { items: [{ id: 'same-1', kind: 'movie', title: 'Same' }], next: cursor ? null : 'p2' };
+        },
+      };`,
+    );
+    const dupPageRep = await checkPlugin(dupPageDir);
+    assert.equal(dupPageRep.ok, false);
+    assert.ok(dupPageRep.errors.some((e) => e.includes('duplicated page 1 items')));
+
+    // 7. Plugin with length-2 cursor cycle (p2 -> p3 -> p2) fails check
+    const cycle2Dir = writePlugin(
+      'cycle2',
+      `export default {
+        home() { return []; },
+        browse() { return { items: [], next: null }; },
+        detail() { return { id: '1', kind: 'movie', title: 'T' }; },
+        playback() { return { url: 'https://cdn.example.com/v.mp4' }; },
+        search(ctx, { query = '', cursor = null } = {}) {
+          if (!String(query).trim()) return { items: [], next: null };
+          if (!cursor) return { items: [{ id: '1', kind: 'movie', title: 'One' }], next: 'p2' };
+          if (cursor === 'p2') return { items: [{ id: '2', kind: 'movie', title: 'Two' }], next: 'p3' };
+          return { items: [{ id: '3', kind: 'movie', title: 'Three' }], next: 'p2' };
+        },
+      };`,
+    );
+    const cycle2Rep = await checkPlugin(cycle2Dir);
+    assert.equal(cycle2Rep.ok, false);
+    assert.ok(cycle2Rep.errors.some((e) => e.includes('cursor cycle')));
   } finally {
     fs.rmSync(tmpBase, { recursive: true, force: true });
   }
 });
 
-test('Task H: jellyfin search handles empty query without HTTP, series includes episodes, and unknown kind is ignored', async () => {
+test('Task H: jellyfin search handles empty query before login without HTTP, series includes episodes, and unknown kind is ignored', async () => {
   const loaded = await loadPluginSource(JF_PLUGIN_DIR);
   const queries = [];
   const storage = new PluginStorage();
@@ -2490,10 +2529,16 @@ test('Task H: jellyfin search handles empty query without HTTP, series includes 
   });
 
   try {
+    // Empty / whitespace search and suggest MUST succeed BEFORE login (no NeedsAuth, 0 HTTP calls)
+    assert.deepEqual(await host.invoke('search', { query: '' }), { items: [], next: null });
+    assert.deepEqual(await host.invoke('search', { query: '   ' }), { items: [], next: null });
+    assert.deepEqual(await host.invoke('suggest', { query: '  ' }), []);
+    assert.equal(queries.length, 0);
+
     await host.invoke('login');
     queries.length = 0;
 
-    // Empty / whitespace search and suggest must return empty without hitting /Items or /Search/Hints
+    // Empty / whitespace search and suggest after login still return empty with 0 HTTP calls
     assert.deepEqual(await host.invoke('search', { query: '' }), { items: [], next: null });
     assert.deepEqual(await host.invoke('search', { query: '   ' }), { items: [], next: null });
     assert.deepEqual(await host.invoke('suggest', { query: '  ' }), []);

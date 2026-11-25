@@ -100,7 +100,14 @@ fun DetailScreen(model: WallModel, nav: WallNav, page: Page.Detail) {
     var retryToken by remember(page.sourceId, page.item.id) { mutableIntStateOf(0) }
     var actionNotice by remember(page.sourceId, page.item.id) { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(src?.source?.id, page.item.id, page.focusSeasonId, page.focusEpisodeId, retryToken) {
+    LaunchedEffect(
+        src?.source?.id,
+        page.item.id,
+        page.focusSeasonId,
+        page.focusEpisodeId,
+        page.resolveEpisodeParent,
+        retryToken,
+    ) {
         if (src == null) {
             loadingDetail = false
             return@LaunchedEffect
@@ -113,6 +120,7 @@ fun DetailScreen(model: WallModel, nav: WallNav, page: Page.Detail) {
                 initialItem = page.item,
                 requestedFocusSeasonId = page.focusSeasonId,
                 requestedFocusEpisodeId = page.focusEpisodeId,
+                resolveEpisodeParent = page.resolveEpisodeParent,
             )
             detailed = resolved.displayItem
             resolvedFocusSeasonId = resolved.focusSeasonId
@@ -635,33 +643,40 @@ private fun SeriesDetailContent(
     val activeState = pageStates[activeKey] ?: SeasonEpisodePageState(loading = source != null)
     val episodes = activeState.items
 
-    val playTarget = remember(activeKey, activeSeasonNumber, episodes, localProgress, initialResolution, focusSeasonId, focusEpisodeId) {
+    val activeExplicitFocusId = remember(hasSeasons, userSelectedSeason, focusSeasonId, focusEpisodeId, activeKey) {
+        if (userSelectedSeason || focusEpisodeId.isNullOrBlank()) {
+            null
+        } else if (!hasSeasons || focusSeasonId == null || focusSeasonId == activeKey) {
+            focusEpisodeId
+        } else {
+            null
+        }
+    }
+
+    val playTarget = remember(activeKey, activeSeasonNumber, episodes, localProgress, initialResolution, activeExplicitFocusId) {
         val res = initialResolution
         if (hasSeasons && res != null && res.seasonId == activeKey && res.target != null) {
             res.target
         } else {
-            val activeFocusId = if (!hasSeasons || focusSeasonId == null || focusSeasonId == activeKey) {
-                focusEpisodeId
-            } else {
-                null
-            }
-            DetailStateLogic.pickPlayTarget(activeSeasonNumber, episodes, localProgress, activeFocusId)
+            DetailStateLogic.pickPlayTarget(activeSeasonNumber, episodes, localProgress, activeExplicitFocusId)
         }
     }
     val episodeRowState = rememberLazyListState()
 
-    // Auto-scroll to the next/focused episode with 1 episode to its left (series.html)
-    var scrolledSeasonKey by remember(item.id) { mutableStateOf<String?>(null) }
-    val scrollAnchorKey = "$activeKey:${playTarget?.episode?.id.orEmpty()}"
-    LaunchedEffect(scrollAnchorKey, episodes.isNotEmpty()) {
-        if (episodes.isNotEmpty() && scrolledSeasonKey != scrollAnchorKey) {
-            scrolledSeasonKey = scrollAnchorKey
-            val targetIdx = DetailStateLogic.initialScrollIndex(episodes, playTarget?.episode?.id)
-            if (targetIdx > 0) {
-                episodeRowState.scrollToItem(targetIdx)
-            } else {
-                episodeRowState.scrollToItem(0)
-            }
+    // One-shot auto-scroll per season (or explicit Search episode focus): never re-scrolls
+    // when watch progress updates change `playTarget` on the same season (series.html).
+    val autoScrollController = remember(item.id) { SeriesAutoScrollController() }
+    val readyForInitialScroll = !loadingDetail && (!hasSeasons || initialResolution != null)
+    LaunchedEffect(activeKey, episodes.size, readyForInitialScroll, activeExplicitFocusId) {
+        val targetIdx = autoScrollController.consumeScrollTargetIndex(
+            seasonKey = activeKey,
+            episodes = episodes,
+            targetEpisodeId = playTarget?.episode?.id,
+            explicitFocusEpisodeId = activeExplicitFocusId,
+            readyForInitialScroll = readyForInitialScroll,
+        )
+        if (targetIdx != null) {
+            episodeRowState.scrollToItem(targetIdx)
         }
     }
 

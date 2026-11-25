@@ -15,11 +15,14 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -30,6 +33,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -40,6 +44,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import java.io.Closeable
+import java.io.IOException
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -146,7 +151,7 @@ class PluginRuntime(
     private val fetchGateway: PluginFetchGateway,
     private val storage: InstanceStorage,
     private val cookieJar: PluginCookieJar,
-    private val logger: PluginLogger,
+    internal val logger: PluginLogger,
     private val locale: PluginLocale = PluginLocale.EMPTY,
     val deviceInfo: DeviceInfo = DeviceInfo(),
     private val androidContext: Context? = null,
@@ -163,8 +168,10 @@ class PluginRuntime(
     private val dispatcher: CoroutineDispatcher = executor.asCoroutineDispatcher()
     private val domParser = PluginDomParser()
 
+    @Volatile
     private var quickJs: QuickJs? = null
     private var bridgeToken: String = ""
+    @Volatile
     private var initialized = false
     @Volatile
     private var cachedExportedMethods: Set<String>? = null
@@ -234,6 +241,10 @@ class PluginRuntime(
     var creationCount: Int = 0
         private set
 
+    /** True when the QuickJS VM is already warm and initialized (no cold-start `init(ctx)` required). */
+    val isInitialized: Boolean
+        get() = initialized && quickJs != null && !closed
+
     /**
      * Lock-free hint returning `true` once the plugin module has been loaded and confirmed
      * NOT to export [method]. Returns `false` if the runtime is not yet initialized or
@@ -273,6 +284,33 @@ class PluginRuntime(
     }
 
     /**
+     * Best-effort optional invocation for latency-sensitive background calls such as `suggest`:
+     * - Returns `null` immediately when the VM is not yet initialized (never triggers cold-start
+     *   bootstrap or `init(ctx)`).
+     * - Returns `null` immediately when another call (`home`, `search`, `detail`, `playback`, ...)
+     *   is running on this instance (never queues behind or cancels active calls).
+     * - Returns `null` silently if [method] is not exported.
+     */
+    suspend fun invokeOptionalIfReadyAndIdle(
+        method: String,
+        arg: JsonElement? = null,
+        itemIdForErrors: String? = null,
+        timeoutMsOverride: Long? = null,
+    ): JsonElement? {
+        if (closed || !initialized || quickJs == null || isMethodKnownMissing(method)) return null
+        if (!callMutex.tryLock()) return null
+        return try {
+            if (closed || !initialized || quickJs == null || isMethodKnownMissing(method)) {
+                null
+            } else {
+                invokeLocked(method, arg, itemIdForErrors, timeoutMsOverride, optional = true)
+            }
+        } finally {
+            callMutex.unlock()
+        }
+    }
+
+    /**
      * Best-effort invocation used by `reportProgress` (§11.1): if this instance
      * is currently busy with another call, immediately drops the call and
      * returns `false` without blocking playback.
@@ -294,6 +332,26 @@ class PluginRuntime(
 
     private class InternalCallTimeoutException(cause: Throwable) : Exception(cause)
 
+    private fun extractSensitiveQueryTerms(method: String, arg: JsonElement?): List<String> {
+        if (method != "search" && method != "suggest") return emptyList()
+        val query = ((arg as? JsonObject)?.get("query") as? JsonPrimitive)
+            ?.takeIf { it.isString }
+            ?.content
+            ?.trim()
+            .orEmpty()
+        return if (query.isEmpty()) emptyList() else listOf(query)
+    }
+
+    private fun isVmDamagedError(t: Throwable): Boolean =
+        t is QuickJsInterruptedException ||
+            hasCause<QuickJsInterruptedException>(t) ||
+            domTimedOutInCall ||
+            hasCause<DomTimeoutException>(t) ||
+            hostOomInCall ||
+            isOutOfMemoryError(t) ||
+            (t is QuickJsException && t.message?.contains("InternalError: interrupted", ignoreCase = true) == true)
+
+    @OptIn(ExperimentalCoroutinesApi::class)
     private suspend fun invokeLocked(
         method: String,
         arg: JsonElement?,
@@ -311,80 +369,119 @@ class PluginRuntime(
         val timeoutMs = timeoutMsOverride
             ?: if (method == "playback") playbackTimeoutMs else defaultTimeoutMs
 
-        ensureInitializedLocked(timeoutMs)
-        if (optional && isMethodKnownMissing(method)) {
-            return null
+        val queryRedactions = extractSensitiveQueryTerms(method, arg)
+        if (queryRedactions.isNotEmpty()) {
+            logger.setActiveQueryRedactions(queryRedactions)
         }
-
-        val gen = callGeneration.incrementAndGet()
-        val callScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        activeCallScope = callScope
-        storageCorruptedInCall = false
-        domTimedOutInCall = false
-        hostOomInCall = false
-        domParser.clear()
-        releaseAllResponseBodies()
-
-        val qjs = quickJs ?: throw PluginErrorMapper.toException(
-            PluginErrorPayload(PluginErrorCode.INTERNAL),
-            itemId = itemIdForErrors,
-            context = androidContext,
-        )
-        qjs.evaluationTimeoutMillis = timeoutMs
-        val dl = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMs)
-        callDeadlineNanos = dl
-        domParser.setCallDeadlineNanos(dl)
-
-        val argJson = arg?.toString() ?: "null"
-        val hasArg = arg != null
-        val invokeFn = if (optional) "__d3_invoke_optional" else "__d3_invoke"
-        val invokeScript = "await $invokeFn(${JsonPrimitive(method)}, ${JsonPrimitive(argJson)}, $hasArg, $gen)"
-
         return try {
-            val rawResult = withContext(dispatcher) {
-                try {
+            ensureInitializedLocked(timeoutMs)
+            if (optional && isMethodKnownMissing(method)) {
+                return null
+            }
+
+            val gen = callGeneration.incrementAndGet()
+            val callScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            val evalScope = CoroutineScope(SupervisorJob() + dispatcher)
+            activeCallScope = callScope
+            storageCorruptedInCall = false
+            domTimedOutInCall = false
+            hostOomInCall = false
+            domParser.clear()
+            releaseAllResponseBodies()
+
+            val qjs = quickJs ?: throw PluginErrorMapper.toException(
+                PluginErrorPayload(PluginErrorCode.INTERNAL),
+                itemId = itemIdForErrors,
+                context = androidContext,
+            )
+            qjs.evaluationTimeoutMillis = timeoutMs
+            val dl = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+            callDeadlineNanos = dl
+            domParser.setCallDeadlineNanos(dl)
+
+            val argJson = arg?.toString() ?: "null"
+            val hasArg = arg != null
+            val invokeFn = if (optional) "__d3_invoke_optional" else "__d3_invoke"
+            val invokeScript = "await $invokeFn(${JsonPrimitive(method)}, ${JsonPrimitive(argJson)}, $hasArg, $gen)"
+
+            val evalDeferred = evalScope.async {
+                qjs.evaluate<String?>(invokeScript, filename = "__d3_call.js")
+            }
+
+            try {
+                val rawResult = try {
                     withTimeout(timeoutMs) {
-                        qjs.evaluate<String?>(invokeScript, filename = "__d3_call.js")
+                        evalDeferred.await()
                     }
                 } catch (e: TimeoutCancellationException) {
                     if (currentCoroutineContext().isActive) {
+                        withContext(NonCancellable) {
+                            cleanupActiveCall(callScope)
+                            try {
+                                qjs.interruptEvaluation()
+                            } catch (_: Throwable) {
+                            }
+                            evalDeferred.cancel()
+                            withTimeoutOrNull(INTERRUPT_JOIN_WAIT_MS) { evalDeferred.join() }
+                        }
                         throw InternalCallTimeoutException(e)
                     } else {
                         throw e
                     }
                 }
-            }
-            if (rawResult.isNullOrEmpty() || rawResult == "undefined") {
-                if (optional) null else JsonNull
-            } else {
-                if (rawResult.length > MAX_RETURN_BYTES ||
-                    rawResult.toByteArray(Charsets.UTF_8).size > MAX_RETURN_BYTES
-                ) {
-                    throw PluginErrorMapper.toException(
-                        PluginErrorPayload(PluginErrorCode.INTERNAL),
-                        itemId = itemIdForErrors,
-                        context = androidContext,
-                    )
+                if (rawResult.isNullOrEmpty() || rawResult == "undefined") {
+                    if (optional) null else JsonNull
+                } else {
+                    if (rawResult.length > MAX_RETURN_BYTES ||
+                        rawResult.toByteArray(Charsets.UTF_8).size > MAX_RETURN_BYTES
+                    ) {
+                        throw PluginErrorMapper.toException(
+                            PluginErrorPayload(PluginErrorCode.INTERNAL),
+                            itemId = itemIdForErrors,
+                            context = androidContext,
+                        )
+                    }
+                    json.parseToJsonElement(rawResult)
                 }
-                json.parseToJsonElement(rawResult)
+            } catch (ce: CancellationException) {
+                // Cooperative caller cancellation (e.g. suggest 800 ms timeout, next keystroke,
+                // new query, leaving screen): cancel in-flight IO/timers first so awaiting JS
+                // unwinds cleanly without tearing down the QuickJS VM. ONLY interrupt and destroy
+                // the VM if JS refuses to settle (CPU loop / hung promise) or was damaged.
+                withContext(NonCancellable) {
+                    cleanupActiveCall(callScope)
+                    val settledGracefully = withTimeoutOrNull(GRACEFUL_CANCEL_WAIT_MS) {
+                        evalDeferred.join()
+                        true
+                    } == true
+                    val evalError = if (settledGracefully && evalDeferred.isCompleted && !evalDeferred.isCancelled) {
+                        runCatching { evalDeferred.getCompletionExceptionOrNull() }.getOrNull()
+                    } else {
+                        null
+                    }
+                    val mustRebuildVm = !settledGracefully || (evalError != null && isVmDamagedError(evalError))
+                    if (mustRebuildVm) {
+                        try {
+                            qjs.interruptEvaluation()
+                        } catch (_: Throwable) {
+                        }
+                        evalDeferred.cancel()
+                        withTimeoutOrNull(INTERRUPT_JOIN_WAIT_MS) { evalDeferred.join() }
+                        destroyRuntimeLocked(runDispose = false)
+                    }
+                }
+                throw ce
+            } catch (t: Throwable) {
+                handleInvocationFailureLocked(qjs, method, t, itemIdForErrors)
+            } finally {
+                cleanupActiveCall(callScope)
+                evalScope.cancel()
+                runCatching { cookieJar.flush() }
             }
-        } catch (ce: CancellationException) {
-            // Caller cancelled or caller's own timeout fired: cancel in-flight IO cleanly,
-            // rebuild the interrupted VM silently, and preserve cooperative cancellation.
-            fetchGateway.cancelAllActive()
-            try {
-                qjs.interruptEvaluation()
-            } catch (_: Throwable) {
-            }
-            withContext(NonCancellable) {
-                destroyRuntimeLocked(runDispose = false)
-            }
-            throw ce
-        } catch (t: Throwable) {
-            handleInvocationFailureLocked(qjs, method, t, itemIdForErrors)
         } finally {
-            cleanupActiveCall(callScope)
-            runCatching { cookieJar.flush() }
+            if (queryRedactions.isNotEmpty()) {
+                logger.clearActiveQueryRedactions()
+            }
         }
     }
 
@@ -475,34 +572,45 @@ class PluginRuntime(
         bridgeToken = PluginCrypto.hexEncode(PluginCrypto.randomBytes(16))
         creationCount += 1
 
+        val evalScope = CoroutineScope(SupervisorJob() + dispatcher)
+        var pendingEval: Deferred<*>? = null
         try {
             bindHostBridge(qjs, bridgeToken)
-            withContext(dispatcher) {
-                withTimeout(timeoutMs) {
-                    qjs.evaluate<Unit>(SHARED_BOOTSTRAP_JS, filename = "__d3_bootstrap.js")
-                    qjs.evaluate<Unit>(
-                        "__d3_seal_bootstrap(${JsonPrimitive(bridgeToken)});",
-                        filename = "__d3_seal.js",
-                    )
-                    qjs.evaluate<Unit>(
-                        """
-                        import __plugin from 'plugin/main.js';
-                        globalThis.__d3_register(__plugin);
-                        """.trimIndent(),
-                        filename = "__d3_entry.js",
-                        asModule = true,
-                    )
-                    val exportsJson = qjs.evaluate<String>("__d3_exports()", filename = "__d3_exports.js")
-                    val parsedExports = runCatching {
-                        (json.parseToJsonElement(exportsJson) as? kotlinx.serialization.json.JsonArray)
-                            ?.mapNotNull { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content }
-                            ?.toSet()
-                    }.getOrNull()
-                    if (parsedExports != null) {
-                        cachedExportedMethods = parsedExports
-                    }
+            val bootDeferred = evalScope.async {
+                qjs.evaluate<Unit>(SHARED_BOOTSTRAP_JS, filename = "__d3_bootstrap.js")
+                qjs.evaluate<Unit>(
+                    "__d3_seal_bootstrap(${JsonPrimitive(bridgeToken)});",
+                    filename = "__d3_seal.js",
+                )
+                qjs.evaluate<Unit>(
+                    """
+                    import __plugin from 'plugin/main.js';
+                    globalThis.__d3_register(__plugin);
+                    """.trimIndent(),
+                    filename = "__d3_entry.js",
+                    asModule = true,
+                )
+                val exportsJson = qjs.evaluate<String>("__d3_exports()", filename = "__d3_exports.js")
+                val parsedExports = runCatching {
+                    (json.parseToJsonElement(exportsJson) as? kotlinx.serialization.json.JsonArray)
+                        ?.mapNotNull { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content }
+                        ?.toSet()
+                }.getOrNull()
+                if (parsedExports != null) {
+                    cachedExportedMethods = parsedExports
                 }
             }
+            pendingEval = bootDeferred
+            try {
+                withTimeout(timeoutMs) { bootDeferred.await() }
+            } catch (e: TimeoutCancellationException) {
+                if (currentCoroutineContext().isActive) {
+                    throw InternalCallTimeoutException(e)
+                } else {
+                    throw e
+                }
+            }
+            pendingEval = null
             quickJs = qjs
             // Run optional init(ctx) inside its own scoped invocation (§11.1: failure == call failure)
             val gen = callGeneration.incrementAndGet()
@@ -512,31 +620,70 @@ class PluginRuntime(
             domTimedOutInCall = false
             hostOomInCall = false
             try {
-                withContext(dispatcher) {
-                    withTimeout(timeoutMs) {
-                        qjs.evaluate<String?>(
-                            "await __d3_invoke_optional('init', 'null', false, $gen)",
-                            filename = "__d3_init.js",
-                        )
+                val initDeferred = evalScope.async {
+                    qjs.evaluate<String?>(
+                        "await __d3_invoke_optional('init', 'null', false, $gen)",
+                        filename = "__d3_init.js",
+                    )
+                }
+                pendingEval = initDeferred
+                try {
+                    withTimeout(timeoutMs) { initDeferred.await() }
+                } catch (e: TimeoutCancellationException) {
+                    if (currentCoroutineContext().isActive) {
+                        throw InternalCallTimeoutException(e)
+                    } else {
+                        throw e
                     }
                 }
+                pendingEval = null
             } finally {
                 cleanupActiveCall(initScope)
                 runCatching { cookieJar.flush() }
             }
             initialized = true
+        } catch (ce: CancellationException) {
+            // Caller cancelled during init: silently release the half-initialized VM without
+            // logging an error and rethrow cooperative CancellationException directly.
+            withContext(NonCancellable) {
+                cancelAllCallResources()
+                try {
+                    qjs.interruptEvaluation()
+                } catch (_: Throwable) {
+                }
+                pendingEval?.cancel()
+                withTimeoutOrNull(INTERRUPT_JOIN_WAIT_MS) { pendingEval?.join() }
+                evalScope.cancel()
+                try {
+                    withContext(dispatcher) { qjs.close() }
+                } catch (_: Throwable) {
+                    runCatching { qjs.close() }
+                }
+                quickJs = null
+                initialized = false
+            }
+            throw ce
         } catch (t: Throwable) {
-            try {
-                qjs.interruptEvaluation()
-            } catch (_: Throwable) {
+            withContext(NonCancellable) {
+                cancelAllCallResources()
+                try {
+                    qjs.interruptEvaluation()
+                } catch (_: Throwable) {
+                }
+                pendingEval?.cancel()
+                withTimeoutOrNull(INTERRUPT_JOIN_WAIT_MS) { pendingEval?.join() }
+                evalScope.cancel()
+                try {
+                    withContext(dispatcher) { qjs.close() }
+                } catch (_: Throwable) {
+                    runCatching { qjs.close() }
+                }
+                quickJs = null
+                initialized = false
             }
-            try {
-                qjs.close()
-            } catch (_: Throwable) {
-            }
-            quickJs = null
-            initialized = false
             handleInvocationFailureLocked(null, "init", t, null)
+        } finally {
+            evalScope.cancel()
         }
     }
 
@@ -889,7 +1036,7 @@ class PluginRuntime(
                     ?: throw IllegalArgumentException("Missing fetch request")
                 val gen = (args.getOrNull(2) as? Number)?.toInt() ?: -1
                 if (gen != callGeneration.get()) {
-                    throw CancellationException("Call already finished")
+                    throw IOException("Call already finished")
                 }
                 if (reqJson.length > PluginFetchGateway.MAX_FETCH_META_JSON_BYTES ||
                     reqJson.toByteArray(Charsets.UTF_8).size > PluginFetchGateway.MAX_FETCH_META_JSON_BYTES
@@ -942,7 +1089,7 @@ class PluginRuntime(
                 val resp = try {
                     fetchGateway.withSlot {
                         if (gen != callGeneration.get()) {
-                            throw CancellationException("Call already finished")
+                            throw IOException("Call already finished")
                         }
                         // Decode request body ONLY while holding one of the 4 active execution permits
                         val bodyBytes = when {
@@ -972,7 +1119,7 @@ class PluginRuntime(
                 }
                 // Reserve buffer bytes against the 16 MB in-flight budget until JS reads or call ends
                 if (gen != callGeneration.get()) {
-                    throw CancellationException("Call already finished")
+                    throw IOException("Call already finished")
                 }
                 fetchGateway.inFlightBudget.reserve(resp.body.size.toLong())
                 val handleId = responseHandleSeq.getAndIncrement()
@@ -1194,6 +1341,8 @@ class PluginRuntime(
         const val PLAYBACK_CALL_TIMEOUT_MS = 30_000L
         private const val DISPOSE_TIMEOUT_MS = 2_000L
         private const val SHUTDOWN_WAIT_MS = 2_000L
+        private const val GRACEFUL_CANCEL_WAIT_MS = 250L
+        private const val INTERRUPT_JOIN_WAIT_MS = 500L
 
         private val SHARED_BOOTSTRAP_JS: String by lazy {
             JsonSchemaValidator.loadBundledResourceText("runtime-bootstrap.js")

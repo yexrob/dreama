@@ -952,11 +952,11 @@ export default {
   },
 
   async search(ctx, { query = '', cursor = null, kind = null } = {}) {
-    const { base, authHeader, routes } = await requireSession(ctx);
     const term = String(query ?? '').trim();
     if (!term) {
       return { items: [], next: null };
     }
+    const { base, authHeader, routes } = await requireSession(ctx);
     const startIndex = cursor ? Math.max(0, parseInt(String(cursor), 10) || 0) : 0;
     const typeMap = {
       movie: 'Movie',
@@ -984,9 +984,9 @@ export default {
   },
 
   async suggest(ctx, { query = '' } = {}) {
-    const { session } = await requireSession(ctx);
     const term = String(query ?? '').trim();
     if (!term) return [];
+    const { session } = await requireSession(ctx);
     const data = await apiRequest(ctx, '/Search/Hints', {
       query: { searchTerm: term, userId: session.userId, limit: 8 },
     });

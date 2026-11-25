@@ -145,6 +145,13 @@ class WallModel(app: Application) : AndroidViewModel(app) {
         WallDatabase.get(app).progress().recent(SearchConfig.MAX_IDLE_RECENT_WATCHED * 2)
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    /** Lookup map of local watch progress keyed by `(sourceId, itemId)` for Search direct-play & progress bars. */
+    val recentWatchProgressMap: StateFlow<Map<Pair<String, String>, WatchProgress>> =
+        WallDatabase.get(app).progress().recent(200)
+            .map { rows -> rows.associateBy { it.sourceId to it.itemId } }
+            .distinctUntilChanged()
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyMap())
+
     fun setRememberSearchHistory(enabled: Boolean) {
         searchHistory.setRememberEnabled(enabled)
     }

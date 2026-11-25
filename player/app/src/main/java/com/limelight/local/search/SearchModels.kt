@@ -7,16 +7,19 @@ import com.limelight.local.media.Page
 import com.limelight.local.media.SourceKind
 import com.limelight.local.media.SourceNeedsAuthException
 import com.limelight.local.media.SourceRateLimitedException
+import com.limelight.local.media.WatchProgress
 import com.limelight.local.plugin.PluginCapability
 import com.limelight.local.plugin.PluginInstanceEntity
 import com.limelight.local.plugin.PluginMediaSource
 import com.limelight.local.stream.StringLookup
+import com.limelight.local.wall.DetailStateLogic
 import com.limelight.local.wall.Load
 import com.limelight.local.wall.SourceErrorActionKind
 import com.limelight.local.wall.SourceErrorDispatcher
+import com.limelight.local.wall.WatchState
 
 /**
- * Centralized search timing, concurrency, pagination, and cache constants
+ * Centralized search timing, pagination, and cache constants
  * (`design-opus/ux-spec.md` §3.9, §7, §8 #25; `docs/specs/08-search.md`).
  */
 object SearchConfig {
@@ -26,8 +29,8 @@ object SearchConfig {
     /** Per-source abandon timeout; slow sources turn into a timeout row after 10 s (§3.9.4). */
     const val SOURCE_TIMEOUT_MS: Long = 10_000L
 
-    /** Maximum number of plugin sources queried concurrently in one search session. */
-    const val MAX_CONCURRENT_SOURCES: Int = 4
+    /** Delay before showing the bottom 「还在搜：…」 tail line for slow sources (§3.9.4). */
+    const val PENDING_TAIL_DELAY_MS: Long = 3_000L
 
     /** In-memory search result cache TTL for repeated identical queries (§3.9.4, §7). */
     const val CACHE_TTL_MS: Long = 5 * 60 * 1000L
@@ -65,9 +68,6 @@ object SearchConfig {
     /** Maximum recent watched cards on the idle screen (§3.9.3). */
     const val MAX_IDLE_RECENT_WATCHED: Int = 10
 
-    /** Maximum recently added items on the idle screen (§3.9.3). */
-    const val MAX_IDLE_RECENT_ADDED: Int = 20
-
     /** Delay before showing next-page skeleton blocks in the expanded grid (§3.9.4). */
     const val PAGE_SKELETON_DELAY_MS: Long = 300L
 
@@ -80,6 +80,9 @@ object SearchConfig {
 
     /** Maximum consecutive auto-fetch pages when a source ignores `kind` (§3.9.4). */
     const val MAX_FILTER_AUTO_PAGES: Int = 3
+
+    /** Maximum consecutive duplicate-only pages skipped automatically in expanded pagination. */
+    const val MAX_DUPLICATE_SKIP_PAGES: Int = 3
 }
 
 /**
@@ -181,9 +184,85 @@ object SearchQueryNormalizer {
 
 /**
  * Ensures search query text is never written to logs or diagnostics (`08-search.md` §2).
+ * Wired directly into [com.limelight.local.plugin.PluginLogger] during every `search()` and
+ * `suggest()` invocation so neither plugin `ctx.log.*` nor host error logs can emit raw or
+ * URL-encoded search keywords.
  */
 object SearchLogSanitizer {
+    const val REDACTED_QUERY = "[REDACTED_QUERY]"
+
     fun redactQuery(raw: String): String = "<redacted:len=${raw.length}>"
+
+    fun redactInText(text: String, queries: Collection<String>): String {
+        if (text.isEmpty() || queries.isEmpty()) return text
+        val candidates = LinkedHashSet<String>()
+        for (raw in queries) {
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty()) continue
+            candidates += trimmed
+            val norm = SearchQueryNormalizer.normalize(trimmed)
+            if (norm.isNotEmpty()) candidates += norm
+            for (term in listOf(trimmed, norm).filter { it.isNotEmpty() }.distinct()) {
+                val encoded = runCatching { java.net.URLEncoder.encode(term, "UTF-8") }.getOrNull()
+                if (!encoded.isNullOrEmpty() && encoded != term) {
+                    candidates += encoded
+                    val pct20 = encoded.replace("+", "%20")
+                    if (pct20 != encoded) candidates += pct20
+                }
+            }
+        }
+        if (candidates.isEmpty()) return text
+
+        var out = text
+        for (term in candidates.sortedByDescending { it.length }) {
+            val hasNonAscii = term.any { it.code > 0x7F }
+            if (term.length >= 2 || hasNonAscii) {
+                out = out.replace(term, REDACTED_QUERY, ignoreCase = !hasNonAscii)
+            } else {
+                val escaped = Regex.escape(term)
+                val quoted = Regex("""(["'「『])$escaped(["'」』])""", RegexOption.IGNORE_CASE)
+                out = quoted.replace(out) { m -> "${m.groupValues[1]}$REDACTED_QUERY${m.groupValues[2]}" }
+                val param = Regex("""([?&=:]\s*)$escaped(?=(?:[&#\s,"'}\]|]|$))""", RegexOption.IGNORE_CASE)
+                out = param.replace(out) { m -> "${m.groupValues[1]}$REDACTED_QUERY" }
+                val labeled = Regex("""(\b(?:query|q|term|keyword)\s+)$escaped(?=(?:\s|$))""", RegexOption.IGNORE_CASE)
+                out = labeled.replace(out) { m -> "${m.groupValues[1]}$REDACTED_QUERY" }
+            }
+        }
+        return out
+    }
+}
+
+/** Navigation decision when clicking an item card in Search (`ux-spec.md` §3.9.7). */
+sealed interface SearchItemAction {
+    data class OpenFolder(val source: MediaSource, val item: Item) : SearchItemAction
+    data class PlayDirect(val source: MediaSource, val item: Item, val startMs: Long) : SearchItemAction
+    data class OpenEpisodeInSeries(val source: MediaSource, val item: Item) : SearchItemAction
+    data class OpenDetail(val source: MediaSource, val item: Item) : SearchItemAction
+}
+
+/**
+ * Pure navigation policy shared by aggregated results, expanded source view, and local typing hits:
+ * - Folder -> open directory (`GridScreen`)
+ * - Episode -> open owning series detail focused on that episode
+ * - Video / Live (non-multipart) -> play directly with resumable progress (local overrides remote)
+ * - Movie / Series / multi-part -> open detail screen
+ */
+object SearchNavigationPolicy {
+    fun resolveClickAction(
+        source: MediaSource,
+        item: Item,
+        localProgress: WatchProgress? = null,
+    ): SearchItemAction = when {
+        item.isFolder -> SearchItemAction.OpenFolder(source, item)
+        item.kind == ItemKind.EPISODE -> SearchItemAction.OpenEpisodeInSeries(source, item)
+        (item.kind == ItemKind.VIDEO || item.kind == ItemKind.LIVE) &&
+            item.episodes.isEmpty() && item.seasons.isEmpty() -> {
+            val ws = DetailStateLogic.computeWatchState(item, localProgress)
+            val startMs = (ws as? WatchState.InProgress)?.positionMs ?: 0L
+            SearchItemAction.PlayDirect(source, item, startMs)
+        }
+        else -> SearchItemAction.OpenDetail(source, item)
+    }
 }
 
 /**
@@ -206,6 +285,8 @@ interface SearchableSource {
 
 /**
  * Production adapter wrapping an enabled [PluginMediaSource] with `SEARCH` capability.
+ * Implements structural equality on immutable identity/capability fields so Compose keys
+ * (e.g. typing suggestion effects) stay stable across recompositions.
  */
 class PluginSearchableSource(
     private val plugin: PluginMediaSource,
@@ -223,6 +304,25 @@ class PluginSearchableSource(
 
     override suspend fun suggest(query: String): List<String> =
         if (plugin.isSuggestKnownUnsupported) emptyList() else plugin.suggest(query)
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is PluginSearchableSource) return false
+        return plugin === other.plugin &&
+            sourceId == other.sourceId &&
+            displayName == other.displayName &&
+            typeLabel == other.typeLabel &&
+            knownNeedsAuth == other.knownNeedsAuth
+    }
+
+    override fun hashCode(): Int {
+        var h = System.identityHashCode(plugin)
+        h = 31 * h + sourceId.hashCode()
+        h = 31 * h + displayName.hashCode()
+        h = 31 * h + typeLabel.hashCode()
+        h = 31 * h + knownNeedsAuth.hashCode()
+        return h
+    }
 }
 
 data class SearchSourcePartition(
@@ -342,6 +442,7 @@ data class SearchSourceRow(
     val mediaSource: MediaSource?,
     val status: SearchRowStatus,
     val refreshingInPlace: Boolean = false,
+    val arrivedAfterBatch: Boolean = false,
 ) {
     val isResultsRow: Boolean get() = status is SearchRowStatus.Results && !refreshingInPlace
 }
@@ -356,6 +457,7 @@ data class AggregatedSearchState(
     val nonSearchableSourceNames: List<String> = emptyList(),
     val initialBatchSettled: Boolean = false,
     val showInitialSkeleton: Boolean = false,
+    val showPendingTail: Boolean = false,
     val visibleRows: List<SearchSourceRow> = emptyList(),
     val pendingSourceNames: List<String> = emptyList(),
     val emptySourceNames: List<String> = emptyList(),
@@ -381,5 +483,5 @@ data class AggregatedSearchState(
         get() = allSettled &&
             totalSearchableSources > 0 &&
             !hasAnyFailureOrAuth &&
-            visibleRows.isEmpty()
+            visibleRows.none { it.status is SearchRowStatus.Results }
 }

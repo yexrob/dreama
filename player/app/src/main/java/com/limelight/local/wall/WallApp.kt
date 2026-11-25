@@ -61,6 +61,7 @@ sealed interface Page {
         val item: Item,
         val focusSeasonId: String? = null,
         val focusEpisodeId: String? = null,
+        val resolveEpisodeParent: Boolean = false,
     ) : Page
     data object Search : Page
     data class PcApps(val computer: StreamingComputer) : Page
@@ -109,12 +110,29 @@ class WallNav(
     @Suppress("UNCHECKED_CAST")
     fun <T : Any> keep(page: Page, name: String, make: () -> T): T = kept.getOrPut(page to name, make) as T
 
+    private fun closeAndClearKept() {
+        val values = kept.values.toList()
+        kept.clear()
+        values.forEach { (it as? java.io.Closeable)?.close() }
+    }
+
+    private fun closeAndEvictKept(page: Page) {
+        val iter = kept.entries.iterator()
+        while (iter.hasNext()) {
+            val entry = iter.next()
+            if (entry.key.first == page) {
+                iter.remove()
+                (entry.value as? java.io.Closeable)?.close()
+            }
+        }
+    }
+
     fun tab(t: Tab) {
         if (Page.Search in stack) {
             model.searchAggregator.resetToIdle()
         }
         stack.clear()
-        kept.clear()
+        closeAndClearKept()
         stack += Page.Tabs(t)
     }
 
@@ -161,7 +179,7 @@ class WallNav(
         if (stack.size > 1) {
             val gone = stack.removeAt(stack.size - 1)
             if (gone !in stack) {
-                kept.keys.removeAll { it.first == gone }
+                closeAndEvictKept(gone)
                 if (gone == Page.Search) {
                     model.searchAggregator.resetToIdle()
                 }
@@ -183,6 +201,9 @@ class WallNav(
     }
 
     fun detail(source: MediaSource, item: Item) = open(Page.Detail(source.source.id, item))
+
+    fun openSearchEpisode(source: MediaSource, item: Item) =
+        open(Page.Detail(source.source.id, item, resolveEpisodeParent = true))
 
     fun category(source: MediaSource, categoryId: String, title: String, count: Int? = null) =
         open(Page.Grid(source.source.id, categoryId, title, count))

@@ -1,6 +1,7 @@
 package com.limelight.local.plugin
 
 import com.limelight.LimeLog
+import com.limelight.local.search.SearchLogSanitizer
 import java.util.ArrayDeque
 
 enum class PluginLogLevel { DEBUG, INFO, WARN, ERROR }
@@ -47,10 +48,25 @@ class PluginLogger(
     private val ring = ArrayDeque<StoredEntry>(maxEntries)
     private var totalBufferedBytes: Int = 0
     private val lock = Any()
+    @Volatile
+    private var activeQueryRedactions: List<String> = emptyList()
+
+    /** Registers active search/suggest query terms to be scrubbed from all log lines during the call. */
+    internal fun setActiveQueryRedactions(queries: Collection<String>) {
+        activeQueryRedactions = queries.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+    }
+
+    /** Clears active search/suggest query redactions once the call completes. */
+    internal fun clearActiveQueryRedactions() {
+        activeQueryRedactions = emptyList()
+    }
 
     fun log(level: PluginLogLevel, rawMessage: String) {
         val truncated = truncateUtf8(rawMessage, maxMessageBytes)
-        val scrubbed = redact(truncated, knownSecretsProvider())
+        val scrubbed = SearchLogSanitizer.redactInText(
+            redact(truncated, knownSecretsProvider()),
+            activeQueryRedactions,
+        )
         val finalMsg = truncateUtf8(scrubbed, maxMessageBytes)
         val msgBytes = finalMsg.toByteArray(Charsets.UTF_8).size
         val formatted = "depth3d: plugin $pluginId [$instanceId] ${level.name}: $finalMsg"
