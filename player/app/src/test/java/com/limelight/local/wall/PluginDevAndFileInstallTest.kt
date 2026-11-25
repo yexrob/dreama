@@ -717,7 +717,7 @@ class PluginDevAndFileInstallTest {
             appVersion = "1.0.0",
             deviceInfo = DeviceInfo.detect("1.0.0"),
         )
-        val pluginId = "dev.depth3d.sample"
+        val pluginId = "dev.dreama.sample"
         val builtInZip = buildZip(makeManifest(id = pluginId, name = "Sample", version = "1.0.0"), simpleMainJs("BuiltIn"))
         val devZip = buildZip(makeManifest(id = pluginId, name = "Sample", version = "1.0.0"), simpleMainJs("Dev"))
         val repoZip = buildZip(makeManifest(id = pluginId, name = "Sample", version = "2.0.0"), simpleMainJs("Repo"))
@@ -1737,8 +1737,8 @@ class PluginDevAndFileInstallTest {
                 RepoEntryAction.INSTALLED,
                 PluginInstallGuard.classifyRepoEntryAction(
                     baseEntity.copy(
-                        sourceOrigin = BuiltInPluginInstaller.sourceOriginFor("dev.depth3d.jellyfin"),
-                        sourceUrl = BuiltInPluginInstaller.sourceUrlFor("dev.depth3d.jellyfin"),
+                        sourceOrigin = BuiltInPluginInstaller.sourceOriginFor("dev.dreama.jellyfin"),
+                        sourceUrl = BuiltInPluginInstaller.sourceUrlFor("dev.dreama.jellyfin"),
                         version = "1.0.0",
                     ),
                     repoOrigin,

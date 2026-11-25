@@ -55,7 +55,7 @@ class PluginConfigFormAndRepoTest {
     fun configFormCodecHandlesAllSixFieldTypesHttpWarningAndPasswordHandling() {
         val manifest = PluginManifest(
             api = 1,
-            id = "dev.depth3d.allfields",
+            id = "dev.dreama.allfields",
             name = "AllFields",
             version = "1.0.0",
             auth = PluginAuthMode.FORM,
@@ -150,7 +150,7 @@ class PluginConfigFormAndRepoTest {
         val manifestJson = """
             {
               "api": 1,
-              "id": "dev.depth3d.authfail",
+              "id": "dev.dreama.authfail",
               "name": "AuthFail",
               "version": "1.0.0",
               "minApp": "1.0.0",
@@ -186,7 +186,7 @@ class PluginConfigFormAndRepoTest {
             appVersion = "1.0.0",
             deviceInfo = DeviceInfo.detect("1.0.0"),
         )
-        val installed = pm.installFromBytes(buildZip(manifestJson, mainJs), sourceUrl = "builtin:dev.depth3d.authfail")
+        val installed = pm.installFromBytes(buildZip(manifestJson, mainJs), sourceUrl = "builtin:dev.dreama.authfail")
 
         try {
             PluginInstanceAuthenticator.createAndAuthenticateFormOrNone(
@@ -208,7 +208,7 @@ class PluginConfigFormAndRepoTest {
         val wildcardManifest = """
             {
               "api": 1,
-              "id": "dev.depth3d.lanwild",
+              "id": "dev.dreama.lanwild",
               "name": "LanWild",
               "version": "1.0.0",
               "minApp": "1.0.0",
@@ -246,36 +246,36 @@ class PluginConfigFormAndRepoTest {
                 .contains("局域网里的任意设备"),
         )
 
-        val pending1 = PendingPluginInstall(zipA, "https://repo-a.example.com/a.d3plugin", "https://repo-a.example.com/repo.json", "dev.depth3d.lanwild", "1.0.0", null, preview1)
+        val pending1 = PendingPluginInstall(zipA, "https://repo-a.example.com/a.d3plugin", "https://repo-a.example.com/repo.json", "dev.dreama.lanwild", "1.0.0", null, preview1)
         PluginInstallGuard.confirmInstall(pm, pending1, userConfirmedReplacement = false)
 
         // 2. Installing same ID from different repository MUST throw PluginSourceMismatchException when userConfirmedReplacement=false
         val preview2 = pm.previewPackage(zipB, sourceUrl = "https://repo-b.example.com/b.d3plugin", repoUrl = "https://repo-b.example.com/repo.json")
         assertTrue("Different source must require replacement confirmation", preview2.requiresReplacementConfirmation)
-        val pending2 = PendingPluginInstall(zipB, "https://repo-b.example.com/b.d3plugin", "https://repo-b.example.com/repo.json", "dev.depth3d.lanwild", "1.1.0", null, preview2)
+        val pending2 = PendingPluginInstall(zipB, "https://repo-b.example.com/b.d3plugin", "https://repo-b.example.com/repo.json", "dev.dreama.lanwild", "1.1.0", null, preview2)
         try {
             PluginInstallGuard.confirmInstall(pm, pending2, userConfirmedReplacement = false)
             fail("Must NEVER auto-confirm PluginSourceMismatchException")
         } catch (_: PluginSourceMismatchException) {
             // expected
         }
-        assertEquals("1.0.0", store.getPackage("dev.depth3d.lanwild")!!.version)
+        assertEquals("1.0.0", store.getPackage("dev.dreama.lanwild")!!.version)
 
         // Explicit user confirmation succeeds
         PluginInstallGuard.confirmInstall(pm, pending2, userConfirmedReplacement = true)
-        assertEquals("1.1.0", store.getPackage("dev.depth3d.lanwild")!!.version)
+        assertEquals("1.1.0", store.getPackage("dev.dreama.lanwild")!!.version)
 
         // 3. Built-in plugins cannot be uninstalled
-        val builtInZip = buildZip(wildcardManifest.replace("dev.depth3d.lanwild", "dev.depth3d.builtin"), simpleJs)
+        val builtInZip = buildZip(wildcardManifest.replace("dev.dreama.lanwild", "dev.dreama.builtin"), simpleJs)
         BuiltInPluginInstaller.syncPackages(pm, store, listOf(builtInZip))
-        val builtInEntity = store.getPackage("dev.depth3d.builtin")!!
+        val builtInEntity = store.getPackage("dev.dreama.builtin")!!
         try {
             PluginInstallGuard.uninstallIfAllowed(pm, builtInEntity)
             fail("Built-in plugin uninstall must be blocked")
         } catch (_: PackageInstallException) {
             // expected
         }
-        assertNotNull(store.getPackage("dev.depth3d.builtin"))
+        assertNotNull(store.getPackage("dev.dreama.builtin"))
 
         // 4. Update detection matches ONLY same-source newer SemVer
         val repoIndexJson = """
@@ -283,14 +283,14 @@ class PluginConfigFormAndRepoTest {
               "name": "Repo B",
               "plugins": [
                 {
-                  "id": "dev.depth3d.lanwild",
+                  "id": "dev.dreama.lanwild",
                   "name": "LanWild",
                   "version": "1.2.0",
                   "url": "https://repo-b.example.com/lanwild-1.2.0.d3plugin",
                   "sha256": "${"a".repeat(64)}"
                 },
                 {
-                  "id": "dev.depth3d.builtin",
+                  "id": "dev.dreama.builtin",
                   "name": "BuiltIn Hijack",
                   "version": "9.9.9",
                   "url": "https://repo-b.example.com/hijack.d3plugin",
@@ -304,9 +304,9 @@ class PluginConfigFormAndRepoTest {
             repos = listOf(PluginRepoEntity("https://repo-b.example.com/repo.json", "Repo B", 1L, repoIndexJson)),
             repoClient = PluginRepositoryClient(),
         )
-        assertTrue(updates.containsKey("dev.depth3d.lanwild"))
-        assertEquals("1.2.0", updates["dev.depth3d.lanwild"]!!.entry.version)
-        assertFalse("Different-origin repo must not propose silent in-place update for built-in", updates.containsKey("dev.depth3d.builtin"))
+        assertTrue(updates.containsKey("dev.dreama.lanwild"))
+        assertEquals("1.2.0", updates["dev.dreama.lanwild"]!!.entry.version)
+        assertFalse("Different-origin repo must not propose silent in-place update for built-in", updates.containsKey("dev.dreama.builtin"))
         pm.shutdownAll()
     }
 }

@@ -77,7 +77,7 @@ class CtxApiAndRecoveryTest {
 
         val manifest = PluginManifest(
             api = 1,
-            id = "dev.depth3d.ctxtest",
+            id = "dev.dreama.ctxtest",
             name = "\$t:title",
             version = "1.0.0",
             author = "depth3d",
@@ -255,7 +255,7 @@ class CtxApiAndRecoveryTest {
             assertEquals("你好，世界", out["greeting"]!!.jsonPrimitive.content)
             assertEquals("fired", out["timerRes"]!!.jsonPrimitive.content)
 
-            assertTrue(loggedLines.any { it.startsWith("depth3d: plugin dev.depth3d.ctxtest") })
+            assertTrue(loggedLines.any { it.startsWith("depth3d: plugin dev.dreama.ctxtest") })
             for (line in loggedLines) {
                 assertFalse("Password leaked in log: $line", line.contains("TopSecretPass99!"))
                 assertFalse("Bearer token leaked in log: $line", line.contains("leakToken777"))
@@ -302,7 +302,7 @@ class CtxApiAndRecoveryTest {
         val cookieJar = PluginCookieJar(File(tmpDir, "cookies.enc"), secretBox)
         val manifest = PluginManifest(
             api = 1,
-            id = "dev.depth3d.b2mem",
+            id = "dev.dreama.b2mem",
             name = "B2Mem",
             version = "1.0.0",
             permissions = PluginPermissions(hosts = emptyList(), userHosts = true, lan = true),
@@ -412,7 +412,7 @@ class CtxApiAndRecoveryTest {
 
         val manifest = PluginManifest(
             api = 1,
-            id = "dev.depth3d.s345",
+            id = "dev.dreama.s345",
             name = "S345",
             version = "1.0.0",
             permissions = PluginPermissions(hosts = emptyList(), userHosts = true, lan = true),
@@ -554,7 +554,7 @@ class CtxApiAndRecoveryTest {
             assertArrayEquals("Original corrupted cookies.enc must NOT be overwritten", garbage, cookieFile.readBytes())
 
             // Inside PluginRuntime, StorageCorruptedException maps cleanly to SourceNeedsAuthException
-            val manifest = PluginManifest(api = 1, id = "dev.depth3d.corrupt", name = "Corrupt", version = "1.0.0")
+            val manifest = PluginManifest(api = 1, id = "dev.dreama.corrupt", name = "Corrupt", version = "1.0.0")
             val mainJs = """
                 export default {
                   async home(ctx) { await ctx.storage.get('token'); return []; },
@@ -629,7 +629,7 @@ class CtxApiAndRecoveryTest {
         val cookieJar = PluginCookieJar(File(tmpDir, "cookies.enc"), secretBox)
         val manifest = PluginManifest(
             api = 1,
-            id = "dev.depth3d.recovery",
+            id = "dev.dreama.recovery",
             name = "Recovery",
             version = "1.0.0",
             author = "depth3d",
@@ -737,7 +737,7 @@ class CtxApiAndRecoveryTest {
         val secretBox = SoftwareAesSecretBox()
         val warnings = java.util.concurrent.CopyOnWriteArrayList<String>()
         val logger = PluginLogger(
-            pluginId = "dev.depth3d.r3",
+            pluginId = "dev.dreama.r3",
             instanceId = "inst-r3",
             sink = { level, line -> if (level == PluginLogLevel.WARN) warnings += line },
         )
@@ -767,7 +767,7 @@ class CtxApiAndRecoveryTest {
             .build()
         val manifest = PluginManifest(
             api = 1,
-            id = "dev.depth3d.r3",
+            id = "dev.dreama.r3",
             name = "R3",
             version = "1.0.0",
             permissions = PluginPermissions(hosts = emptyList(), userHosts = true, lan = true),
@@ -1093,7 +1093,7 @@ class CtxApiAndRecoveryTest {
         // Also verify through real QuickJS PluginRuntime -> maps cleanly to PluginInternalException
         val tmpDir = Files.createTempDirectory("d3-r4-limits").toFile()
         val secretBox = SoftwareAesSecretBox()
-        val logger = PluginLogger("dev.depth3d.r4", "inst-r4", sink = { _, _ -> })
+        val logger = PluginLogger("dev.dreama.r4", "inst-r4", sink = { _, _ -> })
         val storage = InstanceStorage(File(tmpDir, "storage.enc"), secretBox)
         val cookieJar = PluginCookieJar(File(tmpDir, "cookies.enc"), secretBox)
 
@@ -1115,7 +1115,7 @@ class CtxApiAndRecoveryTest {
             .build()
         val manifest = PluginManifest(
             api = 1,
-            id = "dev.depth3d.r4",
+            id = "dev.dreama.r4",
             name = "R4",
             version = "1.0.0",
             permissions = PluginPermissions(hosts = emptyList(), userHosts = true, lan = true),
@@ -1428,7 +1428,7 @@ class CtxApiAndRecoveryTest {
         // 4. Round 5 Item #5: fetch method/redirect length pre-checks + 8 MB queued+active request body cap
         val tmpDir = Files.createTempDirectory("d3-r5-fetch").toFile()
         val secretBox = SoftwareAesSecretBox()
-        val logger = PluginLogger("dev.depth3d.r5", "inst-r5", sink = { _, _ -> })
+        val logger = PluginLogger("dev.dreama.r5", "inst-r5", sink = { _, _ -> })
         val storage = InstanceStorage(File(tmpDir, "storage.enc"), secretBox)
         val cookieJar = PluginCookieJar(File(tmpDir, "cookies.enc"), secretBox)
         val server = MockWebServer()
@@ -1447,7 +1447,7 @@ class CtxApiAndRecoveryTest {
             .build()
         val manifest = PluginManifest(
             api = 1,
-            id = "dev.depth3d.r5",
+            id = "dev.dreama.r5",
             name = "R5",
             version = "1.0.0",
             permissions = PluginPermissions(hosts = emptyList(), userHosts = true, lan = true),
@@ -1541,10 +1541,10 @@ class CtxApiAndRecoveryTest {
         //    StackOverflowError / OutOfMemoryError traps inside real QuickJS PluginRuntime.
         val tmpDir = Files.createTempDirectory("d3-r6-runtime").toFile()
         val secretBox = SoftwareAesSecretBox()
-        val logger = PluginLogger("dev.depth3d.r6", "inst-r6", sink = { _, _ -> })
+        val logger = PluginLogger("dev.dreama.r6", "inst-r6", sink = { _, _ -> })
         val storage = InstanceStorage(File(tmpDir, "storage.enc"), secretBox)
         val cookieJar = PluginCookieJar(File(tmpDir, "cookies.enc"), secretBox)
-        val manifest = PluginManifest(api = 1, id = "dev.depth3d.r6", name = "R6", version = "1.0.0")
+        val manifest = PluginManifest(api = 1, id = "dev.dreama.r6", name = "R6", version = "1.0.0")
         val mainJs = """
             export default {
               home() { return []; },
@@ -1867,12 +1867,12 @@ class CtxApiAndRecoveryTest {
         // End-to-end through QuickJS PluginRuntime: simulated missing Jsoup field surfaces as PluginInternalException
         val tmpDir = Files.createTempDirectory("plugin-r10-reflect-").toFile()
         val secretBox = SoftwareAesSecretBox()
-        val logger = PluginLogger("dev.depth3d.r10reflect", "inst-r10-reflect", sink = { _, _ -> })
+        val logger = PluginLogger("dev.dreama.r10reflect", "inst-r10-reflect", sink = { _, _ -> })
         val storage = InstanceStorage(File(tmpDir, "storage.enc"), secretBox)
         val cookieJar = PluginCookieJar(File(tmpDir, "cookies.enc"), secretBox)
         val manifest = PluginManifest(
             api = 1,
-            id = "dev.depth3d.r10reflect",
+            id = "dev.dreama.r10reflect",
             name = "R10Reflect",
             version = "1.0.0",
             permissions = PluginPermissions(hosts = listOf("api.example.com")),

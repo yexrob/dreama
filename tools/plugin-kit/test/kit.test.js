@@ -168,7 +168,7 @@ test('B2: 8 MB fetch succeeds via ArrayBuffer inside 64 MB heap; > 8 MB rejected
   const eightMb = Buffer.alloc(8 * 1024 * 1024, 0x42);
   const manifest = {
     api: 1,
-    id: 'dev.depth3d.memtest',
+    id: 'dev.dreama.memtest',
     name: 'MemTest',
     version: '1.0.0',
     permissions: { hosts: ['api.example.com'] },
@@ -257,7 +257,7 @@ test('S3, S4, S5: clearTimeout cancels host wait, Promise.race aborts fetch, 450
   let slowFetchAborted = false;
   const manifest = {
     api: 1,
-    id: 'dev.depth3d.s345',
+    id: 'dev.dreama.s345',
     name: 'S345',
     version: '1.0.0',
     permissions: { hosts: ['api.example.com'] },
@@ -382,7 +382,7 @@ test('ctx APIs (async storage/cookies, crypto, parse HTML/XML, log redaction, co
 
   const manifest = {
     api: 1,
-    id: 'dev.depth3d.ctxtest',
+    id: 'dev.dreama.ctxtest',
     name: 'CtxTest',
     version: '1.0.0',
     author: 'depth3d',
@@ -481,7 +481,7 @@ test('ctx APIs (async storage/cookies, crypto, parse HTML/XML, log redaction, co
     assert.equal(r.xTitle, '剧集A');
     assert.equal(r.delayed, 'tick');
 
-    assert.ok(logs.some((l) => l.startsWith('depth3d: plugin dev.depth3d.ctxtest')));
+    assert.ok(logs.some((l) => l.startsWith('depth3d: plugin dev.dreama.ctxtest')));
     for (const line of logs) {
       assert.equal(line.includes('SuperSecretPw!'), false);
       assert.equal(line.includes('tok12345'), false);
@@ -495,7 +495,7 @@ test('ctx APIs (async storage/cookies, crypto, parse HTML/XML, log redaction, co
 test('QuickJS runtime recovers cleanly after timeout and OOM', async () => {
   const manifest = {
     api: 1,
-    id: 'dev.depth3d.limits',
+    id: 'dev.dreama.limits',
     name: 'Limits',
     version: '1.0.0',
   };
@@ -841,7 +841,7 @@ test('Round 3: shared zip-vectors.json (incl. dual.zip PoC) and shared dom-vecto
   const domVectors = JSON.parse(fs.readFileSync(path.join(SCHEMA_DIR, 'dom-vectors.json'), 'utf8'));
   assert.ok(domVectors.cases.length >= 4);
   const host = new QuickJsPluginHost({
-    manifest: { api: 1, id: 'dev.depth3d.domvec', name: 'DomVec', version: '1.0.0' },
+    manifest: { api: 1, id: 'dev.dreama.domvec', name: 'DomVec', version: '1.0.0' },
     mainJs: `export default {
       home() { return []; },
       browse(ctx, arg) {
@@ -1173,7 +1173,7 @@ test('Round 6: selector hard caps, 16 MB memo budget, budgeted attr/class, dedup
 
   // 6. Real QuickJS host: doc.close() loop (> 8 sequential docs), 9 unclosed docs fails, bridge RangeError trapped
   const host = new QuickJsPluginHost({
-    manifest: { api: 1, id: 'dev.depth3d.r6js', name: 'R6JS', version: '1.0.0' },
+    manifest: { api: 1, id: 'dev.dreama.r6js', name: 'R6JS', version: '1.0.0' },
     mainJs: `export default {
       home() { return []; },
       browse(ctx, arg) {
@@ -1542,7 +1542,7 @@ test('Round 3: host memory caps, tool/host parity, redirect safe-headers, cookie
 
   const manifest = {
     api: 1,
-    id: 'dev.depth3d.r3parity',
+    id: 'dev.dreama.r3parity',
     name: 'R3Parity',
     version: '1.0.0',
     permissions: { hosts: ['api.example.com', 'other.example.net'], userHosts: false, lan: false },
@@ -1931,10 +1931,10 @@ test('pack and serve produce valid .d3plugin archive and repository index with m
   const outFile = path.join(tmpDir, 'ref.d3plugin');
   try {
     const packed = await packPluginToFile(REF_PLUGIN_DIR, outFile);
-    assert.equal(packed.manifest.id, 'dev.depth3d.reference');
+    assert.equal(packed.manifest.id, 'dev.dreama.reference');
     assert.equal(packed.sha256.length, 64);
     const inspected = await inspectArchiveBuffer(fs.readFileSync(outFile));
-    assert.equal(inspected.manifest.id, 'dev.depth3d.reference');
+    assert.equal(inspected.manifest.id, 'dev.dreama.reference');
     assert.ok(inspected.locales['zh-CN']);
 
     const srv = await startDevServer(REF_PLUGIN_DIR, { host: '127.0.0.1', port: 0 });
@@ -1943,7 +1943,7 @@ test('pack and serve produce valid .d3plugin archive and repository index with m
       assert.equal(idxRes.status, 200);
       const idx = await idxRes.json();
       assert.equal(validateRepository(idx).valid, true);
-      assert.equal(idx.plugins[0].id, 'dev.depth3d.reference');
+      assert.equal(idx.plugins[0].id, 'dev.dreama.reference');
 
       const pkgRes = await fetch(idx.plugins[0].url);
       assert.equal(pkgRes.status, 200);
@@ -2044,7 +2044,7 @@ test('d3plugin serve UDP discovery answers private probes with {name,id,version,
     const rawReply = await sendUdpProbe(testSrv.discoverPort, DEV_DISCOVERY_PROBE, 1000);
     assert.ok(rawReply, 'Expected UDP discovery JSON reply');
     const parsed = JSON.parse(rawReply);
-    assert.equal(parsed.id, 'dev.depth3d.reference');
+    assert.equal(parsed.id, 'dev.dreama.reference');
     assert.equal(parsed.version, '1.0.0');
     assert.equal(parsed.port, testSrv.port);
     assert.ok(parsed.name && !parsed.name.startsWith('$t:'), `Expected localized plugin name, got ${parsed.name}`);

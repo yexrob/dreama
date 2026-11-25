@@ -709,16 +709,16 @@ class Round2ReviewFixesRoomAndUiTest {
             },
         )
         val pkg = InstalledPluginEntity(
-            pluginId = "dev.depth3d.jellyfin",
+            pluginId = "dev.dreama.jellyfin",
             name = "Jellyfin",
             version = "1.0.1",
             author = "depth3d",
             description = "",
             manifestJson = "{}",
             packagePath = "/tmp/p",
-            sourceUrl = "builtin:dev.depth3d.jellyfin",
+            sourceUrl = "builtin:dev.dreama.jellyfin",
             repoUrl = null,
-            sourceOrigin = "other:builtin:dev.depth3d.jellyfin",
+            sourceOrigin = "other:builtin:dev.dreama.jellyfin",
             sha256 = "abc",
             enabled = true,
             needsPermissionReconfirm = false,
@@ -728,7 +728,7 @@ class Round2ReviewFixesRoomAndUiTest {
         )
         val inst = PluginInstanceEntity(
             instanceId = "inst-adding",
-            pluginId = "dev.depth3d.jellyfin",
+            pluginId = "dev.dreama.jellyfin",
             displayName = "Adding...",
             encryptedConfig = "{}",
             enabled = true,
@@ -796,30 +796,30 @@ class Round2ReviewFixesRoomAndUiTest {
     @Test
     fun item13_builtInInstallerUpgradesSameVersionWhenSha256ChangesPreservingInstances() = runBlocking {
         val pm = newPackageManager()
-        val blob1 = buildFormPluginZip(pluginId = "dev.depth3d.samever", version = "1.0.0", extraMarker = "build-A")
-        val blob2 = buildFormPluginZip(pluginId = "dev.depth3d.samever", version = "1.0.0", extraMarker = "build-B")
+        val blob1 = buildFormPluginZip(pluginId = "dev.dreama.samever", version = "1.0.0", extraMarker = "build-A")
+        val blob2 = buildFormPluginZip(pluginId = "dev.dreama.samever", version = "1.0.0", extraMarker = "build-B")
 
         val r1 = BuiltInPluginInstaller.syncPackages(pm, store, listOf(blob1))
-        assertEquals(listOf("dev.depth3d.samever"), r1.installed)
-        val sha1 = store.getPackage("dev.depth3d.samever")!!.sha256
+        assertEquals(listOf("dev.dreama.samever"), r1.installed)
+        val sha1 = store.getPackage("dev.dreama.samever")!!.sha256
 
         // Create a user instance that must survive the in-place SHA-256 refresh
         val inst = pm.createInstance(
-            pluginId = "dev.depth3d.samever",
+            pluginId = "dev.dreama.samever",
             displayName = "My Server",
             config = mapOf("server" to JsonPrimitive("http://192.168.1.9:8096"), "username" to JsonPrimitive("u"), "password" to JsonPrimitive("p")),
         )
 
         // Identical blob -> skipped
         val rSame = BuiltInPluginInstaller.syncPackages(pm, store, listOf(blob1))
-        assertEquals(listOf("dev.depth3d.samever"), rSame.skipped)
+        assertEquals(listOf("dev.dreama.samever"), rSame.skipped)
 
         // Same version (1.0.0) but changed content / SHA-256 -> MUST upgrade in place!
         val rUpgraded = BuiltInPluginInstaller.syncPackages(pm, store, listOf(blob2))
-        assertEquals(listOf("dev.depth3d.samever"), rUpgraded.upgraded)
+        assertEquals(listOf("dev.dreama.samever"), rUpgraded.upgraded)
         assertTrue(rUpgraded.failed.isEmpty())
 
-        val pkgAfter = store.getPackage("dev.depth3d.samever")!!
+        val pkgAfter = store.getPackage("dev.dreama.samever")!!
         assertNotEquals("SHA-256 must update on same-version content change", sha1, pkgAfter.sha256)
         assertEquals("1.0.0", pkgAfter.version)
         assertTrue(File(pkgAfter.packagePath, "main.js").readText().contains("build-B"))
@@ -1040,7 +1040,7 @@ class Round2ReviewFixesRoomAndUiTest {
     @Test
     fun round3_roomReplacePackageAtomicCascadesInstancesAndSurvivesCancellation() = runBlocking {
         val pm = newPackageManager()
-        val pluginId = "dev.depth3d.roomreplace"
+        val pluginId = "dev.dreama.roomreplace"
         val repoZip = buildFormPluginZip(pluginId = pluginId, version = "1.0.0", extraMarker = "repo-orig")
         val devZip = buildFormPluginZip(pluginId = pluginId, version = "1.0.0", extraMarker = "dev-new")
 

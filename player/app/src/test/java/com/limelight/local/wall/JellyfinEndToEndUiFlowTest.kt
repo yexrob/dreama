@@ -63,7 +63,7 @@ class JellyfinEndToEndUiFlowTest {
     private fun packBuiltInJellyfin(repoRoot: File): ByteArray {
         val generated = File(
             repoRoot,
-            "player/app/build/generated/assets/builtin-plugins/builtin-plugins/dev.depth3d.jellyfin.d3plugin",
+            "player/app/build/generated/assets/builtin-plugins/builtin-plugins/dev.dreama.jellyfin.d3plugin",
         )
         if (generated.isFile) return generated.readBytes()
         val dir = File(repoRoot, "plugins/jellyfin")
@@ -161,8 +161,8 @@ class JellyfinEndToEndUiFlowTest {
         try {
             // 1. Built-in Jellyfin silent install
             val sync = BuiltInPluginInstaller.syncPackages(pm, store, listOf(packBuiltInJellyfin(repoRoot)))
-            assertEquals(listOf("dev.depth3d.jellyfin"), sync.installed)
-            val pkg = store.getPackage("dev.depth3d.jellyfin")!!
+            assertEquals(listOf("dev.dreama.jellyfin"), sync.installed)
+            val pkg = store.getPackage("dev.dreama.jellyfin")!!
             val rawManifest = com.limelight.local.plugin.ManifestParser.parseAndValidate(pkg.manifestJson)
             val localizedManifest = PluginLocale.fromPackageDir(File(pkg.packagePath), "zh-CN").localizeManifest(rawManifest)
             assertFalse("Localized manifest name must not contain raw \$t: keys", localizedManifest.name.startsWith("\$t:"))

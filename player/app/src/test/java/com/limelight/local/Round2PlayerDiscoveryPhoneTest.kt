@@ -250,7 +250,7 @@ class Round2PlayerDiscoveryPhoneTest {
         val validManifest = ManifestParser.parseAndValidate(
             """
             {
-              "api": 1, "id": "dev.depth3d.udpcheck", "name": "UDP Check", "version": "1.0.0",
+              "api": 1, "id": "dev.dreama.udpcheck", "name": "UDP Check", "version": "1.0.0",
               "permissions": { "hosts": [], "userHosts": true, "lan": true },
               "config": [
                 { "key": "s1", "type": "url", "label": "JF", "discover": "udp:jellyfin" },
@@ -268,7 +268,7 @@ class Round2PlayerDiscoveryPhoneTest {
             ManifestParser.parseAndValidate(
                 """
                 {
-                  "api": 1, "id": "dev.depth3d.badudp", "name": "Bad", "version": "1.0.0",
+                  "api": 1, "id": "dev.dreama.badudp", "name": "Bad", "version": "1.0.0",
                   "permissions": { "hosts": [], "userHosts": false, "lan": true },
                   "config": [{ "key": "s1", "type": "url", "label": "Bad", "discover": "udp:arbitrary" }],
                   "auth": "none"

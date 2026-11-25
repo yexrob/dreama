@@ -1,9 +1,9 @@
 {
   "api": 1,
-  "id": "dev.depth3d.reference",
+  "id": "dev.dreama.reference",
   "name": "$t:plugin_name",
   "version": "1.0.0",
-  "author": "depth3d",
+  "author": "Dreama",
   "description": "$t:plugin_desc",
   "homepage": "https://depth3d.dev/plugins/reference",
   "license": "GPL-3.0-or-later",

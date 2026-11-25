@@ -362,37 +362,37 @@ class Round3ReviewFixesTest {
             appVersion = PLUGIN_HOST_VERSION,
             deviceInfo = DeviceInfo.detect(PLUGIN_HOST_VERSION),
         )
-        val blobA = buildSimpleBuiltInZip("dev.depth3d.heal", "1.0.0", "marker-A")
-        val blobB = buildSimpleBuiltInZip("dev.depth3d.heal", "1.0.0", "marker-B")
+        val blobA = buildSimpleBuiltInZip("dev.dreama.heal", "1.0.0", "marker-A")
+        val blobB = buildSimpleBuiltInZip("dev.dreama.heal", "1.0.0", "marker-B")
 
         // 1. Initial install + create a user instance that MUST survive every repair/refresh
         val r1 = BuiltInPluginInstaller.syncPackages(pm, spyStore, listOf(blobA))
-        assertEquals(listOf("dev.depth3d.heal"), r1.installed)
+        assertEquals(listOf("dev.dreama.heal"), r1.installed)
         val inst = pm.createInstance(
-            pluginId = "dev.depth3d.heal",
+            pluginId = "dev.dreama.heal",
             displayName = "Keep Me",
             config = mapOf("server" to JsonPrimitive("http://192.168.1.50:8096")),
         )
 
         // 2. Simulate DB leftover with unparseable bad version ("refreshing") -> next launch self-heals!
-        val current = store.getPackage("dev.depth3d.heal")!!
+        val current = store.getPackage("dev.dreama.heal")!!
         store.upsertPackage(current.copy(version = "refreshing"))
         writtenVersions.clear()
 
         val rHealVer = BuiltInPluginInstaller.syncPackages(pm, spyStore, listOf(blobA))
-        assertEquals("Corrupted unparseable DB version must self-heal", listOf("dev.depth3d.heal"), rHealVer.upgraded)
-        assertEquals("1.0.0", store.getPackage("dev.depth3d.heal")!!.version)
+        assertEquals("Corrupted unparseable DB version must self-heal", listOf("dev.dreama.heal"), rHealVer.upgraded)
+        assertEquals("1.0.0", store.getPackage("dev.dreama.heal")!!.version)
         assertNotNull("User instance must survive DB version self-heal", store.getInstance(inst.instanceId))
 
         // 3. Simulate missing package directory on disk while DB has matching version + SHA -> next launch self-heals!
-        val pkgDir = File(store.getPackage("dev.depth3d.heal")!!.packagePath)
+        val pkgDir = File(store.getPackage("dev.dreama.heal")!!.packagePath)
         assertTrue(pkgDir.deleteRecursively())
         assertFalse(pkgDir.exists())
         writtenVersions.clear()
 
         val rHealDir = BuiltInPluginInstaller.syncPackages(pm, spyStore, listOf(blobA))
-        assertEquals("Missing package directory must self-heal", listOf("dev.depth3d.heal"), rHealDir.upgraded)
-        val restoredPkg = store.getPackage("dev.depth3d.heal")!!
+        assertEquals("Missing package directory must self-heal", listOf("dev.dreama.heal"), rHealDir.upgraded)
+        val restoredPkg = store.getPackage("dev.dreama.heal")!!
         assertTrue("Restored manifest.json must exist", File(restoredPkg.packagePath, "manifest.json").isFile)
         assertTrue("Restored main.js must exist", File(restoredPkg.packagePath, "main.js").isFile)
         assertNotNull("User instance must survive dir self-heal", store.getInstance(inst.instanceId))
@@ -400,13 +400,13 @@ class Round3ReviewFixesTest {
         // 4. Same-version SHA-256 update -> MUST NEVER write any fake/unparseable version string to DB!
         writtenVersions.clear()
         val rSameVerSha = BuiltInPluginInstaller.syncPackages(pm, spyStore, listOf(blobB))
-        assertEquals(listOf("dev.depth3d.heal"), rSameVerSha.upgraded)
+        assertEquals(listOf("dev.dreama.heal"), rSameVerSha.upgraded)
         assertTrue("Expected at least one upsert", writtenVersions.isNotEmpty())
         assertTrue(
             "Every DB upsert during same-version refresh must be a valid SemVer, got: $writtenVersions",
             writtenVersions.all { SemVer.parse(it) != null },
         )
-        val finalPkg = store.getPackage("dev.depth3d.heal")!!
+        val finalPkg = store.getPackage("dev.dreama.heal")!!
         assertTrue(File(finalPkg.packagePath, "main.js").readText().contains("marker-B"))
         assertNotNull("User instance must survive same-version SHA refresh", store.getInstance(inst.instanceId))
     }
@@ -752,9 +752,9 @@ class Round3ReviewFixesTest {
             appVersion = PLUGIN_HOST_VERSION,
             deviceInfo = DeviceInfo.detect(PLUGIN_HOST_VERSION),
         )
-        pm.installFromBytes(buildSimpleBuiltInZip("dev.depth3d.qrtest", "1.0.0", "qr", auth = "qr"), sourceUrl = "builtin:qrtest")
+        pm.installFromBytes(buildSimpleBuiltInZip("dev.dreama.qrtest", "1.0.0", "qr", auth = "qr"), sourceUrl = "builtin:qrtest")
         val origCfg = mapOf("server" to JsonPrimitive("http://192.168.1.36:8096"))
-        val inst = pm.createInstance("dev.depth3d.qrtest", "客厅 QR", origCfg)
+        val inst = pm.createInstance("dev.dreama.qrtest", "客厅 QR", origCfg)
         store.updateInstanceAuth(inst.instanceId, "AUTHENTICATED", """{"name":"alice"}""", System.currentTimeMillis())
 
         val beforeEdit = store.getInstance(inst.instanceId)!!

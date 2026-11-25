@@ -231,7 +231,7 @@ class Media3DashAndRoomTest {
         val manifestJson = """
             {
               "api": 1,
-              "id": "dev.depth3d.exotest",
+              "id": "dev.dreama.exotest",
               "name": "ExoTest",
               "version": "1.0.0",
               "permissions": { "hosts": [], "userHosts": $userHosts, "lan": $lan },
@@ -252,7 +252,7 @@ class Media3DashAndRoomTest {
         } else {
             emptyMap()
         }
-        val inst = mgr.createInstance("dev.depth3d.exotest", "ExoTest", cfg)
+        val inst = mgr.createInstance("dev.dreama.exotest", "ExoTest", cfg)
         val src = mgr.openSource(inst.instanceId) { listOf(InetAddress.getByName(dnsIp)) }
         mgr to src
     }
@@ -1027,13 +1027,13 @@ class Media3DashAndRoomTest {
             migrated.execSQL("PRAGMA foreign_keys = ON")
             migrated.execSQL(
                 "INSERT INTO plugin_packages VALUES " +
-                    "('dev.depth3d.ref','Ref','1.0.0','depth3d','desc','{}','/pkg',NULL,'https://repo.example/index.json'," +
+                    "('dev.dreama.ref','Ref','1.0.0','depth3d','desc','{}','/pkg',NULL,'https://repo.example/index.json'," +
                     "'repo:https://repo.example/index.json','deadbeef',1,0,'{}',1000,1000)",
             )
             migrated.execSQL(
-                "INSERT INTO plugin_instances VALUES ('inst-1','dev.depth3d.ref','My Ref','cipher',1,'NONE',NULL,1000,1000)",
+                "INSERT INTO plugin_instances VALUES ('inst-1','dev.dreama.ref','My Ref','cipher',1,'NONE',NULL,1000,1000)",
             )
-            migrated.execSQL("DELETE FROM plugin_packages WHERE pluginId = 'dev.depth3d.ref'")
+            migrated.execSQL("DELETE FROM plugin_packages WHERE pluginId = 'dev.dreama.ref'")
             migrated.query("SELECT COUNT(*) FROM plugin_instances").use { c ->
                 assertTrue(c.moveToFirst())
                 assertEquals(0, c.getInt(0))

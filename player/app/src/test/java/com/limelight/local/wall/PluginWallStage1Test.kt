@@ -143,7 +143,7 @@ class PluginWallStage1Test {
         // Verify Gradle-generated asset when assemble has run, and always verify packed archive validity
         val generatedAsset = File(
             repoRoot,
-            "player/app/build/generated/assets/builtin-plugins/builtin-plugins/dev.depth3d.jellyfin.d3plugin",
+            "player/app/build/generated/assets/builtin-plugins/builtin-plugins/dev.dreama.jellyfin.d3plugin",
         )
         val jellyfinZip = if (generatedAsset.isFile) {
             generatedAsset.readBytes()
@@ -158,47 +158,47 @@ class PluginWallStage1Test {
 
         // First launch: silent install
         val r1 = BuiltInPluginInstaller.syncPackages(pm, store, listOf(jellyfinZip))
-        assertEquals(listOf("dev.depth3d.jellyfin"), r1.installed)
+        assertEquals(listOf("dev.dreama.jellyfin"), r1.installed)
         assertTrue(r1.failed.isEmpty())
-        val pkg1 = store.getPackage("dev.depth3d.jellyfin")
+        val pkg1 = store.getPackage("dev.dreama.jellyfin")
         assertNotNull(pkg1)
         assertTrue(BuiltInPluginInstaller.isBuiltIn(pkg1!!))
 
         // Second launch with same version: skipped cleanly
         val r2 = BuiltInPluginInstaller.syncPackages(pm, store, listOf(jellyfinZip))
-        assertEquals(listOf("dev.depth3d.jellyfin"), r2.skipped)
+        assertEquals(listOf("dev.dreama.jellyfin"), r2.skipped)
         assertTrue(r2.installed.isEmpty())
         assertTrue(r2.upgraded.isEmpty())
 
         // Built-in upgrade with higher version and expanded permissions auto-confirms and preserves instances
-        val v1Zip = packSimplePlugin("dev.depth3d.sample", "1.0.0")
+        val v1Zip = packSimplePlugin("dev.dreama.sample", "1.0.0")
         val r3 = BuiltInPluginInstaller.syncPackages(pm, store, listOf(v1Zip))
-        assertEquals(listOf("dev.depth3d.sample"), r3.installed)
+        assertEquals(listOf("dev.dreama.sample"), r3.installed)
         val inst = pm.createInstance(
-            pluginId = "dev.depth3d.sample",
+            pluginId = "dev.dreama.sample",
             displayName = "My Sample",
             config = mapOf("server" to JsonPrimitive("http://192.168.1.9:8096")),
         )
 
         val v2Zip = packSimplePlugin(
-            id = "dev.depth3d.sample",
+            id = "dev.dreama.sample",
             version = "1.1.0",
             extraPermissions = """, "lan": true""",
         )
         val r4 = BuiltInPluginInstaller.syncPackages(pm, store, listOf(v2Zip))
-        assertEquals(listOf("dev.depth3d.sample"), r4.upgraded)
-        val pkg2 = store.getPackage("dev.depth3d.sample")!!
+        assertEquals(listOf("dev.dreama.sample"), r4.upgraded)
+        val pkg2 = store.getPackage("dev.dreama.sample")!!
         assertEquals("1.1.0", pkg2.version)
         assertFalse("Built-in upgrade must auto-confirm permissions", pkg2.needsPermissionReconfirm)
         assertNotNull("Existing instance must be preserved across built-in upgrade", store.getInstance(inst.instanceId))
 
         // Foreign-origin plugin with same ID must NOT be overwritten by built-in sync
-        val foreignZip = packSimplePlugin("dev.depth3d.foreign", "1.0.0")
+        val foreignZip = packSimplePlugin("dev.dreama.foreign", "1.0.0")
         pm.installFromBytes(foreignZip, sourceUrl = "https://repo.example.com/foreign.d3plugin")
-        val foreignV2 = packSimplePlugin("dev.depth3d.foreign", "2.0.0")
+        val foreignV2 = packSimplePlugin("dev.dreama.foreign", "2.0.0")
         val r5 = BuiltInPluginInstaller.syncPackages(pm, store, listOf(foreignV2))
-        assertEquals(listOf("dev.depth3d.foreign"), r5.skippedDifferentSource)
-        assertEquals("1.0.0", store.getPackage("dev.depth3d.foreign")!!.version)
+        assertEquals(listOf("dev.dreama.foreign"), r5.skippedDifferentSource)
+        assertEquals("1.0.0", store.getPackage("dev.dreama.foreign")!!.version)
     }
 
     @Test
@@ -250,7 +250,7 @@ class PluginWallStage1Test {
         )
 
         val pkg = InstalledPluginEntity(
-            pluginId = "dev.depth3d.test",
+            pluginId = "dev.dreama.test",
             name = "Test",
             version = "1.0.0",
             author = "t",
@@ -259,7 +259,7 @@ class PluginWallStage1Test {
             packagePath = "/tmp",
             sourceUrl = null,
             repoUrl = null,
-            sourceOrigin = "other:builtin:dev.depth3d.test",
+            sourceOrigin = "other:builtin:dev.dreama.test",
             sha256 = "00",
             enabled = true,
             needsPermissionReconfirm = false,
@@ -270,7 +270,7 @@ class PluginWallStage1Test {
         val instances = (1..5).map { i ->
             PluginInstanceEntity(
                 instanceId = "inst-$i",
-                pluginId = "dev.depth3d.test",
+                pluginId = "dev.dreama.test",
                 displayName = "Plugin $i",
                 encryptedConfig = "",
                 enabled = true,
@@ -428,21 +428,21 @@ class PluginWallStage1Test {
     fun pluginLogBufferParsesCapsAndClearsPerPlugin() {
         val buf = PluginLogBuffer(maxEntriesPerPlugin = 3, maxBytesPerPlugin = 1024)
         assertFalse(buf.recordLine("depth3d: unrelated log line"))
-        assertTrue(buf.recordLine("depth3d: plugin dev.depth3d.jellyfin [inst-1] INFO: hello 1", 1000L))
-        assertTrue(buf.recordLine("depth3d: plugin dev.depth3d.jellyfin [inst-1] WARN: hello 2", 2000L))
-        assertTrue(buf.recordLine("depth3d: plugin dev.depth3d.jellyfin [inst-1] ERROR: hello 3", 3000L))
-        assertTrue(buf.recordLine("depth3d: plugin dev.depth3d.jellyfin [inst-1] INFO: hello 4", 4000L))
-        assertTrue(buf.recordLine("depth3d: plugin dev.depth3d.other [inst-2] DEBUG: other", 5000L))
+        assertTrue(buf.recordLine("depth3d: plugin dev.dreama.jellyfin [inst-1] INFO: hello 1", 1000L))
+        assertTrue(buf.recordLine("depth3d: plugin dev.dreama.jellyfin [inst-1] WARN: hello 2", 2000L))
+        assertTrue(buf.recordLine("depth3d: plugin dev.dreama.jellyfin [inst-1] ERROR: hello 3", 3000L))
+        assertTrue(buf.recordLine("depth3d: plugin dev.dreama.jellyfin [inst-1] INFO: hello 4", 4000L))
+        assertTrue(buf.recordLine("depth3d: plugin dev.dreama.other [inst-2] DEBUG: other", 5000L))
 
-        val jellyfinLogs = buf.recentEntries("dev.depth3d.jellyfin")
+        val jellyfinLogs = buf.recentEntries("dev.dreama.jellyfin")
         assertEquals(3, jellyfinLogs.size)
         assertEquals("hello 2", jellyfinLogs[0].message)
         assertEquals(PluginLogLevel.ERROR, jellyfinLogs[1].level)
         assertEquals("hello 4", jellyfinLogs[2].message)
 
-        buf.clear("dev.depth3d.jellyfin")
-        assertTrue(buf.recentEntries("dev.depth3d.jellyfin").isEmpty())
-        assertEquals(1, buf.recentEntries("dev.depth3d.other").size)
+        buf.clear("dev.dreama.jellyfin")
+        assertTrue(buf.recentEntries("dev.dreama.jellyfin").isEmpty())
+        assertEquals(1, buf.recentEntries("dev.dreama.other").size)
     }
 
     @Test

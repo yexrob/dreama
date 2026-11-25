@@ -84,7 +84,7 @@ class PluginPlaybackStage2Test {
         val manifest = """
             {
               "api": 1,
-              "id": "dev.depth3d.playtest",
+              "id": "dev.dreama.playtest",
               "name": "PlayTest",
               "version": "1.0.0",
               "minApp": "1.0.0",
@@ -248,9 +248,9 @@ class PluginPlaybackStage2Test {
             appVersion = "1.0.0",
             deviceInfo = DeviceInfo.detect("1.0.0"),
         )
-        pm.installFromBytes(buildPlaybackPluginZip(baseUrl), sourceUrl = "builtin:dev.depth3d.playtest")
+        pm.installFromBytes(buildPlaybackPluginZip(baseUrl), sourceUrl = "builtin:dev.dreama.playtest")
         val inst = pm.createInstance(
-            pluginId = "dev.depth3d.playtest",
+            pluginId = "dev.dreama.playtest",
             displayName = "PlayTest Server",
             config = mapOf("server" to JsonPrimitive(baseUrl)),
         )

@@ -88,9 +88,9 @@ class ReferenceAndJellyfinConformanceTest {
                 locales = mapOf("zh-CN" to File(refDir, "locales/zh-CN.json").readText()),
             )
             val installed = mgr.installFromBytes(zip)
-            assertEquals("dev.depth3d.reference", installed.manifest.id)
+            assertEquals("dev.dreama.reference", installed.manifest.id)
 
-            val inst = mgr.createInstance("dev.depth3d.reference", "参考插件实例")
+            val inst = mgr.createInstance("dev.dreama.reference", "参考插件实例")
             val source = mgr.openSource(inst.instanceId)
 
             // 1. home() covers all 5 shelf styles & localized metadata
@@ -252,13 +252,13 @@ class ReferenceAndJellyfinConformanceTest {
 
             // 10. Form and Device auth variants
             val deviceManifestJson = File(refDir, "manifest.json").readText()
-                .replace("\"id\": \"dev.depth3d.reference\"", "\"id\": \"dev.depth3d.refdevice\"")
+                .replace("\"id\": \"dev.dreama.reference\"", "\"id\": \"dev.dreama.refdevice\"")
                 .replace("\"auth\": \"qr\"", "\"auth\": \"device\"")
             mgr.installFromBytes(
                 PackageManagerAndMigrationTest.buildPluginZip(deviceManifestJson, File(refDir, "main.js").readText()),
             )
             val devInst = mgr.createInstance(
-                "dev.depth3d.refdevice",
+                "dev.dreama.refdevice",
                 "设备码实例",
                 mapOf("authFlow" to JsonPrimitive("device")),
             )
@@ -268,13 +268,13 @@ class ReferenceAndJellyfinConformanceTest {
             assertTrue(devStart.url.startsWith("https://"))
 
             val formManifestJson = File(refDir, "manifest.json").readText()
-                .replace("\"id\": \"dev.depth3d.reference\"", "\"id\": \"dev.depth3d.refform\"")
+                .replace("\"id\": \"dev.dreama.reference\"", "\"id\": \"dev.dreama.refform\"")
                 .replace("\"auth\": \"qr\"", "\"auth\": \"form\"")
             mgr.installFromBytes(
                 PackageManagerAndMigrationTest.buildPluginZip(formManifestJson, File(refDir, "main.js").readText()),
             )
             val formInst = mgr.createInstance(
-                "dev.depth3d.refform",
+                "dev.dreama.refform",
                 "表单实例",
                 mapOf("username" to JsonPrimitive("alice"), "password" to JsonPrimitive("good")),
             )
@@ -409,7 +409,7 @@ class ReferenceAndJellyfinConformanceTest {
             mgr.installFromBytes(zip)
 
             val inst = mgr.createInstance(
-                pluginId = "dev.depth3d.jellyfin",
+                pluginId = "dev.dreama.jellyfin",
                 displayName = "客厅 Jellyfin",
                 config = mapOf(
                     "server" to JsonPrimitive("http://192.168.1.50:${server.port}"),
@@ -666,7 +666,7 @@ class ReferenceAndJellyfinConformanceTest {
             try {
                 mgr107.installFromBytes(zip)
                 val inst = mgr107.createInstance(
-                    "dev.depth3d.jellyfin",
+                    "dev.dreama.jellyfin",
                     "JF 10.7",
                     mapOf(
                         "server" to JsonPrimitive("http://192.168.1.50:${server.port}"),
@@ -695,7 +695,7 @@ class ReferenceAndJellyfinConformanceTest {
             try {
                 mgr108.installFromBytes(zip)
                 val inst = mgr108.createInstance(
-                    "dev.depth3d.jellyfin",
+                    "dev.dreama.jellyfin",
                     "JF 10.8",
                     mapOf(
                         "server" to JsonPrimitive("http://192.168.1.50:${server.port}"),
