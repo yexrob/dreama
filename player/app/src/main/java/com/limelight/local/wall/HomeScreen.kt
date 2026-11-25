@@ -91,8 +91,9 @@ fun HomeScreen(model: WallModel, nav: WallNav) {
                 }
                 for ((src, state) in shelves) {
                     when (state) {
-                        is Load.Ready -> state.value.filter { it.items.isNotEmpty() }.distinctBy { it.category.id }.forEach { shelf ->
-                            item("${src.source.id}/${shelf.category.id}") { ShelfRow(src, shelf, nav) }
+                        is Load.Ready -> state.value.filter { it.items.isNotEmpty() }.forEachIndexed { i, shelf ->
+                            // Sources may repeat a category id; the index keeps keys unique without dropping rows.
+                            item("${src.source.id}/$i/${shelf.category.id}") { ShelfRow(src, shelf, nav) }
                         }
                         is Load.Failed -> item("${src.source.id}/failed") { FailedRow(src, state.error, model, nav) }
                         else -> item("${src.source.id}/loading") { SkeletonRow() }

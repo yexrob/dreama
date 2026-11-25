@@ -3,7 +3,7 @@ package com.limelight.local.stream
 import java.nio.charset.StandardCharsets
 
 /**
- * Pure-Kotlin ISO/IEC 18004 QR Code encoder (Byte mode, ECC Level L, Versions 1..6).
+ * Pure-Kotlin ISO/IEC 18004 QR Code encoder (Byte mode, ECC Level L, Versions 1..9).
  *
  * Keeps QR generation self-contained with zero third-party dependencies for the phone-input
  * URL sheet (e.g. `http://192.168.1.15:54321/?code=4829`).
@@ -32,12 +32,22 @@ class QrCodeMatrix(val size: Int, private val modules: BooleanArray) {
             VersionSpec(4, 100, 20, 1, intArrayOf(6, 26)),
             VersionSpec(5, 134, 26, 1, intArrayOf(6, 30)),
             VersionSpec(6, 172, 18, 2, intArrayOf(6, 34)),
+            VersionSpec(7, 196, 20, 2, intArrayOf(6, 22, 38)),
+            VersionSpec(8, 242, 24, 2, intArrayOf(6, 24, 42)),
+            VersionSpec(9, 292, 30, 2, intArrayOf(6, 26, 46)),
         )
+
+        /** Largest UTF-8 payload [encode] accepts. */
+        val MAX_PAYLOAD_BYTES: Int get() = SPECS.last().maxByteCapacity
+
+        /** Like [encode], but returns null instead of throwing when the payload does not fit. */
+        fun encodeOrNull(text: String): QrCodeMatrix? =
+            if (text.toByteArray(StandardCharsets.UTF_8).size <= MAX_PAYLOAD_BYTES) encode(text) else null
 
         fun encode(text: String): QrCodeMatrix {
             val bytes = text.toByteArray(StandardCharsets.UTF_8)
             val spec = SPECS.firstOrNull { bytes.size <= it.maxByteCapacity }
-                ?: throw IllegalArgumentException("Payload too long for QR V1..V6 (${bytes.size} bytes)")
+                ?: throw IllegalArgumentException("Payload too long for QR V1..V9 (${bytes.size} bytes)")
             val data = buildDataCodewords(bytes, spec.dataCodewords)
             val finalCodewords = interleaveWithEc(data, spec)
 
@@ -198,6 +208,20 @@ class QrCodeMatrix(val size: Int, private val modules: BooleanArray) {
 
             // Reserve format info & dark module
             drawFormatBits(n, mask, ::setFunc)
+
+            // Version information (versions 7+): 6 version bits + 12 BCH bits, placed twice
+            if (spec.version >= 7) {
+                var rem = spec.version
+                repeat(12) { rem = (rem shl 1) xor ((rem ushr 11) * 0x1F25) }
+                val bits = (spec.version shl 12) or rem
+                for (i in 0 until 18) {
+                    val dark = ((bits ushr i) and 1) != 0
+                    val a = n - 11 + i % 3
+                    val b = i / 3
+                    setFunc(a, b, dark)
+                    setFunc(b, a, dark)
+                }
+            }
 
             // Place data bits (2-column upward/downward zigzag, skipping column 6)
             var bitIdx = 0
