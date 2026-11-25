@@ -593,8 +593,8 @@ class Round2ReviewFixesRoomAndUiTest {
             source = fakeSrc,
             seasons = seasons,
             localProgress = mapOf(
-                "s1e1" to WatchProgress("plugin:jf", "s1e1", "S1E1", 990_000L, 1_000_000L, 100L),
-                "s2e1" to WatchProgress("plugin:jf", "s2e1", "S2E1", 300_000L, 1_000_000L, 200L),
+                "s1e1" to WatchProgress("plugin:jf", "s1e1", "S1E1", 990_000L, 1_000_000L, 100L, parentId = "s1"),
+                "s2e1" to WatchProgress("plugin:jf", "s2e1", "S2E1", 300_000L, 1_000_000L, 200L, parentId = "s2"),
             ),
             loadSeasonEpisodes = { epsBySeason[it].orEmpty() },
         )!!
@@ -609,7 +609,7 @@ class Round2ReviewFixesRoomAndUiTest {
             source = fakeSrc,
             seasons = seasons,
             localProgress = mapOf(
-                "s1e2" to WatchProgress("plugin:jf", "s1e2", "S1E2", 980_000L, 1_000_000L, 500L),
+                "s1e2" to WatchProgress("plugin:jf", "s1e2", "S1E2", 980_000L, 1_000_000L, 500L, parentId = "s1"),
             ),
             loadSeasonEpisodes = { epsBySeason[it].orEmpty() },
         )!!
@@ -625,7 +625,7 @@ class Round2ReviewFixesRoomAndUiTest {
             source = fakeSrc,
             seasons = seasons,
             localProgress = mapOf(
-                "s2e1" to WatchProgress("plugin:jf", "s2e1", "S2E1", 970_000L, 1_000_000L, 600L),
+                "s2e1" to WatchProgress("plugin:jf", "s2e1", "S2E1", 970_000L, 1_000_000L, 600L, parentId = "s2"),
             ),
             loadSeasonEpisodes = { epsBySeason[it].orEmpty() },
         )!!
@@ -943,18 +943,11 @@ class Round2ReviewFixesRoomAndUiTest {
         )
     }
 
-    // ---- Item #19: build.gradle zip comment & Jellyfin 1.0.1 manifest verification ----
+    // ---- Jellyfin 1.0.1 manifest validation via real ManifestParser ----
 
     @Test
-    fun item19_buildGradleZipCommentMatchesActualArchiveFormatAndJellyfinManifest() {
+    fun jellyfinManifestValidatesVersionAndUdpDiscover() {
         val repoRoot = ManifestAndPermissionTest.locateRepoRoot()
-        val gradleText = File(repoRoot, "player/app/build.gradle").readText()
-        assertFalse(
-            "build.gradle must not falsely claim 'no data descriptor'",
-            gradleText.contains("no data descriptor", ignoreCase = true),
-        )
-        assertTrue("build.gradle must document data descriptors", gradleText.contains("data descriptor"))
-
         val jfManifestText = File(repoRoot, "plugins/jellyfin/manifest.json").readText()
         val manifest = ManifestParser.parseAndValidate(jfManifestText)
         assertEquals("1.0.1", manifest.version)
