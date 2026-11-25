@@ -653,6 +653,19 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
                 }
 
                 SettingsCategory.PRIVACY -> {
+                    item("remember-search-history") {
+                        SettingRow(
+                            title = stringResource(R.string.settings_remember_search_title),
+                            sub = stringResource(R.string.settings_remember_search_sub),
+                        ) {
+                            WallSwitch(snapshot.rememberSearchHistory) { enabled ->
+                                update {
+                                    StreamSettingsMapper.setRememberSearchHistory(store, enabled)
+                                    model.setRememberSearchHistory(enabled)
+                                }
+                            }
+                        }
+                    }
                     item("file-log") {
                         SettingRow(
                             title = stringResource(R.string.settings_log_title),
@@ -769,7 +782,14 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
             }
         }
 
-        NavBar(selected = null, onTab = nav::tab, onSettings = { nav.back() }, solid = true, settingsSelected = true)
+        NavBar(
+            selected = null,
+            onTab = nav::tab,
+            onSettings = { nav.back() },
+            solid = true,
+            settingsSelected = true,
+            onSearch = nav::openSearch,
+        )
 
         if (showRenameSheet) {
             PhoneInputSheet(

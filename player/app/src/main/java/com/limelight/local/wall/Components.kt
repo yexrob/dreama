@@ -226,6 +226,7 @@ fun NavBar(
     onSettings: () -> Unit,
     solid: Boolean,
     settingsSelected: Boolean = false,
+    onSearch: (() -> Unit)? = null,
 ) {
     val bg by animateColorAsState(if (solid) Wall.Bg else Color.Transparent, tween(240), label = "nav")
     Row(
@@ -237,7 +238,15 @@ fun NavBar(
             TabChip(androidx.compose.ui.res.stringResource(t.labelRes), t == selected) { onTab(t) }
         }
         Spacer(Modifier.weight(1f))
-        RoundButton(WallIcons.Gear, onSettings, selected = settingsSelected)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            if (onSearch != null) {
+                RoundButton(WallIcons.Search, onSearch)
+            }
+            RoundButton(WallIcons.Gear, onSettings, selected = settingsSelected)
+        }
     }
 }
 

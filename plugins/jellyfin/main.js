@@ -953,21 +953,25 @@ export default {
 
   async search(ctx, { query = '', cursor = null, kind = null } = {}) {
     const { base, authHeader, routes } = await requireSession(ctx);
+    const term = String(query ?? '').trim();
+    if (!term) {
+      return { items: [], next: null };
+    }
     const startIndex = cursor ? Math.max(0, parseInt(String(cursor), 10) || 0) : 0;
     const typeMap = {
       movie: 'Movie',
-      series: 'Series',
+      series: 'Series,Episode',
       episode: 'Episode',
       collection: 'BoxSet',
       video: 'Video',
     };
     const req = routes.items({
-      SearchTerm: query,
+      SearchTerm: term,
       Recursive: 'true',
       IncludeItemTypes: (kind && typeMap[kind]) || 'Movie,Series,Episode,Video,BoxSet',
       StartIndex: startIndex,
       Limit: 30,
-      Fields: 'Overview,Genres,MediaSources,UserData',
+      Fields: 'Overview,Genres,MediaSources,UserData,ChildCount',
     });
     const data = await apiRequest(ctx, req.path, { query: req.query });
     const rawItems = Array.isArray(data?.Items) ? data.Items : [];
@@ -975,16 +979,29 @@ export default {
     const nextIdx = startIndex + rawItems.length;
     return {
       items: rawItems.map((it) => mapItem(it, base, authHeader)),
-      next: nextIdx < total ? String(nextIdx) : null,
+      next: rawItems.length > 0 && nextIdx < total ? String(nextIdx) : null,
     };
   },
 
   async suggest(ctx, { query = '' } = {}) {
     const { session } = await requireSession(ctx);
+    const term = String(query ?? '').trim();
+    if (!term) return [];
     const data = await apiRequest(ctx, '/Search/Hints', {
-      query: { searchTerm: query, userId: session.userId, limit: 8 },
+      query: { searchTerm: term, userId: session.userId, limit: 8 },
     });
-    return (data?.SearchHints || []).map((h) => String(h.Name)).filter(Boolean);
+    const seen = new Set();
+    const out = [];
+    for (const h of data?.SearchHints || []) {
+      const name = h?.Name ? String(h.Name).trim() : '';
+      if (!name) continue;
+      const key = name.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        out.push(name);
+      }
+    }
+    return out;
   },
 
   async reportProgress(ctx, { itemId, positionMs = 0, durationMs = 0, event = 'progress', session = null }) {

@@ -117,7 +117,10 @@ fun CastScreen(model: WallModel, nav: WallNav) {
             }, {
                 streaming.cancelActiveOperation()
                 nav.openSettings()
-            }, solid = true)
+            }, solid = true, onSearch = {
+                streaming.cancelActiveOperation()
+                nav.openSearch()
+            })
         }
         return
     }
@@ -126,7 +129,7 @@ fun CastScreen(model: WallModel, nav: WallNav) {
     if (!hasWifi && (air.phase == AirPlayState.Phase.NO_WIFI || dlna.phase == ReceiverStatus.Phase.NO_NETWORK)) {
         Box(Modifier.fillMaxSize()) {
             NoWifiTakeover()
-            NavBar(Tab.Cast, nav::tab, nav::openSettings, solid = true)
+            NavBar(Tab.Cast, nav::tab, nav::openSettings, solid = true, onSearch = nav::openSearch)
         }
         return
     }
@@ -134,7 +137,7 @@ fun CastScreen(model: WallModel, nav: WallNav) {
     if (air.takesPage) {
         Box(Modifier.fillMaxSize()) {
             AirPlayTakeover(air)
-            NavBar(Tab.Cast, nav::tab, nav::openSettings, solid = true)
+            NavBar(Tab.Cast, nav::tab, nav::openSettings, solid = true, onSearch = nav::openSearch)
         }
         return
     }
@@ -306,7 +309,7 @@ fun CastScreen(model: WallModel, nav: WallNav) {
             }
         }
 
-        NavBar(Tab.Cast, nav::tab, nav::openSettings, solid = true)
+        NavBar(Tab.Cast, nav::tab, nav::openSettings, solid = true, onSearch = nav::openSearch)
 
         if (showAddSheet) {
             PhoneInputSheet(

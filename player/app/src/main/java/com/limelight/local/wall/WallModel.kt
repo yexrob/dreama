@@ -23,6 +23,10 @@ import com.limelight.local.plugin.PluginManifest
 import com.limelight.local.plugin.PluginMediaSource
 import com.limelight.local.plugin.PluginRepoEntity
 import com.limelight.local.plugin.PluginRepoIndex
+import com.limelight.local.search.SearchAggregator
+import com.limelight.local.search.SearchConfig
+import com.limelight.local.search.SearchHistoryStore
+import com.limelight.local.stream.AndroidPrefsStore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -129,6 +133,22 @@ class WallModel(app: Application) : AndroidViewModel(app) {
         reloadSavedWebDav()
     }
 
+    val searchHistory = SearchHistoryStore(
+        historyStore = AndroidPrefsStore.namedPrefs(app, SearchHistoryStore.PREFS_NAME),
+        settingsStore = AndroidPrefsStore.defaultPrefs(app),
+    )
+
+    val searchAggregator = SearchAggregator(scope = viewModelScope)
+
+    /** Local-only recent watch history (both in-progress and finished) for Search idle screen. */
+    val recentWatchProgress: StateFlow<List<WatchProgress>> =
+        WallDatabase.get(app).progress().recent(SearchConfig.MAX_IDLE_RECENT_WATCHED * 2)
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    fun setRememberSearchHistory(enabled: Boolean) {
+        searchHistory.setRememberEnabled(enabled)
+    }
+
     init {
         refreshAll()
         viewModelScope.launch {
@@ -143,7 +163,11 @@ class WallModel(app: Application) : AndroidViewModel(app) {
                 .collect { (pkgs, insts, pendingIds) ->
                     refreshPluginRepos()
                     val reconciled = pluginManager.reconcile(pkgs, insts, pendingIds)
-                    reconciled.removedSourceIds.forEach { shelves.remove(it) }
+                    reconciled.removedSourceIds.forEach {
+                        shelves.remove(it)
+                        searchAggregator.invalidateSourceCache(it)
+                    }
+                    reconciled.changedSourceIds.forEach { searchAggregator.invalidateSourceCache(it) }
                     pluginSources.value = reconciled.sources
                     reconciled.sources.forEach { src ->
                         if (src.source.id in reconciled.changedSourceIds || shelves[src.source.id] == null) {
@@ -161,6 +185,7 @@ class WallModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
+        searchAggregator.cancelActive()
         pluginManager.cancelAll()
         streaming.onDestroy()
         super.onCleared()

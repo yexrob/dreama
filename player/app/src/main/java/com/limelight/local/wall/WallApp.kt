@@ -56,7 +56,13 @@ interface WallActions {
 sealed interface Page {
     data class Tabs(val tab: Tab) : Page
     data class Grid(val sourceId: String, val categoryId: String, val title: String, val count: Int?) : Page
-    data class Detail(val sourceId: String, val item: Item) : Page
+    data class Detail(
+        val sourceId: String,
+        val item: Item,
+        val focusSeasonId: String? = null,
+        val focusEpisodeId: String? = null,
+    ) : Page
+    data object Search : Page
     data class PcApps(val computer: StreamingComputer) : Page
     data object Settings : Page
     data class Sources(val initialTab: SourcesTab = SourcesTab.SOURCES) : Page
@@ -67,6 +73,7 @@ sealed interface Page {
         val prefillServerUrl: String? = null,
         val suggestedName: String? = null,
         val reloginOnly: Boolean = false,
+        val returnAfterSuccess: Boolean = false,
     ) : Page
     data class SourceEdit(val instanceId: String) : Page
     data class PluginDetail(val pluginId: String) : Page
@@ -91,6 +98,9 @@ class WallNav(
         private set
     var pendingLibrarySourceId by mutableStateOf<String?>(null)
         private set
+    private var authReturnSeq = 0
+    var lastAuthenticatedSource by mutableStateOf<Pair<String, Int>?>(null)
+        private set
 
     val top: Page get() = stack.last()
 
@@ -100,9 +110,23 @@ class WallNav(
     fun <T : Any> keep(page: Page, name: String, make: () -> T): T = kept.getOrPut(page to name, make) as T
 
     fun tab(t: Tab) {
+        if (Page.Search in stack) {
+            model.searchAggregator.resetToIdle()
+        }
         stack.clear()
         kept.clear()
         stack += Page.Tabs(t)
+    }
+
+    fun notifyPluginAuthenticated(sourceId: String) {
+        model.searchAggregator.invalidateSourceCache(sourceId)
+        lastAuthenticatedSource = sourceId to (++authReturnSeq)
+    }
+
+    fun consumeAuthenticatedSource(): String? {
+        val current = lastAuthenticatedSource ?: return null
+        lastAuthenticatedSource = null
+        return current.first
     }
 
     fun openLibrarySelecting(sourceId: String) {
@@ -138,6 +162,9 @@ class WallNav(
             val gone = stack.removeAt(stack.size - 1)
             if (gone !in stack) {
                 kept.keys.removeAll { it.first == gone }
+                if (gone == Page.Search) {
+                    model.searchAggregator.resetToIdle()
+                }
             }
             return true
         }
@@ -165,6 +192,8 @@ class WallNav(
 
     fun play(source: MediaSource, item: Item, startMs: Long) = starter(source, item, startMs)
 
+    fun openSearch() = open(Page.Search)
+
     fun openSettings() = open(Page.Settings)
 
     fun openSources(initialTab: SourcesTab = SourcesTab.SOURCES) = open(Page.Sources(initialTab))
@@ -177,7 +206,8 @@ class WallNav(
         prefillServerUrl: String? = null,
         suggestedName: String? = null,
         reloginOnly: Boolean = false,
-    ) = open(Page.PluginForm(pluginId, instanceId, prefillServerUrl, suggestedName, reloginOnly))
+        returnAfterSuccess: Boolean = false,
+    ) = open(Page.PluginForm(pluginId, instanceId, prefillServerUrl, suggestedName, reloginOnly, returnAfterSuccess))
 
     fun openSourceEdit(instanceId: String) = open(Page.SourceEdit(instanceId))
 
@@ -191,12 +221,17 @@ class WallNav(
 
     fun openPcApps(computer: StreamingComputer) = open(Page.PcApps(computer))
 
-    fun pluginLogin(source: MediaSource) {
+    fun pluginLogin(source: MediaSource, returnAfterSuccess: Boolean = false) {
         val pluginId = model.pluginIdForSource(source)
         val instanceId = (source as? PluginMediaSource)?.instanceId
             ?: source.source.id.removePrefix(PluginHost.PLUGIN_SOURCE_PREFIX).takeIf { it != source.source.id }
         if (pluginId != null && instanceId != null) {
-            openPluginForm(pluginId = pluginId, instanceId = instanceId, reloginOnly = true)
+            openPluginForm(
+                pluginId = pluginId,
+                instanceId = instanceId,
+                reloginOnly = true,
+                returnAfterSuccess = returnAfterSuccess,
+            )
         } else {
             openSources()
         }
@@ -330,6 +365,7 @@ fun WallApp(model: WallModel, actions: WallActions, pendingTab: StateFlow<Tab?>)
                     }
                     is Page.Grid -> GridScreen(model, nav, page)
                     is Page.Detail -> DetailScreen(model, nav, page)
+                    Page.Search -> SearchScreen(model, nav)
                     is Page.PcApps -> PcAppsScreen(model, nav, page)
                     Page.Settings -> SettingsScreen(model, nav)
                     is Page.Sources -> SourcesScreen(model, nav, page.initialTab)

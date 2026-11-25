@@ -282,7 +282,43 @@ d3plugin pack ./my-media-plugin -o dist/my-media-plugin-1.0.0.d3plugin
 
 ---
 
-## 5. 错误处理与运行时约束
+## 5. 实现搜索与联想（`search` / `suggest`）
+
+如果播放源支持搜索，在 `manifest.json` 的 `capabilities` 中加入 `"search"`，并在 `main.js` 中导出 `search(ctx, { query, cursor, kind })`；输入联想 `suggest(ctx, { query })` 为**完全可选**导出，不实现时宿主与 `d3plugin check` 均会静默跳过，不会报错或刷日志。
+
+### `search(ctx, { query, cursor, kind })`
+
+- **返回结构**：必须返回 `ItemPage`（`{ items: Item[], next: string | null }`），元素格式与 `browse` 一致。
+- **空查询处理**：当 `query` 为空字符串或仅包含空白字符时，应直接返回 `{ items: [], next: null }`，不要向远端发空查询或返回全库数据。
+- **排序由插件决定**：宿主按播放源分区域展示结果，**永远不会**对单个插件返回的 `items` 重排；请直接把最相关的结果排在前面。
+- **分页游标**：没有下一页时返回 `next: null`。下一页游标不可与当前 `cursor` 重复（宿主也会做去重与死循环兜底）。进入单源「展开」视图时，宿主直接复用第 1 页结果并在接近底部时按 `cursor` 翻页。
+- **可选 `kind` 筛选**：宿主在用户切换类型标签时会传入 `kind`（如 `'movie'`、`'series'`、`'video'`）；**不支持筛选的插件可以直接忽略 `kind`**，并且遇到未知/未来新增的 `kind` 值时**不可抛错**（宿主自身也会在本地按类型做二次过滤，且「剧集」筛选同时包含 `series` 与 `episode`）。
+- **时延与超时预算**：
+  - 宿主在用户提交搜索后并发请求所有支持搜索的播放源；**300 ms** 内到达的源会按配置顺序批量落位，300 ms 之后到达的源按完成顺序追加到底部（不抖动已有行）。
+  - 单源单次搜索超时上限为 **10 秒**；超时后宿主取消该源请求并展示单行重试提示，不影响其他播放源。
+- **错误表达**：
+  - 未登录或登录失效请抛出 `new ctx.Error('NeedsAuth', '...')`，宿主会在该源原位展示「登录」按钮，用户登录成功后自动回到搜索页并只重搜这一个源；
+  - 触发限流请抛出 `new ctx.Error('RateLimited', '...', { retryAfterSec: 30 })`，宿主会在该源行内显示倒计时后再允许重试；
+  - 网络或服务异常请抛出 `new ctx.Error('Unavailable', '...')`，宿主会在该源行内展示「重试」按钮。
+
+### `suggest(ctx, { query })`（可选）
+
+- 返回去重后的字符串数组 `string[]`（建议不超过 8 条）；空查询时返回 `[]`。
+- 宿主在用户输入停止 **250 ms** 且达到最小长度（中文 ≥ 1 字，英文/数字 ≥ 2 字符）后才会并发调用，单源超时 **800 ms**，任何失败、超时或未实现均静默忽略，不弹窗、不中断输入。
+- 联想接口应尽量轻量（例如调用服务端 hints/autocomplete 接口，避免做重型全文检索）。
+
+### 本地自检
+
+运行 `d3plugin check ./my-media-plugin` 时，对声明了 `"search"` 能力的插件会自动校验：
+1. 空字符串与纯空白查询返回 `{ items: [], next: null }`；
+2. 返回值符合 `ItemPage` Schema 且所有图片 URL 满足网络权限策略；
+3. 若返回 `next` 游标，自动拉取第 2 页并验证游标推进不死循环；
+4. 传入已知 `kind`（`'movie'`）与未知 `kind` 均不报错且返回合法 `ItemPage`；
+5. 若导出 `suggest` 则验证返回值 Schema 与空查询返回 `[]`；未导出时静默通过。
+
+---
+
+## 6. 错误处理与运行时约束
 
 - **不要抛出原始技术异常给用户看**：业务可预期错误请抛出 `new ctx.Error(code, '给用户看的简体中文短句')`，可选的 `code` 为：`NeedsAuth`、`AuthFailed`、`NeedsSetup`、`Unavailable`、`NotFound`、`Forbidden`、`RateLimited`、`Unsupported`、`Internal`。普通 `Error`（哪怕消息里包含 `timeout`）一律归类为 `Internal`，只有宿主真实超时或中断才映射为 `Unavailable`。
 - **无状态假设**：宿主随时可能销毁并重建 QuickJS 实例（例如宿主超时或超过 64 MB 堆内存限制后；插件主动抛出 `new ctx.Error('Unavailable', ...)` 不会触发重建）。跨调用必须持久化的凭据或会话 ID 请写入 `ctx.storage`。
@@ -292,7 +328,7 @@ d3plugin pack ./my-media-plugin -o dist/my-media-plugin-1.0.0.d3plugin
 
 ---
 
-## 6. 发布到插件仓库
+## 7. 发布到插件仓库
 
 将 `.d3plugin` 放到 HTTPS 静态托管后，按 [docs/specs/plugin-protocol.md §8](specs/plugin-protocol.md#8-分发) 生成仓库索引 `index.json`（格式受 [repository.schema.json](specs/plugin-schema/repository.schema.json) 约束）：
 

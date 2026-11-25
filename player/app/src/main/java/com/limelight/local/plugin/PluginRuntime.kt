@@ -22,7 +22,10 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -164,6 +167,8 @@ class PluginRuntime(
     private var bridgeToken: String = ""
     private var initialized = false
     @Volatile
+    private var cachedExportedMethods: Set<String>? = null
+    @Volatile
     private var closed = false
     @Volatile
     private var activeCallScope: CoroutineScope? = null
@@ -230,6 +235,14 @@ class PluginRuntime(
         private set
 
     /**
+     * Lock-free hint returning `true` once the plugin module has been loaded and confirmed
+     * NOT to export [method]. Returns `false` if the runtime is not yet initialized or
+     * [method] is exported.
+     */
+    fun isMethodKnownMissing(method: String): Boolean =
+        cachedExportedMethods?.let { method !in it } == true
+
+    /**
      * Invokes an exported method on the plugin's default export object.
      * Calls on the same instance execute serially (§11.1).
      */
@@ -239,7 +252,24 @@ class PluginRuntime(
         itemIdForErrors: String? = null,
         timeoutMsOverride: Long? = null,
     ): JsonElement = callMutex.withLock {
-        invokeLocked(method, arg, itemIdForErrors, timeoutMsOverride)
+        invokeLocked(method, arg, itemIdForErrors, timeoutMsOverride, optional = false) ?: JsonNull
+    }
+
+    /**
+     * Invokes an optional exported method (e.g. `suggest`). If the plugin does not export
+     * [method], returns `null` silently without logging an error or throwing.
+     */
+    suspend fun invokeOptional(
+        method: String,
+        arg: JsonElement? = null,
+        itemIdForErrors: String? = null,
+        timeoutMsOverride: Long? = null,
+    ): JsonElement? {
+        if (isMethodKnownMissing(method)) return null
+        return callMutex.withLock {
+            if (isMethodKnownMissing(method)) return@withLock null
+            invokeLocked(method, arg, itemIdForErrors, timeoutMsOverride, optional = true)
+        }
     }
 
     /**
@@ -255,19 +285,22 @@ class PluginRuntime(
     ): Boolean {
         if (!callMutex.tryLock()) return false
         try {
-            invokeLocked(method, arg, itemIdForErrors, timeoutMsOverride)
+            invokeLocked(method, arg, itemIdForErrors, timeoutMsOverride, optional = false)
             return true
         } finally {
             callMutex.unlock()
         }
     }
 
+    private class InternalCallTimeoutException(cause: Throwable) : Exception(cause)
+
     private suspend fun invokeLocked(
         method: String,
         arg: JsonElement?,
         itemIdForErrors: String?,
         timeoutMsOverride: Long?,
-    ): JsonElement {
+        optional: Boolean,
+    ): JsonElement? {
         if (closed) {
             throw PluginErrorMapper.toException(
                 PluginErrorPayload(PluginErrorCode.INTERNAL),
@@ -279,6 +312,9 @@ class PluginRuntime(
             ?: if (method == "playback") playbackTimeoutMs else defaultTimeoutMs
 
         ensureInitializedLocked(timeoutMs)
+        if (optional && isMethodKnownMissing(method)) {
+            return null
+        }
 
         val gen = callGeneration.incrementAndGet()
         val callScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -301,16 +337,25 @@ class PluginRuntime(
 
         val argJson = arg?.toString() ?: "null"
         val hasArg = arg != null
-        val invokeScript = "await __d3_invoke(${JsonPrimitive(method)}, ${JsonPrimitive(argJson)}, $hasArg, $gen)"
+        val invokeFn = if (optional) "__d3_invoke_optional" else "__d3_invoke"
+        val invokeScript = "await $invokeFn(${JsonPrimitive(method)}, ${JsonPrimitive(argJson)}, $hasArg, $gen)"
 
         return try {
             val rawResult = withContext(dispatcher) {
-                withTimeout(timeoutMs) {
-                    qjs.evaluate<String?>(invokeScript, filename = "__d3_call.js")
+                try {
+                    withTimeout(timeoutMs) {
+                        qjs.evaluate<String?>(invokeScript, filename = "__d3_call.js")
+                    }
+                } catch (e: TimeoutCancellationException) {
+                    if (currentCoroutineContext().isActive) {
+                        throw InternalCallTimeoutException(e)
+                    } else {
+                        throw e
+                    }
                 }
             }
             if (rawResult.isNullOrEmpty() || rawResult == "undefined") {
-                JsonNull
+                if (optional) null else JsonNull
             } else {
                 if (rawResult.length > MAX_RETURN_BYTES ||
                     rawResult.toByteArray(Charsets.UTF_8).size > MAX_RETURN_BYTES
@@ -323,6 +368,18 @@ class PluginRuntime(
                 }
                 json.parseToJsonElement(rawResult)
             }
+        } catch (ce: CancellationException) {
+            // Caller cancelled or caller's own timeout fired: cancel in-flight IO cleanly,
+            // rebuild the interrupted VM silently, and preserve cooperative cancellation.
+            fetchGateway.cancelAllActive()
+            try {
+                qjs.interruptEvaluation()
+            } catch (_: Throwable) {
+            }
+            withContext(NonCancellable) {
+                destroyRuntimeLocked(runDispose = false)
+            }
+            throw ce
         } catch (t: Throwable) {
             handleInvocationFailureLocked(qjs, method, t, itemIdForErrors)
         } finally {
@@ -435,6 +492,15 @@ class PluginRuntime(
                         filename = "__d3_entry.js",
                         asModule = true,
                     )
+                    val exportsJson = qjs.evaluate<String>("__d3_exports()", filename = "__d3_exports.js")
+                    val parsedExports = runCatching {
+                        (json.parseToJsonElement(exportsJson) as? kotlinx.serialization.json.JsonArray)
+                            ?.mapNotNull { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content }
+                            ?.toSet()
+                    }.getOrNull()
+                    if (parsedExports != null) {
+                        cachedExportedMethods = parsedExports
+                    }
                 }
             }
             quickJs = qjs
@@ -563,7 +629,7 @@ class PluginRuntime(
         // 1. Timeout or interrupted -> cancel OkHttp + destroy & rebuild next time, map to Unavailable (§7 & S3)
         // Note: plain plugin `throw new Error("...timeout...")` or `throw new Error("interrupted")` MUST map to Internal,
         // NOT Unavailable; only genuine host timeout/QuickJS interruption triggers Unavailable & VM rebuild.
-        if (t is TimeoutCancellationException || t is QuickJsInterruptedException ||
+        if (t is InternalCallTimeoutException || t is TimeoutCancellationException || t is QuickJsInterruptedException ||
             domTimedOutInCall || hasCause<DomTimeoutException>(t) ||
             (t is QuickJsException && t.message?.contains("InternalError: interrupted", ignoreCase = true) == true)
         ) {

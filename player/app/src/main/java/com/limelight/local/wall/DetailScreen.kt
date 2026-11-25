@@ -89,12 +89,18 @@ fun DetailScreen(model: WallModel, nav: WallNav, page: Page.Detail) {
     val scope = rememberCoroutineScope()
 
     var detailed by remember(page.sourceId, page.item.id) { mutableStateOf(page.item) }
+    var resolvedFocusSeasonId by remember(page.sourceId, page.item.id, page.focusSeasonId) {
+        mutableStateOf(page.focusSeasonId)
+    }
+    var resolvedFocusEpisodeId by remember(page.sourceId, page.item.id, page.focusEpisodeId) {
+        mutableStateOf(page.focusEpisodeId)
+    }
     var loadingDetail by remember(page.sourceId, page.item.id) { mutableStateOf(src != null) }
     var detailError by remember(page.sourceId, page.item.id) { mutableStateOf<Throwable?>(null) }
     var retryToken by remember(page.sourceId, page.item.id) { mutableIntStateOf(0) }
     var actionNotice by remember(page.sourceId, page.item.id) { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(src?.source?.id, page.item.id, retryToken) {
+    LaunchedEffect(src?.source?.id, page.item.id, page.focusSeasonId, page.focusEpisodeId, retryToken) {
         if (src == null) {
             loadingDetail = false
             return@LaunchedEffect
@@ -102,7 +108,15 @@ fun DetailScreen(model: WallModel, nav: WallNav, page: Page.Detail) {
         loadingDetail = true
         detailError = null
         try {
-            detailed = src.detail(page.item.id)
+            val resolved = DetailStateLogic.resolveDetailTarget(
+                source = src,
+                initialItem = page.item,
+                requestedFocusSeasonId = page.focusSeasonId,
+                requestedFocusEpisodeId = page.focusEpisodeId,
+            )
+            detailed = resolved.displayItem
+            resolvedFocusSeasonId = resolved.focusSeasonId
+            resolvedFocusEpisodeId = resolved.focusEpisodeId
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -207,6 +221,8 @@ fun DetailScreen(model: WallModel, nav: WallNav, page: Page.Detail) {
                 onRetryDetail = { retryToken++ },
                 onDismissError = { detailError = null },
                 strings = strings,
+                focusSeasonId = resolvedFocusSeasonId,
+                focusEpisodeId = resolvedFocusEpisodeId,
             )
         } else {
             MovieDetailContent(
@@ -496,6 +512,8 @@ private fun SeriesDetailContent(
     onRetryDetail: () -> Unit,
     onDismissError: () -> Unit,
     strings: AndroidStringLookup,
+    focusSeasonId: String? = null,
+    focusEpisodeId: String? = null,
 ) {
     val seasons = remember(item.seasons) { DetailStateLogic.orderSeasons(item.seasons) }
     val hasSeasons = seasons.isNotEmpty()
@@ -556,7 +574,7 @@ private fun SeriesDetailContent(
     // Cross-season initial default season & play target (#3, #5, #10):
     // matches only parentId hitting this series within a 2s overall timeout, skips Specials by default,
     // and shares mutex-serialized loader.ensureLoaded() so concurrent effects never observe empty items.
-    LaunchedEffect(source?.source?.id, item.id, seasons, loadingDetail, localProgressNullable) {
+    LaunchedEffect(source?.source?.id, item.id, seasons, loadingDetail, localProgressNullable, focusSeasonId, focusEpisodeId) {
         if (source == null || loadingDetail) return@LaunchedEffect
         if (!hasSeasons) {
             selectedSeasonId = SERIES_DIRECT_SEASON_ID
@@ -575,6 +593,8 @@ private fun SeriesDetailContent(
             loadSeasonEpisodes = { sid -> ensureSeasonEpisodesLoaded(sid) },
             loadMoreInSeason = { sid -> loadMoreSeasonEpisodes(sid) },
             knownParentIds = model.knownParentIdsForSource(source.source.id),
+            focusSeasonId = focusSeasonId,
+            focusEpisodeId = focusEpisodeId,
         )
         initialResolution = resolved
         if (resolved != null && !userSelectedSeason) {
@@ -615,21 +635,27 @@ private fun SeriesDetailContent(
     val activeState = pageStates[activeKey] ?: SeasonEpisodePageState(loading = source != null)
     val episodes = activeState.items
 
-    val playTarget = remember(activeKey, activeSeasonNumber, episodes, localProgress, initialResolution) {
+    val playTarget = remember(activeKey, activeSeasonNumber, episodes, localProgress, initialResolution, focusSeasonId, focusEpisodeId) {
         val res = initialResolution
         if (hasSeasons && res != null && res.seasonId == activeKey && res.target != null) {
             res.target
         } else {
-            DetailStateLogic.pickPlayTarget(activeSeasonNumber, episodes, localProgress)
+            val activeFocusId = if (!hasSeasons || focusSeasonId == null || focusSeasonId == activeKey) {
+                focusEpisodeId
+            } else {
+                null
+            }
+            DetailStateLogic.pickPlayTarget(activeSeasonNumber, episodes, localProgress, activeFocusId)
         }
     }
     val episodeRowState = rememberLazyListState()
 
-    // Auto-scroll to the next episode with 1 watched episode to its left (series.html)
+    // Auto-scroll to the next/focused episode with 1 episode to its left (series.html)
     var scrolledSeasonKey by remember(item.id) { mutableStateOf<String?>(null) }
-    LaunchedEffect(activeKey, episodes.isNotEmpty(), playTarget?.episode?.id) {
-        if (episodes.isNotEmpty() && scrolledSeasonKey != activeKey) {
-            scrolledSeasonKey = activeKey
+    val scrollAnchorKey = "$activeKey:${playTarget?.episode?.id.orEmpty()}"
+    LaunchedEffect(scrollAnchorKey, episodes.isNotEmpty()) {
+        if (episodes.isNotEmpty() && scrolledSeasonKey != scrollAnchorKey) {
+            scrolledSeasonKey = scrollAnchorKey
             val targetIdx = DetailStateLogic.initialScrollIndex(episodes, playTarget?.episode?.id)
             if (targetIdx > 0) {
                 episodeRowState.scrollToItem(targetIdx)

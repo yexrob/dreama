@@ -2351,3 +2351,163 @@ test('CLI parseArgs and subcommands handle --no-discover without breaking run/ch
     if (fs.existsSync(tmpOut)) fs.unlinkSync(tmpOut);
   }
 });
+
+test('Task H: d3plugin check validates search empty query, pagination, unsupported kind, and silent optional suggest', async () => {
+  // 1. Reference plugin exercises empty query, pagination cursor progression, unsupported kind, and suggest
+  const refReport = await checkPlugin(REF_PLUGIN_DIR);
+  assert.equal(refReport.ok, true, `reference check failed: ${refReport.errors.join('; ')}`);
+  assert.ok(
+    refReport.checks.includes('search() empty query, kind & unsupported kind tolerance'),
+    `Expected kind/empty search check, got: ${refReport.checks.join(', ')}`,
+  );
+  assert.ok(
+    refReport.checks.includes('search() pagination cursor progression'),
+    `Expected pagination check on reference plugin, got: ${refReport.checks.join(', ')}`,
+  );
+  assert.ok(refReport.checks.includes('suggest() schema & empty query'));
+
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'd3-search-check-'));
+  try {
+    const writePlugin = (name, mainJs) => {
+      const dir = path.join(tmpBase, name);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'manifest.json'),
+        JSON.stringify({
+          api: 1,
+          id: `com.example.${name}`,
+          name,
+          version: '1.0.0',
+          capabilities: ['search'],
+        }),
+      );
+      fs.writeFileSync(path.join(dir, 'main.js'), mainJs);
+      return dir;
+    };
+
+    // 2. Plugin declaring search WITHOUT suggest() passes silently (0 errors, 0 warnings)
+    const noSuggestDir = writePlugin(
+      'nosuggest',
+      `export default {
+        home() { return []; },
+        browse() { return { items: [], next: null }; },
+        detail(ctx, { itemId }) { return { id: itemId, kind: 'movie', title: 'T' }; },
+        playback() { return { url: 'https://cdn.example.com/v.mp4' }; },
+        search(ctx, { query = '', cursor = null } = {}) {
+          if (!String(query).trim()) return { items: [], next: null };
+          if (cursor === 'p2') return { items: [{ id: '2', kind: 'movie', title: 'Two' }], next: null };
+          return { items: [{ id: '1', kind: 'movie', title: 'One' }], next: 'p2' };
+        },
+      };`,
+    );
+    const okNoSug = await checkPlugin(noSuggestDir);
+    assert.equal(okNoSug.ok, true, `no-suggest plugin should pass: ${okNoSug.errors.join('; ')}`);
+    assert.equal(okNoSug.warnings.length, 0);
+    assert.ok(okNoSug.checks.includes('suggest() optional (omitted)'));
+    assert.ok(okNoSug.checks.includes('search() pagination cursor progression'));
+
+    // 3. Plugin returning non-empty items on empty query fails check
+    const badEmptyDir = writePlugin(
+      'badempty',
+      `export default {
+        home() { return []; },
+        browse() { return { items: [], next: null }; },
+        detail() { return { id: '1', kind: 'movie', title: 'T' }; },
+        playback() { return { url: 'https://cdn.example.com/v.mp4' }; },
+        search() { return { items: [{ id: '1', kind: 'movie', title: 'Leaked' }], next: null }; },
+      };`,
+    );
+    const badEmptyRep = await checkPlugin(badEmptyDir);
+    assert.equal(badEmptyRep.ok, false);
+    assert.ok(badEmptyRep.errors.some((e) => e.includes('must return empty items')));
+
+    // 4. Plugin crashing on unknown kind fails check
+    const badKindDir = writePlugin(
+      'badkind',
+      `export default {
+        home() { return []; },
+        browse() { return { items: [], next: null }; },
+        detail() { return { id: '1', kind: 'movie', title: 'T' }; },
+        playback() { return { url: 'https://cdn.example.com/v.mp4' }; },
+        search(ctx, { query = '', kind = null } = {}) {
+          if (!String(query).trim()) return { items: [], next: null };
+          if (kind && kind !== 'movie') throw new ctx.Error('Internal', 'unsupported kind');
+          return { items: [], next: null };
+        },
+      };`,
+    );
+    const badKindRep = await checkPlugin(badKindDir);
+    assert.equal(badKindRep.ok, false);
+
+    // 5. Plugin repeating identical pagination cursor fails check
+    const loopCursorDir = writePlugin(
+      'loopcursor',
+      `export default {
+        home() { return []; },
+        browse() { return { items: [], next: null }; },
+        detail() { return { id: '1', kind: 'movie', title: 'T' }; },
+        playback() { return { url: 'https://cdn.example.com/v.mp4' }; },
+        search(ctx, { query = '' } = {}) {
+          if (!String(query).trim()) return { items: [], next: null };
+          return { items: [{ id: '1', kind: 'movie', title: 'Loop' }], next: 'stuck' };
+        },
+      };`,
+    );
+    const loopRep = await checkPlugin(loopCursorDir);
+    assert.equal(loopRep.ok, false);
+    assert.ok(loopRep.errors.some((e) => e.includes('repeated cursor')));
+  } finally {
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test('Task H: jellyfin search handles empty query without HTTP, series includes episodes, and unknown kind is ignored', async () => {
+  const loaded = await loadPluginSource(JF_PLUGIN_DIR);
+  const queries = [];
+  const storage = new PluginStorage();
+  const host = new QuickJsPluginHost({
+    manifest: loaded.manifest,
+    mainJs: loaded.mainJs,
+    locale: loaded.locale,
+    storage,
+    config: { server: 'http://192.168.1.50:18096', username: 'd3tester', password: 'secret' },
+    dnsResolver: async () => ['192.168.1.50'],
+    transportOverride: async ({ url, method }) => {
+      const jsonResp = (data) => ({
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+        setCookies: [],
+        body: Buffer.from(JSON.stringify(data), 'utf8'),
+      });
+      if (url.pathname === '/System/Info/Public') return jsonResp(JF_FIXTURES.systemInfoPublic);
+      if (url.pathname === '/Users/AuthenticateByName' && method === 'POST') return jsonResp(JF_FIXTURES.authSuccess);
+      queries.push({ path: url.pathname, params: Object.fromEntries(url.searchParams.entries()) });
+      if (url.pathname === '/Items') return jsonResp(JF_FIXTURES.searchResults);
+      if (url.pathname === '/Search/Hints') return jsonResp(JF_FIXTURES.searchHints);
+      return { status: 404, headers: {}, setCookies: [], body: Buffer.alloc(0) };
+    },
+    logSink: () => {},
+  });
+
+  try {
+    await host.invoke('login');
+    queries.length = 0;
+
+    // Empty / whitespace search and suggest must return empty without hitting /Items or /Search/Hints
+    assert.deepEqual(await host.invoke('search', { query: '' }), { items: [], next: null });
+    assert.deepEqual(await host.invoke('search', { query: '   ' }), { items: [], next: null });
+    assert.deepEqual(await host.invoke('suggest', { query: '  ' }), []);
+    assert.equal(queries.length, 0);
+
+    // kind='series' queries Series,Episode (§3.9.7)
+    await host.invoke('search', { query: 'Test', kind: 'series' });
+    assert.equal(queries[0].params.IncludeItemTypes, 'Series,Episode');
+
+    // Unknown kind falls back gracefully without error
+    const unknownRes = await host.invoke('search', { query: 'Test', kind: 'unknown_future' });
+    assert.ok(unknownRes.items.length >= 1);
+    assert.equal(queries[1].params.IncludeItemTypes, 'Movie,Series,Episode,Video,BoxSet');
+  } finally {
+    await host.dispose();
+  }
+});
