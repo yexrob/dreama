@@ -209,6 +209,7 @@
   let nextTimerId = 1;
   const activeTimerIds = new Set();
   const cancelledTimers = new Set();
+  let abortCurrentCall = null;
   let strictAwaitTracking = false;
   let trackedAsyncOps = [];
 
@@ -223,12 +224,25 @@
     activeTimerIds.add(id);
     host.sleep(BRIDGE_TOKEN, id, ms, gen).then((stillActive) => {
       activeTimerIds.delete(id);
-      if (stillActive && gen === currentGen && !cancelledTimers.has(id)) {
-        cancelledTimers.delete(id);
+      const wasCleared = cancelledTimers.delete(id);
+      if (stillActive && gen === currentGen && !wasCleared) {
         fn(...args);
+      } else if (!stillActive && !wasCleared && gen === currentGen && abortCurrentCall) {
+        // Host cancelled this timer during cooperative call cancellation (not clearTimeout):
+        // reject the active call's abort race so `await new Promise(r => setTimeout(r, n))`
+        // unwinds cleanly without hanging or forcing a QuickJS VM rebuild.
+        const abort = abortCurrentCall;
+        abortCurrentCall = null;
+        abort(new Error('Timer cancelled by host'));
       }
-    }).catch(() => {
+    }, (err) => {
       activeTimerIds.delete(id);
+      const wasCleared = cancelledTimers.delete(id);
+      if (!wasCleared && gen === currentGen && abortCurrentCall) {
+        const abort = abortCurrentCall;
+        abortCurrentCall = null;
+        abort(err instanceof Error ? err : new Error(String(err || 'Timer cancelled by host')));
+      }
     });
     return id;
   };
@@ -637,10 +651,18 @@
       throw new Error('Plugin does not implement method: ' + method);
     }
     let succeeded = false;
+    const callAbortPromise = new Promise((_, reject) => {
+      abortCurrentCall = reject;
+    });
+    callAbortPromise.then(() => {}, () => {});
     try {
-      const res = hasArg
-        ? await fn.call(pluginExport, ctx, JSON.parse(argJson))
-        : await fn.call(pluginExport, ctx);
+      const invokePromise = Promise.resolve().then(() => (
+        hasArg
+          ? fn.call(pluginExport, ctx, JSON.parse(argJson))
+          : fn.call(pluginExport, ctx)
+      ));
+      invokePromise.then(() => {}, () => {});
+      const res = await Promise.race([invokePromise, callAbortPromise]);
       if (res === undefined) {
         succeeded = true;
         return 'undefined';
@@ -662,6 +684,7 @@
       }
       throw err;
     } finally {
+      abortCurrentCall = null;
       if (strictAwaitTracking && succeeded && trackedAsyncOps.length > 0) {
         const unawaited = trackedAsyncOps.filter((op) => !op.awaited);
         if (unawaited.length > 0 && typeof host.reportUnawaitedOps === 'function') {
@@ -690,9 +713,15 @@
     activeTimerIds.clear();
     cancelledTimers.clear();
     trackedAsyncOps = [];
+    const callAbortPromise = new Promise((_, reject) => {
+      abortCurrentCall = reject;
+    });
+    callAbortPromise.then(() => {}, () => {});
     try {
       const fn = new Function('ctx', 'return (async () => { ' + fnCode + ' })();');
-      const res = await fn(ctx);
+      const invokePromise = Promise.resolve().then(() => fn(ctx));
+      invokePromise.then(() => {}, () => {});
+      const res = await Promise.race([invokePromise, callAbortPromise]);
       if (res === undefined) return 'undefined';
       const serialized = JSON.stringify(res);
       if (serialized && serialized.length > MAX_RETURN_BYTES) {
@@ -700,6 +729,7 @@
       }
       return serialized;
     } finally {
+      abortCurrentCall = null;
       currentGen = -1;
       activeTimerIds.clear();
       cancelledTimers.clear();

@@ -30,6 +30,7 @@ class SearchAggregatorTest {
         override val typeLabel: String = "插件",
         override val knownNeedsAuth: Boolean = false,
         override val supportsSuggest: Boolean = true,
+        override var isClosed: Boolean = false,
         val onSearch: suspend (query: String, cursor: String?, kind: ItemKind?) -> Page<Item>,
         val onSuggest: suspend (query: String) -> List<String> = { emptyList() },
     ) : SearchableSource {
@@ -561,5 +562,156 @@ class SearchAggregatorTest {
         val seriesRes = (agg.state.value.visibleRows.single().status as SearchRowStatus.Results).items
         assertEquals(listOf("s1", "e1"), seriesRes.map { it.id })
         assertTrue(SearchKindFilter.MOVIE in agg.state.value.availableKinds)
+    }
+
+    @Test
+    fun multiPageKindFilterTimeoutAndLaterPageErrorPreserveCollectedItemsWithoutCaching() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+
+        // Source 1: page 1 returns 2 movies + next="p2", page 2 returns 1 movie + next="p3", page 3 hangs past 10 s
+        val srcSlowPage3 = FakeSearchSource("s-partial-timeout", "分页超时源", onSearch = { _, cursor, _ ->
+            when (cursor) {
+                null -> Page(
+                    items = listOf(
+                        Item("m1", ItemKind.MOVIE, "电影1"),
+                        Item("m2", ItemKind.MOVIE, "电影2"),
+                        Item("v1", ItemKind.VIDEO, "视频1"),
+                    ),
+                    nextPage = null,
+                    nextCursor = "p2",
+                )
+                "p2" -> Page(
+                    items = listOf(
+                        Item("m3", ItemKind.MOVIE, "电影3"),
+                        Item("v2", ItemKind.VIDEO, "视频2"),
+                    ),
+                    nextPage = null,
+                    nextCursor = "p3",
+                )
+                else -> {
+                    delay(20_000)
+                    Page(listOf(Item("m-late", ItemKind.MOVIE, "超时页")), null)
+                }
+            }
+        })
+
+        // Source 2: page 1 returns 1 movie + next="p2", page 2 throws network error
+        val srcFailPage2 = FakeSearchSource("s-partial-err", "分页报错源", onSearch = { _, cursor, _ ->
+            when (cursor) {
+                null -> Page(
+                    items = listOf(
+                        Item("e-m1", ItemKind.MOVIE, "已得电影"),
+                        Item("e-v1", ItemKind.VIDEO, "非电影"),
+                    ),
+                    nextPage = null,
+                    nextCursor = "p2",
+                )
+                else -> throw SourceUnavailableException("page 2 failed")
+            }
+        })
+
+        // Source 3: page 1 hangs immediately (0 items collected) -> MUST still become TimedOut(10)
+        val srcHangPage1 = FakeSearchSource("s-hang-p1", "首页超时源", onSearch = { _, _, _ ->
+            delay(20_000)
+            Page(emptyList(), null)
+        })
+
+        val agg = SearchAggregator(
+            scope = backgroundScope,
+            ioDispatcher = dispatcher,
+            clockMs = { testScheduler.currentTime },
+            initialBatchWindowMs = 300L,
+            sourceTimeoutMs = 10_000L,
+            minFilteredItems = 10,
+            maxAutoFilterPages = 3,
+        )
+
+        agg.search("潮", SearchKindFilter.MOVIE, listOf(srcSlowPage3, srcFailPage2, srcHangPage1))
+        advanceTimeBy(10_000)
+        runCurrent()
+
+        val done = agg.state.value
+        assertTrue(done.allSettled)
+        val byId = done.visibleRows.associateBy { it.sourceId }
+
+        val resTimeout = byId.getValue("s-partial-timeout").status as SearchRowStatus.Results
+        assertEquals(listOf("m1", "m2", "m3"), resTimeout.items.map { it.id })
+        assertEquals("p3", resTimeout.nextCursor)
+        assertTrue(resTimeout.hasMore)
+
+        val resErr = byId.getValue("s-partial-err").status as SearchRowStatus.Results
+        assertEquals(listOf("e-m1"), resErr.items.map { it.id })
+        assertEquals("p2", resErr.nextCursor)
+        assertTrue(resErr.hasMore)
+
+        assertEquals(SearchRowStatus.TimedOut(10), byId.getValue("s-hang-p1").status)
+
+        // Partial timed-out / errored outcomes MUST NOT poison the 5-minute cache:
+        // re-searching the exact same query immediately re-queries srcSlowPage3 & srcFailPage2
+        val prevSlowCalls = srcSlowPage3.searchCalls.get()
+        val prevErrCalls = srcFailPage2.searchCalls.get()
+        agg.search("潮", SearchKindFilter.MOVIE, listOf(srcSlowPage3, srcFailPage2))
+        advanceTimeBy(10_000)
+        runCurrent()
+        assertTrue(srcSlowPage3.searchCalls.get() > prevSlowCalls)
+        assertTrue(srcFailPage2.searchCalls.get() > prevErrCalls)
+    }
+
+    @Test
+    fun retrySourceAndSearchRefreshClosedSourceViaResolverWithoutCallingClosedRuntime() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val closedSrc = FakeSearchSource(
+            sourceId = "plugin:inst1",
+            displayName = "旧实例",
+            isClosed = false,
+            onSearch = { _, _, _ -> throw SourceNeedsAuthException("need auth") },
+        )
+        val liveSrc = FakeSearchSource(
+            sourceId = "plugin:inst1",
+            displayName = "新实例",
+            isClosed = false,
+            onSearch = { _, _, _ -> Page(listOf(Item("live-hit", ItemKind.MOVIE, "刷新成功")), null) },
+        )
+
+        val agg = SearchAggregator(
+            scope = backgroundScope,
+            ioDispatcher = dispatcher,
+            clockMs = { testScheduler.currentTime },
+            initialBatchWindowMs = 300L,
+        )
+
+        agg.search("潮", SearchKindFilter.ALL, listOf(closedSrc))
+        runCurrent()
+        assertTrue(agg.state.value.visibleRows.single().status is SearchRowStatus.NeedsAuth)
+        assertEquals(1, closedSrc.searchCalls.get())
+
+        // Simulate re-login closing the old runtime before model.sources publishes liveSrc
+        closedSrc.isClosed = true
+        agg.retrySource(
+            sourceId = "plugin:inst1",
+            updatedSource = closedSrc,
+            resolveFreshSource = { id -> if (id == "plugin:inst1") liveSrc else null },
+            forceResolveFresh = false,
+        )
+        runCurrent()
+
+        // Closed source was NEVER called again; liveSrc ran and updated the row in place
+        assertEquals(1, closedSrc.searchCalls.get())
+        assertEquals(1, liveSrc.searchCalls.get())
+        val row = agg.state.value.visibleRows.single()
+        assertEquals("新实例", row.displayName)
+        assertEquals(listOf("live-hit"), (row.status as SearchRowStatus.Results).items.map { it.id })
+
+        // New search submitted while stale closedSrc is still in UI list also refreshes transparently
+        agg.search(
+            rawQuery = "雾",
+            kindFilter = SearchKindFilter.ALL,
+            sources = listOf(closedSrc),
+            resolveFreshSource = { id -> if (id == "plugin:inst1") liveSrc else null },
+        )
+        runCurrent()
+        assertEquals(1, closedSrc.searchCalls.get())
+        assertEquals(2, liveSrc.searchCalls.get())
+        assertEquals(listOf("live-hit"), (agg.state.value.visibleRows.single().status as SearchRowStatus.Results).items.map { it.id })
     }
 }
