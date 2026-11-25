@@ -14,3 +14,14 @@ player/app/.cxx/
 proto/samples/
 node_modules/
 *.d3plugin
+
+host/.build/
+host/.cache/
+host/build/
+host/Depth3DHost.xcodeproj/
+host/Experiments/depth-offload/.venv/
+host/Experiments/depth-offload/build/
+host/Experiments/depth-offload/*.mlpackage/
+host/Experiments/depth-offload/*.mlmodelc/
+*.xcuserstate
+xcuserdata/

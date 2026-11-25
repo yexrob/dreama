@@ -179,8 +179,9 @@ sh player/app/src/main/jni/airplay/mac/build.sh     # 需要 Xcode 命令行工�
 | parse5（开发工具 `ctx.parse.html` HTML5 树构建） | 8.1.1，[inikulin/parse5](https://github.com/inikulin/parse5) | MIT | `tools/plugin-kit/package.json` |
 | jszip（`.d3plugin` 打包解包） | 3.10.2，[Stuk/jszip](https://github.com/Stuk/jszip) | MIT / GPL-3.0-or-later | `tools/plugin-kit/package.json` |
 | 测试依赖：`mockwebserver` 5.5.0、`kotlinx-coroutines-test` 1.11.0、`sqlite-jdbc` 3.54.1.0、`room-testing` 2.8.5、`robolectric` 4.18.1 | Maven Central | Apache-2.0 / MIT（Robolectric） | `player/app/build.gradle`（`testImplementation`） |
+| Sunshine（Mac Host 内置串流引擎及随附 OpenSSL 3 / miniupnpc / ICU4C / Qt 6 动态库） | v2026.914.233613（`63d35f70`），[SunshineStream/Sunshine](https://github.com/SunshineStream/Sunshine)（原 `LizardByte/Sunshine` 改名后的官方组织，旧地址 301 跳转至此）官方 macOS DMG | GPL-3.0-only（随附库为 Apache-2.0 / BSD-3-Clause / Unicode-3.0 / LGPL-3.0-only） | 构建时由 `host/scripts/fetch-engine.sh` 按固定 SHA-256 校验后打包进 `depth3d Host.app/Contents/` |
 
-都和本项目的 GPLv3 兼容，许可原文在各自目录里。接入方式参考了 [jqssun/android-airplay-server](https://github.com/jqssun/android-airplay-server)；`jni/airplay/android/` 和 `local/airplay/` 是本项目自己写的。
+都和本项目的 GPLv3 兼容，许可原文在各自目录里。接入方式参考了 [jqssun/android-airplay-server](https://github.com/jqssun/android-airplay-server)；`jni/airplay/android/`、`local/airplay/` 和 `host/` 是本项目自己写的。
 
 ## 原型用法
 
@@ -199,13 +200,21 @@ uv run python -m depth3d_proto.convert 输入.mp4 --debug   # 右半边换成深
 
 M 系列 Mac 上用 MPS，256 输入大约 32–38 ms 一张。warp 目前是 numpy 实现，大约 50 ms 一帧，只用于离线出片，到头显上会改成 GPU shader。
 
-### Mac 作为串流主机
+### Mac 作为串流主机（depth3d Host）
 
-Mac 端跑 Sunshine（`brew tap lizardbyte/homebrew && brew install lizardbyte/homebrew/sunshine`，
-`brew services start lizardbyte/homebrew/sunshine`，需在系统设置里给它「屏幕录制」权限）。
-编码走 VideoToolbox（H.264/HEVC）。管理页 https://localhost:47990，用户 depth3d，
-密码在 `~/.config/depth3d/sunshine-pass`。头显里进「投屏 › 电脑列表」，选这台 Mac，把显示的 PIN
-填进管理页的 PIN 栏完成配对。macOS 上没有虚拟手柄；要声音需另装虚拟声卡（如 BlackHole）。
+现在 Mac 端提供独立伴侣应用 **`depth3d Host`**（`host/`，原生 Swift + SwiftUI，macOS 14+，GPLv3），取代手工安装 Sunshine、开网页填 PIN、装 BlackHole 和跑 `scripts/serve-gdrive.sh`：
+
+```bash
+host/scripts/build.sh --arch arm64 --config Release
+# 产出：host/build/depth3d Host.app
+```
+
+打开后按首次引导开启「屏幕录制 / 辅助功能 / 本地网络」三项权限即可：
+- 内置串流引擎（VideoToolbox HEVC 优先、H.264 兜底）与 macOS 原生系统音频采集（Core Audio Process Tap，支持「串流时静音本机」）；
+- 通过 `_depth3d-host._tcp` 自动发现并弹窗免 PIN 配对（同时保留 4 位数字配对入口）；
+- 统一只读 WebDAV 共享本机文件夹与已配置的 rclone 网盘，凭据自动下发给已配对头显。
+
+详细架构、端口冲突处理和后续签名公证步骤见 [`host/README.md`](host/README.md)；Mac 端 Core ML ZipDepth 深度卸载可行性验证见 [`docs/specs/host-depth-offload.md`](docs/specs/host-depth-offload.md)。
 
 ### 本地播放控制条
 
