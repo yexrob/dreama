@@ -1,5 +1,6 @@
 package com.limelight.local.wall
 
+import com.limelight.LimeLog
 import android.graphics.Bitmap
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
@@ -336,7 +337,10 @@ internal suspend fun loadPluginArtBitmap(
         }
     } catch (e: CancellationException) {
         throw e
-    } catch (_: Exception) {
+    } catch (e: Exception) {
+        // Covers that fail used to vanish without a trace. Host only: the path and query can carry tokens.
+        val host = runCatching { java.net.URI(art.url).host }.getOrNull() ?: "?"
+        LimeLog.warning("depth3d: plugin cover failed host=$host: ${e.javaClass.simpleName}: ${e.message?.take(160)}")
         null
     }
 }
