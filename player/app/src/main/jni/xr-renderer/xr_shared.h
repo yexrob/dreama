@@ -74,6 +74,61 @@
 #define TRANSPORT_HEIGHT 112
 #define TRANSPORT_MARGIN_FRAC 0.02f
 
+// depth3d G2: VR quick palette (single 1024x768 quad layer, 20 x 15 cm).
+// Exact pixel coordinates matching design-opus/mockups/vr-palette.html so
+// native hit-test / hover hysteresis and Java Canvas rendering share one layout.
+#define PALETTE_TEX_W 1024
+#define PALETTE_TEX_H 768
+#define PALETTE_CORNER_PX 48
+#define PALETTE_TAB_Y 24
+#define PALETTE_TAB_H 128
+#define PALETTE_TAB0_X 24
+#define PALETTE_TAB0_W 128
+#define PALETTE_TAB1_X 160
+#define PALETTE_TAB1_W 144
+#define PALETTE_TAB2_X 312
+#define PALETTE_TAB2_W 144
+#define PALETTE_TAB3_X 464
+#define PALETTE_TAB3_W 256
+#define PALETTE_PIN_X 872
+#define PALETTE_PIN_Y 24
+#define PALETTE_PIN_SIZE 128
+#define PALETTE_ROW_X 24
+#define PALETTE_ROW_W 976
+#define PALETTE_ROW_Y0 168
+#define PALETTE_ROW_H 144
+#define PALETTE_MAX_ROWS 4
+#define PALETTE_LABEL_OFFSET_X 32
+#define PALETTE_CTRL_OFFSET_X 224
+#define PALETTE_CTRL_W 592
+#define PALETTE_SEG_GAP 8
+#define PALETTE_CHIP_W 152
+#define PALETTE_FLOAT_VAL_OFFSET_X 392
+#define PALETTE_FLOAT_SLIDER_OFFSET_X 600
+#define PALETTE_FLOAT_SLIDER_W 216
+#define PALETTE_SLIDER_OFFSET_X 520
+#define PALETTE_SLIDER_W 296
+#define PALETTE_RESET_OFFSET_X 840
+#define PALETTE_RESET_SIZE 128
+
+// Palette tab ids
+#define PALETTE_TAB_3D 0
+#define PALETTE_TAB_SCREEN 1
+#define PALETTE_TAB_DANMAKU 2
+#define PALETTE_TAB_SUBTITLE 3
+#define PALETTE_TAB_COUNT 4
+
+// Palette haptic pulse kinds requested from Java or native
+#define PALETTE_HAPTIC_NONE 0
+#define PALETTE_HAPTIC_TICK 1
+#define PALETTE_HAPTIC_DETENT 2
+#define PALETTE_HAPTIC_LIMIT 3
+
+// 3D source format modes (Tab 0 row 1)
+#define STEREO_SRC_AUTO 0
+#define STEREO_SRC_SBS 1
+#define STEREO_SRC_OU 2
+
 // The sheet the launch splash shows: the logo over the app's name, drawn once
 // per number of the logo's wedges open, none to all six, one under the other,
 // so ticking the wedges is a different rectangle of the same image rather than
@@ -246,7 +301,19 @@
 #define IN_ADJUST_INCHES (IN_ADJUST_DIST_CM + 1)
 #define IN_ADJUST_PRESET (IN_ADJUST_INCHES + 1)
 #define IN_ADJUST_SAVED (IN_ADJUST_PRESET + 1)
-#define IN_SLOTS    (IN_ADJUST_SAVED + 1)
+// Local-playback VR quick palette state & input events (G2)
+#define IN_PALETTE_OPEN (IN_ADJUST_SAVED + 1)
+#define IN_PALETTE_PINNED (IN_PALETTE_OPEN + 1)
+#define IN_PALETTE_HAND_MODE (IN_PALETTE_PINNED + 1)
+#define IN_PALETTE_HOVER_X (IN_PALETTE_HAND_MODE + 1)
+#define IN_PALETTE_HOVER_Y (IN_PALETTE_HOVER_X + 1)
+#define IN_PALETTE_CLICK (IN_PALETTE_HOVER_Y + 1)
+#define IN_PALETTE_ROW_STEP (IN_PALETTE_CLICK + 1)
+#define IN_PALETTE_ROW_RESET (IN_PALETTE_ROW_STEP + 1)
+#define IN_PALETTE_TAB_STEP (IN_PALETTE_ROW_RESET + 1)
+#define IN_PALETTE_PAGE_STEP (IN_PALETTE_TAB_STEP + 1)
+#define IN_PALETTE_DIM_FALLBACK (IN_PALETTE_PAGE_STEP + 1)
+#define IN_SLOTS    (IN_PALETTE_DIM_FALLBACK + 1)
 
 // Gamepad mode's buttons, in the bits Moonlight's controller packet carries
 // them in, which are ControllerPacket's flags: the four face buttons, the

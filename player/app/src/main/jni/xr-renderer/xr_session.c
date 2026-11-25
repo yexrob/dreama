@@ -806,6 +806,8 @@ static void destroyCtx(JNIEnv* env, XrCtx* ctx) {
     destroyArtSwapchain(ctx, &ctx->swapchain, &ctx->swapchainImages);
     destroyArtSwapchain(ctx, &ctx->overlaySwapchain, &ctx->overlayImages);
     destroyArtSwapchain(ctx, &ctx->transportSwapchain, &ctx->transportImages);
+    destroyArtSwapchain(ctx, &ctx->paletteSwapchain, &ctx->paletteImages);
+    destroyArtSwapchain(ctx, &ctx->dimmerSwapchain, &ctx->dimmerImages);
     destroyArtSwapchain(ctx, &ctx->pointerSwapchain, &ctx->pointerImages);
     destroyArtSwapchain(ctx, &ctx->barSwapchain, &ctx->barImages);
     destroyArtSwapchain(ctx, &ctx->cornerSwapchain, &ctx->cornerImages);
@@ -1005,6 +1007,10 @@ Java_com_limelight_binding_video_XrRenderer_nativeInit(JNIEnv* env, jobject thiz
     // Local-playback trigger+stick screen adjustment starts enabled until Java hands down pref
     ctx->triggerScreenAdjustOn = 1;
     screenInputInit(&ctx->screenCtrl);
+    paletteInit(&ctx->palette);
+    ctx->paletteActiveRowMask = 0xF;
+    ctx->paletteDragHand = -1;
+    ctx->paletteSliderHand = -1;
     // Comfort comes from absolute disparity and depth comes from the steps
     // between objects, so the overall shape is pulled toward the screen plane
     // while the local detail is boosted. Measured on captured frames this is

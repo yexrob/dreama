@@ -561,4 +561,78 @@
     <string name="settings_screen_dist_current_sub">当前 %1$s · 仅调整纵深，保持视角大小不变</string>
     <string name="settings_curved_flat_label">平面</string>
     <string name="settings_curved_percent">%1$d%%</string>
+
+    <!-- VR Quick Palette, Control Bar buttons & hand-mount setting (G2) -->
+    <string name="settings_palette_hand_title">调色板挂在</string>
+    <string name="settings_palette_hand_sub">看片时调色板默认挂在左手手柄上方，换手后左右操作自动镜像</string>
+    <string name="settings_palette_hand_left">左手</string>
+    <string name="settings_palette_hand_right">右手</string>
+
+    <string name="vr_bar_adjust">调整</string>
+    <string name="vr_bar_danmaku">弹</string>
+
+    <string name="vr_palette_tab_3d">3D</string>
+    <string name="vr_palette_tab_screen">屏幕</string>
+    <string name="vr_palette_tab_danmaku">弹幕</string>
+    <string name="vr_palette_tab_sub_audio">字幕音轨</string>
+
+    <string name="vr_palette_row_strength">强度</string>
+    <string name="vr_palette_row_source">片源</string>
+    <string name="vr_palette_row_float">漂浮感</string>
+    <string name="vr_palette_row_layer">层次</string>
+    <string name="vr_palette_source_auto">自动</string>
+    <string name="vr_palette_source_sbs">左右</string>
+    <string name="vr_palette_source_ou">上下</string>
+    <string name="vr_palette_float_auto">自动</string>
+    <string name="vr_palette_float_flat">贴屏</string>
+    <string name="vr_palette_layer_off">关</string>
+    <string name="vr_palette_layer_shallow">浅</string>
+    <string name="vr_palette_layer_medium">中</string>
+    <string name="vr_palette_layer_deep">深</string>
+
+    <string name="vr_palette_row_size">大小</string>
+    <string name="vr_palette_row_dist">距离</string>
+    <string name="vr_palette_row_curve">曲度</string>
+    <string name="vr_palette_row_env">环境</string>
+    <string name="vr_palette_env_passthrough">透视</string>
+    <string name="vr_palette_env_dim">调暗</string>
+    <string name="vr_palette_env_theater">影院</string>
+    <string name="vr_palette_env_void">纯黑</string>
+
+    <string name="vr_palette_row_danmaku">弹幕</string>
+    <string name="vr_palette_row_area">区域</string>
+    <string name="vr_palette_row_opacity">不透明</string>
+    <string name="vr_palette_danmaku_more">更多：字号 · 速度 · 屏蔽</string>
+    <string name="vr_palette_danmaku_back">返回</string>
+    <string name="vr_palette_toggle_on">开</string>
+    <string name="vr_palette_toggle_off">关</string>
+    <string name="vr_palette_area_full">全屏</string>
+    <string name="vr_palette_area_half">半屏</string>
+    <string name="vr_palette_area_quarter">1/4</string>
+    <string name="vr_palette_row_font_size">字号</string>
+    <string name="vr_palette_row_speed">速度</string>
+    <string name="vr_palette_row_block">屏蔽</string>
+    <string name="vr_palette_speed_slow">慢</string>
+    <string name="vr_palette_speed_normal">标准</string>
+    <string name="vr_palette_speed_fast">快</string>
+    <string name="vr_palette_block_scroll">滚动</string>
+    <string name="vr_palette_block_top">顶部</string>
+    <string name="vr_palette_block_bottom">底部</string>
+    <string name="vr_palette_block_color">彩色</string>
+    <string name="vr_palette_danmaku_unsupported_title">这个片源不提供弹幕</string>
+    <string name="vr_palette_danmaku_unsupported_sub">插件声明了弹幕能力才有</string>
+    <string name="vr_palette_danmaku_failed_title">弹幕没加载出来</string>
+
+    <string name="vr_palette_row_subtitle">字幕</string>
+    <string name="vr_palette_row_audio">音轨</string>
+    <string name="vr_palette_row_sub_scale">缩放</string>
+    <string name="vr_palette_row_sub_pos">位置</string>
+    <string name="vr_palette_subtitle_off">关闭</string>
+    <string name="vr_palette_subtitle_none">这部片子没有字幕</string>
+    <string name="vr_palette_audio_single">只有一条音轨</string>
+
+    <string name="vr_toast_video_only">只改这部片子</string>
+    <string name="vr_toast_no_danmaku">这个片源没有弹幕</string>
+    <string name="vr_toast_danmaku_on">弹幕 已开</string>
+    <string name="vr_toast_danmaku_off">弹幕 已关</string>
 </resources>

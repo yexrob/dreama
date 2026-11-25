@@ -353,6 +353,12 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         default void onVrLocalToggleDanmaku() { }
         default void onVrLocalTogglePalette() { }
         default void onVrScreenAdjustChanged(boolean active) { }
+        // Local-playback VR Quick Palette frame state & events (G2)
+        default void onVrPaletteFrame(boolean open, boolean pinned, boolean handTrackingMode,
+                                      boolean dimFallback, float hoverX, float hoverY,
+                                      int clickState, int rowStep, boolean rowReset,
+                                      int tabStep, int pageStep) { }
+        default void onVrScreenDimensionsSaved(float fovDeg, float distM) { }
     }
 
     public void setInputListener(InputListener listener) {
@@ -584,14 +590,146 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     private native void nativeUploadTransport(long ctx, ByteBuffer pixels);
     private native void nativeSetTransport(long ctx, boolean visible);
     private native void nativeSetLocalMedia(long ctx, boolean on);
+    // depth3d G2: VR Quick Palette & passthrough dimmer native controls
+    private native void nativeUploadPalette(long ctx, ByteBuffer sheet);
+    private native void nativeSetPaletteHand(long ctx, boolean rightHand);
+    private native void nativeSetPaletteRowMask(long ctx, int mask);
+    private native void nativeOpenPaletteFromBar(long ctx);
+    private native void nativeTogglePalettePin(long ctx);
+    private native void nativeClosePalette(long ctx);
+    private native void nativeSetPassthroughDim(long ctx, boolean dim);
+    private native void nativeSetStereoStrength(long ctx, boolean on, float separation,
+                                                float convergence, float depthLocal);
+    private native void nativeSetStereoSourceFormat(long ctx, int format);
+    private native void nativeSetLocalScreenDimensions(long ctx, float fovDeg, float distM,
+                                                       float curvature);
+    private native void nativeTriggerPaletteHaptic(long ctx, int kind);
 
     private final TransportBufferQueue transportQueue =
             new TransportBufferQueue(TRANSPORT_WIDTH * TRANSPORT_HEIGHT * 4);
+    private final TransportBufferQueue paletteQueue =
+            new TransportBufferQueue(PALETTE_TEX_W * PALETTE_TEX_H * 4);
     private volatile boolean localMedia;
+    private volatile boolean cylinderSupportedCached = true;
+    private volatile boolean initialStereoLive = true;
 
     /** Before start(): this session plays a local file rather than a stream. */
     public void setLocalMedia(boolean on) {
         localMedia = on;
+    }
+
+    /** Before start(): allows local playback to start with 3D off while keeping stereo ready to toggle on. */
+    public void setInitialStereoLive(boolean on) {
+        initialStereoLive = on;
+    }
+
+    public boolean isCylinderSupported() {
+        return cylinderSupportedCached;
+    }
+
+    public boolean postPalette(ByteBuffer pixels) {
+        return paletteQueue.post(pixels);
+    }
+
+    public void setPaletteHand(boolean rightHand) {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeSetPaletteHand(nativeCtx, rightHand);
+            }
+        }
+    }
+
+    public void setPaletteRowMask(int mask) {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeSetPaletteRowMask(nativeCtx, mask);
+            }
+        }
+    }
+
+    public void openPaletteFromBar() {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeOpenPaletteFromBar(nativeCtx);
+            }
+        }
+    }
+
+    public void togglePalettePin() {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeTogglePalettePin(nativeCtx);
+            }
+        }
+    }
+
+    public void closePalette() {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeClosePalette(nativeCtx);
+            }
+        }
+    }
+
+    public void setPassthroughDim(boolean dim) {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeSetPassthroughDim(nativeCtx, dim);
+            }
+        }
+    }
+
+    public void setStereoStrength(boolean on, float separation, float convergence, float depthLocal) {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeSetStereoStrength(nativeCtx, on, separation, convergence, depthLocal);
+            }
+        }
+    }
+
+    public void setStereoSourceFormat(int format) {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeSetStereoSourceFormat(nativeCtx, format);
+            }
+        }
+    }
+
+    public void setLocalScreenDimensions(float fovDeg, float distM, float curvature) {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeSetLocalScreenDimensions(nativeCtx, fovDeg, distM, curvature);
+            }
+        }
+    }
+
+    public void setLocalEnvironment(int envCell, boolean passthroughDim) {
+        synchronized (nativeLock) {
+            if (nativeCtx == 0 || !cellExists(envCell)) {
+                return;
+            }
+            environmentChoice = envCell;
+            passthroughOn = envCell == ENV_CELL_PASSTHROUGH;
+            nativeSetPassthroughDim(nativeCtx, passthroughDim && passthroughOn);
+            requestRoom(envCell);
+            nativeSetEnvironment(nativeCtx, envCell);
+        }
+    }
+
+    public void triggerPaletteHaptic(int kind) {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0 && kind > PALETTE_HAPTIC_NONE) {
+                nativeTriggerPaletteHaptic(nativeCtx, kind);
+            }
+        }
+    }
+
+    public void playClickSound() {
+        XrClickSound click = clickSound;
+        PreferenceConfiguration cfg = prefConfig;
+        if (click != null && (cfg == null || cfg.vrClickSound)) {
+            click.click();
+        }
     }
 
     /**
@@ -1271,6 +1409,10 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
             if (transport != null) {
                 nativeUploadTransport(nativeCtx, transport);
             }
+            ByteBuffer paletteSheet = paletteQueue.pollForUpload();
+            if (paletteSheet != null) {
+                nativeUploadPalette(nativeCtx, paletteSheet);
+            }
 
             ByteBuffer grid = pendingPickerArt.getAndSet(null);
             ByteBuffer button = pendingEnvButton.getAndSet(null);
@@ -1424,6 +1566,13 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         nativeSetGamepad(nativeCtx, prefs.vrGamepadToggle, prefs.deadzonePercentage);
         nativeSetControllerModel(nativeCtx, prefs.vrControllerModel);
         nativeSetTriggerScreenAdjust(nativeCtx, prefs.vrTriggerScreenAdjust);
+        nativeSetPaletteHand(nativeCtx, prefs.vrPaletteOnRightHand);
+        nativeSetPassthroughDim(nativeCtx, prefs.vrPassthroughDim && passthroughOn);
+        if (localMedia && !initialStereoLive) {
+            nativeSetStereoStrength(nativeCtx, false, -1.0f, -1.0f, -1.0f);
+            stereoLive = false;
+        }
+        cylinderSupportedCached = nativeGetCylinderSupported(nativeCtx);
         final boolean handHint = prefs.vrHandTracking && !prefs.vrHandLockHintSeen;
         nativeSetHandHint(nativeCtx, handHint);
 
@@ -1731,6 +1880,18 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 if (inputState[IN_LOCAL_MENU] != 0.0f) {
                     inputListener.onVrLocalTogglePalette();
                 }
+                inputListener.onVrPaletteFrame(
+                        inputState[IN_PALETTE_OPEN] != 0.0f,
+                        inputState[IN_PALETTE_PINNED] != 0.0f,
+                        inputState[IN_PALETTE_HAND_MODE] != 0.0f,
+                        inputState[IN_PALETTE_DIM_FALLBACK] != 0.0f,
+                        inputState[IN_PALETTE_HOVER_X],
+                        inputState[IN_PALETTE_HOVER_Y],
+                        (int)inputState[IN_PALETTE_CLICK],
+                        (int)inputState[IN_PALETTE_ROW_STEP],
+                        inputState[IN_PALETTE_ROW_RESET] != 0.0f,
+                        (int)inputState[IN_PALETTE_TAB_STEP],
+                        (int)inputState[IN_PALETTE_PAGE_STEP]);
             }
         }
 
@@ -1762,6 +1923,9 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 prefConfig.vrScreenSize = Math.max(ScreenReadout.MIN_SCREEN_SIZE_DM,
                         Math.min(ScreenReadout.MAX_SCREEN_SIZE_DM,
                                 Math.round(ScreenReadout.flatWidthMeters(fovDeg, distM) * 10.0f)));
+            }
+            if (inputListener != null && localMedia) {
+                inputListener.onVrScreenDimensionsSaved(fovDeg, distM);
             }
         }
 

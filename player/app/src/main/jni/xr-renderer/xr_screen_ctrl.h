@@ -77,6 +77,10 @@
 #define SCREEN_SEEK_REPEAT_NS     400000000LL
 #define SCREEN_B_EXIT_WINDOW_NS   2000000000LL
 
+// Palette row continuous stick repeat (§6.3, §6.5, 待头显验证): 400 ms delay -> 8 Hz (125 ms)
+#define SCREEN_PALETTE_REPEAT_DELAY_NS    400000000LL
+#define SCREEN_PALETTE_REPEAT_INTERVAL_NS 125000000LL
+
 // Haptic feedback durations & amplitudes (§4.5, §6.12, 待头显验证)
 #define SCREEN_HAPTIC_HINT_MS      5
 #define SCREEN_HAPTIC_HINT_AMP     0.2f
@@ -369,6 +373,9 @@ int screenLayerBudgetOk(int count, int maxLimit);
 
 int screenClassifyLocalTarget(int modalOpen, int hoverKind, int transportVisible,
                               float hitU, float hitV, float videoAspect);
+int screenClassifyLocalTargetWithPalette(int modalOpen, int hoverKind, int paletteRowAdjustable,
+                                         int transportVisible, float hitU, float hitV,
+                                         float videoAspect);
 int screenShouldSuppressLeft(const ScreenInputState* st, int externalGrabActive);
 int screenAllowExternalGrab(int grabMode, const ScreenInputState* st);
 int screenIsExternalGrabBusy(int grabMode);

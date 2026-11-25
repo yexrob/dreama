@@ -244,6 +244,12 @@ enum class CurvatureDisabledReason {
     UNSUPPORTED_HEADSET,
 }
 
+/** Which controller holds the VR Quick Palette (§3.8 & §6.3). */
+enum class PaletteHand {
+    LEFT,
+    RIGHT,
+}
+
 data class Depth3dSettingsSnapshot(
     val actualWidth: Int,
     val actualHeight: Int,
@@ -290,6 +296,7 @@ data class Depth3dSettingsSnapshot(
         ScreenReadout.clampDist(actualScreenDistanceDm / 10f),
     ),
     val triggerScreenAdjust: Boolean = PreferenceConfiguration.DEFAULT_VR_TRIGGER_SCREEN_ADJUST,
+    val paletteHand: PaletteHand = PaletteHand.LEFT,
     val cylinderSupported: Boolean = true,
     val curvatureDisabledReason: CurvatureDisabledReason? = null,
 ) {
@@ -336,6 +343,7 @@ object StreamSettingsMapper {
     const val KEY_SCREEN_DISTANCE = PreferenceConfiguration.VR_DISTANCE_PREF_STRING
     const val KEY_CURVATURE = PreferenceConfiguration.VR_CURVATURE_PREF_STRING
     const val KEY_TRIGGER_SCREEN_ADJUST = PreferenceConfiguration.VR_TRIGGER_SCREEN_ADJUST_PREF_STRING
+    const val KEY_PALETTE_HAND_RIGHT = PreferenceConfiguration.VR_PALETTE_HAND_RIGHT_PREF_STRING
     const val KEY_CYLINDER_SUPPORTED = PreferenceConfiguration.VR_CYLINDER_SUPPORTED_PREF_STRING
     const val KEY_ENV_ID = PreferenceConfiguration.VR_ENVIRONMENT_ID_PREF_STRING
     const val KEY_PASSTHROUGH = PreferenceConfiguration.VR_PASSTHROUGH_PREF_STRING
@@ -482,6 +490,7 @@ object StreamSettingsMapper {
             screenFovDeg = fovDeg,
             screenDiagonalInches = diagInches,
             triggerScreenAdjust = cfg.vrTriggerScreenAdjust,
+            paletteHand = if (cfg.vrPaletteOnRightHand) PaletteHand.RIGHT else PaletteHand.LEFT,
             cylinderSupported = cylinderSupported,
             curvatureDisabledReason = curvatureDisabledReason,
         )
@@ -659,6 +668,11 @@ object StreamSettingsMapper {
     /** Setting: "按住扳机调整屏幕" (§3.8, §6.4 Rule 12). */
     fun setTriggerScreenAdjust(store: PrefsStore, enabled: Boolean) {
         store.putBoolean(KEY_TRIGGER_SCREEN_ADJUST, enabled)
+    }
+
+    /** Setting: "调色板挂在 左手 / 右手" (§3.8, §6.3). */
+    fun setPaletteHand(store: PrefsStore, hand: PaletteHand) {
+        store.putBoolean(KEY_PALETTE_HAND_RIGHT, hand == PaletteHand.RIGHT)
     }
 
     fun setEnvironment(store: PrefsStore, preset: VrEnvironmentPreset) {

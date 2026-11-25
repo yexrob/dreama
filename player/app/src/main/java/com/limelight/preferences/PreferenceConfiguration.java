@@ -64,6 +64,10 @@ public class PreferenceConfiguration {
     public static final String VR_SCREEN_SIZE_PREF_STRING = "seekbar_vr_screen_size";
     public static final String VR_CURVATURE_PREF_STRING = "seekbar_vr_curvature";
     public static final String VR_TRIGGER_SCREEN_ADJUST_PREF_STRING = "checkbox_vr_trigger_screen_adjust";
+    // VR quick palette hand mount (false = left hand default, true = right hand mirrored, §3.8 & §6.3)
+    public static final String VR_PALETTE_HAND_RIGHT_PREF_STRING = "checkbox_vr_palette_hand_right";
+    // Passthrough dimmer ("调暗" environment mode in VR quick palette, §6.3)
+    public static final String VR_PASSTHROUGH_DIM_PREF_STRING = "checkbox_vr_passthrough_dim";
     // Cached runtime support for XR_KHR_composition_layer_cylinder so 2D settings
     // can grey out curvature with the spec reason when the headset lacks support.
     public static final String VR_CYLINDER_SUPPORTED_PREF_STRING = "vr_cylinder_supported";
@@ -218,6 +222,8 @@ public class PreferenceConfiguration {
     private static final int DEFAULT_VR_SCREEN_SIZE = 30;
     private static final int DEFAULT_VR_CURVATURE = 0;
     public static final boolean DEFAULT_VR_TRIGGER_SCREEN_ADJUST = true;
+    public static final boolean DEFAULT_VR_PALETTE_HAND_RIGHT = false;
+    public static final boolean DEFAULT_VR_PASSTHROUGH_DIM = false;
     // ZipDepth, the newer model and the only one a Gen 1 headset can run
     static final String DEFAULT_VR_DEPTH_SOURCE = VR_DEPTH_SOURCE_ZIPDEPTH;
     // Standard everywhere, which caps the room at a size every headset here can
@@ -348,6 +354,10 @@ public class PreferenceConfiguration {
     public int vrCurvature;
     // Whether holding trigger + stick adjusts screen distance/size in local playback (§3.8)
     public boolean vrTriggerScreenAdjust;
+    // Whether the VR quick palette mounts on the right controller instead of left (§3.8)
+    public boolean vrPaletteOnRightHand;
+    // Whether passthrough dimmer ("调暗") is enabled in local playback (§6.3)
+    public boolean vrPassthroughDim;
     // 0 off, 1 flat, 2 ramp, 3 blob, 4 eye test, 5 shift test, 6 depth model
     public int vrDepthMode;
     // Which model a depth model session runs, zipdepth or model (MiDaS). The
@@ -679,6 +689,16 @@ public class PreferenceConfiguration {
     public static boolean triggerScreenAdjustOn(SharedPreferences prefs) {
         return prefs.getBoolean(VR_TRIGGER_SCREEN_ADJUST_PREF_STRING,
                 DEFAULT_VR_TRIGGER_SCREEN_ADJUST);
+    }
+
+    public static boolean paletteOnRightHand(SharedPreferences prefs) {
+        return prefs.getBoolean(VR_PALETTE_HAND_RIGHT_PREF_STRING,
+                DEFAULT_VR_PALETTE_HAND_RIGHT);
+    }
+
+    public static boolean passthroughDimOn(SharedPreferences prefs) {
+        return prefs.getBoolean(VR_PASSTHROUGH_DIM_PREF_STRING,
+                DEFAULT_VR_PASSTHROUGH_DIM);
     }
 
     public static int clampCurvature(int percent) {
@@ -1474,6 +1494,8 @@ public class PreferenceConfiguration {
         config.vrCurvature = clampCurvature(
                 prefs.getInt(VR_CURVATURE_PREF_STRING, DEFAULT_VR_CURVATURE));
         config.vrTriggerScreenAdjust = triggerScreenAdjustOn(prefs);
+        config.vrPaletteOnRightHand = paletteOnRightHand(prefs);
+        config.vrPassthroughDim = passthroughDimOn(prefs);
         // A Gen 1 headset runs ZipDepth for a stored MiDaS it does not offer
         String depthSource = depthSourceForHeadset(
                 prefs.getString(VR_DEPTH_SOURCE_PREF_STRING, DEFAULT_VR_DEPTH_SOURCE),

@@ -51,6 +51,7 @@
 #include "xr_headaim.h"
 #include "xr_gamepad.h"
 #include "xr_screen_ctrl.h"
+#include "xr_palette.h"
 
 #define TAG "moonlight-xr"
 
@@ -198,11 +199,16 @@ static inline int64_t nowNs(void) {
 #define FADE_REPORT 4
 #define FADE_HINT 5
 #define FADE_PANELS 6
-// And the layers a colour scale is chained onto: those six, then the splash
-// and the toast
+// And the layers a colour scale is chained onto: those six, then the splash,
+// the toast, and the local-playback quick palette
 #define FADE_SLOT_SPLASH FADE_PANELS
 #define FADE_SLOT_TOAST (FADE_PANELS + 1)
-#define FADE_SLOTS (FADE_PANELS + 2)
+#define FADE_SLOT_PALETTE (FADE_PANELS + 2)
+#define FADE_SLOTS (FADE_PANELS + 3)
+
+// Solid dark translucent backdrop texture for passthrough dimmer ("调暗", 待头显验证)
+#define DIMMER_TEX 16
+#define DIMMER_ALPHA_BYTE 153
 
 // The toast hangs off the eyes, ahead and a little below where they look,
 // in metres
@@ -837,8 +843,11 @@ typedef struct {
     GLint depthCubicUniform;
     GLint gradeOnUniform;
     GLint gradeUniform;
+    GLint sourceFormatUniform;
     GLuint fbo;
     int barTestFramesLogged;
+    // depth3d G2: 0 = auto/depth-warp, 1 = SBS, 2 = OU
+    int stereoSourceFormat;
 
     // Frame capture for offline shader work
     char captureDir[256];
@@ -1405,6 +1414,37 @@ typedef struct {
     int64_t uiHapticSecondAtNs;
     int64_t uiHapticSecondDurNs;
     float uiHapticSecondAmp;
+    int uiHapticSecondHand;
+
+    // depth3d G2: controller-mounted & pinnable VR quick palette (single quad layer)
+    PaletteState palette;
+    PaletteRenderPose palettePose;
+    PaletteHit paletteHit;
+    int paletteActiveRowMask;
+    int paletteClickState;
+    int paletteRowStepOut;
+    int paletteRowResetOut;
+    int paletteTabStepOut;
+    int palettePageStepOut;
+    int palettePendingHaptic;
+    int paletteBarOpenRequested;
+    int palettePinToggleRequested;
+    int paletteCloseRequested;
+    int paletteDragHand;
+    int paletteSliderDragging;
+    int paletteSliderHand;
+    XrSwapchain paletteSwapchain;
+    uint32_t paletteImageCount;
+    XrSwapchainImageOpenGLESKHR* paletteImages;
+    int paletteArtReady;
+    unsigned char* paletteFlipBuf;
+
+    // depth3d G2: passthrough dimmer layer ("调暗" environment, 1 quad layer)
+    XrSwapchain dimmerSwapchain;
+    uint32_t dimmerImageCount;
+    XrSwapchainImageOpenGLESKHR* dimmerImages;
+    int dimmerArtReady;
+    int passthroughDim;
 
     // Hover state, read by the frame loop to decide which handle to draw
     int hoverKind;

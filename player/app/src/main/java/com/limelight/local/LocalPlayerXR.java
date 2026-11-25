@@ -19,8 +19,10 @@ import androidx.media3.common.AudioAttributes;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
 import androidx.media3.common.MediaItem;
+import androidx.media3.common.MimeTypes;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
+import androidx.media3.common.TrackSelectionOverride;
 import androidx.media3.common.Tracks;
 import androidx.media3.common.VideoSize;
 import androidx.media3.common.util.UnstableApi;
@@ -31,18 +33,26 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector;
 
 import com.limelight.LimeLog;
+import com.limelight.R;
 import com.limelight.binding.video.XrRenderer;
+import com.limelight.binding.video.XrShared;
 import com.limelight.binding.video.XrStartFailure;
 import com.limelight.local.dlna.CastReceiver;
 import com.limelight.local.dlna.PlayerLink;
 import com.limelight.local.dlna.PlayerState;
 import com.limelight.local.media.SourceKind;
+import com.limelight.local.media.StereoHint;
 import com.limelight.local.media.WatchHistory;
 import com.limelight.local.plugin.PluginHostGuards;
+import com.limelight.local.stream.DepthStrength;
+import com.limelight.local.stream.PrefsStore;
 import com.limelight.preferences.PreferenceConfiguration;
 
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -104,9 +114,24 @@ public class LocalPlayerXR extends Activity
 
     // Main thread
     private ExoPlayer player;
+    private DefaultTrackSelector trackSelector;
     private DefaultHttpDataSource.Factory http;
     private SourceKind sourceKind = SourceKind.LOCAL;
     private PluginPlayerSession pluginSession;
+
+    // G2 VR Quick Palette state, renderer & stores (synchronized under paletteLock)
+    private final Object paletteLock = new Object();
+    private PaletteController palette;
+    private PaletteRenderer paletteRenderer;
+    private PrefsStore globalPaletteStore;
+    private PrefsStore videoPaletteStore;
+    private String currentVideoKey = "anonymous";
+    private volatile String activeDepthModel;
+    private volatile boolean paletteOpenUi;
+    private volatile boolean danmakuSupportedUi;
+    private volatile boolean danmakuOnUi = true;
+    private int lastPaletteRowMask = -1;
+    private Tracks latestTracks = Tracks.EMPTY;
     private long fallbackDurationMs;
     private boolean refreshInFlight;
     private boolean held;
@@ -169,7 +194,11 @@ public class LocalPlayerXR extends Activity
         CastReceiver.hold(this);
         held = true;
 
-        DefaultTrackSelector trackSelector = createTrackSelector(this);
+        globalPaletteStore = PaletteStore.defaultGlobalStore(this);
+        videoPaletteStore = PaletteStore.defaultVideoStore(this);
+        initPaletteForIntent(getIntent(), false);
+
+        trackSelector = createTrackSelector(this);
 
         if (pluginMode) {
             // Plugin sources NEVER use DefaultHttpDataSource: every manifest, segment,
@@ -275,6 +304,23 @@ public class LocalPlayerXR extends Activity
                         if (media.getDurationMs() != null && media.getDurationMs() > 0L) {
                             fallbackDurationMs = media.getDurationMs();
                         }
+                        boolean supportsDm = pluginSession != null && pluginSession.getSupportsDanmaku();
+                        synchronized (paletteLock) {
+                            if (palette != null) {
+                                palette.setDanmakuSupported(supportsDm);
+                                if (media.getStereoHint() == StereoHint.SBS) {
+                                    palette.seedDefaultSourceFormat(StereoSourceFormat.SBS);
+                                } else if (media.getStereoHint() == StereoHint.OU) {
+                                    palette.seedDefaultSourceFormat(StereoSourceFormat.OU);
+                                }
+                            }
+                        }
+                        danmakuSupportedUi = supportsDm;
+                        XrRenderer xr = renderer;
+                        if (xr != null) {
+                            applyPaletteStereoToRenderer(xr);
+                            redrawPaletteIfReady(xr);
+                        }
                         startMs = media.getResumePositionMs();
                         p.setMediaSource(media.getMediaSource());
                         p.prepare();
@@ -366,6 +412,17 @@ public class LocalPlayerXR extends Activity
         // The Gen 1 profile's 12 maps a second is a stream's budget; a film
         // held 20 on a Pico 4 with no missed refreshes
         prefs.vrDepthRate = Math.max(prefs.vrDepthRate, com.limelight.binding.video.XrShared.DEPTH_RATE_DEFAULT);
+        // Keep stereo pipeline ready in local playback even if 3D starts OFF so
+        // toggling 3D ON from the VR Quick Palette works immediately without restarting.
+        if (prefs.vrDepthMode == XrShared.DEPTH_MODE_OFF) {
+            prefs.vrDepthMode = XrShared.DEPTH_MODE_MODEL;
+            prefs.vrDepthModel = PreferenceConfiguration.VR_DEPTH_SOURCE_ZIPDEPTH;
+        }
+        activeDepthModel = prefs.vrDepthModel;
+        boolean startStereoLive;
+        synchronized (paletteLock) {
+            startStereoLive = palette == null || palette.getEffectiveStrength() != DepthStrength.OFF;
+        }
         LimeLog.info(String.format(Locale.US, "depth3d: %s %dx%d @ %.2f%s", logLabel, size[0], size[1], fps,
                 guessed ? " (guessed)" : ""));
 
@@ -394,6 +451,7 @@ public class LocalPlayerXR extends Activity
 
         XrRenderer r = new XrRenderer();
         r.setLocalMedia(true);
+        r.setInitialStereoLive(startStereoLive);
         r.setInputListener(this);
         r.setSessionListener(this);
         if (!r.start(this, size[0], size[1], prefs)) {
@@ -436,6 +494,19 @@ public class LocalPlayerXR extends Activity
         sessionW = w;
         sessionH = h;
         checkShape = check;
+        synchronized (paletteLock) {
+            if (paletteRenderer == null) {
+                paletteRenderer = new PaletteRenderer();
+            } else {
+                paletteRenderer.invalidate();
+            }
+            if (palette != null) {
+                palette.setCylinderSupported(r.isCylinderSupported());
+            }
+            lastPaletteRowMask = -1;
+        }
+        applyPaletteStereoToRenderer(r);
+        redrawPaletteIfReady(r);
         p.setVideoSurface(r.getInputSurface());
         surfaceSet = true;
         if (pendingNotice != null) {
@@ -602,6 +673,8 @@ public class LocalPlayerXR extends Activity
 
         @Override
         public void onTracksChanged(Tracks tracks) {
+            latestTracks = tracks;
+            updatePaletteTracksFromExo(tracks);
             if (tracks.isEmpty() || probed.getCount() == 0) {
                 return;
             }
@@ -732,10 +805,17 @@ public class LocalPlayerXR extends Activity
             PlayerLink.detach(this, old, position(), duration(), true);
         }
         setIntent(intent);
+        initPaletteForIntent(intent, false);
+        latestTracks = Tracks.EMPTY;
         if (incomingIsPlugin) {
             loadPlugin(incomingPlugin);
         } else {
             load(intent);
+        }
+        XrRenderer curXr = renderer;
+        if (curXr != null) {
+            applyPaletteStereoToRenderer(curXr);
+            redrawPaletteIfReady(curXr);
         }
         if (old != next) {
             guardCastAttachment(sourceKind, castId);
@@ -929,8 +1009,29 @@ public class LocalPlayerXR extends Activity
                 }
                 return;
             }
+            XrRenderer xr = renderer;
+            if (!Float.isNaN(x) && TransportBar.onAdjustButton(x)) {
+                if (xr != null) {
+                    if (paletteOpenUi) {
+                        xr.closePalette();
+                    } else {
+                        xr.openPaletteFromBar();
+                    }
+                    xr.playClickSound();
+                }
+                tickBar();
+                return;
+            }
+            if (!Float.isNaN(x) && TransportBar.onDanmakuButton(x, danmakuSupportedUi)) {
+                toggleDanmakuFromUi();
+                if (xr != null) {
+                    xr.playClickSound();
+                }
+                tickBar();
+                return;
+            }
             float f = Float.isNaN(x) || TransportBar.onButton(x)
-                    ? Float.NaN : TransportBar.trackFraction(x);
+                    ? Float.NaN : TransportBar.trackFraction(x, danmakuSupportedUi);
             if (!Float.isNaN(f)) {
                 long d = duration();
                 if (d > 0 && p.isCurrentMediaItemSeekable()) {
@@ -997,8 +1098,15 @@ public class LocalPlayerXR extends Activity
                 if (show) {
                     float x = since < BAR_LINGER_MS ? b.texX(pointerU, pointerV) : Float.NaN;
                     boolean onBtn = !Float.isNaN(x) && TransportBar.onButton(x);
-                    float hover = Float.isNaN(x) || onBtn ? Float.NaN : TransportBar.trackFraction(x);
-                    r.postTransport(b.draw(on, (int) position(), (int) duration(), hover, onBtn, title()));
+                    boolean onAdj = !Float.isNaN(x) && TransportBar.onAdjustButton(x);
+                    boolean onDm = !Float.isNaN(x) && TransportBar.onDanmakuButton(x, danmakuSupportedUi);
+                    float hover = Float.isNaN(x) || onBtn || onAdj || onDm
+                            ? Float.NaN : TransportBar.trackFraction(x, danmakuSupportedUi);
+                    r.postTransport(b.draw(
+                            on, (int) position(), (int) duration(), hover, onBtn, title(),
+                            getString(R.string.vr_bar_adjust),
+                            getString(R.string.vr_bar_danmaku),
+                            danmakuSupportedUi, danmakuOnUi, paletteOpenUi, onAdj, onDm));
                 }
             }
         }
@@ -1076,6 +1184,440 @@ public class LocalPlayerXR extends Activity
             r.setTransportVisible(false);
         }
         main.post(this::tickBar);
+    }
+
+    @Override
+    public void onVrLocalToggleDanmaku() {
+        main.post(() -> {
+            toggleDanmakuFromUi();
+            tickBar();
+        });
+    }
+
+    @Override
+    public void onVrScreenDimensionsSaved(float fovDeg, float distM) {
+        XrRenderer r = renderer;
+        synchronized (paletteLock) {
+            if (palette != null) {
+                palette.syncExternalScreen(fovDeg, distM);
+            }
+        }
+        if (r != null) {
+            redrawPaletteIfReady(r);
+        }
+    }
+
+    @Override
+    public void onVrPaletteFrame(boolean open, boolean pinned, boolean handTrackingMode,
+                                 boolean dimFallback, float hoverX, float hoverY,
+                                 int clickState, int rowStep, boolean rowReset,
+                                 int tabStep, int pageStep) {
+        XrRenderer r = renderer;
+        if (r == null) {
+            return;
+        }
+        boolean wasOpen = paletteOpenUi;
+        PaletteActionResult res;
+        int rowMask;
+        ByteBuffer sheet;
+        GlobalPaletteSettings globalToSave = null;
+        VideoPaletteOverrides videoToSave = null;
+        String videoKeyToSave = null;
+        synchronized (paletteLock) {
+            if (palette == null) {
+                return;
+            }
+            res = palette.processFrameInput(
+                    open, pinned, handTrackingMode, dimFallback,
+                    hoverX, hoverY, clickState, rowStep, rowReset, tabStep, pageStep);
+            paletteOpenUi = palette.isOpen();
+            danmakuOnUi = palette.getGlobal().getDanmakuOn();
+            rowMask = palette.activeRowMask();
+            sheet = paletteRenderer != null ? paletteRenderer.drawIfChanged(palette) : null;
+            if (res.getSaveGlobalSettings()) {
+                globalToSave = palette.getGlobal();
+            }
+            if (res.getSaveVideoOverrides()) {
+                videoToSave = palette.getVideo();
+                videoKeyToSave = currentVideoKey;
+            }
+        }
+        if (rowMask != lastPaletteRowMask) {
+            lastPaletteRowMask = rowMask;
+            r.setPaletteRowMask(rowMask);
+        }
+        if (sheet != null) {
+            r.postPalette(sheet);
+        }
+        if (res.getStereoChanged() || res.getSourceFormatChanged()) {
+            applyPaletteStereoToRenderer(r);
+        }
+        if (res.getScreenChanged()) {
+            GlobalPaletteSettings g;
+            synchronized (paletteLock) {
+                g = palette != null ? palette.getGlobal() : null;
+            }
+            if (g != null) {
+                r.setLocalScreenDimensions(
+                        g.getScreenFovDeg(), g.getScreenDistM(), g.getScreenCurvaturePct() / 100f);
+            }
+        }
+        if (res.getEnvironmentChanged() && globalPaletteStore != null) {
+            PaletteEnvironment env;
+            synchronized (paletteLock) {
+                env = palette != null ? palette.getGlobal().getEnvironment() : PaletteEnvironment.PASSTHROUGH;
+            }
+            int envCell = PaletteStore.envCellFor(globalPaletteStore, env);
+            r.setLocalEnvironment(envCell, env == PaletteEnvironment.DIM);
+        }
+        if (res.getHapticKind() > XrShared.PALETTE_HAPTIC_NONE) {
+            r.triggerPaletteHaptic(res.getHapticKind());
+        }
+        if (res.getClickSound()) {
+            r.playClickSound();
+        }
+        if (res.getToastMessage() != null) {
+            r.showNotice(res.getToastMessage(), null);
+        }
+
+        final GlobalPaletteSettings finalGlobal = globalToSave;
+        final VideoPaletteOverrides finalVideo = videoToSave;
+        final String finalVideoKey = videoKeyToSave;
+        final boolean applySub = res.getSubtitleTrackChanged();
+        final boolean applyAud = res.getAudioTrackChanged();
+        final boolean barRefresh = (wasOpen != paletteOpenUi) || res.getDanmakuChanged();
+        if (finalGlobal != null || finalVideo != null || applySub || applyAud || barRefresh) {
+            main.post(() -> {
+                if (finalGlobal != null && globalPaletteStore != null) {
+                    PaletteStore.saveGlobal(globalPaletteStore, finalGlobal);
+                }
+                if (finalVideo != null && videoPaletteStore != null && finalVideoKey != null) {
+                    PaletteStore.saveVideoOverrides(videoPaletteStore, finalVideoKey, finalVideo);
+                }
+                if (applySub || applyAud) {
+                    applyExoTrackSelections(latestTracks);
+                }
+                if (barRefresh) {
+                    tickBar();
+                }
+            });
+        }
+    }
+
+    // ---- G2 VR Quick Palette helpers ----
+
+    private PaletteStrings buildPaletteStrings() {
+        return new PaletteStrings(
+                getString(R.string.vr_palette_tab_3d),
+                getString(R.string.vr_palette_tab_screen),
+                getString(R.string.vr_palette_tab_danmaku),
+                getString(R.string.vr_palette_tab_sub_audio),
+                getString(R.string.vr_palette_row_strength),
+                getString(R.string.vr_palette_row_source),
+                getString(R.string.vr_palette_row_float),
+                getString(R.string.vr_palette_row_layer),
+                getString(R.string.settings_depth_off),
+                getString(R.string.settings_depth_soft),
+                getString(R.string.settings_depth_standard),
+                getString(R.string.settings_depth_strong),
+                getString(R.string.vr_palette_source_auto),
+                getString(R.string.vr_palette_source_sbs),
+                getString(R.string.vr_palette_source_ou),
+                getString(R.string.vr_palette_float_auto),
+                getString(R.string.vr_palette_float_flat),
+                getString(R.string.vr_palette_layer_off),
+                getString(R.string.vr_palette_layer_shallow),
+                getString(R.string.vr_palette_layer_medium),
+                getString(R.string.vr_palette_layer_deep),
+                getString(R.string.vr_palette_row_size),
+                getString(R.string.vr_palette_row_dist),
+                getString(R.string.vr_palette_row_curve),
+                getString(R.string.vr_palette_row_env),
+                getString(R.string.vr_screen_preset_small),
+                getString(R.string.vr_screen_preset_medium),
+                getString(R.string.vr_screen_preset_large),
+                getString(R.string.vr_screen_preset_giant),
+                getString(R.string.settings_curved_flat_label),
+                getString(R.string.vr_curve_disabled_in_room),
+                getString(R.string.vr_curve_unsupported_headset),
+                getString(R.string.vr_palette_env_passthrough),
+                getString(R.string.vr_palette_env_dim),
+                getString(R.string.vr_palette_env_theater),
+                getString(R.string.vr_palette_env_void),
+                getString(R.string.vr_palette_row_danmaku),
+                getString(R.string.vr_palette_row_area),
+                getString(R.string.vr_palette_row_opacity),
+                getString(R.string.vr_palette_danmaku_more),
+                getString(R.string.vr_palette_danmaku_back),
+                getString(R.string.vr_palette_toggle_on),
+                getString(R.string.vr_palette_toggle_off),
+                getString(R.string.vr_palette_area_full),
+                getString(R.string.vr_palette_area_half),
+                getString(R.string.vr_palette_area_quarter),
+                getString(R.string.vr_palette_row_font_size),
+                getString(R.string.vr_palette_row_speed),
+                getString(R.string.vr_palette_row_block),
+                getString(R.string.vr_palette_speed_slow),
+                getString(R.string.vr_palette_speed_normal),
+                getString(R.string.vr_palette_speed_fast),
+                getString(R.string.vr_palette_block_scroll),
+                getString(R.string.vr_palette_block_top),
+                getString(R.string.vr_palette_block_bottom),
+                getString(R.string.vr_palette_block_color),
+                getString(R.string.vr_palette_danmaku_unsupported_title),
+                getString(R.string.vr_palette_danmaku_unsupported_sub),
+                getString(R.string.vr_palette_danmaku_failed_title),
+                getString(R.string.action_retry),
+                getString(R.string.vr_palette_row_subtitle),
+                getString(R.string.vr_palette_row_audio),
+                getString(R.string.vr_palette_row_font_size),
+                getString(R.string.vr_palette_row_sub_scale),
+                getString(R.string.vr_palette_row_sub_pos),
+                getString(R.string.vr_palette_subtitle_off),
+                getString(R.string.vr_palette_subtitle_none),
+                getString(R.string.vr_palette_audio_single),
+                getString(R.string.vr_toast_video_only),
+                getString(R.string.vr_toast_no_danmaku),
+                getString(R.string.vr_toast_danmaku_on),
+                getString(R.string.vr_toast_danmaku_off));
+    }
+
+    private void initPaletteForIntent(Intent intent, boolean danmakuSupported) {
+        String srcId = intent != null ? intent.getStringExtra(EXTRA_SOURCE_ID) : null;
+        String itemId = intent != null ? intent.getStringExtra(EXTRA_ITEM_ID) : null;
+        String uriStr = intent != null && intent.getData() != null ? intent.getData().toString() : null;
+        String key = PaletteStore.videoKey(srcId, itemId, uriStr);
+        GlobalPaletteSettings global = PaletteStore.readGlobal(
+                globalPaletteStore, PreferenceConfiguration.isXr2Gen1Headset());
+        VideoPaletteOverrides video = PaletteStore.readVideoOverrides(videoPaletteStore, key);
+        synchronized (paletteLock) {
+            currentVideoKey = key;
+            boolean cylOk = palette == null || palette.getCylinderSupported();
+            palette = new PaletteController(
+                    global, video, buildPaletteStrings(), cylOk, danmakuSupported, false);
+            danmakuSupportedUi = danmakuSupported;
+            danmakuOnUi = global.getDanmakuOn();
+            if (paletteRenderer != null) {
+                paletteRenderer.invalidate();
+            }
+            lastPaletteRowMask = -1;
+        }
+    }
+
+    private void applyPaletteStereoToRenderer(XrRenderer r) {
+        StereoRenderParams params;
+        synchronized (paletteLock) {
+            if (palette == null) {
+                return;
+            }
+            params = palette.computeStereoParams(activeDepthModel);
+        }
+        r.setStereoSourceFormat(params.getSourceFormat().getNativeCode());
+        r.setStereoStrength(params.getOn(), params.getSeparation(),
+                params.getConvergence(), params.getDepthLocal());
+    }
+
+    private void redrawPaletteIfReady(XrRenderer r) {
+        ByteBuffer sheet;
+        int mask;
+        synchronized (paletteLock) {
+            if (palette == null || paletteRenderer == null) {
+                return;
+            }
+            mask = palette.activeRowMask();
+            sheet = paletteRenderer.drawIfChanged(palette);
+        }
+        if (mask != lastPaletteRowMask) {
+            lastPaletteRowMask = mask;
+            r.setPaletteRowMask(mask);
+        }
+        if (sheet != null) {
+            r.postPalette(sheet);
+        }
+    }
+
+    private void toggleDanmakuFromUi() {
+        XrRenderer r = renderer;
+        PaletteActionResult res;
+        GlobalPaletteSettings toSave = null;
+        synchronized (paletteLock) {
+            if (palette == null) {
+                return;
+            }
+            res = palette.toggleDanmakuQuick();
+            danmakuOnUi = palette.getGlobal().getDanmakuOn();
+            if (res.getSaveGlobalSettings()) {
+                toSave = palette.getGlobal();
+            }
+        }
+        if (toSave != null && globalPaletteStore != null) {
+            PaletteStore.saveGlobal(globalPaletteStore, toSave);
+        }
+        if (r != null) {
+            if (res.getHapticKind() > XrShared.PALETTE_HAPTIC_NONE) {
+                r.triggerPaletteHaptic(res.getHapticKind());
+            }
+            if (res.getToastMessage() != null) {
+                r.showNotice(res.getToastMessage(), null);
+            }
+            redrawPaletteIfReady(r);
+        }
+    }
+
+    private void updatePaletteTracksFromExo(Tracks tracks) {
+        List<PaletteSubtitleTrack> subs = new ArrayList<>();
+        List<PaletteAudioTrack> auds = new ArrayList<>();
+        String defaultSubId = null;
+        String defaultAudId = null;
+        List<Tracks.Group> groups = tracks.getGroups();
+        for (int gIdx = 0; gIdx < groups.size(); gIdx++) {
+            Tracks.Group g = groups.get(gIdx);
+            if (g.getType() == C.TRACK_TYPE_TEXT) {
+                for (int tIdx = 0; tIdx < g.length; tIdx++) {
+                    if (!g.isTrackSupported(tIdx)) {
+                        continue;
+                    }
+                    Format fmt = g.getTrackFormat(tIdx);
+                    String id = "sub:" + gIdx + ":" + tIdx;
+                    boolean bitmap = isBitmapSubtitleMime(fmt.sampleMimeType);
+                    String label = formatSubtitleTrackLabel(fmt, subs.size() + 1);
+                    subs.add(new PaletteSubtitleTrack(id, label, bitmap, gIdx, tIdx));
+                    if (g.isTrackSelected(tIdx) && defaultSubId == null) {
+                        defaultSubId = id;
+                    }
+                }
+            } else if (g.getType() == C.TRACK_TYPE_AUDIO) {
+                for (int tIdx = 0; tIdx < g.length; tIdx++) {
+                    if (!g.isTrackSupported(tIdx)) {
+                        continue;
+                    }
+                    Format fmt = g.getTrackFormat(tIdx);
+                    String id = "aud:" + gIdx + ":" + tIdx;
+                    String label = formatAudioTrackLabel(fmt, auds.size() + 1);
+                    auds.add(new PaletteAudioTrack(id, label, gIdx, tIdx));
+                    if (g.isTrackSelected(tIdx) && defaultAudId == null) {
+                        defaultAudId = id;
+                    }
+                }
+            }
+        }
+        boolean hasOverride;
+        synchronized (paletteLock) {
+            if (palette == null) {
+                return;
+            }
+            palette.setTracks(subs, auds, defaultSubId, defaultAudId);
+            VideoPaletteOverrides v = palette.getVideo();
+            hasOverride = v.getSubtitleId() != null || v.getAudioId() != null;
+        }
+        if (hasOverride) {
+            applyExoTrackSelections(tracks);
+        }
+        XrRenderer r = renderer;
+        if (r != null) {
+            redrawPaletteIfReady(r);
+        }
+    }
+
+    private void applyExoTrackSelections(Tracks tracks) {
+        DefaultTrackSelector ts = trackSelector;
+        if (ts == null) {
+            return;
+        }
+        PaletteSubtitleTrack wantedSub;
+        PaletteAudioTrack wantedAud;
+        boolean hasSubs;
+        synchronized (paletteLock) {
+            if (palette == null) {
+                return;
+            }
+            hasSubs = !palette.getSubtitleTracks().isEmpty();
+            wantedSub = palette.getSelectedSubtitleTrack();
+            wantedAud = palette.getSelectedAudioTrack();
+        }
+        DefaultTrackSelector.Parameters.Builder builder = ts.buildUponParameters();
+        List<Tracks.Group> groups = tracks.getGroups();
+        if (hasSubs) {
+            if (wantedSub == null) {
+                builder.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+                        .clearOverridesOfType(C.TRACK_TYPE_TEXT);
+            } else if (wantedSub.getGroupIndex() >= 0 && wantedSub.getGroupIndex() < groups.size()) {
+                Tracks.Group g = groups.get(wantedSub.getGroupIndex());
+                builder.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                        .setOverrideForType(new TrackSelectionOverride(
+                                g.getMediaTrackGroup(), wantedSub.getTrackIndex()));
+            }
+        }
+        if (wantedAud != null && wantedAud.getGroupIndex() >= 0 && wantedAud.getGroupIndex() < groups.size()) {
+            Tracks.Group g = groups.get(wantedAud.getGroupIndex());
+            builder.setOverrideForType(new TrackSelectionOverride(
+                    g.getMediaTrackGroup(), wantedAud.getTrackIndex()));
+        }
+        ts.setParameters(builder);
+    }
+
+    static boolean isBitmapSubtitleMime(String mime) {
+        if (mime == null) {
+            return false;
+        }
+        return MimeTypes.APPLICATION_PGS.equals(mime)
+                || MimeTypes.APPLICATION_VOBSUB.equals(mime)
+                || MimeTypes.APPLICATION_DVBSUBS.equals(mime)
+                || mime.startsWith("image/");
+    }
+
+    static String formatSubtitleTrackLabel(Format fmt, int ordinal) {
+        String lang = friendlyLanguageName(fmt.language);
+        String label = fmt.label != null ? fmt.label.trim() : "";
+        if (!label.isEmpty() && !lang.isEmpty() && !label.contains(lang)) {
+            return lang + " · " + label;
+        }
+        if (!label.isEmpty()) {
+            return label;
+        }
+        if (!lang.isEmpty()) {
+            return lang;
+        }
+        return "字幕 " + ordinal;
+    }
+
+    static String formatAudioTrackLabel(Format fmt, int ordinal) {
+        String lang = friendlyLanguageName(fmt.language);
+        String label = fmt.label != null ? fmt.label.trim() : "";
+        String base = !label.isEmpty() ? label : (!lang.isEmpty() ? lang : ("音轨 " + ordinal));
+        String ch = "";
+        if (fmt.channelCount >= 8) {
+            ch = "7.1";
+        } else if (fmt.channelCount >= 6) {
+            ch = "5.1";
+        } else if (fmt.channelCount == 2) {
+            ch = "2.0";
+        }
+        if (!ch.isEmpty() && !base.contains(ch)) {
+            return base + " · " + ch;
+        }
+        return base;
+    }
+
+    static String friendlyLanguageName(String code) {
+        if (code == null || code.trim().isEmpty() || "und".equalsIgnoreCase(code.trim())) {
+            return "";
+        }
+        String c = code.trim().toLowerCase(Locale.US);
+        if (c.startsWith("zh-tw") || c.startsWith("zh-hk") || c.startsWith("zh-hant") || c.equals("cht")) {
+            return "繁體中文";
+        }
+        if (c.startsWith("zh") || c.equals("chi") || c.equals("zho") || c.equals("chs")) {
+            return "简体中文";
+        }
+        if (c.startsWith("en") || c.equals("eng")) return "英语";
+        if (c.startsWith("ja") || c.equals("jpn")) return "日语";
+        if (c.startsWith("ko") || c.equals("kor")) return "韩语";
+        if (c.startsWith("fr") || c.equals("fra") || c.equals("fre")) return "法语";
+        if (c.startsWith("de") || c.equals("deu") || c.equals("ger")) return "德语";
+        if (c.startsWith("es") || c.equals("spa")) return "西班牙语";
+        if (c.startsWith("ru") || c.equals("rus")) return "俄语";
+        return code.trim();
     }
 
     @Override

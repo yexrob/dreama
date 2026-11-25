@@ -243,6 +243,7 @@ int initGl(XrCtx* ctx) {
     ctx->depthCubicUniform = glGetUniformLocation(ctx->program, "u_depthCubic");
     ctx->gradeOnUniform = glGetUniformLocation(ctx->program, "u_gradeOn");
     ctx->gradeUniform = glGetUniformLocation(ctx->program, "u_grade");
+    ctx->sourceFormatUniform = glGetUniformLocation(ctx->program, "u_sourceFormat");
 
     // Sampler units are fixed: color on 0, depth on 1
     glUseProgram(ctx->program);
@@ -386,11 +387,15 @@ void renderVideoFrame(XrCtx* ctx, const float* texMatrix, float separation) {
     ctx->warpRedraw = 0;
 
     // Both eyes warped, unless the 3D is switched off for the session or has
-    // only just come back on and is waiting for a fresh map. Then the frame
-    // is drawn once, flat, at zero disparity, and none of the depth passes
-    // run.
-    int warping = ctx->stereoMode != DEPTH_MODE_OFF && ctx->stereoLive && !ctx->stereoWaiting;
-    int upsampling = warping && ctx->stereoMode == DEPTH_MODE_MODEL && ctx->upsampleEnabled;
+    // only just come back on and is waiting for a fresh map. Native SBS/OU
+    // stereo sources bypass the depth model and draw left/right halves directly.
+    int nativeStereoSrc = ctx->stereoSourceFormat == STEREO_SRC_SBS
+            || ctx->stereoSourceFormat == STEREO_SRC_OU;
+    int warping = nativeStereoSrc
+            ? (ctx->stereoMode != DEPTH_MODE_OFF && ctx->stereoLive)
+            : (ctx->stereoMode != DEPTH_MODE_OFF && ctx->stereoLive && !ctx->stereoWaiting);
+    int upsampling = !nativeStereoSrc && warping
+            && ctx->stereoMode == DEPTH_MODE_MODEL && ctx->upsampleEnabled;
     int occluding = upsampling && ctx->occlusionEnabled && separation > 0.0f;
 
     // Capture frames do readbacks and file writes inside what would be the
@@ -500,6 +505,7 @@ void renderVideoFrame(XrCtx* ctx, const float* texMatrix, float separation) {
     glUniform1f(ctx->edgeFadeUniform, (float)ctx->edgeFadePx / (float)ctx->videoWidth);
     // Mono never uses the depth it reads, so it keeps the single fetch
     glUniform1f(ctx->depthCubicUniform, ctx->depthCubic && eyes == 2 ? 1.0f : 0.0f);
+    glUniform1f(ctx->sourceFormatUniform, (float)ctx->stereoSourceFormat);
     setGradeUniforms(ctx, ctx->gradeOnUniform, ctx->gradeUniform, ctx->gradeOn);
 
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, VERTEX_DATA);

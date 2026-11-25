@@ -229,6 +229,9 @@ class PluginPlayerSession(
     val supportsProgress: Boolean
         get() = activeSource?.capabilities?.contains(PluginCapability.PROGRESS) == true
 
+    val supportsDanmaku: Boolean
+        get() = activeSource?.capabilities?.contains(PluginCapability.DANMAKU) == true
+
     suspend fun load(
         instanceId: String,
         itemId: String,

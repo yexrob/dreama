@@ -338,7 +338,7 @@ void setRayOn(XrCtx* ctx, int on, const char* from) {
 // comes back for them while it is switched off.
 int panelUp(XrCtx* ctx) {
     return ctx->cogOpen || ctx->pickerOpen || ctx->kbOpen || ctx->exitConfirmOpen
-            || ctx->reportOpen || ctx->hintOpen;
+            || ctx->reportOpen || ctx->hintOpen || ctx->palette.open;
 }
 
 // The 3D on or off for the rest of the session, from the bar or the 3D tab.
@@ -353,7 +353,8 @@ void setStereoLive(XrCtx* ctx, int on, const char* from) {
     }
     ctx->stereoLive = on;
     ctx->warpRedraw = 1;
-    ctx->stereoWaiting = on && ctx->stereoMode == DEPTH_MODE_MODEL;
+    ctx->stereoWaiting = on && ctx->stereoMode == DEPTH_MODE_MODEL
+            && ctx->stereoSourceFormat == STEREO_SRC_AUTO;
     ctx->stereoWaitIndex = atomic_load_explicit(&ctx->depthStagedIndex, memory_order_acquire);
     ctx->stereoWaitNs = nowNs();
     // The shift test measures again in the new state

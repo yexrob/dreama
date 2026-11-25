@@ -56,7 +56,7 @@ public final class EnvironmentIds {
         }
     }
 
-    static int cellForId(int id) {
+    public static int cellForId(int id) {
         switch (id) {
             case PreferenceConfiguration.VR_ENV_PASSTHROUGH: return ENV_CELL_PASSTHROUGH;
             case PreferenceConfiguration.VR_ENV_VOID: return ENV_CELL_VOID;

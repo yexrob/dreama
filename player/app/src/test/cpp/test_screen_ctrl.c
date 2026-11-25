@@ -1183,6 +1183,58 @@ static void testLocalMediaGlueAndMutualExclusion(void) {
     CHECK(res.adjustActive == 0);
 }
 
+static void testPaletteStickRepeatAndTargetClassifier(void) {
+    // Target classifier maps HOVER_PALETTE (adjustable vs non-adjustable) & DEADZONE cleanly
+    CHECK(screenClassifyLocalTargetWithPalette(0, HOVER_PALETTE, 1, 0, 0.5f, 0.5f, 16.0f / 9.0f)
+          == SCREEN_TARGET_PALETTE_ROW);
+    CHECK(screenClassifyLocalTargetWithPalette(0, HOVER_PALETTE, 0, 0, 0.5f, 0.5f, 16.0f / 9.0f)
+          == SCREEN_TARGET_PALETTE_OTHER);
+    CHECK(screenClassifyLocalTargetWithPalette(0, HOVER_PALETTE_DEADZONE, 1, 0, 1.02f, 0.5f, 16.0f / 9.0f)
+          == SCREEN_TARGET_PALETTE_OTHER);
+    CHECK(screenClassifyLocalTargetWithPalette(0, HOVER_SCREEN, 0, 0, 0.5f, 0.5f, 16.0f / 9.0f)
+          == SCREEN_TARGET_SCREEN);
+
+    // §6.3 / §6.4: stick-X on PALETTE_ROW repeats after 400 ms delay at 8 Hz (125 ms interval)
+    ScreenInputState st;
+    ScreenInputResult res;
+    screenInputInit(&st);
+
+    ScreenInputFrame f = baseFrame(MS(1000), 0.016f);
+    f.paletteOpen = 1;
+    f.target = SCREEN_TARGET_PALETTE_ROW;
+    f.rStickX = 0.9f;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.paletteRowStep == 1);
+    CHECK(res.seekDeltaSec == 0);
+
+    // At +390 ms (< 400 ms delay): no repeat yet
+    f.nowNs = MS(1390);
+    screenInputStep(&st, &f, &res);
+    CHECK(res.paletteRowStep == 0);
+
+    // At +400 ms: first repeat fires
+    f.nowNs = MS(1400);
+    screenInputStep(&st, &f, &res);
+    CHECK(res.paletteRowStep == 1);
+
+    // At +520 ms (< 125 ms interval): no repeat
+    f.nowNs = MS(1520);
+    screenInputStep(&st, &f, &res);
+    CHECK(res.paletteRowStep == 0);
+
+    // At +525 ms (8 Hz): second repeat fires
+    f.nowNs = MS(1525);
+    screenInputStep(&st, &f, &res);
+    CHECK(res.paletteRowStep == 1);
+
+    // Sliding off row onto screen while stick still held must NEVER become seek!
+    f.nowNs = MS(1650);
+    f.target = SCREEN_TARGET_SCREEN;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.paletteRowStep == 0);
+    CHECK(res.seekDeltaSec == 0);
+}
+
 int main(void) {
     testInchesAndNorms();
     testCurvatureFormulaAndAngularInvariance();
@@ -1199,5 +1251,6 @@ int main(void) {
     testHandTrackingAdjust();
     testSection64MatrixButtonsAndLeftStick();
     testLocalMediaGlueAndMutualExclusion();
+    testPaletteStickRepeatAndTargetClassifier();
     return checksDone("xr_screen_ctrl");
 }

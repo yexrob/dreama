@@ -365,10 +365,17 @@ int screenLayerBudgetOk(int count, int maxLimit) {
 // Shared xr_input.c glue helpers (tested directly on host)
 // ============================================================================
 
-int screenClassifyLocalTarget(int modalOpen, int hoverKind, int transportVisible,
-                              float hitU, float hitV, float videoAspect) {
+int screenClassifyLocalTargetWithPalette(int modalOpen, int hoverKind, int paletteRowAdjustable,
+                                         int transportVisible, float hitU, float hitV,
+                                         float videoAspect) {
     if (modalOpen) {
         return SCREEN_TARGET_CONTROL;
+    }
+    if (hoverKind == HOVER_PALETTE) {
+        return paletteRowAdjustable ? SCREEN_TARGET_PALETTE_ROW : SCREEN_TARGET_PALETTE_OTHER;
+    }
+    if (hoverKind == HOVER_PALETTE_DEADZONE) {
+        return SCREEN_TARGET_PALETTE_OTHER;
     }
     if (hoverKind == HOVER_SCREEN) {
         int onBar = transportVisible && screenTransportBarHit(hitU, hitV, videoAspect);
@@ -378,6 +385,12 @@ int screenClassifyLocalTarget(int modalOpen, int hoverKind, int transportVisible
         return SCREEN_TARGET_CONTROL;
     }
     return SCREEN_TARGET_NONE;
+}
+
+int screenClassifyLocalTarget(int modalOpen, int hoverKind, int transportVisible,
+                              float hitU, float hitV, float videoAspect) {
+    return screenClassifyLocalTargetWithPalette(modalOpen, hoverKind, 0,
+                                                transportVisible, hitU, hitV, videoAspect);
 }
 
 int screenShouldSuppressLeft(const ScreenInputState* st, int externalGrabActive) {
@@ -1091,6 +1104,7 @@ void screenInputStep(ScreenInputState* st, const ScreenInputFrame* in,
                 }
                 else if (in->paletteOpen && in->target == SCREEN_TARGET_PALETTE_ROW) {
                     st->stickXIntent = SCREEN_STICK_INTENT_PALETTE_ROW;
+                    st->stickXNextRepeatNs = in->nowNs + SCREEN_PALETTE_REPEAT_DELAY_NS;
                     out->paletteRowStep = dir;
                 }
                 else if (in->paletteOpen && in->target == SCREEN_TARGET_PALETTE_OTHER) {
@@ -1109,7 +1123,7 @@ void screenInputStep(ScreenInputState* st, const ScreenInputFrame* in,
             }
             else if (arx > SCREEN_STICK_ENGAGE && in->nowNs >= st->stickXNextRepeatNs) {
                 int dir = rx > 0.0f ? 1 : -1;
-                st->stickXNextRepeatNs = in->nowNs + SCREEN_SEEK_REPEAT_NS;
+                st->stickXNextRepeatNs = in->nowNs + SCREEN_PALETTE_REPEAT_INTERVAL_NS;
                 out->paletteRowStep = dir;
             }
         }

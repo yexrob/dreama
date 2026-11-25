@@ -76,6 +76,7 @@ _Static_assert(MARK_VALUES == COG_OPTION_COUNT, "a mark for every display tab ro
 typedef struct {
     XrCompositionLayerProjection room;
     XrCompositionLayerProjectionView roomViews[ROOM_EYES];
+    XrCompositionLayerQuad dimmer;
     XrCompositionLayerQuad glow;
     // The glow's shape round a curved picture, in the quad's place
     XrCompositionLayerCylinderKHR glowCylinder;
@@ -84,6 +85,7 @@ typedef struct {
     XrCompositionLayerQuad overlay;
     XrCompositionLayerQuad transport;
     XrCompositionLayerCylinderKHR transportCylinder;
+    XrCompositionLayerQuad palette;
     XrCompositionLayerQuad handle;
     XrCompositionLayerQuad envButton;
     XrCompositionLayerQuad cogButton;
@@ -375,6 +377,36 @@ static void addRoomLayer(XrCtx* ctx, const FrameView* view, FrameLayers* layers)
     }
 }
 
+// depth3d G2: passthrough dimmer ("调暗" environment), mutually exclusive with
+// the 3D room layer and occupying its single §6.5 background slot.
+static void addDimmerLayer(XrCtx* ctx, const FrameView* view, FrameLayers* layers) {
+    if (!view->roomOn && ctx->passthrough && ctx->passthroughDim
+            && ctx->dimmerArtReady && ctx->dimmerSwapchain != XR_NULL_HANDLE) {
+        XrPosef pose;
+        memset(&pose, 0, sizeof(pose));
+        pose.orientation.w = 1.0f;
+        pose.position.z = -1.5f;
+        quadLayer(&layers->dimmer, NULL, XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+                  ctx->dimmerSwapchain, DIMMER_TEX, DIMMER_TEX, ctx->viewSpace, pose,
+                  6.0f, 6.0f);
+        pushLayer(ctx, layers, &layers->dimmer);
+    }
+}
+
+// depth3d G2: single-quad VR Quick Palette layer (1024x768 -> 20x15 cm, §6.3 & §6.5).
+static void addPaletteLayer(XrCtx* ctx, const FrameView* view, FrameLayers* layers) {
+    if (!paletteShowLayer(ctx->localMedia, ctx->palettePose.visible,
+                          ctx->paletteArtReady, ctx->palettePose.alpha)
+            || ctx->paletteSwapchain == XR_NULL_HANDLE) {
+        return;
+    }
+    const void* next = fadeNext(ctx, layers, FADE_SLOT_PALETTE, 1, ctx->palettePose.alpha);
+    quadLayer(&layers->palette, next, XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+              ctx->paletteSwapchain, PALETTE_TEX_W, PALETTE_TEX_H, view->space,
+              ctx->palettePose.pose, PALETTE_W_M, PALETTE_H_M);
+    pushLayer(ctx, layers, &layers->palette);
+}
+
 // The ambilight glow behind the picture
 static void addGlowLayer(XrCtx* ctx, const FrameView* view, FrameLayers* layers) {
     // The glow, over the environment and under the picture. Deliberately not
@@ -582,7 +614,7 @@ static void addHandleLayer(XrCtx* ctx, const FrameView* view, FrameLayers* layer
     // never goes up in a room, where the wall holds the picture, though the
     // buttons beside it still come up on the same hover; the corners go up
     // in a room that lets its picture be resized, and nowhere else in one.
-    int isBar = view->barArea && !view->roomOn;
+    int isBar = view->barArea && !view->roomOn && !ctx->localMedia;
     int isCorner = !view->barArea && !(ctx->localMedia && ctx->screenAdjustActive)
             && ctx->hoverKind == HOVER_CORNER && cornerSide(ctx) > 0.0f;
     if (ctx->handleArtReady && (isBar || isCorner)) {
@@ -709,6 +741,9 @@ static int panelButton(XrCtx* ctx, const FrameView* view, FrameLayers* layers, i
 
 // The environment, settings, keyboard and exit buttons beside the move bar
 static void addBarButtonLayers(XrCtx* ctx, const FrameView* view, FrameLayers* layers) {
+    if (ctx->localMedia) {
+        return;
+    }
     const void* next = NULL;
     // The button that opens the environment grid, left of the move bar.
     // Stays up while the grid is open so it reads as the thing that
@@ -1316,7 +1351,8 @@ static int splashWaiting(XrCtx* ctx) {
             && !(ctx->roomRendered && ctx->roomBuiltStyle == style)) {
         waiting |= SPLASH_WAIT_ROOM;
     }
-    if (ctx->stereoMode == DEPTH_MODE_MODEL
+    if (ctx->stereoMode == DEPTH_MODE_MODEL && ctx->stereoLive
+            && ctx->stereoSourceFormat == STEREO_SRC_AUTO
             && atomic_load_explicit(&ctx->depthMapsStaged, memory_order_relaxed) == 0
             && !atomic_load_explicit(&ctx->depthGaveUp, memory_order_relaxed)) {
         waiting |= SPLASH_WAIT_DEPTH;
@@ -1579,6 +1615,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
     // nothing else goes up with it
     if (!splashUp) {
         addRoomLayer(ctx, &view, &layers);
+        addDimmerLayer(ctx, &view, &layers);
         addGlowLayer(ctx, &view, &layers);
     }
     if (!splashUp && ctx->everRendered && ctx->shouldRender) {
@@ -1593,6 +1630,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
         addReportLayer(ctx, &view, &layers);
         addHandHintLayers(ctx, &view, &layers);
         addKeyboardLayers(ctx, &view, &layers);
+        addPaletteLayer(ctx, &view, &layers);
         addModelLayer(ctx, &layers);
         addPointerLayers(ctx, &view, &layers);
     }
