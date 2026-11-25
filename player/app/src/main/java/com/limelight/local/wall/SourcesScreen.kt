@@ -68,6 +68,7 @@ import com.limelight.local.stream.DiscoveredLanService
 import com.limelight.local.stream.NsdServiceBrowser
 import com.limelight.local.stream.PhoneInputServer
 import com.limelight.local.stream.UdpDiscoveryProtocol
+import com.limelight.local.stream.UdpDiscoveryWindow
 import com.limelight.local.stream.UdpLanServerDiscovery
 import com.limelight.local.stream.UserFacingError
 import kotlinx.coroutines.CancellationException
@@ -475,42 +476,39 @@ fun AddSourceScreen(model: WallModel, nav: WallNav) {
         }
     }
 
-    // Host-side UDP 7359 broadcast probe for Jellyfin/Emby (#8/#10):
-    // Re-probes every 5s while on AddSourceScreen, cancels & closes socket immediately on exit,
-    // and catches any non-cancellation error so the discovery effect never crashes.
+    // Host-side UDP 7359 broadcast probe for Jellyfin/Emby:
+    // Re-probes on a 5s cadence measured from round start while on AddSourceScreen, evicts servers
+    // missing for 2 consecutive rounds via UdpDiscoveryWindow, cancels & closes socket immediately
+    // on exit, and catches non-cancellation errors so the discovery effect never crashes.
     val udpProtocolsKey = remember(udpProtocolToPlugin) { udpProtocolToPlugin.keys.toList() }
     LaunchedEffect(udpProtocolsKey, rescanToken) {
         discoveredUdpServices.clear()
         for (proto in udpProtocolsKey) {
             launch {
-                val merged = LinkedHashMap<String, DiscoveredLanService>()
+                val window = UdpDiscoveryWindow()
+                var roundId = 0
                 while (isActive) {
+                    val currentRound = ++roundId
+                    val roundStartMs = System.currentTimeMillis()
                     try {
                         val found = UdpLanServerDiscovery.discover(
                             protocol = proto,
                             onFound = { partial ->
                                 launch(Dispatchers.Main.immediate) {
-                                    for (svc in partial) {
-                                        if (merged.size < UdpLanServerDiscovery.MAX_DISCOVERED_SERVERS || svc.endpointKey in merged) {
-                                            merged[svc.endpointKey] = svc
-                                        }
-                                    }
-                                    discoveredUdpServices[proto] = merged.values.toList()
+                                    discoveredUdpServices[proto] = window.onPartial(currentRound, partial)
                                 }
                             },
                         )
-                        for (svc in found) {
-                            if (merged.size < UdpLanServerDiscovery.MAX_DISCOVERED_SERVERS || svc.endpointKey in merged) {
-                                merged[svc.endpointKey] = svc
-                            }
-                        }
-                        discoveredUdpServices[proto] = merged.values.toList()
+                        discoveredUdpServices[proto] = window.onRoundComplete(currentRound, found)
                     } catch (e: CancellationException) {
                         throw e
                     } catch (_: Exception) {
                         // Keep previously discovered items and retry next cycle
                     }
-                    delay(UdpLanServerDiscovery.REPROBE_INTERVAL_MS)
+                    val waitMs = UdpDiscoveryWindow.nextDelayMs(roundStartMs, System.currentTimeMillis())
+                    if (waitMs > 0L) {
+                        delay(waitMs)
+                    }
                 }
             }
         }

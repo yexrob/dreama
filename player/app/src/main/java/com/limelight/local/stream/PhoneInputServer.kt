@@ -154,6 +154,8 @@ class PhoneInputServer(
     }
 
     private val closed = AtomicBoolean(false)
+    private val lockedOut = AtomicBoolean(false)
+    private val shutdownFinalized = AtomicBoolean(false)
     private val failedAttempts = AtomicInteger(0)
     private val concurrencyGate = Semaphore(MAX_CONCURRENT_CONNECTIONS)
     private val activeReaders = ConcurrentLinkedDeque<Socket>()
@@ -175,6 +177,9 @@ class PhoneInputServer(
     val isClosed: Boolean
         get() = closed.get()
 
+    val isLockedOut: Boolean
+        get() = lockedOut.get()
+
     /** Short URL displayed to the user if they choose to type it manually + enter the 4-digit code. */
     val shortUrl: String
         get() = "http://${HttpHostProtocolClient.formatAuthorityHost(displayHost)}:$boundPort"
@@ -194,11 +199,21 @@ class PhoneInputServer(
     }
 
     override fun close() {
-        if (!closed.compareAndSet(false, true)) return
+        stopAccepting()
+        finalizeShutdown()
+    }
+
+    private fun stopAccepting() {
+        closed.set(true)
         try {
             serverSocket?.close()
         } catch (_: Exception) {
         }
+        acceptThread?.interrupt()
+    }
+
+    private fun finalizeShutdown() {
+        if (!shutdownFinalized.compareAndSet(false, true)) return
         while (true) {
             val s = activeReaders.pollFirst() ?: break
             try {
@@ -206,7 +221,6 @@ class PhoneInputServer(
             } catch (_: Exception) {
             }
         }
-        acceptThread?.interrupt()
         workers.shutdownNow()
     }
 
@@ -336,13 +350,25 @@ class PhoneInputServer(
                     else -> false
                 }
 
+                if (lockedOut.get()) {
+                    writeHtml(out, 403, "Forbidden", renderFormHtml(hiddenToken = null, error = copy.errLockedOut))
+                    return
+                }
+
                 if (!authorized) {
                     val tries = failedAttempts.incrementAndGet()
                     if (tries >= MAX_FAILED_ATTEMPTS) {
                         LimeLog.warning("depth3d: phone input locked out after $tries failed attempts")
-                        writeHtml(out, 403, "Forbidden", renderFormHtml(hiddenToken = null, error = copy.errLockedOut))
-                        close()
-                        onLockedOut()
+                        val firstLockout = lockedOut.compareAndSet(false, true)
+                        stopAccepting()
+                        if (firstLockout) {
+                            runCatching { onLockedOut() }
+                        }
+                        try {
+                            writeHtml(out, 403, "Forbidden", renderFormHtml(hiddenToken = null, error = copy.errLockedOut))
+                        } finally {
+                            finalizeShutdown()
+                        }
                     } else {
                         writeHtml(out, 403, "Forbidden", renderFormHtml(hiddenToken = null, error = copy.errWrongCode))
                     }
@@ -631,6 +657,8 @@ class PhoneFormServer(
     private val onSubmitted: (Map<String, String>) -> PhoneSubmitResult,
 ) : Closeable {
     private val closed = AtomicBoolean(false)
+    private val lockedOut = AtomicBoolean(false)
+    private val shutdownFinalized = AtomicBoolean(false)
     private val failedAttempts = AtomicInteger(0)
     private val submissionInProgress = AtomicBoolean(false)
     private val submissionAccepted = AtomicBoolean(false)
@@ -647,6 +675,7 @@ class PhoneFormServer(
     val verificationCode: String get() = code
     val token: String get() = qrToken
     val isClosed: Boolean get() = closed.get()
+    val isLockedOut: Boolean get() = lockedOut.get()
 
     val shortUrl: String
         get() = "http://${HttpHostProtocolClient.formatAuthorityHost(displayHost)}:$boundPort"
@@ -665,11 +694,21 @@ class PhoneFormServer(
     }
 
     override fun close() {
-        if (!closed.compareAndSet(false, true)) return
+        stopAccepting()
+        finalizeShutdown()
+    }
+
+    private fun stopAccepting() {
+        closed.set(true)
         try {
             serverSocket?.close()
         } catch (_: Exception) {
         }
+        acceptThread?.interrupt()
+    }
+
+    private fun finalizeShutdown() {
+        if (!shutdownFinalized.compareAndSet(false, true)) return
         while (true) {
             val s = activeReaders.pollFirst() ?: break
             try {
@@ -677,7 +716,6 @@ class PhoneFormServer(
             } catch (_: Exception) {
             }
         }
-        acceptThread?.interrupt()
         workers.shutdownNow()
     }
 
@@ -834,13 +872,27 @@ class PhoneFormServer(
                     }
                 }
 
+                if (lockedOut.get()) {
+                    writeHtml(out, 403, "Forbidden", renderFormHtml(hiddenToken = null, preserved = emptyMap(), error = copy.errLockedOut))
+                    return
+                }
+
                 if (!authorized) {
                     val tries = failedAttempts.incrementAndGet()
                     if (tries >= PhoneInputServer.MAX_FAILED_ATTEMPTS) {
                         LimeLog.warning("depth3d: phone form locked out after $tries failed attempts")
-                        writeHtml(out, 403, "Forbidden", renderFormHtml(hiddenToken = null, preserved = emptyMap(), error = copy.errLockedOut))
-                        close()
-                        onLockedOut()
+                        val firstLockout = lockedOut.compareAndSet(false, true)
+                        // Mark locked/closed and invoke onLockedOut BEFORE writing the 5th 403 response
+                        // so the response is still delivered cleanly AND callers observe locked/closed immediately (#3).
+                        stopAccepting()
+                        if (firstLockout) {
+                            runCatching { onLockedOut() }
+                        }
+                        try {
+                            writeHtml(out, 403, "Forbidden", renderFormHtml(hiddenToken = null, preserved = emptyMap(), error = copy.errLockedOut))
+                        } finally {
+                            finalizeShutdown()
+                        }
                     } else {
                         writeHtml(out, 403, "Forbidden", renderFormHtml(hiddenToken = null, preserved = safeNonSecret, error = copy.errWrongCode))
                     }

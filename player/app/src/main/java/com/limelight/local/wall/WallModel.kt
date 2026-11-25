@@ -43,7 +43,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import java.util.concurrent.ConcurrentHashMap
 
 sealed interface Load<out T> {
     data object Loading : Load<Nothing>
@@ -92,11 +91,6 @@ class WallModel(app: Application) : AndroidViewModel(app) {
     val pluginRepos: StateFlow<List<PluginRepoEntity>> get() = _pluginRepos
 
     val shelves = mutableStateMapOf<String, Load<List<Shelf>>>()
-    private val knownParentIds = ConcurrentHashMap<Pair<String, String>, String>()
-
-    fun recordParentId(sourceId: String, itemId: String, parentId: String?) {
-        knownParentIds[sourceId to itemId] = parentId.orEmpty()
-    }
 
     fun knownParentIdsForSource(sourceId: String): Map<String, String?> {
         val out = HashMap<String, String?>()
@@ -106,11 +100,6 @@ class WallModel(app: Application) : AndroidViewModel(app) {
                 if (!item.parentId.isNullOrBlank()) {
                     out[item.id] = item.parentId
                 }
-            }
-        }
-        for ((key, parent) in knownParentIds) {
-            if (key.first == sourceId) {
-                out[key.second] = parent.ifEmpty { null }
             }
         }
         return out
@@ -388,12 +377,18 @@ object ContinueWatchingResolver {
         val states = Array<EntryState>(candidates.size) { idx ->
             val (src, p) = candidates[idx]
             val cached = cachedItems[p.sourceId to p.itemId]
-            val initialItem = cached ?: Item(
-                id = p.itemId,
-                kind = ItemKind.VIDEO,
-                title = p.title.ifBlank { p.itemId },
-                durationMs = p.durationMs.takeIf { it > 0L },
-            )
+            val initialItem = when {
+                cached != null && cached.parentId.isNullOrBlank() && !p.parentId.isNullOrBlank() ->
+                    cached.copy(parentId = p.parentId)
+                cached != null -> cached
+                else -> Item(
+                    id = p.itemId,
+                    kind = ItemKind.VIDEO,
+                    title = p.title.ifBlank { p.itemId },
+                    durationMs = p.durationMs.takeIf { it > 0L },
+                    parentId = p.parentId,
+                )
+            }
             EntryState.Pending(Resume(src, initialItem, p))
         }
 
@@ -461,10 +456,19 @@ object ContinueWatchingResolver {
                             runForSource(src.source.kind) { src.detail(p.itemId) }
                         }
                         if (detailed != null) {
-                            EntryState.Resolved(Resume(src, detailed, p))
+                            val mergedDetail = if (detailed.parentId.isNullOrBlank() && !p.parentId.isNullOrBlank()) {
+                                detailed.copy(parentId = p.parentId)
+                            } else {
+                                detailed
+                            }
+                            EntryState.Resolved(Resume(src, mergedDetail, p))
                         } else {
                             val prev = (states[idx] as? EntryState.Pending)?.resume
-                                ?: Resume(src, Item(p.itemId, ItemKind.VIDEO, p.title.ifBlank { p.itemId }), p)
+                                ?: Resume(
+                                    src,
+                                    Item(p.itemId, ItemKind.VIDEO, p.title.ifBlank { p.itemId }, parentId = p.parentId),
+                                    p,
+                                )
                             EntryState.Fallback(prev)
                         }
                     } catch (e: CancellationException) {
@@ -474,7 +478,11 @@ object ContinueWatchingResolver {
                         EntryState.Dropped
                     } catch (_: Exception) {
                         val prev = (states[idx] as? EntryState.Pending)?.resume
-                            ?: Resume(src, Item(p.itemId, ItemKind.VIDEO, p.title.ifBlank { p.itemId }), p)
+                            ?: Resume(
+                                src,
+                                Item(p.itemId, ItemKind.VIDEO, p.title.ifBlank { p.itemId }, parentId = p.parentId),
+                                p,
+                            )
                         EntryState.Fallback(prev)
                     }
 

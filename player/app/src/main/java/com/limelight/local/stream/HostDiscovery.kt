@@ -232,6 +232,7 @@ class NsdServiceBrowser(
     private val deduplicateKey: (DiscoveredLanService) -> String = { it.endpointKey },
     private val logTag: String = "plugin mDNS",
     private val onServicesChanged: ((List<DiscoveredLanService>) -> Unit)? = null,
+    private val onEndpointResolved: ((DiscoveredLanService) -> Unit)? = null,
 ) {
     val serviceType: String = normalizeServiceType(rawServiceType)
 
@@ -474,6 +475,7 @@ class NsdServiceBrowser(
             newKey = registry.put(rawName, addr, port, svc)
             publishLocked()
         }
+        onEndpointResolved?.invoke(svc)
         return newKey
     }
 
@@ -537,6 +539,13 @@ class HostDiscovery(context: Context) {
                 DiscoveredHost.fromTxt(svc.serviceName, svc.address, svc.port, svc.txt)
             }
             _hosts.value = deduplicateEndpoints(mapped)
+        },
+        onEndpointResolved = { svc ->
+            DiscoveredHost.fromTxt(svc.serviceName, svc.address, svc.port, svc.txt)?.let { host ->
+                LimeLog.info(
+                    "depth3d: host mDNS resolved ${host.name} at ${host.address}:${host.controlPort} (gs=${host.gsPort}, pair=${host.pairMode})",
+                )
+            }
         },
     )
 
@@ -809,5 +818,82 @@ object UdpLanServerDiscovery {
             out += limited
         }
         return out
+    }
+}
+
+/**
+ * Pure state tracker for periodic UDP LAN discovery rounds:
+ * - Accepts incremental partial updates during an active round via [onPartial] (capped at [maxEntries]).
+ * - Finalizes each round via [onRoundComplete]: entries missing for [evictAfterConsecutiveMisses]
+ *   consecutive rounds (default 2) are evicted BEFORE adding newly discovered servers so offline
+ *   hosts never stay stuck or consume the 32-server cap.
+ * - Computes remaining sleep delay via [nextDelayMs] so re-probes maintain a fixed cadence measured
+ *   from the START of each round (default 5s) instead of `probeDuration + 5s`.
+ */
+class UdpDiscoveryWindow(
+    private val maxEntries: Int = UdpLanServerDiscovery.MAX_DISCOVERED_SERVERS,
+    private val evictAfterConsecutiveMisses: Int = DEFAULT_EVICT_AFTER_MISSES,
+) {
+    private data class Tracked(val service: DiscoveredLanService, val consecutiveMisses: Int)
+
+    private val entries = LinkedHashMap<String, Tracked>()
+    private var completedRoundId = 0
+
+    @Synchronized
+    fun onPartial(roundId: Int, partial: List<DiscoveredLanService>): List<DiscoveredLanService> {
+        if (roundId <= completedRoundId) return snapshotLocked()
+        for (svc in partial) {
+            val key = svc.endpointKey
+            if (key in entries || entries.size < maxEntries) {
+                entries[key] = Tracked(svc, consecutiveMisses = 0)
+            }
+        }
+        return snapshotLocked()
+    }
+
+    @Synchronized
+    fun onRoundComplete(roundId: Int, foundInRound: List<DiscoveredLanService>): List<DiscoveredLanService> {
+        if (roundId > completedRoundId) {
+            completedRoundId = roundId
+        }
+        val seenKeys = LinkedHashSet<String>(foundInRound.size)
+        for (svc in foundInRound) {
+            seenKeys += svc.endpointKey
+        }
+        // Evict stale entries FIRST so newly discovered servers can reclaim freed slots up to maxEntries.
+        val iter = entries.entries.iterator()
+        while (iter.hasNext()) {
+            val entry = iter.next()
+            if (entry.key !in seenKeys) {
+                val misses = entry.value.consecutiveMisses + 1
+                if (misses >= evictAfterConsecutiveMisses) {
+                    iter.remove()
+                } else {
+                    entry.setValue(entry.value.copy(consecutiveMisses = misses))
+                }
+            }
+        }
+        for (svc in foundInRound) {
+            val key = svc.endpointKey
+            if (key in entries || entries.size < maxEntries) {
+                entries[key] = Tracked(svc, consecutiveMisses = 0)
+            }
+        }
+        return snapshotLocked()
+    }
+
+    @Synchronized
+    fun snapshot(): List<DiscoveredLanService> = snapshotLocked()
+
+    private fun snapshotLocked(): List<DiscoveredLanService> = entries.values.map { it.service }
+
+    companion object {
+        const val DEFAULT_EVICT_AFTER_MISSES = 2
+
+        fun nextDelayMs(
+            roundStartMs: Long,
+            nowMs: Long,
+            intervalMs: Long = UdpLanServerDiscovery.REPROBE_INTERVAL_MS,
+        ): Long = (intervalMs - (nowMs - roundStartMs)).coerceAtLeast(0L)
     }
 }

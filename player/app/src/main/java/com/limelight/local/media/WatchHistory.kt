@@ -7,6 +7,7 @@ import androidx.room.Entity
 import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.Transaction
 import androidx.room.Upsert
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
@@ -64,7 +65,19 @@ interface WatchProgressDao {
     fun observe(sourceId: String, itemId: String): Flow<WatchProgress?>
 
     @Upsert
-    suspend fun upsert(progress: WatchProgress)
+    suspend fun upsertRow(progress: WatchProgress)
+
+    /**
+     * Atomically upserts [progress] while preserving any previously stored non-null `parentId`
+     * when the incoming write carries a null/blank `parentId` (COALESCE semantics inside a Room
+     * transaction, compatible with all `minSdk 23+` SQLite versions).
+     */
+    @Transaction
+    suspend fun upsert(progress: WatchProgress) {
+        val cleanNew = progress.parentId?.trim()?.takeIf { it.isNotEmpty() }
+        val effectiveParentId = cleanNew ?: get(progress.sourceId, progress.itemId)?.parentId
+        upsertRow(progress.copy(parentId = effectiveParentId))
+    }
 
     @Query("DELETE FROM watch_progress WHERE sourceId = :sourceId AND itemId = :itemId")
     suspend fun delete(sourceId: String, itemId: String)
