@@ -142,6 +142,20 @@ function image(value) {
   return { url, headers: { Referer: REFERER } };
 }
 
+// The wall keys each row and card by item id, so the same id twice in one
+// response crashes its list. Bilibili does return duplicates (search results,
+// multi-page feeds), so every list handed to the host is deduplicated.
+function uniqueById(items) {
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    if (!item || !item.id || seen.has(item.id)) continue;
+    seen.add(item.id);
+    out.push(item);
+  }
+  return out;
+}
+
 function formatCount(value) {
   const n = Number(value) || 0;
   if (n >= 100000000) return `${(n / 100000000).toFixed(1).replace(/\.0$/, '')}亿`;
@@ -440,7 +454,7 @@ function mapVideoDetail(ctx, view) {
 
   if (view.pages.length > 1) {
     item.childCount = view.pages.length;
-    item.episodes = view.pages.map((p) => ({
+    item.episodes = uniqueById(view.pages.map((p) => ({
       id: `v:${view.bvid}:${p.page}`,
       kind: 'episode',
       title: p.part ? `P${p.page} · ${p.part}` : `P${p.page}`,
@@ -449,10 +463,10 @@ function mapVideoDetail(ctx, view) {
       durationMs: p.durationMs || undefined,
       parentId: `v:${view.bvid}`,
       index: p.page,
-    }));
+    })));
   } else if (view.seasonEpisodes.length > 0) {
     item.childCount = view.seasonEpisodes.length;
-    item.episodes = view.seasonEpisodes.map((e, i) => ({
+    item.episodes = uniqueById(view.seasonEpisodes.map((e, i) => ({
       id: e.id,
       kind: 'episode',
       title: e.title,
@@ -461,7 +475,7 @@ function mapVideoDetail(ctx, view) {
       durationMs: e.durationMs || undefined,
       parentId: `v:${view.bvid}`,
       index: i + 1,
-    }));
+    })));
   }
 
   if (view.owner) {
@@ -538,7 +552,7 @@ function mapPgcDetail(season, kind, requestedId) {
     item.childCount = season.seasons.length > 0 ? season.seasons.length : 1;
     item.seasons =
       season.seasons.length > 0
-        ? season.seasons.map((s) => mapPgcSeasonSummary(s))
+        ? uniqueById(season.seasons.map((s) => mapPgcSeasonSummary(s)))
         : [
             {
               id: `sg:${season.seasonId}`,
@@ -549,7 +563,7 @@ function mapPgcDetail(season, kind, requestedId) {
           ];
   } else {
     item.childCount = season.episodes.length;
-    item.episodes = season.episodes.map((ep) => mapPgcEpisode(season, ep));
+    item.episodes = uniqueById(season.episodes.map((ep) => mapPgcEpisode(season, ep)));
   }
 
   const extra = [];
@@ -899,10 +913,24 @@ function mapHistoryItem(raw) {
   return item;
 }
 
-async function recommendShelf(ctx) {
+// Slices an already-fetched list by an offset cursor. Used for endpoints that
+// return their whole result set in one response (rankings), so the wall's
+// infinite scroll can keep appending pages out of a cached list.
+function slicePage(items, cursor) {
+  const offset = cursor ? Math.max(0, parseInt(cursor, 10) || 0) : 0;
+  const slice = items.slice(offset, offset + PAGE_SIZE);
+  const nextOffset = offset + slice.length;
+  return { slice, next: nextOffset < items.length ? String(nextOffset) : null };
+}
+
+// The recommendation feed pages by `fresh_idx`: each index returns a fresh batch
+// of ~20 items (verified against the live API), which maps directly onto an
+// opaque cursor for the wall's endless scroll.
+async function recommendPage(ctx, cursor) {
+  const freshIdx = cursor ? Math.max(1, parseInt(cursor, 10) || 1) : 1;
   const j = await requestJson(
     ctx,
-    `${API}/x/web-interface/index/top/feed/rcmd?ps=20&fresh_idx=1&fresh_type=3`,
+    `${API}/x/web-interface/index/top/feed/rcmd?ps=${PAGE_SIZE}&fresh_idx=${freshIdx}&fresh_type=3`,
   );
   if (j.code !== 0) mapApiCode(ctx, j.code, j.message);
   const list = Array.isArray(j.data && j.data.item) ? j.data.item : [];
@@ -912,7 +940,8 @@ async function recommendShelf(ctx) {
     const item = mapArchiveItem(ctx, raw);
     if (item) items.push(item);
   }
-  return items;
+  const hasNext = items.length > 0 && freshIdx < 50 && list.length >= PAGE_SIZE;
+  return { items: uniqueById(items), next: hasNext ? String(freshIdx + 1) : null };
 }
 
 async function popularPage(ctx, cursor) {
@@ -930,55 +959,72 @@ async function popularPage(ctx, cursor) {
   }
   const noMore = Boolean(j.data && j.data.no_more);
   return {
-    items,
+    items: uniqueById(items),
     next: noMore || list.length < PAGE_SIZE ? null : String(pn + 1),
   };
 }
 
-async function rankingShelf(ctx) {
-  const j = await requestJson(
-    ctx,
-    `${API}/x/web-interface/ranking/v2?rid=0&type=all`,
-  );
+// ranking/v2 returns the whole chart (~100 entries) with no paging parameter.
+async function rankingList(ctx) {
+  const key = 'ranking:all';
+  const hit = cacheGet(key);
+  if (hit) return hit;
+  const j = await requestJson(ctx, `${API}/x/web-interface/ranking/v2?rid=0&type=all`);
   if (j.code !== 0) mapApiCode(ctx, j.code, j.message);
   const list = Array.isArray(j.data && j.data.list) ? j.data.list : [];
-  const items = [];
-  for (const raw of list) {
-    const item = mapArchiveItem(ctx, raw);
-    if (item) items.push(item);
-    if (items.length >= 30) break;
-  }
-  return items;
+  cacheSet(key, list, FAV_TTL_MS);
+  return list;
 }
 
-async function pgcRankShelf(ctx, seasonType) {
+async function rankingPage(ctx, cursor) {
+  const list = await rankingList(ctx);
+  const { slice, next } = slicePage(list, cursor);
+  const items = [];
+  for (const raw of slice) {
+    const item = mapArchiveItem(ctx, raw);
+    if (item) items.push(item);
+  }
+  return { items: uniqueById(items), next };
+}
+
+// pgc/web/rank/list also returns the whole chart (番剧 ~100, 影视 ~48 entries).
+async function pgcRankList(ctx, seasonType) {
+  const key = `pgcrank:${seasonType}`;
+  const hit = cacheGet(key);
+  if (hit) return hit;
   const j = await requestJson(
     ctx,
     `${API}/pgc/web/rank/list?day=3&season_type=${seasonType}`,
   );
   if (j.code !== 0) mapApiCode(ctx, j.code, j.message);
   const list = Array.isArray(j.result && j.result.list) ? j.result.list : [];
-  return list
-    .map((raw) => {
-      const seasonId = Number(raw.season_id);
-      if (!seasonId) return null;
-      const item = {
-        id: `ss:${seasonId}`,
-        kind: 'series',
-        title: cleanText(raw.title) || `番剧 ${seasonId}`,
-      };
-      const sub = [];
-      if (raw.badge) sub.push(cleanText(raw.badge));
-      if (raw.new_ep && raw.new_ep.index_show) sub.push(cleanText(raw.new_ep.index_show));
-      if (sub.length > 0) item.subtitle = sub.join(' · ');
-      if (raw.cover) item.poster = image(raw.cover);
-      const score = parseFloat(String(raw.rating || '').replace(/[^\d.]/g, ''));
-      if (Number.isFinite(score) && score > 0) item.rating = score;
-      if (raw.badge) item.badges = [cleanText(raw.badge)];
-      return item;
-    })
-    .filter(Boolean)
-    .slice(0, 30);
+  cacheSet(key, list, FAV_TTL_MS);
+  return list;
+}
+
+async function pgcRankPage(ctx, seasonType, cursor) {
+  const list = await pgcRankList(ctx, seasonType);
+  const { slice, next } = slicePage(list, cursor);
+  const items = [];
+  for (const raw of slice) {
+    const seasonId = Number(raw && raw.season_id);
+    if (!seasonId) continue;
+    const item = {
+      id: `ss:${seasonId}`,
+      kind: 'series',
+      title: cleanText(raw.title) || `番剧 ${seasonId}`,
+    };
+    const sub = [];
+    if (raw.badge) sub.push(cleanText(raw.badge));
+    if (raw.new_ep && raw.new_ep.index_show) sub.push(cleanText(raw.new_ep.index_show));
+    if (sub.length > 0) item.subtitle = sub.join(' · ');
+    if (raw.cover) item.poster = image(raw.cover);
+    const score = parseFloat(String(raw.rating || '').replace(/[^\d.]/g, ''));
+    if (Number.isFinite(score) && score > 0) item.rating = score;
+    if (raw.badge) item.badges = [cleanText(raw.badge)];
+    items.push(item);
+  }
+  return { items: uniqueById(items), next };
 }
 
 async function regionPage(ctx, ridText, cursor) {
@@ -997,7 +1043,7 @@ async function regionPage(ctx, ridText, cursor) {
     if (item) items.push(item);
   }
   return {
-    items,
+    items: uniqueById(items),
     next: list.length < PAGE_SIZE ? null : String(pn + 1),
   };
 }
@@ -1027,7 +1073,7 @@ async function historyPage(ctx, cursor) {
     const candidate = `${j.data.cursor.max}:${j.data.cursor.view_at}`;
     if (candidate !== cursor) next = candidate;
   }
-  return { items, next };
+  return { items: uniqueById(items), next };
 }
 
 async function favFolderList(ctx) {
@@ -1051,18 +1097,17 @@ async function favFolderList(ctx) {
   return folders;
 }
 
-async function favFoldersPage(ctx) {
+async function favFoldersPage(ctx, cursor) {
   const folders = await favFolderList(ctx);
-  return {
-    items: folders.map((f) => ({
-      id: `fav:${f.id}`,
-      kind: 'folder',
-      title: f.title,
-      subtitle: `${f.count} 个视频`,
-      childCount: f.count,
-    })),
-    next: null,
-  };
+  const mapped = folders.map((f) => ({
+    id: `fav:${f.id}`,
+    kind: 'folder',
+    title: f.title,
+    subtitle: `${f.count} 个视频`,
+    childCount: f.count,
+  }));
+  const { slice, next } = slicePage(mapped, cursor);
+  return { items: uniqueById(slice), next };
 }
 
 function mapFavMedia(raw) {
@@ -1106,7 +1151,7 @@ async function favItemsPage(ctx, mediaId, cursor) {
     if (item) items.push(item);
   }
   return {
-    items,
+    items: uniqueById(items),
     next: j.data && j.data.has_more ? String(pn + 1) : null,
   };
 }
@@ -1340,10 +1385,51 @@ function buildPlayback(ctx, data, meta, quality) {
 /* login helpers                                                       */
 /* ------------------------------------------------------------------ */
 
+// The host renders QR codes with a byte-mode, ECC-L encoder limited to QR
+// versions 1..6, i.e. 134 payload bytes (QrCodeMatrix.kt), and throws on longer
+// input. Bilibili's login URL is ~145 bytes with its analytics parameters, so
+// the payload is trimmed to what the confirm page actually needs:
+// `qrcode_key` is the only functional parameter; `navhide`, `callback` and
+// `from` only affect the H5 page chrome and analytics.
+const QR_MAX_BYTES = 134;
+const QR_BASE = 'https://account.bilibili.com/h5/account-h5/auth/scan-web';
+
+function utf8ByteLength(text) {
+  const s = String(text || '');
+  let bytes = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) bytes += 1;
+    else if (c < 0x800) bytes += 2;
+    else if (c >= 0xd800 && c <= 0xdbff) {
+      bytes += 4;
+      i++;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+function fitQrPayload(ctx, url, qrcodeKey) {
+  const full = String(url || '');
+  const candidates = [
+    full,
+    full.replace(/&from=[^&]*/i, ''),
+    full.replace(/&from=[^&]*/i, '').replace(/&callback=[^&]*/i, ''),
+    full
+      .replace(/&from=[^&]*/i, '')
+      .replace(/&callback=[^&]*/i, '')
+      .replace(/&navhide=[^&]*/i, ''),
+    `${QR_BASE}?qrcode_key=${encodeURIComponent(qrcodeKey)}`,
+  ];
+  for (const candidate of candidates) {
+    if (candidate && utf8ByteLength(candidate) <= QR_MAX_BYTES) return candidate;
+  }
+  throw new ctx.Error('Unavailable', ctx.t('err_qr_too_long'));
+}
+
 // Keep tokens byte-for-byte as the server wrote them: SESSDATA is already
 // cookie-encoded (%2C etc.) and must not be decoded before being sent back.
-function parseUrlParams(url) {
-  const out = {};
+function parseUrlParams(url) {  const out = {};
   const s = String(url || '');
   const q = s.indexOf('?');
   if (q < 0) return out;
@@ -1408,8 +1494,8 @@ export default {
       id: 'bili-recommend',
       title: ctx.t('shelf_recommend'),
       style: 'thumb',
-      more: 'popular',
-      load: () => recommendShelf(ctx),
+      more: 'recommend',
+      load: () => recommendPage(ctx, null).then((page) => page.items),
     });
     tasks.push({
       id: 'bili-popular',
@@ -1423,14 +1509,14 @@ export default {
       title: ctx.t('shelf_ranking'),
       style: 'poster',
       more: 'ranking',
-      load: () => rankingShelf(ctx),
+      load: () => rankingPage(ctx, null).then((page) => page.items),
     });
     tasks.push({
       id: 'bili-bangumi',
       title: ctx.t('shelf_bangumi'),
       style: 'poster',
       more: 'bangumi',
-      load: () => pgcRankShelf(ctx, 1),
+      load: () => pgcRankPage(ctx, 1, null).then((page) => page.items),
     });
 
     const settled = await Promise.allSettled(tasks.map((t) => t.load()));
@@ -1442,7 +1528,7 @@ export default {
       const task = tasks[i];
       if (result.status === 'fulfilled') {
         if (Array.isArray(result.value) && result.value.length > 0) {
-          const shelf = { id: task.id, title: task.title, items: result.value };
+          const shelf = { id: task.id, title: task.title, items: uniqueById(result.value) };
           if (task.style) shelf.style = task.style;
           if (task.more) shelf.more = task.more;
           shelves.push(shelf);
@@ -1461,7 +1547,7 @@ export default {
       id: 'bili-regions',
       title: ctx.t('shelf_regions'),
       style: 'category',
-      items: regionItems(),
+      items: uniqueById(regionItems()),
     });
 
     if (contentCount === 0 && firstError) throw firstError;
@@ -1471,6 +1557,7 @@ export default {
   async categories(ctx) {
     const session = await getSession(ctx);
     const list = [
+      { id: 'recommend', title: ctx.t('shelf_recommend'), icon: 'collection' },
       { id: 'popular', title: ctx.t('cat_popular'), icon: 'video' },
       { id: 'ranking', title: ctx.t('cat_ranking'), icon: 'collection' },
       { id: 'bangumi', title: ctx.t('cat_bangumi'), icon: 'tv' },
@@ -1490,22 +1577,24 @@ export default {
     const id = String(categoryId || '');
     if (!id) {
       return {
-        items: [
+        items: uniqueById([
+          { id: 'recommend', kind: 'folder', title: ctx.t('shelf_recommend') },
           { id: 'popular', kind: 'folder', title: ctx.t('cat_popular') },
           { id: 'ranking', kind: 'folder', title: ctx.t('cat_ranking') },
           { id: 'bangumi', kind: 'folder', title: ctx.t('cat_bangumi') },
           { id: 'movie', kind: 'folder', title: ctx.t('cat_movie') },
           ...regionItems(),
-        ],
+        ]),
         next: null,
       };
     }
+    if (id === 'recommend') return recommendPage(ctx, cursor);
     if (id === 'popular') return popularPage(ctx, cursor);
-    if (id === 'ranking') return { items: await rankingShelf(ctx), next: null };
-    if (id === 'bangumi') return { items: await pgcRankShelf(ctx, 1), next: null };
-    if (id === 'movie') return { items: await pgcRankShelf(ctx, 2), next: null };
+    if (id === 'ranking') return rankingPage(ctx, cursor);
+    if (id === 'bangumi') return pgcRankPage(ctx, 1, cursor);
+    if (id === 'movie') return pgcRankPage(ctx, 2, cursor);
     if (id === 'history') return historyPage(ctx, cursor);
-    if (id === 'favs') return favFoldersPage(ctx);
+    if (id === 'favs') return favFoldersPage(ctx, cursor);
     if (id.indexOf('fav:') === 0) return favItemsPage(ctx, id.slice(4), cursor);
     if (id.indexOf('region:') === 0) return regionPage(ctx, id.slice(7), cursor);
     throw new ctx.Error('NotFound', ctx.t('err_not_found'));
@@ -1548,7 +1637,7 @@ export default {
             if (r) related.push(r);
             if (related.length >= 8) break;
           }
-          if (related.length > 0) item.related = related;
+          if (related.length > 0) item.related = uniqueById(related);
         }
       } catch (err) {
         ctx.log.debug(`bilibili related videos unavailable: ${err.message || err}`);
@@ -1642,7 +1731,7 @@ export default {
       }
       const numPages = Number(data.numPages) || 0;
       const hasNext = numPages > page && page < MAX_SEARCH_PAGE;
-      return { items, next: hasNext ? String(page + 1) : null };
+      return { items: uniqueById(items), next: hasNext ? String(page + 1) : null };
     }
 
     const url = signedUrl(ctx, mixin, `${API}/x/web-interface/wbi/search/type`, {
@@ -1662,7 +1751,7 @@ export default {
     }
     const numPages = Number(data.numPages) || 0;
     const hasNext = numPages > page && page < MAX_SEARCH_PAGE;
-    return { items, next: hasNext ? String(page + 1) : null };
+    return { items: uniqueById(items), next: hasNext ? String(page + 1) : null };
   },
 
   async suggest(ctx, { query = '' } = {}) {
@@ -1769,7 +1858,7 @@ export default {
       throw new ctx.Error('Unavailable', ctx.t('err_unexpected'));
     }
     return {
-      qr: String(data.url),
+      qr: fitQrPayload(ctx, data.url, data.qrcode_key),
       hint: ctx.t('qr_hint'),
       expiresInSec: 180,
       state: String(data.qrcode_key),

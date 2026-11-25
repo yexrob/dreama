@@ -2,7 +2,7 @@
   "api": 1,
   "id": "dev.depth3d.bilibili",
   "name": "$t:plugin_name",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "author": "depth3d",
   "description": "$t:plugin_desc",
   "license": "GPL-3.0-or-later",
@@ -30,11 +30,26 @@
       "type": "select",
       "label": "$t:cfg_quality",
       "options": [
-        { "value": "auto", "label": "$t:q_auto" },
-        { "value": "1080", "label": "$t:q_1080" },
-        { "value": "720", "label": "$t:q_720" },
-        { "value": "480", "label": "$t:q_480" },
-        { "value": "360", "label": "$t:q_360" }
+        {
+          "value": "auto",
+          "label": "$t:q_auto"
+        },
+        {
+          "value": "1080",
+          "label": "$t:q_1080"
+        },
+        {
+          "value": "720",
+          "label": "$t:q_720"
+        },
+        {
+          "value": "480",
+          "label": "$t:q_480"
+        },
+        {
+          "value": "360",
+          "label": "$t:q_360"
+        }
       ],
       "default": "auto"
     }

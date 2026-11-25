@@ -815,6 +815,41 @@ test('jellyfin plugin passes static check and full real-recorded Jellyfin 12.4 R
 
 test('bilibili plugin passes static check and recorded anonymous + QR login flow (WBI, DASH, token privacy)', async () => {
   const ids = BILI_FIXTURES._meta.ids;
+  // Feed/list fixtures carry synthetic bvids that have no hand-written view fixture;
+  // synthesize one so detail()/playback() can be exercised for any of them.
+  const archiveByBvid = new Map();
+  for (const bucket of ['recommend', 'recommendMore', 'popular', 'ranking', 'newlist']) {
+    for (const raw of BILI_FIXTURES[bucket].data.item || BILI_FIXTURES[bucket].data.list ||
+      BILI_FIXTURES[bucket].data.archives || []) {
+      if (raw && raw.bvid) archiveByBvid.set(raw.bvid, raw);
+    }
+  }
+  const synthesizedView = (bvid) => {
+    const raw = archiveByBvid.get(bvid);
+    if (!raw) return null;
+    const cid = Number(raw.cid) || 770500;
+    return {
+      code: 0,
+      message: '0',
+      ttl: 1,
+      data: {
+        aid: Number(raw.aid) || 889000,
+        bvid,
+        cid,
+        videos: 1,
+        tid: Number(raw.tid) || 188,
+        tname: raw.tname || '科技',
+        pic: raw.pic || '',
+        title: raw.title || bvid,
+        pubdate: Number(raw.pubdate) || 1700000000,
+        desc: raw.desc || '',
+        duration: Number(raw.duration) || 600,
+        owner: raw.owner || { mid: 42, name: '测试UP主' },
+        stat: raw.stat || { view: 1, danmaku: 0, like: 0 },
+        pages: [{ cid, page: 1, from: 'vupload', part: '正片', duration: Number(raw.duration) || 600 }],
+      },
+    };
+  };
   const tokenPattern = /SESSDATA|fakecsrf|fake%2Csession/;
   const calls = [];
   const logs = [];
@@ -839,12 +874,15 @@ test('bilibili plugin passes static check and recorded anonymous + QR login flow
     if (p === '/x/web-interface/nav') {
       return json(authed ? BILI_FIXTURES.navLoggedIn : BILI_FIXTURES.navAnonymous);
     }
-    if (p === '/x/web-interface/index/top/feed/rcmd') return json(BILI_FIXTURES.recommend);
+    if (p === '/x/web-interface/index/top/feed/rcmd') {
+      return json(qs.get('fresh_idx') === '1' ? BILI_FIXTURES.recommend : BILI_FIXTURES.recommendMore);
+    }
     if (p === '/x/web-interface/popular') return json(BILI_FIXTURES.popular);
     if (p === '/x/web-interface/ranking/v2') return json(BILI_FIXTURES.ranking);
     if (p === '/x/web-interface/newlist') return json(BILI_FIXTURES.newlist);
     if (p === '/x/web-interface/view') {
-      const view = BILI_FIXTURES.views[qs.get('bvid')];
+      const bvid = qs.get('bvid');
+      const view = BILI_FIXTURES.views[bvid] || synthesizedView(bvid);
       return json(view || BILI_FIXTURES.notFound);
     }
     if (p === '/x/web-interface/archive/related') return json(BILI_FIXTURES.related);
@@ -855,7 +893,9 @@ test('bilibili plugin passes static check and recorded anonymous + QR login flow
     if (p === '/x/player/wbi/v2') {
       return json({ code: 0, data: { subtitle: { subtitles: [] } } });
     }
-    if (p === '/pgc/web/rank/list') return json(BILI_FIXTURES.pgcRank);
+    if (p === '/pgc/web/rank/list') {
+      return json(qs.get('season_type') === '2' ? BILI_FIXTURES.pgcRankMovie : BILI_FIXTURES.pgcRank);
+    }
     if (p === '/pgc/view/web/season') {
       if (qs.get('ep_id') && Number(qs.get('ep_id')) === ids.missingEpId) {
         return json(BILI_FIXTURES.notFound);
@@ -946,13 +986,39 @@ test('bilibili plugin passes static check and recorded anonymous + QR login flow
       home.map((shelf) => shelf.id),
       ['bili-recommend', 'bili-popular', 'bili-ranking', 'bili-bangumi', 'bili-regions'],
     );
-    assert.equal(home[0].items.length, 1, 'live recommendation must be filtered out');
-    assert.equal(home[0].items[0].id, `v:${ids.singleBvid}`);
+    assert.equal(home[0].items.length, 20, 'live recommendation must be filtered out');
+    assert.equal(home[2].items.length, 20, 'ranking rail shows the first page only');
+    assert.equal(home[3].items.length, 20, 'bangumi rail shows the first page only');
+    assert.equal(home[0].items[0].id, 'v:BV1d3Rec0000');
     assert.equal(tokenPattern.test(JSON.stringify(home)), false);
+    // The wall keys rows by `${source.id}/${shelf.category.id}` (HomeScreen.kt),
+    // so two shelves sharing `more` crash the list.
+    const moreIds = home.filter((s) => s.more).map((s) => s.more);
+    assert.equal(new Set(moreIds).size, moreIds.length, 'shelf `more` must be unique');
+    for (const shelf of home) {
+      const shelfItemIds = shelf.items.map((it) => it.id);
+      assert.equal(new Set(shelfItemIds).size, shelfItemIds.length, `duplicate item id in ${shelf.id}`);
+    }
 
     const root = await host.invoke('browse', { categoryId: '' });
     assert.equal(validateProtocolType('ItemPage', root).valid, true);
-    assert.equal(root.items.length, 18);
+    assert.equal(root.items.length, 19);
+
+    const recommendPage = await host.invoke('browse', { categoryId: 'recommend' });
+    assert.equal(recommendPage.items.length, 20);
+    assert.equal(recommendPage.next, '2', 'a full recommendation batch must continue the feed');
+    const recommendMore = await host.invoke('browse', { categoryId: 'recommend', cursor: '2' });
+    assert.equal(recommendMore.items.length, 5);
+    assert.equal(recommendMore.next, null);
+    assert.equal(
+      new Set([...recommendPage.items, ...recommendMore.items].map((it) => it.id)).size,
+      25,
+      'recommendation pages must not repeat items',
+    );
+    assert.ok(
+      calls.some((c) => c.path === '/x/web-interface/index/top/feed/rcmd' && c.query.fresh_idx === '1'),
+      'recommendation feed must be requested with fresh_idx',
+    );
 
     const popular = await host.invoke('browse', { categoryId: 'popular' });
     assert.equal(popular.items.length, 2);
@@ -962,9 +1028,31 @@ test('bilibili plugin passes static check and recorded anonymous + QR login flow
     assert.equal(region.items.length, 1);
     assert.equal(region.next, null);
 
+    // Endless scroll: every category must hand back a cursor until it is exhausted
+    // (LibraryScreen keeps calling browse(categoryId, page) while nextPage != null).
     const bangumi = await host.invoke('browse', { categoryId: 'bangumi' });
-    assert.equal(bangumi.items.length, 2);
+    assert.equal(bangumi.items.length, 20);
+    assert.equal(bangumi.next, '20');
     assert.ok(bangumi.items.every((it) => it.kind === 'series' && it.id.startsWith('ss:')));
+    const bangumiLast = await host.invoke('browse', { categoryId: 'bangumi', cursor: '20' });
+    assert.equal(bangumiLast.items.length, 5);
+    assert.equal(bangumiLast.next, null);
+    assert.equal(
+      new Set([...bangumi.items, ...bangumiLast.items].map((it) => it.id)).size,
+      25,
+      'paged slices must not overlap',
+    );
+
+    const rankingFirst = await host.invoke('browse', { categoryId: 'ranking' });
+    assert.equal(rankingFirst.items.length, 20);
+    assert.equal(rankingFirst.next, '20');
+    const rankingLast = await host.invoke('browse', { categoryId: 'ranking', cursor: '20' });
+    assert.equal(rankingLast.items.length, 5);
+    assert.equal(rankingLast.next, null);
+
+    const movies = await host.invoke('browse', { categoryId: 'movie' });
+    assert.equal(movies.items.length, 2);
+    assert.equal(movies.next, null, 'a chart shorter than one page ends immediately');
 
     // ---- details ----------------------------------------------------------
     const multi = await host.invoke('detail', { itemId: `v:${ids.multiBvid}` });
@@ -1041,7 +1129,7 @@ test('bilibili plugin passes static check and recorded anonymous + QR login flow
 
     // ---- search / suggest -------------------------------------------------
     const search = await host.invoke('search', { query: '深度' });
-    assert.equal(search.items.length, 1);
+    assert.equal(search.items.length, 1, 'duplicate ids must be collapsed before reaching the wall');
     assert.equal(search.items[0].title.includes('<em'), false, 'search titles must be cleaned');
     assert.equal(search.next, '2');
     const seriesSearch = await host.invoke('search', { query: '深度', kind: 'series' });
@@ -1062,8 +1150,15 @@ test('bilibili plugin passes static check and recorded anonymous + QR login flow
     // ---- QR login ---------------------------------------------------------
     const qr = await host.invoke('loginStart');
     assert.equal(validateProtocolType('QrLoginStartResult', qr).valid, true);
-    assert.equal(qr.state, 'FAKEQRKEY');
-    assert.equal(qr.qr.includes('FAKEQRKEY'), true);
+    assert.equal(qr.state, 'FAKEQRKEY0123456789abcdef0123456');
+    assert.equal(qr.qr.includes('FAKEQRKEY0123456789abcdef0123456'), true);
+    // Host QR encoder (QrCodeMatrix.kt) only handles versions 1..6 = 134 bytes
+    // and throws `IllegalArgumentException` (crashing the App) above that.
+    assert.ok(
+      Buffer.byteLength(qr.qr, 'utf8') <= 134,
+      `QR payload must fit the host encoder, got ${Buffer.byteLength(qr.qr, 'utf8')} bytes`,
+    );
+    assert.equal(qr.qr.includes('from=main-fe-header'), false, 'analytics param must be trimmed');
     assert.equal((await host.invoke('loginPoll', { state: qr.state })).status, 'pending');
     assert.equal((await host.invoke('loginPoll', { state: qr.state })).status, 'scanned');
     const done = await host.invoke('loginPoll', { state: qr.state });
