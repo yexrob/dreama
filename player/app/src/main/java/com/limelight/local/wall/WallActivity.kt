@@ -13,11 +13,13 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import com.limelight.LimeLog
 import com.limelight.local.LocalPlayerXR
+import com.limelight.local.PluginPlayerLaunch
 import com.limelight.local.WebDav
 import com.limelight.local.airplay.AirPlayService
 import com.limelight.local.dlna.CastReceiver
 import com.limelight.local.media.LocalVideoSource
 import com.limelight.local.media.PlaybackInfo
+import com.limelight.local.plugin.PluginHostGuards
 import com.limelight.local.stream.StreamSessionBridge
 import kotlinx.coroutines.flow.MutableStateFlow
 
@@ -136,6 +138,7 @@ class WallActivity : ComponentActivity(), WallActions {
     }
 
     override fun launchPlayer(info: PlaybackInfo, sourceId: String, itemId: String) {
+        PluginHostGuards.requireNonPluginPlayback(info)
         val play = Intent(this, LocalPlayerXR::class.java)
             .setData(Uri.parse(info.url))
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -146,6 +149,27 @@ class WallActivity : ComponentActivity(), WallActions {
         // The player takes one header, which is all WebDAV needs
         info.headers["Authorization"]?.let { play.putExtra(LocalPlayerXR.EXTRA_AUTH, it) }
         startActivity(play)
+    }
+
+    override fun launchPluginPlayer(
+        instanceId: String,
+        sourceId: String,
+        itemId: String,
+        title: String?,
+        startMs: Long,
+        durationMs: Long?,
+    ) {
+        startActivity(
+            PluginPlayerLaunch.createIntent(
+                context = this,
+                instanceId = instanceId,
+                sourceId = sourceId,
+                itemId = itemId,
+                title = title,
+                startMs = startMs,
+                durationMs = durationMs,
+            ),
+        )
     }
 
     override fun requestStorage() {

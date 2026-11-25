@@ -25,6 +25,8 @@ import com.limelight.R
 import com.limelight.local.media.Item
 import com.limelight.local.media.MediaSource
 import com.limelight.local.media.PlaybackInfo
+import com.limelight.local.plugin.PluginHostGuards
+import com.limelight.local.plugin.PluginMediaSource
 import com.limelight.local.stream.RetryAction
 import com.limelight.local.stream.StreamFlowState
 import com.limelight.local.stream.StreamingComputer
@@ -37,6 +39,14 @@ import kotlinx.coroutines.launch
 interface WallActions {
     val hostActivity: Activity
     fun launchPlayer(info: PlaybackInfo, sourceId: String, itemId: String)
+    fun launchPluginPlayer(
+        instanceId: String,
+        sourceId: String,
+        itemId: String,
+        title: String?,
+        startMs: Long,
+        durationMs: Long?,
+    )
     fun requestStorage()
     fun toast(text: String)
     fun consumePendingTab()
@@ -191,12 +201,25 @@ fun WallApp(model: WallModel, actions: WallActions, pendingTab: StateFlow<Tab?>)
     val scope = rememberCoroutineScope()
     val nav = remember {
         WallNav(model, actions, scope) { source, item, startMs ->
-            scope.launch {
-                try {
-                    val info = source.playback(item.id).copy(startPositionMs = startMs)
-                    actions.launchPlayer(info, source.source.id, item.id)
-                } catch (e: Exception) {
-                    actions.toast(actions.hostActivity.getString(R.string.wall_play_failed))
+            if (PluginHostGuards.isPluginSource(source.source.kind)) {
+                val instanceId = (source as? PluginMediaSource)?.instanceId
+                    ?: source.source.id.removePrefix(PluginHost.PLUGIN_SOURCE_PREFIX)
+                actions.launchPluginPlayer(
+                    instanceId = instanceId,
+                    sourceId = source.source.id,
+                    itemId = item.id,
+                    title = item.title,
+                    startMs = startMs,
+                    durationMs = item.durationMs,
+                )
+            } else {
+                scope.launch {
+                    try {
+                        val info = source.playback(item.id).copy(startPositionMs = startMs)
+                        actions.launchPlayer(info, source.source.id, item.id)
+                    } catch (e: Exception) {
+                        actions.toast(actions.hostActivity.getString(R.string.wall_play_failed))
+                    }
                 }
             }
         }

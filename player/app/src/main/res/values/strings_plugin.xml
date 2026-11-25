@@ -37,4 +37,15 @@
     <string name="plugin_reconfirm_hint">请前往「设置 › 播放源与插件」重新确认权限。</string>
     <string name="plugin_login_hint">请前往「设置 › 播放源与插件」重新登录该播放源。</string>
     <string name="plugin_setup_hint">请前往「设置 › 播放源与插件」完成配置。</string>
+
+    <!-- In-player plugin playback & error strings -->
+    <string name="player_action_back">返回</string>
+    <string name="plugin_player_opening">正在加载视频…</string>
+    <string name="plugin_player_refreshing">播放地址已过期，正在刷新…</string>
+    <string name="plugin_player_error_auth_expired">登录已失效或无权播放，请重试或重新登录。</string>
+    <string name="plugin_player_error_not_found">播放地址已失效或视频不存在。</string>
+    <string name="plugin_player_error_server">服务器暂时出错，请稍后重试。</string>
+    <string name="plugin_player_error_network">网络连接中断，无法继续播放。</string>
+    <string name="plugin_player_error_format">视频格式或编码暂不支持播放。</string>
+    <string name="plugin_player_error_generic">播放失败，请稍后重试。</string>
 </resources>
