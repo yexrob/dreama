@@ -69,6 +69,12 @@ class SearchAggregator(
         val storedAtMs: Long,
     )
 
+    private data class SingleSourceOutcome(
+        val status: SearchRowStatus,
+        val discoveredKinds: Set<SearchKindFilter>,
+        val cacheable: Boolean,
+    )
+
     private val _state = MutableStateFlow(AggregatedSearchState())
     val state: StateFlow<AggregatedSearchState> = _state.asStateFlow()
 
@@ -111,6 +117,7 @@ class SearchAggregator(
         sources: List<SearchableSource>,
         nonSearchableNames: List<String> = emptyList(),
         bypassCache: Boolean = false,
+        resolveFreshSource: (suspend (String) -> SearchableSource?)? = null,
     ): Long {
         val normalized = SearchQueryNormalizer.normalize(rawQuery)
         if (normalized.isEmpty()) return 0L
@@ -152,6 +159,7 @@ class SearchAggregator(
                 nonSearchableNames = nonSearchableNames,
                 bypassCache = bypassCache,
                 sessionScope = sessionScope,
+                resolveFreshSource = resolveFreshSource,
             )
         }
         return gen
@@ -161,10 +169,16 @@ class SearchAggregator(
      * Retries a single source IN PLACE (after user taps 「重试」 or returns from 「登录」).
      * Never moves rows above or below it; even if retry yields zero items, keeps that exact
      * row index showing `SearchRowStatus.Empty` so lower rows never jump upward.
+     *
+     * When [forceResolveFresh] is true (e.g. immediately after re-login, before async source
+     * reconciliation finishes) or the held source is already closed (`isClosed == true`), resolves
+     * a live [SearchableSource] via [resolveFreshSource] so retry never hits a shut-down runtime.
      */
     fun retrySource(
         sourceId: String,
         updatedSource: SearchableSource? = null,
+        resolveFreshSource: (suspend (String) -> SearchableSource?)? = null,
+        forceResolveFresh: Boolean = false,
     ) {
         val gen = generationSeq.get()
         if (gen == 0L) return
@@ -198,27 +212,56 @@ class SearchAggregator(
                     emitStateLocked(gen)
                     Triple(resolved, activeQueryNormalized, activeKindFilter)
                 } ?: return@launch
-                val (targetSrc, query, filter) = prep
+                var targetSrc = prep.first
+                val query = prep.second
+                val filter = prep.third
+
+                if ((forceResolveFresh || targetSrc.isClosed) && resolveFreshSource != null) {
+                    val live = resolveFreshSafe(resolveFreshSource, sourceId)
+                    if (live != null && !live.isClosed) {
+                        targetSrc = live
+                    }
+                }
 
                 synchronized(cacheLock) {
                     cache.remove(CacheKey(query, filter, sourceId))
                 }
 
-                val (outcome, discoveredKinds) = executeSingleSource(
+                var singleOutcome = executeSingleSource(
                     source = targetSrc,
                     query = query,
                     kindFilter = filter,
                     respectKnownNeedsAuth = false,
                 )
+                if (singleOutcome.status is SearchRowStatus.Failed &&
+                    targetSrc.isClosed &&
+                    resolveFreshSource != null
+                ) {
+                    val live = resolveFreshSafe(resolveFreshSource, sourceId)
+                    if (live != null && live !== targetSrc && !live.isClosed) {
+                        targetSrc = live
+                        singleOutcome = executeSingleSource(
+                            source = targetSrc,
+                            query = query,
+                            kindFilter = filter,
+                            respectKnownNeedsAuth = false,
+                        )
+                    }
+                }
+                val outcome = singleOutcome.status
+                val discoveredKinds = singleOutcome.discoveredKinds
 
                 var shouldFetchFallback = false
                 stateMutex.withLock {
                     if (generationSeq.get() != gen) return@withLock
+                    activeSourcesById = activeSourcesById + (sourceId to targetSrc)
                     activePendingIds.remove(sourceId)
                     activeAvailableKinds.addAll(discoveredKinds)
                     lastKnownKindsByQuery = query to LinkedHashSet(activeAvailableKinds)
 
-                    if (outcome is SearchRowStatus.Results || outcome is SearchRowStatus.Empty) {
+                    if (singleOutcome.cacheable &&
+                        (outcome is SearchRowStatus.Results || outcome is SearchRowStatus.Empty)
+                    ) {
                         synchronized(cacheLock) {
                             cache[CacheKey(query, filter, sourceId)] = CacheEntry(
                                 status = outcome,
@@ -313,6 +356,17 @@ class SearchAggregator(
         }
     }
 
+    private suspend fun resolveFreshSafe(
+        resolver: suspend (String) -> SearchableSource?,
+        sourceId: String,
+    ): SearchableSource? = try {
+        withContext(ioDispatcher) { resolver(sourceId) }
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        null
+    }
+
     private suspend fun runSession(
         gen: Long,
         query: String,
@@ -321,6 +375,7 @@ class SearchAggregator(
         nonSearchableNames: List<String>,
         bypassCache: Boolean,
         sessionScope: CoroutineScope,
+        resolveFreshSource: (suspend (String) -> SearchableSource?)?,
     ) {
         val now = clockMs()
         val cachedOutcomes = LinkedHashMap<String, CacheEntry>()
@@ -427,16 +482,42 @@ class SearchAggregator(
         // Launch independent per-source concurrent search tasks (all sources simultaneously)
         for (src in toQuery) {
             sessionScope.launch {
-                val (status, discoveredKinds) = executeSingleSource(
-                    source = src,
+                var effectiveSrc = src
+                if (effectiveSrc.isClosed && resolveFreshSource != null) {
+                    val live = resolveFreshSafe(resolveFreshSource, effectiveSrc.sourceId)
+                    if (live != null && !live.isClosed) {
+                        effectiveSrc = live
+                    }
+                }
+                var singleOutcome = executeSingleSource(
+                    source = effectiveSrc,
                     query = query,
                     kindFilter = kindFilter,
                     respectKnownNeedsAuth = true,
                 )
+                if (singleOutcome.status is SearchRowStatus.Failed &&
+                    effectiveSrc.isClosed &&
+                    resolveFreshSource != null
+                ) {
+                    val live = resolveFreshSafe(resolveFreshSource, effectiveSrc.sourceId)
+                    if (live != null && live !== effectiveSrc && !live.isClosed) {
+                        effectiveSrc = live
+                        singleOutcome = executeSingleSource(
+                            source = effectiveSrc,
+                            query = query,
+                            kindFilter = kindFilter,
+                            respectKnownNeedsAuth = true,
+                        )
+                    }
+                }
+                val status = singleOutcome.status
+                val discoveredKinds = singleOutcome.discoveredKinds
 
-                if (status is SearchRowStatus.Results || status is SearchRowStatus.Empty) {
+                if (singleOutcome.cacheable &&
+                    (status is SearchRowStatus.Results || status is SearchRowStatus.Empty)
+                ) {
                     synchronized(cacheLock) {
-                        cache[CacheKey(query, kindFilter, src.sourceId)] = CacheEntry(
+                        cache[CacheKey(query, kindFilter, effectiveSrc.sourceId)] = CacheEntry(
                             status = status,
                             availableKinds = discoveredKinds,
                             storedAtMs = clockMs(),
@@ -447,18 +528,19 @@ class SearchAggregator(
                 var shouldFetchFallback = false
                 stateMutex.withLock {
                     if (generationSeq.get() != gen) return@withLock
-                    if (!activePendingIds.remove(src.sourceId)) return@withLock
+                    if (!activePendingIds.remove(effectiveSrc.sourceId)) return@withLock
 
+                    activeSourcesById = activeSourcesById + (effectiveSrc.sourceId to effectiveSrc)
                     activeAvailableKinds.addAll(discoveredKinds)
                     lastKnownKindsByQuery = query to LinkedHashSet(activeAvailableKinds)
 
                     if (!activeInitialBatchSettled) {
-                        activeBatchBuffer[src.sourceId] = status
+                        activeBatchBuffer[effectiveSrc.sourceId] = status
                         if (activePendingIds.isEmpty()) {
                             flushInitialBatchLocked()
                         }
                     } else {
-                        appendPostBatchOutcomeLocked(src, status)
+                        appendPostBatchOutcomeLocked(effectiveSrc, status)
                     }
                     emitStateLocked(gen)
                     shouldFetchFallback = _state.value.isTrueNoResult
@@ -476,19 +558,20 @@ class SearchAggregator(
         query: String,
         kindFilter: SearchKindFilter,
         respectKnownNeedsAuth: Boolean,
-    ): Pair<SearchRowStatus, Set<SearchKindFilter>> {
+    ): SingleSourceOutcome {
         if (respectKnownNeedsAuth && source.knownNeedsAuth) {
-            return SearchRowStatus.NeedsAuth() to emptySet()
+            return SingleSourceOutcome(SearchRowStatus.NeedsAuth(), emptySet(), cacheable = false)
         }
+        val seenIds = LinkedHashSet<String>()
+        val seenCursors = HashSet<String>()
+        val discoveredKinds = LinkedHashSet<SearchKindFilter>()
+        val collected = ArrayList<Item>()
+        var lastValidNextCursor: String? = null
+
         return try {
-            val outcome = withTimeoutOrNull(sourceTimeoutMs) {
-                val seenIds = LinkedHashSet<String>()
-                val seenCursors = HashSet<String>()
-                val discoveredKinds = LinkedHashSet<SearchKindFilter>()
-                val collected = ArrayList<Item>()
+            val completedWithinBudget = withTimeoutOrNull(sourceTimeoutMs) {
                 var cursor: String? = null
                 var autoExtraPages = 0
-                var finalNextCursor: String? = null
 
                 while (true) {
                     val page = withContext(ioDispatcher) {
@@ -508,7 +591,7 @@ class SearchAggregator(
                     } else {
                         null
                     }
-                    finalNextCursor = validNext
+                    lastValidNextCursor = validNext
 
                     val pluginIgnoredKind = pageDeduped.any { !kindFilter.matches(it) }
                     val needMore = kindFilter != SearchKindFilter.ALL &&
@@ -521,33 +604,66 @@ class SearchAggregator(
                     cursor = validNext
                     autoExtraPages++
                 }
+                true
+            } == true
 
-                val status = if (collected.isEmpty()) {
-                    SearchRowStatus.Empty
-                } else {
-                    SearchRowStatus.Results(
-                        items = collected.toList(),
-                        nextCursor = finalNextCursor,
-                        hasMore = finalNextCursor != null || collected.size > SearchConfig.ROW_PREVIEW_LIMIT,
+            when {
+                completedWithinBudget -> {
+                    val status = if (collected.isEmpty()) {
+                        SearchRowStatus.Empty
+                    } else {
+                        SearchRowStatus.Results(
+                            items = collected.toList(),
+                            nextCursor = lastValidNextCursor,
+                            hasMore = lastValidNextCursor != null || collected.size > SearchConfig.ROW_PREVIEW_LIMIT,
+                        )
+                    }
+                    SingleSourceOutcome(status, discoveredKinds.toSet(), cacheable = true)
+                }
+                collected.isNotEmpty() -> {
+                    // Timed out while auto-fetching additional pages for local kind filtering:
+                    // return the items already collected and preserve `lastValidNextCursor` so the
+                    // user can still browse and paginate further instead of seeing TimedOut.
+                    SingleSourceOutcome(
+                        status = SearchRowStatus.Results(
+                            items = collected.toList(),
+                            nextCursor = lastValidNextCursor,
+                            hasMore = lastValidNextCursor != null || collected.size > SearchConfig.ROW_PREVIEW_LIMIT,
+                        ),
+                        discoveredKinds = discoveredKinds.toSet(),
+                        cacheable = false,
                     )
                 }
-                status to discoveredKinds.toSet()
-            }
-            if (outcome == null) {
-                val sec = ((sourceTimeoutMs + 999L) / 1000L).toInt().coerceAtLeast(1)
-                SearchRowStatus.TimedOut(sec) to emptySet()
-            } else {
-                outcome
+                else -> {
+                    val sec = ((sourceTimeoutMs + 999L) / 1000L).toInt().coerceAtLeast(1)
+                    SingleSourceOutcome(SearchRowStatus.TimedOut(sec), discoveredKinds.toSet(), cacheable = false)
+                }
             }
         } catch (ce: CancellationException) {
             throw ce
         } catch (t: Throwable) {
-            SearchErrorClassifier.classifyFailure(
-                error = t,
-                sourceKind = source.sourceKind,
-                sourceName = source.displayName,
-                nowMs = clockMs(),
-            ) to emptySet()
+            if (collected.isNotEmpty()) {
+                SingleSourceOutcome(
+                    status = SearchRowStatus.Results(
+                        items = collected.toList(),
+                        nextCursor = lastValidNextCursor,
+                        hasMore = lastValidNextCursor != null || collected.size > SearchConfig.ROW_PREVIEW_LIMIT,
+                    ),
+                    discoveredKinds = discoveredKinds.toSet(),
+                    cacheable = false,
+                )
+            } else {
+                SingleSourceOutcome(
+                    status = SearchErrorClassifier.classifyFailure(
+                        error = t,
+                        sourceKind = source.sourceKind,
+                        sourceName = source.displayName,
+                        nowMs = clockMs(),
+                    ),
+                    discoveredKinds = discoveredKinds.toSet(),
+                    cacheable = false,
+                )
+            }
         }
     }
 

@@ -17,6 +17,11 @@ import com.limelight.local.wall.Load
 import com.limelight.local.wall.SourceErrorActionKind
 import com.limelight.local.wall.SourceErrorDispatcher
 import com.limelight.local.wall.WatchState
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 /**
  * Centralized search timing, pagination, and cache constants
@@ -277,10 +282,13 @@ interface SearchableSource {
     val sourceKind: SourceKind
     val knownNeedsAuth: Boolean get() = false
     val supportsSuggest: Boolean get() = true
+    val isWarmedUp: Boolean get() = true
+    val isClosed: Boolean get() = false
     val mediaSource: MediaSource? get() = null
 
     suspend fun search(query: String, cursor: String? = null, kind: ItemKind? = null): Page<Item>
     suspend fun suggest(query: String): List<String> = emptyList()
+    suspend fun warmUp() {}
 }
 
 /**
@@ -297,6 +305,8 @@ class PluginSearchableSource(
     override val displayName: String get() = plugin.source.name
     override val sourceKind: SourceKind get() = plugin.source.kind
     override val supportsSuggest: Boolean get() = !plugin.isSuggestKnownUnsupported
+    override val isWarmedUp: Boolean get() = plugin.isRuntimeInitialized
+    override val isClosed: Boolean get() = plugin.isClosed
     override val mediaSource: MediaSource get() = plugin
 
     override suspend fun search(query: String, cursor: String?, kind: ItemKind?): Page<Item> =
@@ -304,6 +314,12 @@ class PluginSearchableSource(
 
     override suspend fun suggest(query: String): List<String> =
         if (plugin.isSuggestKnownUnsupported) emptyList() else plugin.suggest(query)
+
+    override suspend fun warmUp() {
+        if (!knownNeedsAuth && !plugin.isRuntimeInitialized && !plugin.isClosed) {
+            plugin.warmUpIfNeeded()
+        }
+    }
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -336,6 +352,15 @@ data class SearchSourcePartition(
  * - Non-searchable sources (Local, WebDAV, and plugins without `search`) named in the tail/empty UI
  */
 object SearchSourceClassifier {
+    fun typeLabelFor(plugin: PluginMediaSource, genericPluginLabel: String): String {
+        val manifestName = plugin.manifest.name.trim()
+        return if (manifestName.isNotEmpty() && !manifestName.equals(plugin.source.name.trim(), ignoreCase = true)) {
+            manifestName
+        } else {
+            genericPluginLabel
+        }
+    }
+
     fun partition(
         sources: List<MediaSource>,
         pluginInstances: List<PluginInstanceEntity>,
@@ -351,12 +376,7 @@ object SearchSourceClassifier {
                 val inst = instanceById[src.instanceId]
                 val shelfErr = (shelves[src.source.id] as? Load.Failed)?.error
                 val knownNeedsAuth = inst?.authState == "NEEDS_AUTH" || shelfErr is SourceNeedsAuthException
-                val manifestName = src.manifest.name.trim()
-                val typeLabel = if (manifestName.isNotEmpty() && !manifestName.equals(src.source.name.trim(), ignoreCase = true)) {
-                    manifestName
-                } else {
-                    genericPluginLabel
-                }
+                val typeLabel = typeLabelFor(src, genericPluginLabel)
                 searchable += PluginSearchableSource(
                     plugin = src,
                     typeLabel = typeLabel,
@@ -370,6 +390,63 @@ object SearchSourceClassifier {
             searchable = searchable,
             nonSearchableNames = nonSearchable,
         )
+    }
+}
+
+/**
+ * Background cold-VM warm-up coordinator for Search (`docs/specs/08-search.md`):
+ * Entering Search warms up each uninitialized, open, non-needs-auth searchable source at most
+ * once in the background so typing `suggest()` does not cold-skip it. Warm-up runs on its own
+ * coroutine outside the 800 ms suggestion budget and swallows non-cancellation failures silently.
+ */
+class SearchWarmUpCoordinator(
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+) {
+    private val attemptedKeys = HashSet<String>()
+
+    fun warmUpUninitialized(
+        sources: List<SearchableSource>,
+        scope: CoroutineScope,
+    ): List<String> {
+        val scheduled = ArrayList<String>()
+        for (src in sources) {
+            if (src.isWarmedUp || src.isClosed || src.knownNeedsAuth) continue
+            val identity = System.identityHashCode(src.mediaSource ?: src)
+            val key = "${src.sourceId}@$identity"
+            if (!attemptedKeys.add(key)) continue
+            scheduled += src.sourceId
+            scope.launch(ioDispatcher) {
+                try {
+                    src.warmUp()
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    // Silent background warm-up; errors surface only on explicit user actions.
+                }
+            }
+        }
+        return scheduled
+    }
+}
+
+/**
+ * Tracks which post-batch rows have already played their 200 ms fade-in animation so scrolling
+ * off/on screen or returning from Detail/Expanded never replays the fade-in.
+ */
+class SearchRowFadeTracker {
+    private val completedKeys = HashSet<String>()
+
+    fun shouldFadeIn(generation: Long, sourceId: String, arrivedAfterBatch: Boolean): Boolean {
+        if (!arrivedAfterBatch) return false
+        return "$generation:$sourceId" !in completedKeys
+    }
+
+    fun markFadedIn(generation: Long, sourceId: String) {
+        completedKeys.add("$generation:$sourceId")
+    }
+
+    fun clear() {
+        completedKeys.clear()
     }
 }
 

@@ -53,6 +53,8 @@ data class EpisodeTargetResolution(
     val displayItem: Item,
     val focusSeasonId: String? = null,
     val focusEpisodeId: String? = null,
+    val fallbackParentId: String? = null,
+    val fallbackSeasonId: String? = null,
 )
 
 /**
@@ -66,9 +68,22 @@ object DetailStateLogic {
     private const val RESUME_MIN_MS = 10_000L
     private const val WATCHED_FRACTION = 0.95
     const val DEFAULT_RESOLVE_TIMEOUT_MS = 2_000L
+    const val DEFAULT_EPISODE_PARENT_TIMEOUT_MS = 4_000L
 
     fun isSeriesLayout(item: Item): Boolean =
         item.kind == ItemKind.SERIES || item.seasons.isNotEmpty() || item.episodes.isNotEmpty()
+
+    /**
+     * Pure readiness gate for one-shot initial horizontal scrolling on [SeriesDetailContent]:
+     * waits for detail fetch, local Room watch progress, AND (when seasons exist) cross-season
+     * initial resolution so seasonless multi-part items never scroll before local progress loads.
+     */
+    fun isReadyForInitialSeriesScroll(
+        loadingDetail: Boolean,
+        hasSeasons: Boolean,
+        hasInitialResolution: Boolean,
+        localProgressLoaded: Boolean,
+    ): Boolean = !loadingDetail && localProgressLoaded && (!hasSeasons || hasInitialResolution)
 
     /**
      * Resolves an item opened in [DetailScreen]:
@@ -77,9 +92,12 @@ object DetailStateLogic {
      *   preserving exact pre-search behavior with zero extra network hops.
      * - Only when the caller explicitly requests episode-to-series navigation
      *   (`resolveEpisodeParent = true`, e.g. clicking an [ItemKind.EPISODE] in Search results
-     *   per `ux-spec.md` §3.9.7), traverses `Episode -> Season -> Series` (up to 3 `detail()`
-     *   calls total) inside a single bounded [parentResolveTimeoutMs] budget. Any parent
-     *   lookup failure or budget exhaustion falls back cleanly to the episode's own detail.
+     *   per `ux-spec.md` §3.9.7, or tapping 「查看所属剧集」 on a fallback episode screen),
+     *   fetches the item's own full detail OUTSIDE the parent lookup budget, then bounds ONLY
+     *   the upward `Season -> Series` traversal inside [parentResolveTimeoutMs].
+     * - If the upward parent lookup times out or fails, returns the episode's complete own detail
+     *   along with [EpisodeTargetResolution.fallbackParentId] so the UI still renders full episode
+     *   metadata plus an explicit 「查看所属剧集」 action without rebuilding the plugin VM.
      */
     suspend fun resolveDetailTarget(
         source: MediaSource,
@@ -87,25 +105,66 @@ object DetailStateLogic {
         requestedFocusSeasonId: String? = null,
         requestedFocusEpisodeId: String? = null,
         resolveEpisodeParent: Boolean = false,
-        parentResolveTimeoutMs: Long = DEFAULT_RESOLVE_TIMEOUT_MS,
+        parentResolveTimeoutMs: Long = DEFAULT_EPISODE_PARENT_TIMEOUT_MS,
     ): EpisodeTargetResolution {
-        if (!resolveEpisodeParent || initialItem.kind != ItemKind.EPISODE) {
+        if (!resolveEpisodeParent ||
+            (initialItem.kind != ItemKind.EPISODE && initialItem.kind != ItemKind.SEASON)
+        ) {
             return EpisodeTargetResolution(
                 displayItem = source.detail(initialItem.id),
                 focusSeasonId = requestedFocusSeasonId,
                 focusEpisodeId = requestedFocusEpisodeId,
             )
         }
-        var fetchedEpisode: Item? = null
-        val resolved = withTimeoutOrNull(parentResolveTimeoutMs) {
-            val epDetail = source.detail(initialItem.id)
-            fetchedEpisode = epDetail
-            val parentId = epDetail.parentId?.takeIf { it.isNotBlank() }
-                ?: initialItem.parentId?.takeIf { it.isNotBlank() }
-                ?: return@withTimeoutOrNull EpisodeTargetResolution(displayItem = epDetail)
 
+        if (initialItem.kind == ItemKind.SEASON) {
+            val loaded = source.detail(initialItem.id)
+            if (loaded.kind == ItemKind.SERIES || (loaded.kind != ItemKind.SEASON && isSeriesLayout(loaded))) {
+                return EpisodeTargetResolution(
+                    displayItem = loaded,
+                    focusSeasonId = requestedFocusSeasonId,
+                    focusEpisodeId = requestedFocusEpisodeId,
+                )
+            }
+            val seriesId = loaded.parentId?.takeIf { it.isNotBlank() }
+            if (seriesId != null) {
+                val series = withTimeoutOrNull(parentResolveTimeoutMs) {
+                    try {
+                        source.detail(seriesId)
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+                if (series != null && isSeriesLayout(series)) {
+                    return EpisodeTargetResolution(
+                        displayItem = series,
+                        focusSeasonId = loaded.id,
+                        focusEpisodeId = requestedFocusEpisodeId,
+                    )
+                }
+            }
+            return EpisodeTargetResolution(
+                displayItem = loaded,
+                focusSeasonId = loaded.id.takeIf { loaded.kind == ItemKind.SEASON } ?: requestedFocusSeasonId,
+                focusEpisodeId = requestedFocusEpisodeId,
+                fallbackParentId = seriesId,
+            )
+        }
+
+        // Step 1: Fetch the episode's own complete detail outside the upward lookup budget.
+        val epDetail = source.detail(initialItem.id)
+        val initialParentId = epDetail.parentId?.takeIf { it.isNotBlank() }
+            ?: initialItem.parentId?.takeIf { it.isNotBlank() }
+            ?: return EpisodeTargetResolution(displayItem = epDetail)
+
+        // Step 2: Bound ONLY the upward Season -> Series lookup calls inside [parentResolveTimeoutMs].
+        var bestFallbackParentId: String = initialParentId
+        var bestFallbackSeasonId: String? = requestedFocusSeasonId
+        val resolved = withTimeoutOrNull(parentResolveTimeoutMs) {
             val parent = try {
-                source.detail(parentId)
+                source.detail(initialParentId)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (_: Exception) {
@@ -113,6 +172,8 @@ object DetailStateLogic {
             }
             if (parent != null) {
                 if (parent.kind == ItemKind.SEASON && !parent.parentId.isNullOrBlank()) {
+                    bestFallbackParentId = parent.parentId
+                    bestFallbackSeasonId = parent.id
                     val series = try {
                         source.detail(parent.parentId)
                     } catch (ce: CancellationException) {
@@ -136,9 +197,13 @@ object DetailStateLogic {
                     )
                 }
             }
-            EpisodeTargetResolution(displayItem = epDetail)
+            null
         }
-        return resolved ?: EpisodeTargetResolution(displayItem = fetchedEpisode ?: initialItem)
+        return resolved ?: EpisodeTargetResolution(
+            displayItem = epDetail,
+            fallbackParentId = bestFallbackParentId,
+            fallbackSeasonId = bestFallbackSeasonId,
+        )
     }
 
     /** Specials seasons use index == 0 (e.g. Jellyfin Season 0 "Specials") and are sorted last (#10). */

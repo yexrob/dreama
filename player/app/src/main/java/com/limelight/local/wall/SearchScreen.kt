@@ -93,6 +93,7 @@ import com.limelight.local.media.Item
 import com.limelight.local.media.ItemKind
 import com.limelight.local.media.MediaSource
 import com.limelight.local.media.WatchProgress
+import com.limelight.local.plugin.PluginMediaSource
 import com.limelight.local.search.AggregatedSearchState
 import com.limelight.local.search.ExpandedSourcePaginator
 import com.limelight.local.search.ExpandedSourceState
@@ -107,11 +108,13 @@ import com.limelight.local.search.SearchItemAction
 import com.limelight.local.search.SearchKindFilter
 import com.limelight.local.search.SearchNavigationPolicy
 import com.limelight.local.search.SearchQueryNormalizer
+import com.limelight.local.search.SearchRowFadeTracker
 import com.limelight.local.search.SearchRowPacker
 import com.limelight.local.search.SearchRowStatus
 import com.limelight.local.search.SearchSourceClassifier
 import com.limelight.local.search.SearchSourceRow
 import com.limelight.local.search.SearchSuggestionEngine
+import com.limelight.local.search.SearchWarmUpCoordinator
 import com.limelight.local.search.SearchableSource
 import com.limelight.local.search.SuggestionRow
 import kotlinx.coroutines.CoroutineScope
@@ -133,6 +136,8 @@ import kotlin.math.ceil
  */
 private class SearchUiHolder : Closeable {
     val paginatorScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    val warmUpCoordinator = SearchWarmUpCoordinator()
+    val fadeTracker = SearchRowFadeTracker()
 
     var draftText by mutableStateOf("")
     var savedDraftText by mutableStateOf("")
@@ -211,14 +216,34 @@ fun SearchScreen(model: WallModel, nav: WallNav) {
         }
     }
 
-    // Returning from post-login flow re-searches ONLY that source in place (§3.9.3)
+    // Background one-shot warm-up for cold searchable plugin VMs so typing `suggest()` does not
+    // cold-skip them; runs outside the 800 ms suggestion budget and ignores failures silently.
+    LaunchedEffect(searchableSources) {
+        holder.warmUpCoordinator.warmUpUninitialized(
+            sources = searchableSources,
+            scope = holder.paginatorScope,
+        )
+    }
+
+    val resolveFreshSource: suspend (String) -> SearchableSource? = { id ->
+        model.resolveFreshSearchableSource(id, genericPluginLabel)
+    }
+
+    // Returning from post-login flow re-searches ONLY that source in place (§3.9.3).
+    // Always resolves the live PluginMediaSource from PluginHost in case async reconcile
+    // has not yet published the newly authenticated instance to `model.sources`.
     val authSignal = nav.lastAuthenticatedSource
-    LaunchedEffect(authSignal, searchableSources) {
+    LaunchedEffect(authSignal) {
         if (authSignal != null) {
             val authedSourceId = nav.consumeAuthenticatedSource()
             if (authedSourceId != null && aggState.hasActiveQuery) {
                 val fresh = searchableSources.firstOrNull { it.sourceId == authedSourceId }
-                model.searchAggregator.retrySource(authedSourceId, updatedSource = fresh)
+                model.searchAggregator.retrySource(
+                    sourceId = authedSourceId,
+                    updatedSource = fresh,
+                    resolveFreshSource = resolveFreshSource,
+                    forceResolveFresh = true,
+                )
             }
         }
     }
@@ -242,6 +267,7 @@ fun SearchScreen(model: WallModel, nav: WallNav) {
         if (norm.isEmpty() || !hasSearchableSources) return
         holder.closeExpanded()
         holder.clearRowListStates()
+        holder.fadeTracker.clear()
         holder.undoHistorySnapshot = null
         holder.savedDraftText = ""
         holder.draftText = norm
@@ -256,26 +282,48 @@ fun SearchScreen(model: WallModel, nav: WallNav) {
             kindFilter = filter,
             sources = searchableSources,
             nonSearchableNames = nonSearchableNames,
+            resolveFreshSource = resolveFreshSource,
         )
     }
 
     fun switchAggregatedKind(newFilter: SearchKindFilter) {
         if (!aggState.hasActiveQuery || holder.kindFilter == newFilter) return
         holder.clearRowListStates()
+        holder.fadeTracker.clear()
         holder.kindFilter = newFilter
         model.searchAggregator.search(
             rawQuery = aggState.query,
             kindFilter = newFilter,
             sources = searchableSources,
             nonSearchableNames = nonSearchableNames,
+            resolveFreshSource = resolveFreshSource,
         )
+    }
+
+    fun liveMediaSource(candidate: MediaSource?): MediaSource? {
+        if (candidate == null) return null
+        if (candidate is PluginMediaSource && candidate.isClosed) {
+            return model.source(candidate.source.id)?.takeUnless { (it as? PluginMediaSource)?.isClosed == true }
+                ?: candidate
+        }
+        return candidate
     }
 
     fun openExpandedSource(row: SearchSourceRow) {
         val results = row.status as? SearchRowStatus.Results ?: return
-        val src = searchableSources.firstOrNull { it.sourceId == row.sourceId } ?: return
+        val liveSource = liveMediaSource(row.mediaSource)
+        val src = searchableSources.firstOrNull { it.sourceId == row.sourceId && !it.isClosed }
+            ?: (liveSource as? PluginMediaSource)?.takeIf { !it.isClosed }?.let { plugin ->
+                com.limelight.local.search.PluginSearchableSource(
+                    plugin = plugin,
+                    typeLabel = SearchSourceClassifier.typeLabelFor(plugin, genericPluginLabel),
+                    knownNeedsAuth = false,
+                )
+            }
+            ?: searchableSources.firstOrNull { it.sourceId == row.sourceId }
+            ?: return
         holder.closeExpanded()
-        holder.expandedMediaSource = row.mediaSource
+        holder.expandedMediaSource = liveSource ?: src.mediaSource
         holder.expandedPaginator = ExpandedSourcePaginator(
             scope = holder.paginatorScope,
             source = src,
@@ -287,7 +335,7 @@ fun SearchScreen(model: WallModel, nav: WallNav) {
     }
 
     fun openResultItem(mediaSource: MediaSource?, item: Item) {
-        val src = mediaSource ?: return
+        val src = liveMediaSource(mediaSource) ?: return
         val localProgress = progressMap[src.source.id to item.id]
         when (val action = SearchNavigationPolicy.resolveClickAction(src, item, localProgress)) {
             is SearchItemAction.OpenFolder -> nav.category(action.source, action.item.id, action.item.title, action.item.childCount)
@@ -449,16 +497,21 @@ fun SearchScreen(model: WallModel, nav: WallNav) {
                             state = aggState,
                             listState = holder.resultsListState,
                             rowListStateFor = holder::rowListState,
+                            fadeTracker = holder.fadeTracker,
                             progressMap = progressMap,
                             listSep = listSep,
                             onExpandSource = ::openExpandedSource,
                             onItemClick = ::openResultItem,
                             onRetrySource = { row ->
                                 val fresh = searchableSources.firstOrNull { it.sourceId == row.sourceId }
-                                model.searchAggregator.retrySource(row.sourceId, updatedSource = fresh)
+                                model.searchAggregator.retrySource(
+                                    sourceId = row.sourceId,
+                                    updatedSource = fresh,
+                                    resolveFreshSource = resolveFreshSource,
+                                )
                             },
                             onLoginSource = { row ->
-                                row.mediaSource?.let { nav.pluginLogin(it, returnAfterSuccess = true) }
+                                liveMediaSource(row.mediaSource)?.let { nav.pluginLogin(it, returnAfterSuccess = true) }
                                     ?: nav.openSources()
                             },
                         )
@@ -1228,11 +1281,26 @@ private fun SearchStatusCounter(
 // ---------------------------------------------------------------------------
 
 @Composable
-private fun PostBatchFadeIn(enabled: Boolean, content: @Composable () -> Unit) {
-    val alpha = remember { Animatable(if (enabled) 0f else 1f) }
-    LaunchedEffect(enabled) {
-        if (enabled && alpha.value < 1f) {
-            alpha.animateTo(1f, tween(200))
+private fun PostBatchFadeIn(
+    generation: Long,
+    sourceId: String,
+    arrivedAfterBatch: Boolean,
+    fadeTracker: SearchRowFadeTracker,
+    content: @Composable () -> Unit,
+) {
+    val shouldAnimate = remember(generation, sourceId) {
+        fadeTracker.shouldFadeIn(generation, sourceId, arrivedAfterBatch)
+    }
+    val alpha = remember(generation, sourceId) { Animatable(if (shouldAnimate) 0f else 1f) }
+    LaunchedEffect(generation, sourceId, shouldAnimate) {
+        if (shouldAnimate) {
+            try {
+                if (alpha.value < 1f) {
+                    alpha.animateTo(1f, tween(200))
+                }
+            } finally {
+                fadeTracker.markFadedIn(generation, sourceId)
+            }
         }
     }
     Box(Modifier.graphicsLayer { this.alpha = alpha.value }) {
@@ -1245,6 +1313,7 @@ private fun AggregatedResultsList(
     state: AggregatedSearchState,
     listState: LazyListState,
     rowListStateFor: (String) -> LazyListState,
+    fadeTracker: SearchRowFadeTracker,
     progressMap: Map<Pair<String, String>, WatchProgress>,
     listSep: String,
     onExpandSource: (SearchSourceRow) -> Unit,
@@ -1280,7 +1349,12 @@ private fun AggregatedResultsList(
 
         itemsIndexed(state.visibleRows, key = { _, row -> "src:${row.sourceId}" }) { index, row ->
             val topGap = if (index == 0) 0.dp else 18.dp
-            PostBatchFadeIn(enabled = row.arrivedAfterBatch) {
+            PostBatchFadeIn(
+                generation = state.generation,
+                sourceId = row.sourceId,
+                arrivedAfterBatch = row.arrivedAfterBatch,
+                fadeTracker = fadeTracker,
+            ) {
                 if (row.refreshingInPlace) {
                     Box(Modifier.padding(top = topGap)) {
                         SearchStatusLine(

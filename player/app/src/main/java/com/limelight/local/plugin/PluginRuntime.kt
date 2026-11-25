@@ -245,6 +245,26 @@ class PluginRuntime(
     val isInitialized: Boolean
         get() = initialized && quickJs != null && !closed
 
+    /** True once [close] or [shutdown] has been called on this runtime. */
+    val isClosed: Boolean
+        get() = closed
+
+    /**
+     * Best-effort background warm-up (e.g. when entering Search so optional `suggest()` can run
+     * on a warm VM): returns immediately if already initialized, closed, or busy with another call.
+     */
+    suspend fun warmUpIfIdle(timeoutMsOverride: Long? = null) {
+        if (closed || (initialized && quickJs != null)) return
+        if (!callMutex.tryLock()) return
+        try {
+            if (!closed && (!initialized || quickJs == null)) {
+                ensureInitializedLocked(timeoutMsOverride ?: defaultTimeoutMs)
+            }
+        } finally {
+            callMutex.unlock()
+        }
+    }
+
     /**
      * Lock-free hint returning `true` once the plugin module has been loaded and confirmed
      * NOT to export [method]. Returns `false` if the runtime is not yet initialized or

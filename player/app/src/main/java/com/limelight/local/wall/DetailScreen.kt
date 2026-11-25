@@ -62,6 +62,7 @@ import androidx.compose.ui.zIndex
 import com.limelight.R
 import com.limelight.local.media.Artworks
 import com.limelight.local.media.Item
+import com.limelight.local.media.ItemKind
 import com.limelight.local.media.MediaSource
 import com.limelight.local.media.WatchProgress
 import com.limelight.local.plugin.PluginMediaSource
@@ -95,6 +96,12 @@ fun DetailScreen(model: WallModel, nav: WallNav, page: Page.Detail) {
     var resolvedFocusEpisodeId by remember(page.sourceId, page.item.id, page.focusEpisodeId) {
         mutableStateOf(page.focusEpisodeId)
     }
+    var resolvedFallbackParentId by remember(page.sourceId, page.item.id) {
+        mutableStateOf<String?>(null)
+    }
+    var resolvedFallbackSeasonId by remember(page.sourceId, page.item.id) {
+        mutableStateOf<String?>(null)
+    }
     var loadingDetail by remember(page.sourceId, page.item.id) { mutableStateOf(src != null) }
     var detailError by remember(page.sourceId, page.item.id) { mutableStateOf<Throwable?>(null) }
     var retryToken by remember(page.sourceId, page.item.id) { mutableIntStateOf(0) }
@@ -125,6 +132,8 @@ fun DetailScreen(model: WallModel, nav: WallNav, page: Page.Detail) {
             detailed = resolved.displayItem
             resolvedFocusSeasonId = resolved.focusSeasonId
             resolvedFocusEpisodeId = resolved.focusEpisodeId
+            resolvedFallbackParentId = resolved.fallbackParentId
+            resolvedFallbackSeasonId = resolved.fallbackSeasonId
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -250,6 +259,25 @@ fun DetailScreen(model: WallModel, nav: WallNav, page: Page.Detail) {
                 onRetryDetail = { retryToken++ },
                 onDismissError = { detailError = null },
                 strings = strings,
+                onOpenSeries = resolvedFallbackParentId?.let { parentId ->
+                    {
+                        if (src != null) {
+                            nav.open(
+                                Page.Detail(
+                                    sourceId = src.source.id,
+                                    item = Item(
+                                        id = parentId,
+                                        kind = ItemKind.SEASON,
+                                        title = item.title,
+                                    ),
+                                    focusSeasonId = resolvedFallbackSeasonId,
+                                    focusEpisodeId = item.id,
+                                    resolveEpisodeParent = true,
+                                ),
+                            )
+                        }
+                    }
+                },
             )
         }
     }
@@ -273,6 +301,7 @@ private fun MovieDetailContent(
     onRetryDetail: () -> Unit,
     onDismissError: () -> Unit,
     strings: AndroidStringLookup,
+    onOpenSeries: (() -> Unit)? = null,
 ) {
     val localProgress by remember(source?.source?.id, item.id) {
         model.progress(source?.source?.id.orEmpty(), item.id)
@@ -382,6 +411,14 @@ private fun MovieDetailContent(
                             onClick = { nav.play(source, item, 0L) },
                             icon = WallIcons.Play,
                             kind = ButtonKind.Primary,
+                        )
+                    }
+
+                    if (onOpenSeries != null && !loadingDetail) {
+                        WallButton(
+                            text = stringResource(R.string.detail_open_series),
+                            onClick = onOpenSeries,
+                            kind = ButtonKind.Plain,
                         )
                     }
 
@@ -665,8 +702,14 @@ private fun SeriesDetailContent(
 
     // One-shot auto-scroll per season (or explicit Search episode focus): never re-scrolls
     // when watch progress updates change `playTarget` on the same season (series.html).
+    // Waits for local Room watch progress even on seasonless series so initial scroll uses real progress.
     val autoScrollController = remember(item.id) { SeriesAutoScrollController() }
-    val readyForInitialScroll = !loadingDetail && (!hasSeasons || initialResolution != null)
+    val readyForInitialScroll = DetailStateLogic.isReadyForInitialSeriesScroll(
+        loadingDetail = loadingDetail,
+        hasSeasons = hasSeasons,
+        hasInitialResolution = initialResolution != null,
+        localProgressLoaded = localProgressNullable != null,
+    )
     LaunchedEffect(activeKey, episodes.size, readyForInitialScroll, activeExplicitFocusId) {
         val targetIdx = autoScrollController.consumeScrollTargetIndex(
             seasonKey = activeKey,
