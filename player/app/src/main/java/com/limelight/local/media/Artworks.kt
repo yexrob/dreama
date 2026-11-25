@@ -43,6 +43,12 @@ object Artworks {
     fun cached(art: Artwork, size: Size): Bitmap? = memory.get(key(art, size))
 
     suspend fun load(context: Context, art: Artwork, size: Size): Bitmap? {
+        if (art.sourceKind == SourceKind.PLUGIN) {
+            LimeLog.warning(
+                "depth3d: Artworks.load refused SourceKind.PLUGIN artwork; returning null (use PluginImages.loadBitmap)",
+            )
+            return null
+        }
         val key = key(art, size)
         memory.get(key)?.let { return it }
         if (key in failed) {
@@ -66,6 +72,12 @@ object Artworks {
     // A tenth of the way in, capped at five minutes, skips the black or the
     // studio logo a frame at zero usually is
     private fun frame(context: Context, art: Artwork, size: Size): Bitmap? {
+        if (art.sourceKind == SourceKind.PLUGIN) {
+            LimeLog.warning(
+                "depth3d: Artworks.frame refused SourceKind.PLUGIN artwork; returning null (MediaMetadataRetriever forbidden for plugins)",
+            )
+            return null
+        }
         val mmr = MediaMetadataRetriever()
         return try {
             if (art.url.startsWith("http")) {

@@ -170,6 +170,15 @@ sh player/app/src/main/jni/airplay/mac/build.sh     # 需要 Xcode 命令行工�
 | llhttp（随 UxPlay） | 9.3.0 | MIT | `jni/airplay/uxplay/lib/llhttp/` |
 | libplist（只取库本身） | 2.6.0，[libimobiledevice/libplist](https://github.com/libimobiledevice/libplist) 2117b8fd | LGPL-2.1+ | `jni/airplay/libplist/` |
 | OpenSSL libcrypto | 4.0.2，仓库里 moonlight-core 已有的预编译库 | Apache-2.0 | `jni/moonlight-core/openssl/` |
+| quickjs-kt（插件运行时 QuickJS 绑定） | 1.0.18，[dokar3/quickjs-kt](https://github.com/dokar3/quickjs-kt)（内嵌 QuickJS / c-vector） | Apache-2.0（QuickJS 与 c-vector 为 MIT） | `player/app/build.gradle` |
+| jsoup（`ctx.parse.html` / `xml`） | 1.24.1，[jhy/jsoup](https://github.com/jhy/jsoup) | MIT | `player/app/build.gradle` |
+| kotlinx-serialization-json（JSON AST / Schema 校验） | 1.13.0，[Kotlin/kotlinx.serialization](https://github.com/Kotlin/kotlinx.serialization) | Apache-2.0 | `player/app/build.gradle` |
+| quickjs-emscripten（开发工具 QuickJS WASM） | 0.32.0，[justjake/quickjs-emscripten](https://github.com/justjake/quickjs-emscripten) | MIT | `tools/plugin-kit/package.json` |
+| ajv（共用 JSON Schema 校验） | 8.20.0，[ajv-validator/ajv](https://github.com/ajv-validator/ajv) | MIT | `tools/plugin-kit/package.json` |
+| linkedom（开发工具 `ctx.parse.xml`） | 0.18.15，[WebReflection/linkedom](https://github.com/WebReflection/linkedom) | ISC | `tools/plugin-kit/package.json` |
+| parse5（开发工具 `ctx.parse.html` HTML5 树构建） | 8.1.1，[inikulin/parse5](https://github.com/inikulin/parse5) | MIT | `tools/plugin-kit/package.json` |
+| jszip（`.d3plugin` 打包解包） | 3.10.2，[Stuk/jszip](https://github.com/Stuk/jszip) | MIT / GPL-3.0-or-later | `tools/plugin-kit/package.json` |
+| 测试依赖：`mockwebserver` 5.5.0、`kotlinx-coroutines-test` 1.11.0、`sqlite-jdbc` 3.54.1.0、`room-testing` 2.8.5、`robolectric` 4.18.1 | Maven Central | Apache-2.0 / MIT（Robolectric） | `player/app/build.gradle`（`testImplementation`） |
 
 都和本项目的 GPLv3 兼容，许可原文在各自目录里。接入方式参考了 [jqssun/android-airplay-server](https://github.com/jqssun/android-airplay-server)；`jni/airplay/android/` 和 `local/airplay/` 是本项目自己写的。
 

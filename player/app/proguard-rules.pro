@@ -33,3 +33,23 @@
 # jMDNS
 -dontwarn javax.jmdns.impl.DNSCache
 -dontwarn org.slf4j.**
+
+# QuickJS-KT JNI callbacks
+-keep class com.dokar.quickjs.** { *; }
+
+# Jsoup container compaction fields used by PluginDomParser
+-keepclassmembers class org.jsoup.nodes.Attributes {
+    int size;
+    java.lang.String[] keys;
+}
+-keepclassmembers class org.jsoup.nodes.Element {
+    org.jsoup.nodes.Attributes attributes;
+    org.jsoup.nodes.Element$NodeList childNodes;
+    private static final org.jsoup.nodes.Element$NodeList EmptyNodeList;
+}
+-keepclassmembers class org.jsoup.nodes.LeafNode {
+    java.lang.Object value;
+}
+-keepclassmembers class org.jsoup.nodes.FormElement {
+    private final java.util.ArrayList linkedEls;
+}

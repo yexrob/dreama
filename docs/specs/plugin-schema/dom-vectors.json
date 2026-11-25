@@ -1,0 +1,1464 @@
+{
+  "description": "Shared HTML/XML DOM parity test vectors run on Android PluginDomParser (Jsoup) and tools/plugin-kit (parse5 for HTML, linkedom for XML), including knownDifference malformed-HTML tree vectors.",
+  "cases": [
+    {
+      "name": "xml_dash_mpd_self_closing_and_case",
+      "mode": "xml",
+      "input": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><MPD xmlns:dvb=\"urn:dvb:dash:dash-extensions:2014-1\" mediaPresentationDuration=\"PT120S\"><Period><AdaptationSet mimeType=\"video/mp4\"><Representation id=\"v1\" bandwidth=\"4000000\"><BaseURL dvb:priority=\"1\">https://cdn1.example.com/v.mp4</BaseURL><BaseURL dvb:priority=\"2\">https://cdn2.example.com/v.mp4</BaseURL><SegmentBase indexRange=\"700-750\"><Initialization range=\"0-699\"/><RepresentationIndex range=\"700-750\"/></SegmentBase></Representation></AdaptationSet></Period></MPD>",
+      "assertions": [
+        {
+          "op": "rootTag",
+          "expected": "#document"
+        },
+        {
+          "op": "rootChildrenTags",
+          "expected": [
+            "MPD"
+          ]
+        },
+        {
+          "op": "firstTag",
+          "selector": "Representation",
+          "expected": "Representation"
+        },
+        {
+          "op": "firstTag",
+          "selector": "representation",
+          "expected": null
+        },
+        {
+          "op": "firstAttr",
+          "selector": "Representation",
+          "attr": "id",
+          "expected": "v1"
+        },
+        {
+          "op": "firstAttr",
+          "selector": "Representation",
+          "attr": "ID",
+          "expected": null
+        },
+        {
+          "op": "firstAttr",
+          "selector": "Representation",
+          "attr": "missing",
+          "expected": null
+        },
+        {
+          "op": "allTexts",
+          "selector": "BaseURL",
+          "expected": [
+            "https://cdn1.example.com/v.mp4",
+            "https://cdn2.example.com/v.mp4"
+          ]
+        },
+        {
+          "op": "allAttrs",
+          "selector": "BaseURL",
+          "attr": "dvb:priority",
+          "expected": [
+            "1",
+            "2"
+          ]
+        },
+        {
+          "op": "childrenTags",
+          "selector": "SegmentBase",
+          "expected": [
+            "Initialization",
+            "RepresentationIndex"
+          ]
+        },
+        {
+          "op": "firstAttr",
+          "selector": "Initialization",
+          "attr": "range",
+          "expected": "0-699"
+        }
+      ]
+    },
+    {
+      "name": "xml_rss_cdata_and_link",
+      "mode": "xml",
+      "input": "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><item><title><![CDATA[  Hello & <World>   2026  ]]></title><link>https://feeds.example.com/ep/1</link><description>Plain   text</description></item></channel></rss>",
+      "assertions": [
+        {
+          "op": "rootTag",
+          "expected": "#document"
+        },
+        {
+          "op": "firstTag",
+          "selector": "rss",
+          "expected": "rss"
+        },
+        {
+          "op": "firstText",
+          "selector": "item title",
+          "expected": "Hello & <World> 2026"
+        },
+        {
+          "op": "firstText",
+          "selector": "item link",
+          "expected": "https://feeds.example.com/ep/1"
+        },
+        {
+          "op": "firstText",
+          "selector": "item description",
+          "expected": "Plain text"
+        },
+        {
+          "op": "firstText",
+          "selector": "item",
+          "expected": "Hello & <World> 2026 https://feeds.example.com/ep/1Plain text"
+        }
+      ]
+    },
+    {
+      "name": "xml_namespaces_entities_and_case_sensitivity",
+      "mode": "xml",
+      "input": "<?xml version=\"1.0\"?><!DOCTYPE r [<!ENTITY e \"EXP\">]><r xmlns:dvb=\"u\"><dvb:x Attr=\"1\">caf&eacute; &amp; &#233; &e;</dvb:x><item><title>A</title><description>B</description></item><a><b/><c>after</c></a></r>",
+      "assertions": [
+        {
+          "op": "firstText",
+          "selector": "dvb|x",
+          "expected": "caf&eacute; & é &e;"
+        },
+        {
+          "op": "firstAttr",
+          "selector": "dvb|x",
+          "attr": "Attr",
+          "expected": "1"
+        },
+        {
+          "op": "firstAttr",
+          "selector": "dvb|x",
+          "attr": "attr",
+          "expected": null
+        },
+        {
+          "op": "firstTag",
+          "selector": "dvb|x[Attr=\"1\"]",
+          "expected": "dvb:x"
+        },
+        {
+          "op": "firstTag",
+          "selector": "dvb|x[attr=\"1\"]",
+          "expected": null
+        },
+        {
+          "op": "firstText",
+          "selector": "item",
+          "expected": "AB"
+        },
+        {
+          "op": "firstText",
+          "selector": "a > c",
+          "expected": "after"
+        }
+      ]
+    },
+    {
+      "name": "html_case_whitespace_and_attrs",
+      "mode": "html",
+      "input": "<!DOCTYPE html><html><head><title>Sample</title></head><body><DIV class=\"Hero\" DATA-X=\"1\" data-id=\"42\" disabled><H1>  Title   One </H1><P>Line  1</P><P>Line\n\t2</P></DIV><div class=\"a\"><div class=\"b\">inner</div></div></body></html>",
+      "assertions": [
+        {
+          "op": "rootTag",
+          "expected": "#document"
+        },
+        {
+          "op": "firstTag",
+          "selector": ".Hero",
+          "expected": "div"
+        },
+        {
+          "op": "firstTag",
+          "selector": "H1",
+          "expected": "h1"
+        },
+        {
+          "op": "firstText",
+          "selector": "h1",
+          "expected": "Title One"
+        },
+        {
+          "op": "firstText",
+          "selector": ".Hero",
+          "expected": "Title One Line 1 Line 2"
+        },
+        {
+          "op": "firstAttr",
+          "selector": ".Hero",
+          "attr": "data-id",
+          "expected": "42"
+        },
+        {
+          "op": "firstAttr",
+          "selector": ".Hero",
+          "attr": "data-x",
+          "expected": "1"
+        },
+        {
+          "op": "firstAttr",
+          "selector": ".Hero",
+          "attr": "DATA-X",
+          "expected": "1"
+        },
+        {
+          "op": "firstAttr",
+          "selector": ".Hero",
+          "attr": "disabled",
+          "expected": ""
+        },
+        {
+          "op": "firstAttr",
+          "selector": ".Hero",
+          "attr": "nonexistent",
+          "expected": null
+        },
+        {
+          "op": "allTexts",
+          "selector": "p",
+          "expected": [
+            "Line 1",
+            "Line 2"
+          ]
+        },
+        {
+          "op": "subFirstAttr",
+          "parent": "div.a",
+          "selector": "div",
+          "attr": "class",
+          "expected": "b"
+        }
+      ]
+    },
+    {
+      "name": "html_script_style_blocks_unicode_space_and_unsupported_pseudos",
+      "mode": "html",
+      "input": "<!DOCTYPE html><html><head><title>T</title><style>.x{color:red}</style></head><body><div id=\"s\"><script>var x=1;</script><style>body{display:none}</style>Hi</div><div id=\"n\">a&nbsp;&nbsp;b</div><div id=\"br\">a<br>b</div><div id=\"v\"><span>a</span><video>v</video>b</div><div id=\"d\"><details><summary>S</summary>D</details>x</div><select id=\"sel\"><option>o1</option><option>o2</option></select><div id=\"u\">a  b</div><table id=\"tb\"><tr><td>a</td><td>b</td></tr></table><div id=\"ta\"><textarea>  t  </textarea></div><ul><li>1</li><li>2</li></ul></body></html>",
+      "assertions": [
+        {
+          "op": "firstText",
+          "selector": "#s",
+          "expected": "Hi"
+        },
+        {
+          "op": "firstText",
+          "selector": "#n",
+          "expected": "a b"
+        },
+        {
+          "op": "firstText",
+          "selector": "#br",
+          "expected": "a b"
+        },
+        {
+          "op": "firstText",
+          "selector": "#v",
+          "expected": "a v b"
+        },
+        {
+          "op": "firstText",
+          "selector": "#d",
+          "expected": "SD x"
+        },
+        {
+          "op": "firstText",
+          "selector": "#sel",
+          "expected": "o1 o2"
+        },
+        {
+          "op": "firstText",
+          "selector": "#u",
+          "expected": "a  b"
+        },
+        {
+          "op": "firstText",
+          "selector": "#tb",
+          "expected": "a b"
+        },
+        {
+          "op": "firstText",
+          "selector": "#ta",
+          "expected": "t"
+        },
+        {
+          "op": "firstText",
+          "selector": "li:nth-child(2)",
+          "expected": "2"
+        },
+        {
+          "op": "selectorThrows",
+          "selector": "li:eq(1)",
+          "expected": true
+        },
+        {
+          "op": "selectorThrows",
+          "selector": "div:contains(Hi)",
+          "expected": true
+        }
+      ]
+    },
+    {
+      "name": "html_fragment_wrapping",
+      "mode": "html",
+      "input": "<title>T</title><p>body</p><ul class=\"list\"><li>First</li><li>Second</li></ul>",
+      "assertions": [
+        {
+          "op": "rootTag",
+          "expected": "#document"
+        },
+        {
+          "op": "rootText",
+          "expected": "T body First Second"
+        },
+        {
+          "op": "allTexts",
+          "selector": "ul.list > li",
+          "expected": [
+            "First",
+            "Second"
+          ]
+        },
+        {
+          "op": "allTags",
+          "selector": "ul.list > li",
+          "expected": [
+            "li",
+            "li"
+          ]
+        }
+      ]
+    }
+  ],
+  "matrixCases": [
+    {
+      "id": 1,
+      "mode": "html",
+      "input": "<table><tr><td>a</td></tr></table>",
+      "target": "table > tbody > tr",
+      "op": "text",
+      "throws": false,
+      "expected": "a"
+    },
+    {
+      "id": 2,
+      "mode": "html",
+      "input": "<table><tr><td>a</td></tr></table>",
+      "target": "table > tr",
+      "op": "text",
+      "throws": false,
+      "expected": null
+    },
+    {
+      "id": 3,
+      "mode": "html",
+      "input": "<p>a<p>b",
+      "target": "p",
+      "op": "all:p",
+      "throws": false,
+      "expected": ""
+    },
+    {
+      "id": 4,
+      "mode": "html",
+      "input": "<div><p>a<p>b</div>",
+      "target": "#root",
+      "op": "all:p",
+      "throws": false,
+      "expected": "p=a|p=b"
+    },
+    {
+      "id": 5,
+      "mode": "html",
+      "input": "<p>x<div>y</div></p>",
+      "target": "p",
+      "op": "text",
+      "throws": false,
+      "expected": "x"
+    },
+    {
+      "id": 6,
+      "mode": "html",
+      "input": "<p>x<div>y</div></p>",
+      "target": "p > div",
+      "op": "text",
+      "throws": false,
+      "expected": null
+    },
+    {
+      "id": 7,
+      "mode": "html",
+      "input": "<ul><li>a<li>b</ul>",
+      "target": "li",
+      "op": "text",
+      "throws": false,
+      "expected": "a"
+    },
+    {
+      "id": 8,
+      "mode": "html",
+      "input": "<b><p>x</b>y</p>",
+      "target": "p > b",
+      "op": "text",
+      "throws": false,
+      "expected": "x"
+    },
+    {
+      "id": 9,
+      "mode": "html",
+      "input": "<a href=1><a href=2>x</a>",
+      "target": "a",
+      "op": "all:a a",
+      "throws": false,
+      "expected": ""
+    },
+    {
+      "id": 10,
+      "mode": "html",
+      "input": "<table><b>x</b><tr><td>y</td></tr></table>",
+      "target": "body > b",
+      "op": "text",
+      "throws": false,
+      "expected": "x"
+    },
+    {
+      "id": 11,
+      "mode": "html",
+      "input": "<div class=a><div class=a>x</div></div>",
+      "target": "div",
+      "op": "all:div",
+      "throws": false,
+      "expected": "div=x"
+    },
+    {
+      "id": 12,
+      "mode": "html",
+      "input": "<div><p>a</p><p>b</p></div>",
+      "target": "div",
+      "op": "html",
+      "throws": false,
+      "expected": "<p>a</p><p>b</p>"
+    },
+    {
+      "id": 13,
+      "mode": "html",
+      "input": "<div><p>a</p><p>b</p></div>",
+      "target": "div",
+      "op": "outer",
+      "throws": false,
+      "expected": "<div><p>a</p><p>b</p></div>"
+    },
+    {
+      "id": 14,
+      "mode": "html",
+      "input": "<p title=\"a&amp;b\">&nbsp;x&lt;</p>",
+      "target": "p",
+      "op": "outer",
+      "throws": false,
+      "expected": "<p title=\"a&amp;b\">&nbsp;x&lt;</p>"
+    },
+    {
+      "id": 15,
+      "mode": "html",
+      "input": "<div><br><input disabled></div>",
+      "target": "div",
+      "op": "html",
+      "throws": false,
+      "expected": "<br><input disabled>"
+    },
+    {
+      "id": 16,
+      "mode": "html",
+      "input": "<div><input disabled></div>",
+      "target": "input",
+      "op": "attrs",
+      "throws": false,
+      "expected": "{\"disabled\":\"\"}"
+    },
+    {
+      "id": 17,
+      "mode": "html",
+      "input": "<div DATA-X=1 data-x=2></div>",
+      "target": "div",
+      "op": "attrs",
+      "throws": false,
+      "expected": "{\"data-x\":\"1\"}"
+    },
+    {
+      "id": 18,
+      "mode": "html",
+      "input": "<DIV>x</DIV>",
+      "target": "DIV",
+      "op": "tag",
+      "throws": false,
+      "expected": "div"
+    },
+    {
+      "id": 19,
+      "mode": "html",
+      "input": "<div data-x=1>x</div>",
+      "target": "[DATA-X]",
+      "op": "text",
+      "throws": false,
+      "expected": "x"
+    },
+    {
+      "id": 20,
+      "mode": "html",
+      "input": "<input type=TEXT>",
+      "target": "[type=text]",
+      "op": "tag",
+      "throws": false,
+      "expected": null
+    },
+    {
+      "id": 21,
+      "mode": "html",
+      "input": "<input type=TEXT>",
+      "target": "[type=text i]",
+      "op": "tag",
+      "throws": false,
+      "expected": "input"
+    },
+    {
+      "id": 22,
+      "mode": "html",
+      "input": "<svg><foreignObject>x</foreignObject></svg>",
+      "target": "foreignObject",
+      "op": "tag",
+      "throws": false,
+      "expected": "foreignobject"
+    },
+    {
+      "id": 23,
+      "mode": "html",
+      "input": "<svg viewBox=\"0 0 1 1\"></svg>",
+      "target": "svg",
+      "op": "attrs",
+      "throws": false,
+      "expected": "{\"viewbox\":\"0 0 1 1\"}"
+    },
+    {
+      "id": 24,
+      "mode": "html",
+      "input": "<ul><li>1</li><li>2</li><li>3</li><li>4</li></ul>",
+      "target": "li:nth-child(2n+1)",
+      "op": "all:*",
+      "throws": false,
+      "expected": ""
+    },
+    {
+      "id": 25,
+      "mode": "html",
+      "input": "<ul><li>1</li><li>2</li><li>3</li></ul>",
+      "target": "ul",
+      "op": "all:li:nth-child(odd)",
+      "throws": false,
+      "expected": "li=1|li=3"
+    },
+    {
+      "id": 26,
+      "mode": "html",
+      "input": "<ul><li>1</li><li>2</li><li>3</li></ul>",
+      "target": "ul",
+      "op": "all:li:nth-child(-n+2)",
+      "throws": false,
+      "expected": "li=1|li=2"
+    },
+    {
+      "id": 27,
+      "mode": "html",
+      "input": "<ul><li>1</li><li>2</li><li>3</li></ul>",
+      "target": "ul",
+      "op": "all:li:not(:first-child)",
+      "throws": false,
+      "expected": "li=2|li=3"
+    },
+    {
+      "id": 28,
+      "mode": "html",
+      "input": "<div><p></p><p> </p></div>",
+      "target": "div",
+      "op": "all:p:empty",
+      "throws": false,
+      "expected": "p="
+    },
+    {
+      "id": 29,
+      "mode": "html",
+      "input": "<div><a></a><b></b><a></a></div>",
+      "target": "div",
+      "op": "all:b ~ a",
+      "throws": false,
+      "expected": "a="
+    },
+    {
+      "id": 30,
+      "mode": "html",
+      "input": "<div><a></a><b></b><a></a></div>",
+      "target": "div",
+      "op": "all:b + a",
+      "throws": false,
+      "expected": "a="
+    },
+    {
+      "id": 31,
+      "mode": "html",
+      "input": "<div><span>x</span></div>",
+      "target": "div:has(span)",
+      "op": "tag",
+      "throws": true,
+      "expected": null
+    },
+    {
+      "id": 32,
+      "mode": "html",
+      "input": "<p id=\"a:b\">x</p>",
+      "target": "#a\\:b",
+      "op": "text",
+      "throws": false,
+      "expected": "x"
+    },
+    {
+      "id": 33,
+      "mode": "html",
+      "input": "<p>x</p>",
+      "target": "p >",
+      "op": "tag",
+      "throws": true,
+      "expected": null
+    },
+    {
+      "id": 34,
+      "mode": "html",
+      "input": "<p>x</p>",
+      "target": "",
+      "op": "tag",
+      "throws": true,
+      "expected": null
+    },
+    {
+      "id": 35,
+      "mode": "html",
+      "input": "<p>x</p>",
+      "target": "[a=",
+      "op": "tag",
+      "throws": true,
+      "expected": null
+    },
+    {
+      "id": 36,
+      "mode": "html",
+      "input": "<div><pre>  a\n  b </pre></div>",
+      "target": "div",
+      "op": "text",
+      "throws": false,
+      "expected": "a b"
+    },
+    {
+      "id": 37,
+      "mode": "html",
+      "input": "<div><noscript>n</noscript>x</div>",
+      "target": "div",
+      "op": "text",
+      "throws": false,
+      "expected": "n x"
+    },
+    {
+      "id": 38,
+      "mode": "html",
+      "input": "<div><template><p>t</p></template>x</div>",
+      "target": "div",
+      "op": "text",
+      "throws": false,
+      "expected": "t x"
+    },
+    {
+      "id": 39,
+      "mode": "html",
+      "input": "<div><template><p>t</p></template>x</div>",
+      "target": "div p",
+      "op": "text",
+      "throws": false,
+      "expected": "t"
+    },
+    {
+      "id": 40,
+      "mode": "html",
+      "input": "<p>a　b​c d</p>",
+      "target": "p",
+      "op": "text",
+      "throws": false,
+      "expected": "a　b​c d"
+    },
+    {
+      "id": 41,
+      "mode": "html",
+      "input": "<head><title>T</title><style>s{}</style></head><body>b</body>",
+      "target": "#root",
+      "op": "text",
+      "throws": false,
+      "expected": "T b"
+    },
+    {
+      "id": 42,
+      "mode": "html",
+      "input": "<div>a<span>b</span>c<p>d</p>e</div>",
+      "target": "div",
+      "op": "text",
+      "throws": false,
+      "expected": "abc d e"
+    },
+    {
+      "id": 43,
+      "mode": "html",
+      "input": "<div>x<!-- c -->y</div>",
+      "target": "div",
+      "op": "text",
+      "throws": false,
+      "expected": "xy"
+    },
+    {
+      "id": 44,
+      "mode": "html",
+      "input": "<div><textarea>a<b>b</b></textarea></div>",
+      "target": "div",
+      "op": "text",
+      "throws": false,
+      "expected": "a<b>b</b>"
+    },
+    {
+      "id": 45,
+      "mode": "html",
+      "input": "<div><textarea>a<b>b</b></textarea></div>",
+      "target": "div b",
+      "op": "tag",
+      "throws": false,
+      "expected": null
+    },
+    {
+      "id": 46,
+      "mode": "html",
+      "input": "<div><title>a<b>b</b></title></div>",
+      "target": "div b",
+      "op": "tag",
+      "throws": false,
+      "expected": null
+    },
+    {
+      "id": 47,
+      "mode": "html",
+      "input": "<html><body><p>x</p></body></html><p>y</p>",
+      "target": "#root",
+      "op": "all:p",
+      "throws": false,
+      "expected": "p=x|p=y"
+    },
+    {
+      "id": 48,
+      "mode": "html",
+      "input": "<frameset><frame></frameset>",
+      "target": "#root",
+      "op": "all:*",
+      "throws": false,
+      "expected": "html=|head=|frameset=|frame="
+    },
+    {
+      "id": 49,
+      "mode": "html",
+      "input": "<div id=x></div><div id=x></div>",
+      "target": "#root",
+      "op": "all:#x",
+      "throws": false,
+      "expected": "div=|div="
+    },
+    {
+      "id": 50,
+      "mode": "html",
+      "input": "<div class=\"A b\"></div>",
+      "target": "#root",
+      "op": "all:.a",
+      "throws": false,
+      "expected": ""
+    },
+    {
+      "id": 51,
+      "mode": "html",
+      "input": "<div class=\"A b\"></div>",
+      "target": "#root",
+      "op": "all:.A",
+      "throws": false,
+      "expected": "div="
+    },
+    {
+      "id": 52,
+      "mode": "html",
+      "input": "<p>&notit; &amp &copy &#128512; &#x0;</p>",
+      "target": "p",
+      "op": "text",
+      "throws": false,
+      "expected": "¬it; & © 😀 �"
+    },
+    {
+      "id": 53,
+      "mode": "html",
+      "input": "<p>x</p>",
+      "target": "#root",
+      "op": "children",
+      "throws": false,
+      "expected": "html"
+    },
+    {
+      "id": 54,
+      "mode": "html",
+      "input": "",
+      "target": "#root",
+      "op": "children",
+      "throws": false,
+      "expected": "html"
+    },
+    {
+      "id": 55,
+      "mode": "html",
+      "input": "<p>x</p>",
+      "target": "p",
+      "op": "attr:missing",
+      "throws": false,
+      "expected": null
+    },
+    {
+      "id": 56,
+      "mode": "xml",
+      "input": "<r><a>1</a><a>2</a></r>",
+      "target": "r",
+      "op": "all:a",
+      "throws": false,
+      "expected": "a=1|a=2"
+    },
+    {
+      "id": 57,
+      "mode": "xml",
+      "input": "<r xmlns=\"urn:x\"><a>1</a></r>",
+      "target": "a",
+      "op": "text",
+      "throws": false,
+      "expected": "1"
+    },
+    {
+      "id": 58,
+      "mode": "xml",
+      "input": "<r xmlns:d=\"u\"><d:a>1</d:a><a>2</a></r>",
+      "target": "r",
+      "op": "all:*|a",
+      "throws": false,
+      "expected": "d:a=1|a=2"
+    },
+    {
+      "id": 59,
+      "mode": "xml",
+      "input": "<r xmlns:d=\"u\"><d:a>1</d:a><a>2</a></r>",
+      "target": "r",
+      "op": "all:|a",
+      "throws": false,
+      "expected": "a=2"
+    },
+    {
+      "id": 60,
+      "mode": "xml",
+      "input": "<r xmlns:d=\"u\"><d:a>1</d:a><a>2</a></r>",
+      "target": "r",
+      "op": "all:d|*",
+      "throws": false,
+      "expected": "d:a=1"
+    },
+    {
+      "id": 61,
+      "mode": "xml",
+      "input": "<r xmlns:d=\"u\"><d:a>1</d:a><a>2</a></r>",
+      "target": "r",
+      "op": "all:a",
+      "throws": false,
+      "expected": "a=2"
+    },
+    {
+      "id": 62,
+      "mode": "xml",
+      "input": "<r xmlns:d=\"u\"><d:a>1</d:a></r>",
+      "target": "d|a",
+      "op": "tag",
+      "throws": false,
+      "expected": "d:a"
+    },
+    {
+      "id": 63,
+      "mode": "xml",
+      "input": "<r><a Id=\"1\"/></r>",
+      "target": "[id]",
+      "op": "tag",
+      "throws": false,
+      "expected": null
+    },
+    {
+      "id": 64,
+      "mode": "xml",
+      "input": "<r><a Id=\"1\"/></r>",
+      "target": "[Id]",
+      "op": "tag",
+      "throws": false,
+      "expected": "a"
+    },
+    {
+      "id": 65,
+      "mode": "xml",
+      "input": "<r><a id=\"x\"/></r>",
+      "target": "#x",
+      "op": "tag",
+      "throws": false,
+      "expected": "a"
+    },
+    {
+      "id": 66,
+      "mode": "xml",
+      "input": "<r><a class=\"c\"/></r>",
+      "target": ".c",
+      "op": "tag",
+      "throws": false,
+      "expected": "a"
+    },
+    {
+      "id": 67,
+      "mode": "xml",
+      "input": "<r><![CDATA[a<b>]]>c</r>",
+      "target": "#root",
+      "op": "text",
+      "throws": false,
+      "expected": "a<b>c"
+    },
+    {
+      "id": 68,
+      "mode": "xml",
+      "input": "<r>a<?pi x?>b<!-- c -->d</r>",
+      "target": "#root",
+      "op": "text",
+      "throws": false,
+      "expected": "abd"
+    },
+    {
+      "id": 69,
+      "mode": "xml",
+      "input": "<r><a>1</a></r>",
+      "target": "r",
+      "op": "html",
+      "throws": false,
+      "expected": "<a>1</a>"
+    },
+    {
+      "id": 70,
+      "mode": "xml",
+      "input": "<r><a/><b x=\"1&amp;2\">t&lt;</b></r>",
+      "target": "r",
+      "op": "html",
+      "throws": false,
+      "expected": "<a/><b x=\"1&amp;2\">t&lt;</b>"
+    },
+    {
+      "id": 71,
+      "mode": "xml",
+      "input": "<r><a/></r>",
+      "target": "r",
+      "op": "outer",
+      "throws": false,
+      "expected": "<r><a/></r>"
+    },
+    {
+      "id": 72,
+      "mode": "xml",
+      "input": "<r>&#x1F600;&#233;&lt;&quot;&apos;</r>",
+      "target": "#root",
+      "op": "text",
+      "throws": false,
+      "expected": "😀é<\"'"
+    },
+    {
+      "id": 73,
+      "mode": "xml",
+      "input": "<r>&amp;eacute;</r>",
+      "target": "#root",
+      "op": "text",
+      "throws": false,
+      "expected": "&eacute;"
+    },
+    {
+      "id": 74,
+      "mode": "xml",
+      "input": "<r>&</r>",
+      "target": "#root",
+      "op": "text",
+      "throws": false,
+      "expected": "&"
+    },
+    {
+      "id": 75,
+      "mode": "xml",
+      "input": "<r><a></r>",
+      "target": "#root",
+      "op": "text",
+      "throws": false,
+      "expected": ""
+    },
+    {
+      "id": 76,
+      "mode": "xml",
+      "input": "<r>a</r><s>b</s>",
+      "target": "#root",
+      "op": "all:*",
+      "throws": false,
+      "expected": "r=a|s=b"
+    },
+    {
+      "id": 77,
+      "mode": "xml",
+      "input": "not xml",
+      "target": "#root",
+      "op": "text",
+      "throws": false,
+      "expected": "not xml"
+    },
+    {
+      "id": 78,
+      "mode": "xml",
+      "input": "<r>  a   b  </r>",
+      "target": "r",
+      "op": "text",
+      "throws": false,
+      "expected": "a b"
+    },
+    {
+      "id": 79,
+      "mode": "xml",
+      "input": "<r><p>a</p><p>b</p></r>",
+      "target": "r",
+      "op": "text",
+      "throws": false,
+      "expected": "ab"
+    },
+    {
+      "id": 80,
+      "mode": "xml",
+      "input": "<R><r>x</r></R>",
+      "target": "r",
+      "op": "tag",
+      "throws": false,
+      "expected": "r"
+    },
+    {
+      "id": 81,
+      "mode": "xml",
+      "input": "<r><a>1</a></r>",
+      "target": "A",
+      "op": "tag",
+      "throws": false,
+      "expected": null
+    },
+    {
+      "id": 82,
+      "mode": "xml",
+      "input": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><r a=\"1\"/>",
+      "target": "#root",
+      "op": "children",
+      "throws": false,
+      "expected": "r"
+    },
+    {
+      "id": 83,
+      "mode": "xml",
+      "input": "<r xml:lang=\"en\"/>",
+      "target": "r",
+      "op": "attrs",
+      "throws": false,
+      "expected": "{\"xml:lang\":\"en\"}"
+    },
+    {
+      "id": 84,
+      "mode": "xml",
+      "input": "<r>&eacute;<![CDATA[&eacute;]]></r>",
+      "target": "r",
+      "op": "text",
+      "throws": false,
+      "expected": "&eacute;&eacute;"
+    },
+    {
+      "id": 85,
+      "mode": "xml",
+      "input": "<r a=\"&eacute;\"/>",
+      "target": "r",
+      "op": "attr:a",
+      "throws": false,
+      "expected": "&eacute;"
+    },
+    {
+      "id": 86,
+      "mode": "html",
+      "input": "<ul><li k=1></li><li k=2></li><li k=3></li></ul>",
+      "target": "li:nth-child(n-2147483648)",
+      "op": "tag",
+      "throws": true,
+      "expected": null
+    },
+    {
+      "id": 87,
+      "mode": "html",
+      "input": "<ul><li k=1></li><li k=2></li><li k=3></li></ul>",
+      "target": "li:nth-child(2n-2147483647)",
+      "op": "tag",
+      "throws": true,
+      "expected": null
+    },
+    {
+      "id": 88,
+      "mode": "html",
+      "input": "<ul><li k=1></li><li k=2></li><li k=3></li></ul>",
+      "target": "li:nth-child(2147483648)",
+      "op": "tag",
+      "throws": true,
+      "expected": null
+    },
+    {
+      "id": 89,
+      "mode": "html",
+      "input": "<ul><li k=1></li><li k=2></li><li k=3></li></ul>",
+      "target": "li:nth-child(1000001)",
+      "op": "tag",
+      "throws": true,
+      "expected": null
+    },
+    {
+      "id": 90,
+      "mode": "html",
+      "input": "<ul><li k=1></li><li k=2></li><li k=3></li></ul>",
+      "target": "li:nth-child(-1000001n+1)",
+      "op": "tag",
+      "throws": true,
+      "expected": null
+    },
+    {
+      "id": 91,
+      "mode": "html",
+      "knownDifference": true,
+      "category": "select_non_option",
+      "reason": "Jsoup retains non-<option> elements inside <select>, whereas WHATWG HTML5 (parse5) drops disallowed start tags in 'in select' insertion mode.",
+      "input": "<select><div><p>a</p></div><option>b</option></select>",
+      "target": "#root",
+      "op": "outer",
+      "throws": false,
+      "expectedAndroid": "<html><head></head><body><select><div><p>a</p></div><option>b</option></select></body></html>",
+      "expectedKit": "<html><head></head><body><select>a<option>b</option></select></body></html>"
+    },
+    {
+      "id": 92,
+      "mode": "html",
+      "knownDifference": true,
+      "category": "select_non_option",
+      "reason": "WHATWG HTML5 (parse5) closes <select> upon seeing <textarea>, whereas Jsoup nests <textarea> inside <select>.",
+      "input": "<select><textarea>raw</textarea><option>b</option></select>",
+      "target": "#root",
+      "op": "outer",
+      "throws": false,
+      "expectedAndroid": "<html><head></head><body><select><textarea>raw</textarea><option>b</option></select></body></html>",
+      "expectedKit": "<html><head></head><body><select></select><textarea>raw</textarea><option>b</option></body></html>"
+    },
+    {
+      "id": 93,
+      "mode": "html",
+      "knownDifference": true,
+      "category": "whitespace_before_html",
+      "reason": "Jsoup retains leading whitespace text nodes before <html>, whereas WHATWG HTML5 (parse5) drops whitespace in initial/before-html mode.",
+      "input": "</em> </span><p>a</p>",
+      "target": "#root",
+      "op": "outer",
+      "throws": false,
+      "expectedAndroid": " <html><head></head><body><p>a</p></body></html>",
+      "expectedKit": "<html><head></head><body><p>a</p></body></html>"
+    },
+    {
+      "id": 94,
+      "mode": "html",
+      "knownDifference": true,
+      "category": "whitespace_after_body",
+      "reason": "Jsoup keeps trailing whitespace after </body> as a child of <html>, whereas WHATWG HTML5 (parse5) re-inserts after-body whitespace into <body>.",
+      "input": "<html><body><p>a</p></body>   ",
+      "target": "#root",
+      "op": "outer",
+      "throws": false,
+      "expectedAndroid": "<html><head></head><body><p>a</p></body>   </html>",
+      "expectedKit": "<html><head></head><body><p>a</p>   </body></html>"
+    },
+    {
+      "id": 95,
+      "mode": "html",
+      "knownDifference": true,
+      "category": "template_malformed_nesting",
+      "reason": "Inside <select> with malformed tags around <template>, parse5 drops <nobr> and keeps <template> directly under <select>, whereas Jsoup keeps <nobr> wrapping <template>.",
+      "input": "<select><nobr><template><p>t</p></template></nobr></select>",
+      "target": "#root",
+      "op": "outer",
+      "throws": false,
+      "expectedAndroid": "<html><head></head><body><select><nobr><template><p>t</p></template></nobr></select></body></html>",
+      "expectedKit": "<html><head></head><body><select><template><p>t</p></template></select></body></html>"
+    },
+    {
+      "id": 96,
+      "mode": "html",
+      "knownDifference": true,
+      "category": "template_malformed_nesting",
+      "reason": "Inside <template><table><form>, parse5 follows WHATWG in-table form pointer rules and drops the empty <form>, whereas Jsoup retains <form> under <table>.",
+      "input": "<template><table><form></form></table></template>",
+      "target": "#root",
+      "op": "outer",
+      "throws": false,
+      "expectedAndroid": "<html><head><template><table><form></form></table></template></head><body></body></html>",
+      "expectedKit": "<html><head><template><table></table></template></head><body></body></html>"
+    }
+  ],
+  "estimatedBytesVectors": [
+    {
+      "name": "html_table_pretty",
+      "mode": "html",
+      "prefix": "<!DOCTYPE html><html><head><title>t</title></head><body><table class=\"list\"><tbody>",
+      "unit": "  <tr><td>1</td><td><a href=\"/item/1\">alpha beta</a></td><td class=\"size\">123 MB</td><td>2024-01-11</td></tr>\n",
+      "repeat": 300,
+      "suffix": "</tbody></table></body></html>",
+      "expectedBytes": 258356,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_list_cards",
+      "mode": "html",
+      "prefix": "<!DOCTYPE html><html><body><ul class=\"items\">\n",
+      "unit": "<li class=\"item card\" data-id=\"42\"><a class=\"title\" href=\"/v/42.html\" title=\"电影\"><img src=\"/p/42.jpg\" alt=\"第一季\" loading=\"lazy\"></a><span class=\"meta\">HD · 45分钟</span></li>\n",
+      "repeat": 200,
+      "suffix": "</ul></body></html>",
+      "expectedBytes": 141952,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_article_cjk",
+      "mode": "html",
+      "prefix": "<html><body><article>",
+      "unit": "<p>视频 电影 剧集 第一季 1080p <a href=\"#n1\">[1]</a> alpha beta gamma delta</p>\n",
+      "repeat": 200,
+      "suffix": "</article></body></html>",
+      "expectedBytes": 107176,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_script_heavy",
+      "mode": "html",
+      "prefix": "<!DOCTYPE html><html><head><style>.c{color:red;margin:0 auto}\n.c{color:red;margin:0 auto}\n</style></head><body><div id=\"__next\">",
+      "unit": "<script>self.__next_f.push([1,\"payload-data-block-0123456789\"])</script><div class=\"r\"><a href=\"/a/1\">alpha</a></div>",
+      "repeat": 120,
+      "suffix": "</div></body></html>",
+      "expectedBytes": 72020,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_dup_attrs_97",
+      "mode": "html",
+      "prefix": "<div>",
+      "unit": "<p a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a></p>",
+      "repeat": 200,
+      "suffix": "</div>",
+      "expectedBytes": 23832,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_long_attr_256",
+      "mode": "html",
+      "prefix": "<div>",
+      "unit": "<p aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0=1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1=1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2=1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3=1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4=1></p>",
+      "repeat": 100,
+      "suffix": "</div>",
+      "expectedBytes": 163832,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_long_tag_256_same",
+      "mode": "html",
+      "prefix": "<div>",
+      "unit": "<tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttx/>",
+      "repeat": 800,
+      "suffix": "</div>",
+      "expectedBytes": 60128,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_adoption_moved",
+      "mode": "html",
+      "prefix": "",
+      "unit": "<b><div><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br></b></div>",
+      "repeat": 40,
+      "suffix": "",
+      "expectedBytes": 90092,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_forms_many",
+      "mode": "html",
+      "prefix": "",
+      "unit": "<form><input></form>",
+      "repeat": 1000,
+      "suffix": "",
+      "expectedBytes": 157292,
+      "tolerancePct": 5
+    },
+    {
+      "name": "xml_dash_mpd_timeline",
+      "mode": "xml",
+      "prefix": "<?xml version=\"1.0\"?><MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\"><Period id=\"0\"><AdaptationSet mimeType=\"video/mp4\"><SegmentTemplate media=\"v-$Time$.m4s\"><SegmentTimeline>\n",
+      "unit": "  <S t=\"180000\" d=\"180000\"/>\n",
+      "repeat": 800,
+      "suffix": "</SegmentTimeline></SegmentTemplate></AdaptationSet></Period></MPD>",
+      "expectedBytes": 118844,
+      "tolerancePct": 5
+    },
+    {
+      "name": "xml_rss_cdata",
+      "mode": "xml",
+      "prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><rss version=\"2.0\"><channel><title>Podcast</title>\n",
+      "unit": "  <item><title>Episode 1</title><link>https://example.com/p/1</link><enclosure url=\"https://cdn.example.com/1.mp3\" length=\"1000\" type=\"audio/mpeg\"/><description><![CDATA[<p>中文简介 alpha</p>]]></description></item>\n",
+      "repeat": 150,
+      "suffix": "</channel></rss>",
+      "expectedBytes": 128376,
+      "tolerancePct": 5
+    },
+    {
+      "name": "xml_xspf_playlist",
+      "mode": "xml",
+      "prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><playlist version=\"1\" xmlns=\"http://xspf.org/ns/0/\"><trackList>\n",
+      "unit": "<track><location>http://iptv.ex.com/live/0.m3u8</location><title>频道0 测试</title><image>http://ex.com/logo/0.png</image><extension application=\"x\"><group>影视</group></extension></track>\n",
+      "repeat": 250,
+      "suffix": "</trackList></playlist>",
+      "expectedBytes": 231912,
+      "tolerancePct": 5
+    },
+    {
+      "name": "xml_dup_attrs_97",
+      "mode": "xml",
+      "prefix": "<r>",
+      "unit": "<p a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1'/>",
+      "repeat": 200,
+      "suffix": "</r>",
+      "expectedBytes": 23820,
+      "tolerancePct": 5
+    },
+    {
+      "name": "xml_undef_ent_pi_doctype",
+      "mode": "xml",
+      "prefix": "<?xml version=\"1.0\"?><r>",
+      "unit": "<!DOCTYPE a><?p data1234567890?>&eacute;<b/>",
+      "repeat": 300,
+      "suffix": "</r>",
+      "expectedBytes": 117072,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_entity_text_bypass",
+      "mode": "html",
+      "prefix": "<p>",
+      "unit": "&lt;<!>",
+      "repeat": 4000,
+      "suffix": "</p>",
+      "expectedBytes": 449384,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_attr_entity_many",
+      "mode": "html",
+      "prefix": "<div>",
+      "unit": "<p a=\"&amp;&lt;&#x4e2d;\" b=\"&NotNestedGreaterGreater;\"></p>",
+      "repeat": 500,
+      "suffix": "</div>",
+      "expectedBytes": 105480,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_svg_tag_attr_cache_evict",
+      "mode": "html",
+      "prefix": "<div>",
+      "unit": "<svg viewBox='0 0 1 1'><path d='M0'/></svg>",
+      "repeat": 600,
+      "suffix": "</div>",
+      "expectedBytes": 196008,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_text_crlf_humongous",
+      "mode": "html",
+      "prefix": "<p>",
+      "unit": "x\r\n",
+      "repeat": 200000,
+      "suffix": "</p>",
+      "expectedBytes": 1050020,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_adopt_nested_maxdepth",
+      "mode": "html",
+      "prefix": "",
+      "unit": "<a><b><i><u><div><br><br><br><br><br><br><br><br><br><br></a>",
+      "repeat": 400,
+      "suffix": "",
+      "expectedBytes": 327036,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_unclosed_attrs_511",
+      "mode": "html",
+      "prefix": "",
+      "unit": "<b a0=1 a1=1 a2=1 a3=1 a4=1 a5=1 a6=1 a7=1 a8=1 a9=1 aa=1 ab=1 ac=1 ad=1 ae=1 af=1 ag=1 ah=1 ai=1 aj=1 ak=1 al=1 am=1 an=1 ao=1 ap=1 aq=1 ar=1 as=1 at=1 au=1 av=1 aw=1 ax=1 ay=1 az=1 a10=1 a11=1 a12=1 a13=1 a14=1 a15=1 a16=1 a17=1 a18=1 a19=1 a1a=1 a1b=1 a1c=1 a1d=1 a1e=1 a1f=1 a1g=1 a1h=1 a1i=1 a1j=1 a1k=1 a1l=1 a1m=1 a1n=1 a1o=1 a1p=1 a1q=1 a1r=1 a1s=1 a1t=1 a1u=1 a1v=1 a1w=1 a1x=1 a1y=1 a1z=1 a20=1 a21=1 a22=1 a23=1 a24=1 a25=1 a26=1 a27=1 a28=1 a29=1 a2a=1 a2b=1 a2c=1 a2d=1 a2e=1 a2f=1 a2g=1 a2h=1 a2i=1 a2j=1 a2k=1 a2l=1 a2m=1 a2n=1 a2o=1 a2p=1 a2q=1 a2r=1 a2s=1 a2t=1 a2u=1 a2v=1 a2w=1 a2x=1 a2y=1 a2z=1 a30=1 a31=1 a32=1 a33=1 a34=1 a35=1 a36=1 a37=1 a38=1 a39=1 a3a=1 a3b=1 a3c=1 a3d=1 a3e=1 a3f=1 a3g=1 a3h=1 a3i=1 a3j=1 a3k=1 a3l=1 a3m=1 a3n=1 a3o=1 a3p=1 a3q=1 a3r=1 a3s=1 a3t=1 a3u=1 a3v=1 a3w=1 a3x=1 a3y=1 a3z=1 a40=1 a41=1 a42=1 a43=1 a44=1 a45=1 a46=1 a47=1 a48=1 a49=1 a4a=1 a4b=1 a4c=1 a4d=1 a4e=1 a4f=1 a4g=1 a4h=1 a4i=1 a4j=1 a4k=1 a4l=1 a4m=1 a4n=1 a4o=1 a4p=1 a4q=1 a4r=1 a4s=1 a4t=1 a4u=1 a4v=1 a4w=1 a4x=1 a4y=1 a4z=1 a50=1 a51=1 a52=1 a53=1 a54=1 a55=1 a56=1 a57=1 a58=1 a59=1 a5a=1 a5b=1 a5c=1 a5d=1 a5e=1 a5f=1 a5g=1 a5h=1 a5i=1 a5j=1 a5k=1 a5l=1 a5m=1 a5n=1 a5o=1 a5p=1 a5q=1 a5r=1 a5s=1 a5t=1 a5u=1 a5v=1 a5w=1 a5x=1 a5y=1 a5z=1 a60=1 a61=1 a62=1 a63=1 a64=1 a65=1 a66=1 a67=1 a68=1 a69=1 a6a=1 a6b=1 a6c=1 a6d=1 a6e=1 a6f=1 a6g=1 a6h=1 a6i=1 a6j=1 a6k=1 a6l=1 a6m=1 a6n=1 a6o=1 a6p=1 a6q=1 a6r=1 a6s=1 a6t=1 a6u=1 a6v=1 a6w=1 a6x=1 a6y=1 a6z=1 a70=1 a71=1 a72=1 a73=1 a74=1 a75=1 a76=1 a77=1 a78=1 a79=1 a7a=1 a7b=1 a7c=1 a7d=1 a7e=1 a7f=1 a7g=1 a7h=1 a7i=1 a7j=1 a7k=1 a7l=1 a7m=1 a7n=1 a7o=1 a7p=1 a7q=1 a7r=1 a7s=1 a7t=1 a7u=1 a7v=1 a7w=1 a7x=1 a7y=1 a7z=1 a80=1 a81=1 a82=1 a83=1 a84=1 a85=1 a86=1 a87=1 a88=1 a89=1 a8a=1 a8b=1 a8c=1 a8d=1 a8e=1 a8f=1 a8g=1 a8h=1 a8i=1 a8j=1 a8k=1 a8l=1 a8m=1 a8n=1 a8o=1 a8p=1 a8q=1 a8r=1 a8s=1 a8t=1 a8u=1 a8v=1 a8w=1 a8x=1 a8y=1 a8z=1 a90=1 a91=1 a92=1 a93=1 a94=1 a95=1 a96=1 a97=1 a98=1 a99=1 a9a=1 a9b=1 a9c=1 a9d=1 a9e=1 a9f=1 a9g=1 a9h=1 a9i=1 a9j=1 a9k=1 a9l=1 a9m=1 a9n=1 a9o=1 a9p=1 a9q=1 a9r=1 a9s=1 a9t=1 a9u=1 a9v=1 a9w=1 a9x=1 a9y=1 a9z=1 aa0=1 aa1=1 aa2=1 aa3=1 aa4=1 aa5=1 aa6=1 aa7=1 aa8=1 aa9=1 aaa=1 aab=1 aac=1 aad=1 aae=1 aaf=1 aag=1 aah=1 aai=1 aaj=1 aak=1 aal=1 aam=1 aan=1 aao=1 aap=1 aaq=1 aar=1 aas=1 aat=1 aau=1 aav=1 aaw=1 aax=1 aay=1 aaz=1 ab0=1 ab1=1 ab2=1 ab3=1 ab4=1 ab5=1 ab6=1 ab7=1 ab8=1 ab9=1 aba=1 abb=1 abc=1 abd=1 abe=1 abf=1 abg=1 abh=1 abi=1 abj=1 abk=1 abl=1 abm=1 abn=1 abo=1 abp=1 abq=1 abr=1 abs=1 abt=1 abu=1 abv=1 abw=1 abx=1 aby=1 abz=1 ac0=1 ac1=1 ac2=1 ac3=1 ac4=1 ac5=1 ac6=1 ac7=1 ac8=1 ac9=1 aca=1 acb=1 acc=1 acd=1 ace=1 acf=1 acg=1 ach=1 aci=1 acj=1 ack=1 acl=1 acm=1 acn=1 aco=1 acp=1 acq=1 acr=1 acs=1 act=1 acu=1 acv=1 acw=1 acx=1 acy=1 acz=1 ad0=1 ad1=1 ad2=1 ad3=1 ad4=1 ad5=1 ad6=1 ad7=1 ad8=1 ad9=1 ada=1 adb=1 adc=1 add=1 ade=1 adf=1 adg=1 adh=1 adi=1 adj=1 adk=1 adl=1 adm=1 adn=1 ado=1 adp=1 adq=1 adr=1 ads=1 adt=1 adu=1 adv=1 adw=1 adx=1 ady=1 adz=1 ae0=1 ae1=1 ae2=1 ae3=1 ae4=1 ae5=1 ae6=1>",
+      "repeat": 30,
+      "suffix": "",
+      "expectedBytes": 608420,
+      "tolerancePct": 5
+    },
+    {
+      "name": "xml_text_entity_coalesce",
+      "mode": "xml",
+      "prefix": "<r>",
+      "unit": "x&amp;",
+      "repeat": 5000,
+      "suffix": "</r>",
+      "expectedBytes": 11320,
+      "tolerancePct": 5
+    },
+    {
+      "name": "xml_bang_decl_element",
+      "mode": "xml",
+      "prefix": "<r>",
+      "unit": "<!ELEMENT a b c d e f g h>",
+      "repeat": 1000,
+      "suffix": "</r>",
+      "expectedBytes": 177732,
+      "tolerancePct": 5
+    },
+    {
+      "name": "xml_doctype_unique_digits",
+      "mode": "xml",
+      "input": "<r><!DOCTYPE a0 PUBLIC \"p0\" \"s0\"><!DOCTYPE a1 PUBLIC \"p1\" \"s1\"><!DOCTYPE a2 PUBLIC \"p2\" \"s2\"><!DOCTYPE a3 PUBLIC \"p3\" \"s3\"><!DOCTYPE a4 PUBLIC \"p4\" \"s4\"><!DOCTYPE a5 PUBLIC \"p5\" \"s5\"><!DOCTYPE a6 PUBLIC \"p6\" \"s6\"><!DOCTYPE a7 PUBLIC \"p7\" \"s7\"><!DOCTYPE a8 PUBLIC \"p8\" \"s8\"><!DOCTYPE a9 PUBLIC \"p9\" \"s9\"><!DOCTYPE a10 PUBLIC \"p10\" \"s10\"><!DOCTYPE a11 PUBLIC \"p11\" \"s11\"><!DOCTYPE a12 PUBLIC \"p12\" \"s12\"><!DOCTYPE a13 PUBLIC \"p13\" \"s13\"><!DOCTYPE a14 PUBLIC \"p14\" \"s14\"><!DOCTYPE a15 PUBLIC \"p15\" \"s15\"><!DOCTYPE a16 PUBLIC \"p16\" \"s16\"><!DOCTYPE a17 PUBLIC \"p17\" \"s17\"><!DOCTYPE a18 PUBLIC \"p18\" \"s18\"><!DOCTYPE a19 PUBLIC \"p19\" \"s19\"><!DOCTYPE a20 PUBLIC \"p20\" \"s20\"><!DOCTYPE a21 PUBLIC \"p21\" \"s21\"><!DOCTYPE a22 PUBLIC \"p22\" \"s22\"><!DOCTYPE a23 PUBLIC \"p23\" \"s23\"><!DOCTYPE a24 PUBLIC \"p24\" \"s24\"><!DOCTYPE a25 PUBLIC \"p25\" \"s25\"><!DOCTYPE a26 PUBLIC \"p26\" \"s26\"><!DOCTYPE a27 PUBLIC \"p27\" \"s27\"><!DOCTYPE a28 PUBLIC \"p28\" \"s28\"><!DOCTYPE a29 PUBLIC \"p29\" \"s29\"><!DOCTYPE a30 PUBLIC \"p30\" \"s30\"><!DOCTYPE a31 PUBLIC \"p31\" \"s31\"><!DOCTYPE a32 PUBLIC \"p32\" \"s32\"><!DOCTYPE a33 PUBLIC \"p33\" \"s33\"><!DOCTYPE a34 PUBLIC \"p34\" \"s34\"><!DOCTYPE a35 PUBLIC \"p35\" \"s35\"><!DOCTYPE a36 PUBLIC \"p36\" \"s36\"><!DOCTYPE a37 PUBLIC \"p37\" \"s37\"><!DOCTYPE a38 PUBLIC \"p38\" \"s38\"><!DOCTYPE a39 PUBLIC \"p39\" \"s39\"><!DOCTYPE a40 PUBLIC \"p40\" \"s40\"><!DOCTYPE a41 PUBLIC \"p41\" \"s41\"><!DOCTYPE a42 PUBLIC \"p42\" \"s42\"><!DOCTYPE a43 PUBLIC \"p43\" \"s43\"><!DOCTYPE a44 PUBLIC \"p44\" \"s44\"><!DOCTYPE a45 PUBLIC \"p45\" \"s45\"><!DOCTYPE a46 PUBLIC \"p46\" \"s46\"><!DOCTYPE a47 PUBLIC \"p47\" \"s47\"><!DOCTYPE a48 PUBLIC \"p48\" \"s48\"><!DOCTYPE a49 PUBLIC \"p49\" \"s49\"><!DOCTYPE a50 PUBLIC \"p50\" \"s50\"><!DOCTYPE a51 PUBLIC \"p51\" \"s51\"><!DOCTYPE a52 PUBLIC \"p52\" \"s52\"><!DOCTYPE a53 PUBLIC \"p53\" \"s53\"><!DOCTYPE a54 PUBLIC \"p54\" \"s54\"><!DOCTYPE a55 PUBLIC \"p55\" \"s55\"><!DOCTYPE a56 PUBLIC \"p56\" \"s56\"><!DOCTYPE a57 PUBLIC \"p57\" \"s57\"><!DOCTYPE a58 PUBLIC \"p58\" \"s58\"><!DOCTYPE a59 PUBLIC \"p59\" \"s59\"><!DOCTYPE a60 PUBLIC \"p60\" \"s60\"><!DOCTYPE a61 PUBLIC \"p61\" \"s61\"><!DOCTYPE a62 PUBLIC \"p62\" \"s62\"><!DOCTYPE a63 PUBLIC \"p63\" \"s63\"><!DOCTYPE a64 PUBLIC \"p64\" \"s64\"><!DOCTYPE a65 PUBLIC \"p65\" \"s65\"><!DOCTYPE a66 PUBLIC \"p66\" \"s66\"><!DOCTYPE a67 PUBLIC \"p67\" \"s67\"><!DOCTYPE a68 PUBLIC \"p68\" \"s68\"><!DOCTYPE a69 PUBLIC \"p69\" \"s69\"><!DOCTYPE a70 PUBLIC \"p70\" \"s70\"><!DOCTYPE a71 PUBLIC \"p71\" \"s71\"><!DOCTYPE a72 PUBLIC \"p72\" \"s72\"><!DOCTYPE a73 PUBLIC \"p73\" \"s73\"><!DOCTYPE a74 PUBLIC \"p74\" \"s74\"><!DOCTYPE a75 PUBLIC \"p75\" \"s75\"><!DOCTYPE a76 PUBLIC \"p76\" \"s76\"><!DOCTYPE a77 PUBLIC \"p77\" \"s77\"><!DOCTYPE a78 PUBLIC \"p78\" \"s78\"><!DOCTYPE a79 PUBLIC \"p79\" \"s79\"><!DOCTYPE a80 PUBLIC \"p80\" \"s80\"><!DOCTYPE a81 PUBLIC \"p81\" \"s81\"><!DOCTYPE a82 PUBLIC \"p82\" \"s82\"><!DOCTYPE a83 PUBLIC \"p83\" \"s83\"><!DOCTYPE a84 PUBLIC \"p84\" \"s84\"><!DOCTYPE a85 PUBLIC \"p85\" \"s85\"><!DOCTYPE a86 PUBLIC \"p86\" \"s86\"><!DOCTYPE a87 PUBLIC \"p87\" \"s87\"><!DOCTYPE a88 PUBLIC \"p88\" \"s88\"><!DOCTYPE a89 PUBLIC \"p89\" \"s89\"><!DOCTYPE a90 PUBLIC \"p90\" \"s90\"><!DOCTYPE a91 PUBLIC \"p91\" \"s91\"><!DOCTYPE a92 PUBLIC \"p92\" \"s92\"><!DOCTYPE a93 PUBLIC \"p93\" \"s93\"><!DOCTYPE a94 PUBLIC \"p94\" \"s94\"><!DOCTYPE a95 PUBLIC \"p95\" \"s95\"><!DOCTYPE a96 PUBLIC \"p96\" \"s96\"><!DOCTYPE a97 PUBLIC \"p97\" \"s97\"><!DOCTYPE a98 PUBLIC \"p98\" \"s98\"><!DOCTYPE a99 PUBLIC \"p99\" \"s99\"><!DOCTYPE a100 PUBLIC \"p100\" \"s100\"><!DOCTYPE a101 PUBLIC \"p101\" \"s101\"><!DOCTYPE a102 PUBLIC \"p102\" \"s102\"><!DOCTYPE a103 PUBLIC \"p103\" \"s103\"><!DOCTYPE a104 PUBLIC \"p104\" \"s104\"><!DOCTYPE a105 PUBLIC \"p105\" \"s105\"><!DOCTYPE a106 PUBLIC \"p106\" \"s106\"><!DOCTYPE a107 PUBLIC \"p107\" \"s107\"><!DOCTYPE a108 PUBLIC \"p108\" \"s108\"><!DOCTYPE a109 PUBLIC \"p109\" \"s109\"><!DOCTYPE a110 PUBLIC \"p110\" \"s110\"><!DOCTYPE a111 PUBLIC \"p111\" \"s111\"><!DOCTYPE a112 PUBLIC \"p112\" \"s112\"><!DOCTYPE a113 PUBLIC \"p113\" \"s113\"><!DOCTYPE a114 PUBLIC \"p114\" \"s114\"><!DOCTYPE a115 PUBLIC \"p115\" \"s115\"><!DOCTYPE a116 PUBLIC \"p116\" \"s116\"><!DOCTYPE a117 PUBLIC \"p117\" \"s117\"><!DOCTYPE a118 PUBLIC \"p118\" \"s118\"><!DOCTYPE a119 PUBLIC \"p119\" \"s119\"><!DOCTYPE a120 PUBLIC \"p120\" \"s120\"><!DOCTYPE a121 PUBLIC \"p121\" \"s121\"><!DOCTYPE a122 PUBLIC \"p122\" \"s122\"><!DOCTYPE a123 PUBLIC \"p123\" \"s123\"><!DOCTYPE a124 PUBLIC \"p124\" \"s124\"><!DOCTYPE a125 PUBLIC \"p125\" \"s125\"><!DOCTYPE a126 PUBLIC \"p126\" \"s126\"><!DOCTYPE a127 PUBLIC \"p127\" \"s127\"><!DOCTYPE a128 PUBLIC \"p128\" \"s128\"><!DOCTYPE a129 PUBLIC \"p129\" \"s129\"><!DOCTYPE a130 PUBLIC \"p130\" \"s130\"><!DOCTYPE a131 PUBLIC \"p131\" \"s131\"><!DOCTYPE a132 PUBLIC \"p132\" \"s132\"><!DOCTYPE a133 PUBLIC \"p133\" \"s133\"><!DOCTYPE a134 PUBLIC \"p134\" \"s134\"><!DOCTYPE a135 PUBLIC \"p135\" \"s135\"><!DOCTYPE a136 PUBLIC \"p136\" \"s136\"><!DOCTYPE a137 PUBLIC \"p137\" \"s137\"><!DOCTYPE a138 PUBLIC \"p138\" \"s138\"><!DOCTYPE a139 PUBLIC \"p139\" \"s139\"><!DOCTYPE a140 PUBLIC \"p140\" \"s140\"><!DOCTYPE a141 PUBLIC \"p141\" \"s141\"><!DOCTYPE a142 PUBLIC \"p142\" \"s142\"><!DOCTYPE a143 PUBLIC \"p143\" \"s143\"><!DOCTYPE a144 PUBLIC \"p144\" \"s144\"><!DOCTYPE a145 PUBLIC \"p145\" \"s145\"><!DOCTYPE a146 PUBLIC \"p146\" \"s146\"><!DOCTYPE a147 PUBLIC \"p147\" \"s147\"><!DOCTYPE a148 PUBLIC \"p148\" \"s148\"><!DOCTYPE a149 PUBLIC \"p149\" \"s149\"><!DOCTYPE a150 PUBLIC \"p150\" \"s150\"><!DOCTYPE a151 PUBLIC \"p151\" \"s151\"><!DOCTYPE a152 PUBLIC \"p152\" \"s152\"><!DOCTYPE a153 PUBLIC \"p153\" \"s153\"><!DOCTYPE a154 PUBLIC \"p154\" \"s154\"><!DOCTYPE a155 PUBLIC \"p155\" \"s155\"><!DOCTYPE a156 PUBLIC \"p156\" \"s156\"><!DOCTYPE a157 PUBLIC \"p157\" \"s157\"><!DOCTYPE a158 PUBLIC \"p158\" \"s158\"><!DOCTYPE a159 PUBLIC \"p159\" \"s159\"><!DOCTYPE a160 PUBLIC \"p160\" \"s160\"><!DOCTYPE a161 PUBLIC \"p161\" \"s161\"><!DOCTYPE a162 PUBLIC \"p162\" \"s162\"><!DOCTYPE a163 PUBLIC \"p163\" \"s163\"><!DOCTYPE a164 PUBLIC \"p164\" \"s164\"><!DOCTYPE a165 PUBLIC \"p165\" \"s165\"><!DOCTYPE a166 PUBLIC \"p166\" \"s166\"><!DOCTYPE a167 PUBLIC \"p167\" \"s167\"><!DOCTYPE a168 PUBLIC \"p168\" \"s168\"><!DOCTYPE a169 PUBLIC \"p169\" \"s169\"><!DOCTYPE a170 PUBLIC \"p170\" \"s170\"><!DOCTYPE a171 PUBLIC \"p171\" \"s171\"><!DOCTYPE a172 PUBLIC \"p172\" \"s172\"><!DOCTYPE a173 PUBLIC \"p173\" \"s173\"><!DOCTYPE a174 PUBLIC \"p174\" \"s174\"><!DOCTYPE a175 PUBLIC \"p175\" \"s175\"><!DOCTYPE a176 PUBLIC \"p176\" \"s176\"><!DOCTYPE a177 PUBLIC \"p177\" \"s177\"><!DOCTYPE a178 PUBLIC \"p178\" \"s178\"><!DOCTYPE a179 PUBLIC \"p179\" \"s179\"><!DOCTYPE a180 PUBLIC \"p180\" \"s180\"><!DOCTYPE a181 PUBLIC \"p181\" \"s181\"><!DOCTYPE a182 PUBLIC \"p182\" \"s182\"><!DOCTYPE a183 PUBLIC \"p183\" \"s183\"><!DOCTYPE a184 PUBLIC \"p184\" \"s184\"><!DOCTYPE a185 PUBLIC \"p185\" \"s185\"><!DOCTYPE a186 PUBLIC \"p186\" \"s186\"><!DOCTYPE a187 PUBLIC \"p187\" \"s187\"><!DOCTYPE a188 PUBLIC \"p188\" \"s188\"><!DOCTYPE a189 PUBLIC \"p189\" \"s189\"><!DOCTYPE a190 PUBLIC \"p190\" \"s190\"><!DOCTYPE a191 PUBLIC \"p191\" \"s191\"><!DOCTYPE a192 PUBLIC \"p192\" \"s192\"><!DOCTYPE a193 PUBLIC \"p193\" \"s193\"><!DOCTYPE a194 PUBLIC \"p194\" \"s194\"><!DOCTYPE a195 PUBLIC \"p195\" \"s195\"><!DOCTYPE a196 PUBLIC \"p196\" \"s196\"><!DOCTYPE a197 PUBLIC \"p197\" \"s197\"><!DOCTYPE a198 PUBLIC \"p198\" \"s198\"><!DOCTYPE a199 PUBLIC \"p199\" \"s199\"><!DOCTYPE a200 PUBLIC \"p200\" \"s200\"><!DOCTYPE a201 PUBLIC \"p201\" \"s201\"><!DOCTYPE a202 PUBLIC \"p202\" \"s202\"><!DOCTYPE a203 PUBLIC \"p203\" \"s203\"><!DOCTYPE a204 PUBLIC \"p204\" \"s204\"><!DOCTYPE a205 PUBLIC \"p205\" \"s205\"><!DOCTYPE a206 PUBLIC \"p206\" \"s206\"><!DOCTYPE a207 PUBLIC \"p207\" \"s207\"><!DOCTYPE a208 PUBLIC \"p208\" \"s208\"><!DOCTYPE a209 PUBLIC \"p209\" \"s209\"><!DOCTYPE a210 PUBLIC \"p210\" \"s210\"><!DOCTYPE a211 PUBLIC \"p211\" \"s211\"><!DOCTYPE a212 PUBLIC \"p212\" \"s212\"><!DOCTYPE a213 PUBLIC \"p213\" \"s213\"><!DOCTYPE a214 PUBLIC \"p214\" \"s214\"><!DOCTYPE a215 PUBLIC \"p215\" \"s215\"><!DOCTYPE a216 PUBLIC \"p216\" \"s216\"><!DOCTYPE a217 PUBLIC \"p217\" \"s217\"><!DOCTYPE a218 PUBLIC \"p218\" \"s218\"><!DOCTYPE a219 PUBLIC \"p219\" \"s219\"><!DOCTYPE a220 PUBLIC \"p220\" \"s220\"><!DOCTYPE a221 PUBLIC \"p221\" \"s221\"><!DOCTYPE a222 PUBLIC \"p222\" \"s222\"><!DOCTYPE a223 PUBLIC \"p223\" \"s223\"><!DOCTYPE a224 PUBLIC \"p224\" \"s224\"><!DOCTYPE a225 PUBLIC \"p225\" \"s225\"><!DOCTYPE a226 PUBLIC \"p226\" \"s226\"><!DOCTYPE a227 PUBLIC \"p227\" \"s227\"><!DOCTYPE a228 PUBLIC \"p228\" \"s228\"><!DOCTYPE a229 PUBLIC \"p229\" \"s229\"><!DOCTYPE a230 PUBLIC \"p230\" \"s230\"><!DOCTYPE a231 PUBLIC \"p231\" \"s231\"><!DOCTYPE a232 PUBLIC \"p232\" \"s232\"><!DOCTYPE a233 PUBLIC \"p233\" \"s233\"><!DOCTYPE a234 PUBLIC \"p234\" \"s234\"><!DOCTYPE a235 PUBLIC \"p235\" \"s235\"><!DOCTYPE a236 PUBLIC \"p236\" \"s236\"><!DOCTYPE a237 PUBLIC \"p237\" \"s237\"><!DOCTYPE a238 PUBLIC \"p238\" \"s238\"><!DOCTYPE a239 PUBLIC \"p239\" \"s239\"><!DOCTYPE a240 PUBLIC \"p240\" \"s240\"><!DOCTYPE a241 PUBLIC \"p241\" \"s241\"><!DOCTYPE a242 PUBLIC \"p242\" \"s242\"><!DOCTYPE a243 PUBLIC \"p243\" \"s243\"><!DOCTYPE a244 PUBLIC \"p244\" \"s244\"><!DOCTYPE a245 PUBLIC \"p245\" \"s245\"><!DOCTYPE a246 PUBLIC \"p246\" \"s246\"><!DOCTYPE a247 PUBLIC \"p247\" \"s247\"><!DOCTYPE a248 PUBLIC \"p248\" \"s248\"><!DOCTYPE a249 PUBLIC \"p249\" \"s249\"></r>",
+      "expectedBytes": 85484,
+      "tolerancePct": 5
+    },
+    {
+      "name": "xml_doctype_long_pub_sys",
+      "mode": "xml",
+      "prefix": "<r>",
+      "unit": "<!DOCTYPE a PUBLIC \"pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp\" \"ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss\">",
+      "repeat": 200,
+      "suffix": "</r>",
+      "expectedBytes": 135932,
+      "tolerancePct": 5
+    }
+  ]
+}

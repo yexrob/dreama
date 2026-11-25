@@ -1,0 +1,398 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://depth3d.dev/schemas/plugin/v1/protocol-types.schema.json",
+  "title": "depth3d Plugin Protocol Data Types (v1 + §11.2 forward-compatible)",
+  "$defs": {
+    "Headers": {
+      "type": ["object", "null"],
+      "additionalProperties": { "type": ["string", "null"] }
+    },
+    "Image": {
+      "oneOf": [
+        { "type": "null" },
+        { "type": "string", "minLength": 1 },
+        {
+          "type": "object",
+          "required": ["url"],
+          "additionalProperties": true,
+          "properties": {
+            "url": { "type": "string", "minLength": 1 },
+            "headers": { "$ref": "#/$defs/Headers" },
+            "blurhash": { "type": ["string", "null"] }
+          }
+        }
+      ]
+    },
+    "Person": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "role": { "type": ["string", "null"] },
+        "image": { "$ref": "#/$defs/Image" },
+        "id": { "type": ["string", "null"] }
+      }
+    },
+    "ExtraField": {
+      "type": "object",
+      "required": ["label", "value"],
+      "additionalProperties": true,
+      "properties": {
+        "label": { "type": "string", "minLength": 1 },
+        "value": { "type": "string" }
+      }
+    },
+    "Item": {
+      "type": "object",
+      "required": ["id", "kind", "title"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "subtitle": { "type": ["string", "null"] },
+        "poster": { "$ref": "#/$defs/Image" },
+        "thumb": { "$ref": "#/$defs/Image" },
+        "backdrop": { "$ref": "#/$defs/Image" },
+        "year": { "type": ["integer", "null"] },
+        "overview": { "type": ["string", "null"] },
+        "rating": { "type": ["number", "null"] },
+        "durationMs": { "type": ["number", "null"] },
+        "progressMs": { "type": ["number", "null"] },
+        "played": { "type": ["boolean", "null"] },
+        "favorite": { "type": ["boolean", "null"] },
+        "badges": {
+          "type": ["array", "null"],
+          "items": { "type": "string" }
+        },
+        "stereo": { "type": ["string", "null"] },
+        "parentId": { "type": ["string", "null"] },
+        "index": { "type": ["integer", "null"] },
+        "childCount": { "type": ["integer", "null"] },
+        "seasons": {
+          "type": ["array", "null"],
+          "items": { "$ref": "#/$defs/Item" }
+        },
+        "episodes": {
+          "type": ["array", "null"],
+          "items": { "$ref": "#/$defs/Item" }
+        },
+        "related": {
+          "type": ["array", "null"],
+          "items": { "$ref": "#/$defs/Item" }
+        },
+        "people": {
+          "type": ["array", "null"],
+          "items": { "$ref": "#/$defs/Person" }
+        },
+        "genres": {
+          "type": ["array", "null"],
+          "items": { "type": "string" }
+        },
+        "extra": {
+          "type": ["array", "null"],
+          "items": { "$ref": "#/$defs/ExtraField" }
+        }
+      }
+    },
+    "Shelf": {
+      "type": "object",
+      "required": ["id", "title", "items"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "style": { "type": ["string", "null"] },
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Item" }
+        },
+        "more": { "type": ["string", "null"] }
+      }
+    },
+    "HomeResult": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Shelf" }
+    },
+    "ItemPage": {
+      "type": "object",
+      "required": ["items"],
+      "additionalProperties": true,
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Item" }
+        },
+        "next": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "Track": {
+      "type": "object",
+      "required": ["id", "url", "mime", "codecs", "bandwidth"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "url": { "type": "string", "minLength": 1 },
+        "backupUrls": {
+          "type": ["array", "null"],
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "mime": { "type": "string", "minLength": 1 },
+        "codecs": { "type": "string", "minLength": 1 },
+        "bandwidth": { "type": "number" },
+        "width": { "type": ["integer", "null"] },
+        "height": { "type": ["integer", "null"] },
+        "frameRate": { "type": ["number", "null"] },
+        "quality": { "type": ["string", "null"] },
+        "initRange": { "type": ["string", "null"] },
+        "indexRange": { "type": ["string", "null"] }
+      }
+    },
+    "DashSource": {
+      "type": "object",
+      "required": ["video", "audio"],
+      "additionalProperties": true,
+      "properties": {
+        "video": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/Track" }
+        },
+        "audio": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Track" }
+        }
+      }
+    },
+    "QualityOption": {
+      "type": "object",
+      "required": ["id", "label"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "selected": { "type": ["boolean", "null"] },
+        "locked": { "type": ["string", "null"] }
+      }
+    },
+    "Subtitle": {
+      "type": "object",
+      "required": ["id", "label", "url", "format"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "lang": { "type": ["string", "null"] },
+        "url": { "type": "string", "minLength": 1 },
+        "format": { "type": "string", "minLength": 1 },
+        "headers": { "$ref": "#/$defs/Headers" },
+        "default": { "type": ["boolean", "null"] }
+      }
+    },
+    "AudioOption": {
+      "type": "object",
+      "required": ["id", "label"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "lang": { "type": ["string", "null"] }
+      }
+    },
+    "PlaybackInfo": {
+      "type": "object",
+      "additionalProperties": true,
+      "oneOf": [
+        {
+          "required": ["url"],
+          "properties": {
+            "url": { "type": "string", "minLength": 1 },
+            "dash": { "type": "null" },
+            "mpd": { "type": "null" }
+          }
+        },
+        {
+          "required": ["dash", "durationMs"],
+          "properties": {
+            "dash": { "type": "object" },
+            "durationMs": { "type": "number", "exclusiveMinimum": 0 },
+            "url": { "type": "null" },
+            "mpd": { "type": "null" }
+          }
+        },
+        {
+          "required": ["mpd"],
+          "properties": {
+            "mpd": { "type": "string", "minLength": 1 },
+            "url": { "type": "null" },
+            "dash": { "type": "null" }
+          }
+        }
+      ],
+      "properties": {
+        "url": { "type": ["string", "null"] },
+        "dash": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/DashSource" }
+          ]
+        },
+        "mpd": { "type": ["string", "null"] },
+        "title": { "type": ["string", "null"] },
+        "durationMs": { "type": ["number", "null"] },
+        "mime": { "type": ["string", "null"] },
+        "headers": { "$ref": "#/$defs/Headers" },
+        "qualities": {
+          "type": ["array", "null"],
+          "items": { "$ref": "#/$defs/QualityOption" }
+        },
+        "subtitles": {
+          "type": ["array", "null"],
+          "items": { "$ref": "#/$defs/Subtitle" }
+        },
+        "audios": {
+          "type": ["array", "null"],
+          "items": { "$ref": "#/$defs/AudioOption" }
+        },
+        "startMs": { "type": ["number", "null"] },
+        "live": { "type": ["boolean", "null"] },
+        "expiresAt": { "type": ["number", "null"] },
+        "stereo": { "type": ["string", "null"] },
+        "next": { "type": ["string", "null"] },
+        "session": { "type": ["string", "null"] }
+      }
+    },
+    "Option": {
+      "type": "object",
+      "required": ["value", "label"],
+      "additionalProperties": true,
+      "properties": {
+        "value": { "type": "string" },
+        "label": { "type": "string", "minLength": 1 }
+      }
+    },
+    "FilterGroup": {
+      "type": "object",
+      "required": ["key", "label", "options"],
+      "additionalProperties": true,
+      "properties": {
+        "key": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "options": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Option" }
+        }
+      }
+    },
+    "FiltersResult": {
+      "type": "object",
+      "required": ["sorts", "filters"],
+      "additionalProperties": true,
+      "properties": {
+        "sorts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Option" }
+        },
+        "filters": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/FilterGroup" }
+        }
+      }
+    },
+    "DanmakuItem": {
+      "type": "object",
+      "required": ["timeMs", "text"],
+      "additionalProperties": true,
+      "properties": {
+        "timeMs": { "type": "number" },
+        "text": { "type": "string" },
+        "color": { "type": ["string", "integer", "null"] },
+        "mode": { "type": ["string", "null"] }
+      }
+    },
+    "DanmakuResult": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/DanmakuItem" }
+    },
+    "CategoryEntry": {
+      "type": "object",
+      "required": ["id", "title"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "icon": { "type": ["string", "null"] }
+      }
+    },
+    "CategoriesResult": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/CategoryEntry" }
+    },
+    "SuggestResult": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "UserProfile": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "avatar": { "$ref": "#/$defs/Image" }
+      }
+    },
+    "FormLoginResult": {
+      "type": "object",
+      "required": ["ok"],
+      "additionalProperties": true,
+      "properties": {
+        "ok": { "type": "boolean", "const": true },
+        "user": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/UserProfile" }
+          ]
+        }
+      }
+    },
+    "QrLoginStartResult": {
+      "type": "object",
+      "required": ["qr", "expiresInSec", "state"],
+      "additionalProperties": true,
+      "properties": {
+        "qr": { "type": "string", "minLength": 1 },
+        "hint": { "type": ["string", "null"] },
+        "expiresInSec": { "type": "number" },
+        "state": { "type": "string", "minLength": 1 }
+      }
+    },
+    "DeviceLoginStartResult": {
+      "type": "object",
+      "required": ["url", "code", "expiresInSec", "state"],
+      "additionalProperties": true,
+      "properties": {
+        "url": { "type": "string", "minLength": 1 },
+        "code": { "type": "string", "minLength": 1 },
+        "expiresInSec": { "type": "number" },
+        "state": { "type": "string", "minLength": 1 }
+      }
+    },
+    "LoginPollResult": {
+      "type": "object",
+      "required": ["status"],
+      "additionalProperties": true,
+      "properties": {
+        "status": { "type": "string", "minLength": 1 },
+        "user": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/UserProfile" }
+          ]
+        }
+      }
+    }
+  }
+}

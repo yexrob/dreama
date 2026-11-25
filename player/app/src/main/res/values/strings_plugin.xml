@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="plugin_error_needs_auth">需要重新登录，请点此进入登录页。</string>
+    <string name="plugin_error_auth_failed">登录失败，请检查账号或凭据后重试。</string>
+    <string name="plugin_error_needs_setup">尚未完成配置，请先填写连接设置。</string>
+    <string name="plugin_error_unavailable">暂时连不上这个来源，请检查网络或服务器状态后重试。</string>
+    <string name="plugin_error_not_found">这个内容已经不在了，请返回刷新列表。</string>
+    <string name="plugin_error_forbidden">暂时无法访问这个内容，请检查账号权限或地区限制。</string>
+    <string name="plugin_error_rate_limited">请求太频繁，请稍后再试。</string>
+    <string name="plugin_error_rate_limited_seconds">请求太频繁，请等待 %1$d 秒后再试。</string>
+    <string name="plugin_error_unsupported">这个内容类型暂不支持播放，请尝试其他片源。</string>
+    <string name="plugin_error_internal">这个插件出错了，可以查看日志或停用插件。</string>
+    <string name="plugin_error_disabled">这个插件已停用，请先在插件管理中启用。</string>
+    <string name="plugin_error_permission_reconfirm">插件更新后申请了更多权限，请先重新确认后再使用。</string>
+</resources>
