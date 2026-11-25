@@ -189,7 +189,7 @@ private fun FolderPane(src: MediaSource, listing: Listing, model: WallModel, nav
         else -> LazyVerticalGrid(GridCells.Fixed(3), Modifier.height(480.dp),
             horizontalArrangement = Arrangement.spacedBy(24.dp), verticalArrangement = Arrangement.spacedBy(24.dp),
             contentPadding = PaddingValues(top = 8.dp, bottom = 64.dp)) {
-            items(listing.items, key = { it.id }) { item ->
+            items(listing.items.distinctBy { it.id }, key = { it.id }) { item ->
                 val countLabel = item.childCount?.let { stringResource(R.string.home_folder_count, it) }
                     ?: item.subtitle?.takeIf { it.isNotEmpty() }
                 FolderTile(item.title, countLabel,
@@ -278,7 +278,7 @@ fun GridScreen(model: WallModel, nav: WallNav, page: Page.Grid) {
                 else -> LazyVerticalGrid(GridCells.Fixed(6), Modifier.fillMaxSize(), state = grid,
                     contentPadding = PaddingValues(start = Wall.Margin, end = Wall.Margin, top = 128.dp, bottom = 64.dp),
                     horizontalArrangement = Arrangement.spacedBy(24.dp), verticalArrangement = Arrangement.spacedBy(26.dp)) {
-                    items(listing.items, key = { it.id }) { item ->
+                    items(listing.items.distinctBy { it.id }, key = { it.id }) { item ->
                         if (item.isFolder) {
                             val countLabel = item.childCount?.let { stringResource(R.string.home_folder_count, it) }
                             FolderTile(item.title, countLabel, item.previews.ifEmpty { listOfNotNull(item.poster, item.thumb) },

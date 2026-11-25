@@ -817,7 +817,7 @@ private fun SeriesDetailContent(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             if (hasSeasons) {
-                itemsIndexed(seasons, key = { _, s -> s.id }) { idx, season ->
+                itemsIndexed(seasons.distinctBy { it.id }, key = { _, s -> s.id }) { idx, season ->
                     val label = DetailStateLogic.formatSeasonTabLabel(seasons, idx, strings)
                     SeasonTabChip(
                         label = label,
@@ -901,7 +901,7 @@ private fun SeriesDetailContent(
                         contentPadding = PaddingValues(horizontal = Wall.Margin),
                         horizontalArrangement = Arrangement.spacedBy(24.dp),
                     ) {
-                        itemsIndexed(episodes, key = { _, ep -> ep.id }) { idx, ep ->
+                        itemsIndexed(episodes.distinctBy { it.id }, key = { _, ep -> ep.id }) { idx, ep ->
                             val state = DetailStateLogic.computeWatchState(ep, localProgress[ep.id])
                             val epNum = ep.index?.takeIf { it > 0 } ?: (idx + 1)
                             val metaLabel = when (state) {
