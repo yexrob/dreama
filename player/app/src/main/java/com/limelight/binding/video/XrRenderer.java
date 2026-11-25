@@ -353,6 +353,12 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         default void onVrLocalToggleDanmaku() { }
         default void onVrLocalTogglePalette() { }
         default void onVrScreenAdjustChanged(boolean active) { }
+        // Local-playback VR Quick Palette frame state & events (G2)
+        default void onVrPaletteFrame(boolean open, boolean pinned, boolean handTrackingMode,
+                                      boolean dimFallback, float hoverX, float hoverY,
+                                      int clickState, int rowStep, boolean rowReset,
+                                      int tabStep, int pageStep) { }
+        default void onVrScreenDimensionsSaved(float fovDeg, float distM) { }
     }
 
     public void setInputListener(InputListener listener) {
@@ -482,7 +488,8 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                                    boolean handTracking, int sharpenMode, int supersampleMode,
                                    boolean perfOverlay,
                                    boolean ambilight, int ambiLevel, boolean roomLight,
-                                   int envResTier);
+                                   int envResTier, boolean localMedia,
+                                   boolean startStereoLive);
     private native void nativeSetCaptureDir(long ctx, String dir);
     private native int nativeGetTexId(long ctx);
     private native ByteBuffer nativeGetModelInput(long ctx, int pair);
@@ -584,14 +591,161 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     private native void nativeUploadTransport(long ctx, ByteBuffer pixels);
     private native void nativeSetTransport(long ctx, boolean visible);
     private native void nativeSetLocalMedia(long ctx, boolean on);
+    // depth3d G2: VR Quick Palette & passthrough dimmer native controls
+    private native void nativeUploadPalette(long ctx, ByteBuffer sheet);
+    private native void nativeSetPaletteHand(long ctx, boolean rightHand);
+    private native void nativeSetPaletteRowMask(long ctx, int mask);
+    private native void nativeOpenPaletteFromBar(long ctx);
+    private native void nativeTogglePalettePin(long ctx);
+    private native void nativeClosePalette(long ctx);
+    private native void nativeSetPassthroughDim(long ctx, boolean dim);
+    private native void nativeSetStereoStrength(long ctx, boolean on, float separation,
+                                                float convergence, float depthLocal);
+    private native void nativeSetStereoSourceFormat(long ctx, int format);
+    private native void nativeSetLocalScreenDimensions(long ctx, float fovDeg, float distM,
+                                                       float curvature);
+    private native void nativeTriggerPaletteHaptic(long ctx, int kind);
+    private native boolean nativeEnsureDepthModel(long ctx);
 
     private final TransportBufferQueue transportQueue =
             new TransportBufferQueue(TRANSPORT_WIDTH * TRANSPORT_HEIGHT * 4);
+    private final TransportBufferQueue paletteQueue =
+            new TransportBufferQueue(PALETTE_TEX_W * PALETTE_TEX_H * 4);
+    private final Object localEnvLock = new Object();
+    private int pendingLocalEnvCell = -1;
+    private boolean pendingLocalEnvDim;
+    private MidasDepthSource.Spec lazyDepthSpec;
+    private MidasDepthSource.Route lazyDepthRoute;
+    private boolean depthThreadStarted;
+    private boolean firstDepthCapturePending;
     private volatile boolean localMedia;
+    private volatile boolean cylinderSupportedCached = true;
+    private volatile boolean initialStereoLive = true;
 
     /** Before start(): this session plays a local file rather than a stream. */
     public void setLocalMedia(boolean on) {
         localMedia = on;
+    }
+
+    /** Before start(): allows local playback to start with 3D off while keeping stereo ready to toggle on. */
+    public void setInitialStereoLive(boolean on) {
+        initialStereoLive = on;
+    }
+
+    public boolean isCylinderSupported() {
+        return cylinderSupportedCached;
+    }
+
+    public boolean postPalette(ByteBuffer pixels) {
+        return paletteQueue.post(pixels);
+    }
+
+    public void setPaletteHand(boolean rightHand) {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeSetPaletteHand(nativeCtx, rightHand);
+            }
+        }
+    }
+
+    public void setPaletteRowMask(int mask) {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeSetPaletteRowMask(nativeCtx, mask);
+            }
+        }
+    }
+
+    public void openPaletteFromBar() {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeOpenPaletteFromBar(nativeCtx);
+            }
+        }
+    }
+
+    public void togglePalettePin() {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeTogglePalettePin(nativeCtx);
+            }
+        }
+    }
+
+    public void closePalette() {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeClosePalette(nativeCtx);
+            }
+        }
+    }
+
+    public void setPassthroughDim(boolean dim) {
+        if (!localMedia) {
+            return;
+        }
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeSetPassthroughDim(nativeCtx, dim);
+            }
+        }
+    }
+
+    public void setStereoStrength(boolean on, float separation, float convergence, float depthLocal) {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeSetStereoStrength(nativeCtx, on, separation, convergence, depthLocal);
+            }
+        }
+    }
+
+    public void setStereoSourceFormat(int format) {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeSetStereoSourceFormat(nativeCtx, format);
+            }
+        }
+    }
+
+    public void setLocalScreenDimensions(float fovDeg, float distM, float curvature) {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0) {
+                nativeSetLocalScreenDimensions(nativeCtx, fovDeg, distM, curvature);
+            }
+            if (prefConfig != null) {
+                prefConfig.vrDistance = Math.max(ScreenReadout.MIN_SCREEN_DIST_DM,
+                        Math.min(ScreenReadout.MAX_SCREEN_DIST_DM, Math.round(distM * 10.0f)));
+                prefConfig.vrScreenSize = Math.max(ScreenReadout.MIN_SCREEN_SIZE_DM,
+                        Math.min(ScreenReadout.MAX_SCREEN_SIZE_DM,
+                                Math.round(ScreenReadout.flatWidthMeters(fovDeg, distM) * 10.0f)));
+            }
+        }
+    }
+
+    public void setLocalEnvironment(int envCell, boolean passthroughDim) {
+        if (!localMedia || !cellExists(envCell)) {
+            return;
+        }
+        synchronized (localEnvLock) {
+            pendingLocalEnvCell = envCell;
+            pendingLocalEnvDim = passthroughDim;
+        }
+    }
+
+    public void triggerPaletteHaptic(int kind) {
+        synchronized (nativeLock) {
+            if (nativeCtx != 0 && kind > PALETTE_HAPTIC_NONE) {
+                nativeTriggerPaletteHaptic(nativeCtx, kind);
+            }
+        }
+    }
+
+    public void playClickSound() {
+        XrClickSound click = clickSound;
+        PreferenceConfiguration cfg = prefConfig;
+        if (click != null && (cfg == null || cfg.vrClickSound)) {
+            click.click();
+        }
     }
 
     /**
@@ -671,13 +825,17 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                         +"/"+android.os.Build.DEVICE+")");
                 MidasDepthSource.Route depthRoute = depthSpec.route(cpuRoute);
                 DepthSize mapSize = depthRoute.size;
+                lazyDepthSpec = depthSpec;
+                lazyDepthRoute = depthRoute;
+                depthThreadStarted = false;
+                firstDepthCapturePending = false;
                 nativeCtx = nativeInit(activity, videoWidth, videoHeight, prefs.fps,
                         prefs.vrDepthMode, mapSize.width, mapSize.height,
                         prefs.vrDepthDebug, prefs.vrConvergence, prefs.vrDepthScale,
                         prefs.vrHandTracking, prefs.vrSharpening, prefs.vrSupersampling,
                         prefs.enablePerfOverlay,
                         prefs.vrAmbilight, prefs.vrAmbilightLevel, prefs.vrRoomLight,
-                        prefs.vrEnvResTier);
+                        prefs.vrEnvResTier, localMedia, initialStereoLive);
                 if (nativeCtx == 0) {
                     initLatch.countDown();
                     return;
@@ -734,10 +892,11 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 surfaceTexture.setOnFrameAvailableListener(XrRenderer.this);
                 inputSurface = new Surface(surfaceTexture);
 
-                if (prefs.vrDepthMode == DEPTH_MODE_MODEL) {
+                if (prefs.vrDepthMode == DEPTH_MODE_MODEL && (!localMedia || initialStereoLive)) {
                     FileLog.event("depth model "+depthSpec.name+", "+depthRoute.label()
                             +", map "+mapSize);
-                    startDepthThread(activity, depthSpec, depthRoute);
+                    depthThreadStarted = true;
+                    startDepthThread(prefsContext, depthSpec, depthRoute);
                 }
 
                 initOk[0] = true;
@@ -835,7 +994,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
      * stage thread, started here once the model has loaded, turns captures
      * into model input and model output into maps around the model's runs.
      */
-    private void startDepthThread(final Activity activity, final MidasDepthSource.Spec spec,
+    private void startDepthThread(final Context context, final MidasDepthSource.Spec spec,
                                   final MidasDepthSource.Route route) {
         depthThread = new Thread() {
             @Override
@@ -867,7 +1026,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
 
                     MidasDepthSource model = new MidasDepthSource(route);
                     source = model;
-                    if (!source.initialize(activity, inputs, outputs)) {
+                    if (!source.initialize(context, inputs, outputs)) {
                         // The depth texture keeps the flat map it was
                         // initialized with, so zero disparity, and the
                         // stream stays watchable
@@ -1192,6 +1351,24 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 nativeSetRumble(nativeCtx, XrPad.rumbleLow(rumble), XrPad.rumbleHigh(rumble));
             }
 
+            // Apply any pending local-playback environment switch on the render thread
+            int envReq = -1;
+            boolean envDimReq = false;
+            synchronized (localEnvLock) {
+                if (pendingLocalEnvCell >= 0) {
+                    envReq = pendingLocalEnvCell;
+                    envDimReq = pendingLocalEnvDim;
+                    pendingLocalEnvCell = -1;
+                }
+            }
+            if (envReq >= 0 && localMedia) {
+                environmentChoice = envReq;
+                passthroughOn = envReq == ENV_CELL_PASSTHROUGH;
+                nativeSetPassthroughDim(nativeCtx, envDimReq && passthroughOn);
+                requestRoom(envReq);
+                nativeSetEnvironment(nativeCtx, envReq);
+            }
+
             // The pointer sleep row on the panel writes back to this same
             // object, so it is read fresh each frame like head lock
             nativeUpdateInput(nativeCtx, distance, quadWidth, curvature, headLocked,
@@ -1210,6 +1387,19 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
             // Back on, it wants a map of what is showing now, so the frame in
             // hand is captured at once whatever the depth rate says.
             boolean stereoOn = inputState[IN_STEREO] != 0.0f;
+            if (stereoOn && !depthThreadStarted && localMedia
+                    && lazyDepthSpec != null && lazyDepthRoute != null && prefsContext != null) {
+                depthThreadStarted = true;
+                if (nativeEnsureDepthModel(nativeCtx)) {
+                    LimeLog.info("depth3d: lazily loading depth model on first 3D enable ("
+                            + lazyDepthSpec.name + ", " + lazyDepthRoute.label() + ")");
+                    startDepthThread(prefsContext, lazyDepthSpec, lazyDepthRoute);
+                    firstDepthCapturePending = true;
+                } else {
+                    LimeLog.warning("depth3d: lazy depth GL init failed");
+                    nativeDepthGaveUp(nativeCtx);
+                }
+            }
             boolean stereoBack = stereoOn && !stereoLive;
             stereoLive = stereoOn;
             if (stereoBack) {
@@ -1222,9 +1412,11 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 surfaceTexture.getTransformMatrix(texMatrix);
 
                 if (depthReady && stereoOn) {
+                    boolean forceCapture = stereoBack || firstDepthCapturePending;
+                    firstDepthCapturePending = false;
                     // By time since the last capture rather than by frame
                     // count, so the model's rate does not follow the stream's
-                    if (nativeDepthDue(nativeCtx, stereoBack)) {
+                    if (nativeDepthDue(nativeCtx, forceCapture)) {
                         startDepthCapture();
                     }
                     if (publishedFrameNs != 0 && publishedFrameNs >= stereoBackNs) {
@@ -1251,8 +1443,10 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 }
                 videoFrameIndex++;
             }
-            else if (stereoBack && depthReady && videoFrameIndex > 0) {
+            else if ((stereoBack || firstDepthCapturePending) && depthReady && stereoOn
+                    && videoFrameIndex > 0) {
                 // Nothing new from the decoder, so the frame still latched
+                firstDepthCapturePending = false;
                 nativeDepthDue(nativeCtx, true);
                 startDepthCapture();
             }
@@ -1270,6 +1464,10 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
             ByteBuffer transport = transportQueue.pollForUpload();
             if (transport != null) {
                 nativeUploadTransport(nativeCtx, transport);
+            }
+            ByteBuffer paletteSheet = paletteQueue.pollForUpload();
+            if (paletteSheet != null) {
+                nativeUploadPalette(nativeCtx, paletteSheet);
             }
 
             ByteBuffer grid = pendingPickerArt.getAndSet(null);
@@ -1424,6 +1622,12 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         nativeSetGamepad(nativeCtx, prefs.vrGamepadToggle, prefs.deadzonePercentage);
         nativeSetControllerModel(nativeCtx, prefs.vrControllerModel);
         nativeSetTriggerScreenAdjust(nativeCtx, prefs.vrTriggerScreenAdjust);
+        nativeSetPaletteHand(nativeCtx, prefs.vrPaletteOnRightHand);
+        nativeSetPassthroughDim(nativeCtx, localMedia && prefs.vrPassthroughDim && passthroughOn);
+        if (localMedia && !initialStereoLive) {
+            stereoLive = false;
+        }
+        cylinderSupportedCached = nativeGetCylinderSupported(nativeCtx);
         final boolean handHint = prefs.vrHandTracking && !prefs.vrHandLockHintSeen;
         nativeSetHandHint(nativeCtx, handHint);
 
@@ -1731,6 +1935,18 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 if (inputState[IN_LOCAL_MENU] != 0.0f) {
                     inputListener.onVrLocalTogglePalette();
                 }
+                inputListener.onVrPaletteFrame(
+                        inputState[IN_PALETTE_OPEN] != 0.0f,
+                        inputState[IN_PALETTE_PINNED] != 0.0f,
+                        inputState[IN_PALETTE_HAND_MODE] != 0.0f,
+                        inputState[IN_PALETTE_DIM_FALLBACK] != 0.0f,
+                        inputState[IN_PALETTE_HOVER_X],
+                        inputState[IN_PALETTE_HOVER_Y],
+                        (int)inputState[IN_PALETTE_CLICK],
+                        (int)inputState[IN_PALETTE_ROW_STEP],
+                        inputState[IN_PALETTE_ROW_RESET] != 0.0f,
+                        (int)inputState[IN_PALETTE_TAB_STEP],
+                        (int)inputState[IN_PALETTE_PAGE_STEP]);
             }
         }
 
@@ -1762,6 +1978,9 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 prefConfig.vrScreenSize = Math.max(ScreenReadout.MIN_SCREEN_SIZE_DM,
                         Math.min(ScreenReadout.MAX_SCREEN_SIZE_DM,
                                 Math.round(ScreenReadout.flatWidthMeters(fovDeg, distM) * 10.0f)));
+            }
+            if (inputListener != null && localMedia) {
+                inputListener.onVrScreenDimensionsSaved(fovDeg, distM);
             }
         }
 

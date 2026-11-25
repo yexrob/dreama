@@ -51,6 +51,7 @@ import com.limelight.local.stream.DepthStrength
 import com.limelight.local.stream.FileLogMode
 import com.limelight.local.stream.GamepadToggleShortcut
 import com.limelight.local.stream.MouseMode
+import com.limelight.local.stream.PaletteHand
 import com.limelight.local.stream.PhoneInputServer
 import com.limelight.local.stream.ScreenDistancePreset
 import com.limelight.local.stream.ScreenSizePreset
@@ -598,6 +599,21 @@ fun SettingsScreen(model: WallModel, nav: WallNav) {
                             WallSwitch(snapshot.triggerScreenAdjust) {
                                 update { StreamSettingsMapper.setTriggerScreenAdjust(store, it) }
                             }
+                        }
+                    }
+                    item("palette-hand") {
+                        SettingRow(
+                            title = stringResource(R.string.settings_palette_hand_title),
+                            sub = stringResource(R.string.settings_palette_hand_sub),
+                        ) {
+                            SegmentedControl(
+                                options = listOf(
+                                    PaletteHand.LEFT to stringResource(R.string.settings_palette_hand_left),
+                                    PaletteHand.RIGHT to stringResource(R.string.settings_palette_hand_right),
+                                ),
+                                selected = snapshot.paletteHand,
+                                onSelect = { update { StreamSettingsMapper.setPaletteHand(store, it) } },
+                            )
                         }
                     }
                     item("hand-tracking") {

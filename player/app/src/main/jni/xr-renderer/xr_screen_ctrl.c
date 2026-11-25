@@ -158,6 +158,76 @@ void screenMigratePoseGeometry(XrPosef screenPose, Vec3 refPos,
     screenPlacementForFov(fovDeg, d, curve, cylinderSupported, outWidth, outRadius);
 }
 
+void screenApplyLocalDims(ScreenPlacementState* st, Vec3 headPos,
+                          float fovDeg, float distM, float curve,
+                          int cylinderSupported, int roomOn, float* outPanelCurve) {
+    float fov = screenClampFov(fovDeg);
+    float dist = screenClampDist(distM);
+    float qCurve = screenQuantizeCurve(curve);
+    if (outPanelCurve != NULL) {
+        *outPanelCurve = qCurve;
+    }
+    if (!st->placementValid || roomOn) {
+        return;
+    }
+    Vec3 sp = { st->screenPose.position.x, st->screenPose.position.y, st->screenPose.position.z };
+    Vec3 diff = vecSub(sp, headPos);
+    float len = sqrtf(vecDot(diff, diff));
+    Vec3 dir = len > 0.05f ? vecNorm(diff) : (Vec3){ 0.0f, 0.0f, -1.0f };
+    st->screenPose.position.x = headPos.x + dir.x * dist;
+    st->screenPose.position.y = headPos.y + dir.y * dist;
+    st->screenPose.position.z = headPos.z + dir.z * dist;
+    screenPlacementForFov(fov, dist, qCurve, cylinderSupported,
+                          &st->screenWidth, &st->screenRadius);
+    st->poseDirty = 1;
+}
+
+int screenUpdatePlacement(ScreenPlacementState* st, Vec3 headPos,
+                          float distance, float quadWidth, float curvature,
+                          int cylinderSupported, int* outMigrated) {
+    if (outMigrated != NULL) {
+        *outMigrated = 0;
+    }
+    int sliderMoved = st->sliderSeen
+            && (fabsf(distance - st->lastDistance) > 1e-4f
+                || fabsf(quadWidth - st->lastQuadWidth) > 1e-4f);
+    int reseeded = !st->placementValid || sliderMoved;
+
+    if (reseeded) {
+        memset(&st->screenPose, 0, sizeof(st->screenPose));
+        st->screenPose.orientation.w = 1.0f;
+        st->screenPose.position.z = -distance;
+        float fovDeg = screenFovFromFlatWidth(quadWidth, distance);
+        screenPlacementForFov(fovDeg, distance, curvature, cylinderSupported,
+                              &st->screenWidth, &st->screenRadius);
+        st->placementValid = 1;
+        st->poseNeedsCurveMigration = 0;
+        st->grabMode = GRAB_NONE;
+        st->poseDirty = 1;
+    }
+    else if (st->poseNeedsCurveMigration) {
+        st->poseNeedsCurveMigration = 0;
+        float newW = st->screenWidth;
+        float newR = st->screenRadius;
+        screenMigratePoseGeometry(st->screenPose, headPos, st->screenWidth, st->screenRadius,
+                                  curvature, cylinderSupported, &newW, &newR);
+        if (fabsf(newW - st->screenWidth) > 1e-3f
+                || fabsf(newR - st->screenRadius) > 1e-3f) {
+            st->screenWidth = newW;
+            st->screenRadius = newR;
+            st->poseDirty = 1;
+            if (outMigrated != NULL) {
+                *outMigrated = 1;
+            }
+        }
+    }
+
+    st->lastDistance = distance;
+    st->lastQuadWidth = quadWidth;
+    st->sliderSeen = 1;
+    return reseeded;
+}
+
 static XrPosef localOffsetPose(XrPosef base, Vec3 local) {
     Vec3 off = quatRotate(base.orientation, local);
     XrPosef out;
@@ -365,10 +435,17 @@ int screenLayerBudgetOk(int count, int maxLimit) {
 // Shared xr_input.c glue helpers (tested directly on host)
 // ============================================================================
 
-int screenClassifyLocalTarget(int modalOpen, int hoverKind, int transportVisible,
-                              float hitU, float hitV, float videoAspect) {
+int screenClassifyLocalTargetWithPalette(int modalOpen, int hoverKind, int paletteRowAdjustable,
+                                         int transportVisible, float hitU, float hitV,
+                                         float videoAspect) {
     if (modalOpen) {
         return SCREEN_TARGET_CONTROL;
+    }
+    if (hoverKind == HOVER_PALETTE) {
+        return paletteRowAdjustable ? SCREEN_TARGET_PALETTE_ROW : SCREEN_TARGET_PALETTE_OTHER;
+    }
+    if (hoverKind == HOVER_PALETTE_DEADZONE) {
+        return SCREEN_TARGET_PALETTE_OTHER;
     }
     if (hoverKind == HOVER_SCREEN) {
         int onBar = transportVisible && screenTransportBarHit(hitU, hitV, videoAspect);
@@ -378,6 +455,12 @@ int screenClassifyLocalTarget(int modalOpen, int hoverKind, int transportVisible
         return SCREEN_TARGET_CONTROL;
     }
     return SCREEN_TARGET_NONE;
+}
+
+int screenClassifyLocalTarget(int modalOpen, int hoverKind, int transportVisible,
+                              float hitU, float hitV, float videoAspect) {
+    return screenClassifyLocalTargetWithPalette(modalOpen, hoverKind, 0,
+                                                transportVisible, hitU, hitV, videoAspect);
 }
 
 int screenShouldSuppressLeft(const ScreenInputState* st, int externalGrabActive) {
@@ -1091,6 +1174,7 @@ void screenInputStep(ScreenInputState* st, const ScreenInputFrame* in,
                 }
                 else if (in->paletteOpen && in->target == SCREEN_TARGET_PALETTE_ROW) {
                     st->stickXIntent = SCREEN_STICK_INTENT_PALETTE_ROW;
+                    st->stickXNextRepeatNs = in->nowNs + SCREEN_PALETTE_REPEAT_DELAY_NS;
                     out->paletteRowStep = dir;
                 }
                 else if (in->paletteOpen && in->target == SCREEN_TARGET_PALETTE_OTHER) {
@@ -1109,7 +1193,7 @@ void screenInputStep(ScreenInputState* st, const ScreenInputFrame* in,
             }
             else if (arx > SCREEN_STICK_ENGAGE && in->nowNs >= st->stickXNextRepeatNs) {
                 int dir = rx > 0.0f ? 1 : -1;
-                st->stickXNextRepeatNs = in->nowNs + SCREEN_SEEK_REPEAT_NS;
+                st->stickXNextRepeatNs = in->nowNs + SCREEN_PALETTE_REPEAT_INTERVAL_NS;
                 out->paletteRowStep = dir;
             }
         }

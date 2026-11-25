@@ -25,7 +25,9 @@ float furnitureWidth(XrCtx* ctx) {
 // The same shape as the picture, so the furniture keeps the proportions it has
 // outside a room at the same size
 float furnitureHeight(XrCtx* ctx) {
-    return furnitureWidth(ctx) * (float)ctx->videoHeight / (float)ctx->videoWidth;
+    return furnitureWidth(ctx)
+            * paletteVideoHeightOverWidth(ctx->videoWidth, ctx->videoHeight,
+                                          ctx->stereoSourceFormat);
 }
 
 // The frame the bar's row is laid out in. In a room, under the room's picture
@@ -34,7 +36,8 @@ float furnitureHeight(XrCtx* ctx) {
 // cylinder held under a full turn that is smaller than the placement, and the
 // row follows it there too.
 BarFrame barFrame(XrCtx* ctx) {
-    float aspect = (float)ctx->videoHeight / (float)ctx->videoWidth;
+    float aspect = paletteVideoHeightOverWidth(ctx->videoWidth, ctx->videoHeight,
+                                               ctx->stereoSourceFormat);
     if (roomEffective(ctx) > 0) {
         return roomBarFrame(ctx->screenPose, ctx->screenWidth * aspect, aspect);
     }
@@ -338,7 +341,7 @@ void setRayOn(XrCtx* ctx, int on, const char* from) {
 // comes back for them while it is switched off.
 int panelUp(XrCtx* ctx) {
     return ctx->cogOpen || ctx->pickerOpen || ctx->kbOpen || ctx->exitConfirmOpen
-            || ctx->reportOpen || ctx->hintOpen;
+            || ctx->reportOpen || ctx->hintOpen || ctx->palette.open;
 }
 
 // The 3D on or off for the rest of the session, from the bar or the 3D tab.
@@ -353,7 +356,8 @@ void setStereoLive(XrCtx* ctx, int on, const char* from) {
     }
     ctx->stereoLive = on;
     ctx->warpRedraw = 1;
-    ctx->stereoWaiting = on && ctx->stereoMode == DEPTH_MODE_MODEL;
+    ctx->stereoWaiting = on && ctx->stereoMode == DEPTH_MODE_MODEL
+            && ctx->stereoSourceFormat == STEREO_SRC_AUTO;
     ctx->stereoWaitIndex = atomic_load_explicit(&ctx->depthStagedIndex, memory_order_acquire);
     ctx->stereoWaitNs = nowNs();
     // The shift test measures again in the new state

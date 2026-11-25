@@ -60,6 +60,7 @@ const char* const FRAGMENT_SRC =
     // falls to nothing, in frame uv. 0 is no band.
     "uniform float u_edgeFade;\n"
     "uniform float u_depthCubic;\n"
+    "uniform float u_sourceFormat;\n"
     GRADE_GLSL
     "out vec4 fragColor;\n"
     // The depth here is a quarter of the frame wide, so a texel of it spans
@@ -113,6 +114,24 @@ const char* const FRAGMENT_SRC =
     "        return;\n"
     "    }\n"
     "    vec2 tc = v_plain;\n"
+    "    if (u_sourceFormat > 0.5 && u_sourceFormat < 1.5) {\n"
+    "        tc.x = tc.x * 0.5 + (u_eyeIndex > 0.5 ? 0.5 : 0.0);\n"
+    "        fragColor = texture(u_texture, (u_texmatrix * vec4(tc, 0.0, 1.0)).xy);\n"
+    "        if (u_gradeOn > 0.5) {\n"
+    "            fragColor.rgb = grade(fragColor.rgb);\n"
+    "        }\n"
+    "        fragColor.rgb *= u_tint;\n"
+    "        return;\n"
+    "    }\n"
+    "    if (u_sourceFormat >= 1.5) {\n"
+    "        tc.y = tc.y * 0.5 + (u_eyeIndex < 0.5 ? 0.5 : 0.0);\n"
+    "        fragColor = texture(u_texture, (u_texmatrix * vec4(tc, 0.0, 1.0)).xy);\n"
+    "        if (u_gradeOn > 0.5) {\n"
+    "            fragColor.rgb = grade(fragColor.rgb);\n"
+    "        }\n"
+    "        fragColor.rgb *= u_tint;\n"
+    "        return;\n"
+    "    }\n"
     // A pixel near a side edge whose shift points outward has nothing in the
     // frame to read, and the clamp below hands it the edge column, so that
     // column gets smeared across the width of the shift. Letting the shift die

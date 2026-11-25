@@ -268,6 +268,17 @@ class ScreenReadoutAndPrefsTest {
         assertEquals(XrShared.IN_ADJUST_DIST_CM + 1, XrShared.IN_ADJUST_INCHES)
         assertEquals(XrShared.IN_ADJUST_INCHES + 1, XrShared.IN_ADJUST_PRESET)
         assertEquals(XrShared.IN_ADJUST_PRESET + 1, XrShared.IN_ADJUST_SAVED)
-        assertEquals(XrShared.IN_ADJUST_SAVED + 1, XrShared.IN_SLOTS)
+        assertEquals(XrShared.IN_ADJUST_SAVED + 1, XrShared.IN_PALETTE_OPEN)
+        assertEquals(XrShared.IN_PALETTE_OPEN + 1, XrShared.IN_PALETTE_PINNED)
+        assertEquals(XrShared.IN_PALETTE_PINNED + 1, XrShared.IN_PALETTE_HAND_MODE)
+        assertEquals(XrShared.IN_PALETTE_HAND_MODE + 1, XrShared.IN_PALETTE_HOVER_X)
+        assertEquals(XrShared.IN_PALETTE_HOVER_X + 1, XrShared.IN_PALETTE_HOVER_Y)
+        assertEquals(XrShared.IN_PALETTE_HOVER_Y + 1, XrShared.IN_PALETTE_CLICK)
+        assertEquals(XrShared.IN_PALETTE_CLICK + 1, XrShared.IN_PALETTE_ROW_STEP)
+        assertEquals(XrShared.IN_PALETTE_ROW_STEP + 1, XrShared.IN_PALETTE_ROW_RESET)
+        assertEquals(XrShared.IN_PALETTE_ROW_RESET + 1, XrShared.IN_PALETTE_TAB_STEP)
+        assertEquals(XrShared.IN_PALETTE_TAB_STEP + 1, XrShared.IN_PALETTE_PAGE_STEP)
+        assertEquals(XrShared.IN_PALETTE_PAGE_STEP + 1, XrShared.IN_PALETTE_DIM_FALLBACK)
+        assertEquals(XrShared.IN_PALETTE_DIM_FALLBACK + 1, XrShared.IN_SLOTS)
     }
 }

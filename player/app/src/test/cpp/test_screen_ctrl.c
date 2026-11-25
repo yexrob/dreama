@@ -1183,6 +1183,191 @@ static void testLocalMediaGlueAndMutualExclusion(void) {
     CHECK(res.adjustActive == 0);
 }
 
+static void testPaletteStickRepeatAndTargetClassifier(void) {
+    // Target classifier maps HOVER_PALETTE (adjustable vs non-adjustable) & DEADZONE cleanly
+    CHECK(screenClassifyLocalTargetWithPalette(0, HOVER_PALETTE, 1, 0, 0.5f, 0.5f, 16.0f / 9.0f)
+          == SCREEN_TARGET_PALETTE_ROW);
+    CHECK(screenClassifyLocalTargetWithPalette(0, HOVER_PALETTE, 0, 0, 0.5f, 0.5f, 16.0f / 9.0f)
+          == SCREEN_TARGET_PALETTE_OTHER);
+    CHECK(screenClassifyLocalTargetWithPalette(0, HOVER_PALETTE_DEADZONE, 1, 0, 1.02f, 0.5f, 16.0f / 9.0f)
+          == SCREEN_TARGET_PALETTE_OTHER);
+    CHECK(screenClassifyLocalTargetWithPalette(0, HOVER_SCREEN, 0, 0, 0.5f, 0.5f, 16.0f / 9.0f)
+          == SCREEN_TARGET_SCREEN);
+
+    // §6.3 / §6.4: stick-X on PALETTE_ROW repeats after 400 ms delay at 8 Hz (125 ms interval)
+    ScreenInputState st;
+    ScreenInputResult res;
+    screenInputInit(&st);
+
+    ScreenInputFrame f = baseFrame(MS(1000), 0.016f);
+    f.paletteOpen = 1;
+    f.target = SCREEN_TARGET_PALETTE_ROW;
+    f.rStickX = 0.9f;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.paletteRowStep == 1);
+    CHECK(res.seekDeltaSec == 0);
+
+    // At +390 ms (< 400 ms delay): no repeat yet
+    f.nowNs = MS(1390);
+    screenInputStep(&st, &f, &res);
+    CHECK(res.paletteRowStep == 0);
+
+    // At +400 ms: first repeat fires
+    f.nowNs = MS(1400);
+    screenInputStep(&st, &f, &res);
+    CHECK(res.paletteRowStep == 1);
+
+    // At +520 ms (< 125 ms interval): no repeat
+    f.nowNs = MS(1520);
+    screenInputStep(&st, &f, &res);
+    CHECK(res.paletteRowStep == 0);
+
+    // At +525 ms (8 Hz): second repeat fires
+    f.nowNs = MS(1525);
+    screenInputStep(&st, &f, &res);
+    CHECK(res.paletteRowStep == 1);
+
+    // Sliding off row onto screen while stick still held must NEVER become seek!
+    f.nowNs = MS(1650);
+    f.target = SCREEN_TARGET_SCREEN;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.paletteRowStep == 0);
+    CHECK(res.seekDeltaSec == 0);
+}
+
+// G2 review #1: setting screen size/distance/curve from the VR Quick Palette must
+// preserve a custom grabbed pose and must NOT trigger sliderMoved reseed on the
+// next frame when Java keeps passing launch-time distance/quadWidth.
+static void testSetLocalDimsPreservesGrabbedPoseAcrossUpdatePlacement(void) {
+    ScreenPlacementState ps;
+    memset(&ps, 0, sizeof(ps));
+    Vec3 head = { 0.0f, 0.0f, 0.0f };
+
+    // Initial seed at launch prefs: 3.0 m, 50 deg (~2.798 m flat width)
+    float launchDist = 3.0f;
+    float launchWidth = screenFlatWidth(50.0f, launchDist);
+    int migrated = 0;
+    CHECK(screenUpdatePlacement(&ps, head, launchDist, launchWidth, 0.0f, 1, &migrated) == 1);
+    CHECK(ps.placementValid == 1);
+    CHECK(ps.sliderSeen == 1);
+    ps.poseDirty = 0;
+
+    // User sphere-drags screen off to the right (30 deg yaw) and slightly up
+    float yawRad = 0.5236f; // 30 deg
+    Vec3 customDir = vecNorm((Vec3){ sinf(yawRad), 0.20f, -cosf(yawRad) });
+    ps.screenPose.position.x = customDir.x * 3.0f;
+    ps.screenPose.position.y = customDir.y * 3.0f;
+    ps.screenPose.position.z = customDir.z * 3.0f;
+    Vec3 yAxis = { 0.0f, 1.0f, 0.0f };
+    ps.screenPose.orientation = axisAngleQuat(yAxis, -yawRad);
+    XrQuaternionf grabbedOrient = ps.screenPose.orientation;
+
+    // Palette changes screen to 62 deg @ 4.5 m, 35% curvature
+    float panelCurve = -1.0f;
+    screenApplyLocalDims(&ps, head, 62.0f, 4.5f, 0.35f, 1, 0, &panelCurve);
+    CHECK_NEAR(panelCurve, 0.35f, 1e-4f);
+    CHECK(ps.poseDirty == 1);
+    float expectedW = 0.0f, expectedR = 0.0f;
+    screenPlacementForFov(62.0f, 4.5f, 0.35f, 1, &expectedW, &expectedR);
+    CHECK_NEAR(ps.screenWidth, expectedW, 1e-4f);
+    CHECK_NEAR(ps.screenRadius, expectedR, 1e-4f);
+    CHECK_NEAR(ps.screenPose.position.x, customDir.x * 4.5f, 1e-3f);
+    CHECK_NEAR(ps.screenPose.position.y, customDir.y * 4.5f, 1e-3f);
+    CHECK_NEAR(ps.screenPose.position.z, customDir.z * 4.5f, 1e-3f);
+
+    // Next frame: runFrameLoop passes UNCHANGED launch distance/quadWidth to updatePlacement!
+    int reseeded = screenUpdatePlacement(&ps, head, launchDist, launchWidth, panelCurve, 1, &migrated);
+    CHECK(reseeded == 0);
+    // Custom grabbed orientation & off-axis direction + new palette width/distance are preserved!
+    CHECK_NEAR(ps.screenPose.orientation.x, grabbedOrient.x, 1e-5f);
+    CHECK_NEAR(ps.screenPose.orientation.y, grabbedOrient.y, 1e-5f);
+    CHECK_NEAR(ps.screenPose.orientation.z, grabbedOrient.z, 1e-5f);
+    CHECK_NEAR(ps.screenPose.orientation.w, grabbedOrient.w, 1e-5f);
+    CHECK_NEAR(ps.screenPose.position.x, customDir.x * 4.5f, 1e-3f);
+    CHECK_NEAR(ps.screenPose.position.y, customDir.y * 4.5f, 1e-3f);
+    CHECK_NEAR(ps.screenPose.position.z, customDir.z * 4.5f, 1e-3f);
+    CHECK_NEAR(ps.screenWidth, expectedW, 1e-4f);
+    CHECK_NEAR(ps.screenRadius, expectedR, 1e-4f);
+
+    // When in a 3D theater room, screenApplyLocalDims must not alter the room wall pose
+    ps.poseDirty = 0;
+    float beforeW = ps.screenWidth;
+    screenApplyLocalDims(&ps, head, 40.0f, 2.0f, 0.50f, 1, 1 /* roomOn */, &panelCurve);
+    CHECK_NEAR(ps.screenWidth, beforeW, 1e-4f);
+    CHECK(ps.poseDirty == 0);
+}
+
+// B-button priority ladder when VR Quick Palette is open (Rule 10):
+// adjust-undo > close-card > close-palette > exit-prompt > exit-confirm.
+static void testPaletteOpenBPriorityLadder(void) {
+    ScreenInputState st;
+    ScreenInputResult res;
+    screenInputInit(&st);
+
+    // 1. Palette open AND screen adjust active -> B undoes adjust first, NOT close palette!
+    ScreenInputFrame f = baseFrame(MS(1000), 0.016f);
+    f.paletteOpen = 1;
+    f.triggerDown = 1;
+    screenInputStep(&st, &f, &res);
+
+    f.nowNs = MS(1050);
+    f.rStickX = 0.8f;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.adjustActive == 1);
+
+    f.nowNs = MS(1100);
+    f.btnB = 1;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.bAction == SCREEN_B_UNDO_ADJUST);
+    CHECK(res.adjustUndone == 1);
+    CHECK(res.adjustActive == 0);
+
+    // Release B, trigger, stick -> settle
+    f.nowNs = MS(1150);
+    f.btnB = 0;
+    f.triggerDown = 0;
+    f.rStickX = 0.0f;
+    screenInputStep(&st, &f, &res);
+
+    // 2. Palette open AND card open (no adjust) -> B closes card first!
+    f.nowNs = MS(1200);
+    f.cardKind = SCREEN_CARD_NEXT_EP;
+    f.btnB = 1;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.bAction == SCREEN_B_CLOSE_CARD);
+
+    f.nowNs = MS(1250);
+    f.btnB = 0;
+    f.cardKind = SCREEN_CARD_NONE;
+    screenInputStep(&st, &f, &res);
+
+    // 3. Palette open (no adjust, no card) -> B closes palette (NOT exit prompt)!
+    f.nowNs = MS(1300);
+    f.btnB = 1;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.bAction == SCREEN_B_CLOSE_PALETTE);
+
+    f.nowNs = MS(1350);
+    f.btnB = 0;
+    f.paletteOpen = 0;
+    screenInputStep(&st, &f, &res);
+
+    // 4. Palette now closed -> first B shows exit prompt, second B within 2s confirms exit!
+    f.nowNs = MS(1400);
+    f.btnB = 1;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.bAction == SCREEN_B_EXIT_PROMPT);
+
+    f.nowNs = MS(1500);
+    f.btnB = 0;
+    screenInputStep(&st, &f, &res);
+
+    f.nowNs = MS(1800);
+    f.btnB = 1;
+    screenInputStep(&st, &f, &res);
+    CHECK(res.bAction == SCREEN_B_EXIT_CONFIRM);
+}
+
 int main(void) {
     testInchesAndNorms();
     testCurvatureFormulaAndAngularInvariance();
@@ -1199,5 +1384,8 @@ int main(void) {
     testHandTrackingAdjust();
     testSection64MatrixButtonsAndLeftStick();
     testLocalMediaGlueAndMutualExclusion();
+    testPaletteStickRepeatAndTargetClassifier();
+    testSetLocalDimsPreservesGrabbedPoseAcrossUpdatePlacement();
+    testPaletteOpenBPriorityLadder();
     return checksDone("xr_screen_ctrl");
 }

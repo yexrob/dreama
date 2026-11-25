@@ -21,6 +21,9 @@ interface PrefsStore {
     fun putInt(key: String, value: Int)
     fun putBoolean(key: String, value: Boolean)
     fun remove(key: String)
+    fun batch(block: (PrefsStore) -> Unit) {
+        block(this)
+    }
 }
 
 class AndroidPrefsStore(private val prefs: SharedPreferences) : PrefsStore {
@@ -34,6 +37,23 @@ class AndroidPrefsStore(private val prefs: SharedPreferences) : PrefsStore {
     override fun putBoolean(key: String, value: Boolean) { prefs.edit().putBoolean(key, value).apply() }
     override fun remove(key: String) { prefs.edit().remove(key).apply() }
 
+    override fun batch(block: (PrefsStore) -> Unit) {
+        val editor = prefs.edit()
+        val staged = object : PrefsStore {
+            override fun asSharedPreferences(): SharedPreferences = prefs
+            override fun getString(key: String, def: String?): String? = prefs.getString(key, def)
+            override fun getInt(key: String, def: Int): Int = prefs.getInt(key, def)
+            override fun getBoolean(key: String, def: Boolean): Boolean = prefs.getBoolean(key, def)
+            override fun contains(key: String): Boolean = prefs.contains(key)
+            override fun putString(key: String, value: String) { editor.putString(key, value) }
+            override fun putInt(key: String, value: Int) { editor.putInt(key, value) }
+            override fun putBoolean(key: String, value: Boolean) { editor.putBoolean(key, value) }
+            override fun remove(key: String) { editor.remove(key) }
+        }
+        block(staged)
+        editor.apply()
+    }
+
     companion object {
         @Suppress("DEPRECATION")
         fun defaultPrefs(context: Context): AndroidPrefsStore =
@@ -46,6 +66,13 @@ class AndroidPrefsStore(private val prefs: SharedPreferences) : PrefsStore {
 
 class MapPrefsStore : PrefsStore, SharedPreferences {
     private val map = LinkedHashMap<String, Any?>()
+    private var inBatch = false
+    var applyCount: Int = 0
+        private set
+
+    fun resetApplyCount() {
+        applyCount = 0
+    }
 
     override fun asSharedPreferences(): SharedPreferences = this
     override fun getAll(): MutableMap<String, *> = LinkedHashMap(map)
@@ -62,10 +89,33 @@ class MapPrefsStore : PrefsStore, SharedPreferences {
     override fun registerOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) = Unit
     override fun unregisterOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) = Unit
 
-    override fun putString(key: String, value: String) { map[key] = value }
-    override fun putInt(key: String, value: Int) { map[key] = value }
-    override fun putBoolean(key: String, value: Boolean) { map[key] = value }
-    override fun remove(key: String) { map.remove(key) }
+    override fun putString(key: String, value: String) {
+        map[key] = value
+        if (!inBatch) applyCount++
+    }
+    override fun putInt(key: String, value: Int) {
+        map[key] = value
+        if (!inBatch) applyCount++
+    }
+    override fun putBoolean(key: String, value: Boolean) {
+        map[key] = value
+        if (!inBatch) applyCount++
+    }
+    override fun remove(key: String) {
+        map.remove(key)
+        if (!inBatch) applyCount++
+    }
+
+    override fun batch(block: (PrefsStore) -> Unit) {
+        val nested = inBatch
+        inBatch = true
+        try {
+            block(this)
+        } finally {
+            inBatch = nested
+            if (!nested) applyCount++
+        }
+    }
 
     private inner class MapEditor : SharedPreferences.Editor {
         override fun putString(key: String, value: String?): SharedPreferences.Editor = apply {
@@ -80,8 +130,13 @@ class MapPrefsStore : PrefsStore, SharedPreferences {
         override fun putBoolean(key: String, value: Boolean): SharedPreferences.Editor = apply { map[key] = value }
         override fun remove(key: String): SharedPreferences.Editor = apply { map.remove(key) }
         override fun clear(): SharedPreferences.Editor = apply { map.clear() }
-        override fun commit(): Boolean = true
-        override fun apply() = Unit
+        override fun commit(): Boolean {
+            if (!inBatch) applyCount++
+            return true
+        }
+        override fun apply() {
+            if (!inBatch) applyCount++
+        }
     }
 
     fun snapshot(): Map<String, Any?> = LinkedHashMap(map)
@@ -244,6 +299,12 @@ enum class CurvatureDisabledReason {
     UNSUPPORTED_HEADSET,
 }
 
+/** Which controller holds the VR Quick Palette (§3.8 & §6.3). */
+enum class PaletteHand {
+    LEFT,
+    RIGHT,
+}
+
 data class Depth3dSettingsSnapshot(
     val actualWidth: Int,
     val actualHeight: Int,
@@ -291,6 +352,7 @@ data class Depth3dSettingsSnapshot(
         ScreenReadout.clampDist(actualScreenDistanceDm / 10f),
     ),
     val triggerScreenAdjust: Boolean = PreferenceConfiguration.DEFAULT_VR_TRIGGER_SCREEN_ADJUST,
+    val paletteHand: PaletteHand = PaletteHand.LEFT,
     val cylinderSupported: Boolean = true,
     val curvatureDisabledReason: CurvatureDisabledReason? = null,
 ) {
@@ -337,6 +399,7 @@ object StreamSettingsMapper {
     const val KEY_SCREEN_DISTANCE = PreferenceConfiguration.VR_DISTANCE_PREF_STRING
     const val KEY_CURVATURE = PreferenceConfiguration.VR_CURVATURE_PREF_STRING
     const val KEY_TRIGGER_SCREEN_ADJUST = PreferenceConfiguration.VR_TRIGGER_SCREEN_ADJUST_PREF_STRING
+    const val KEY_PALETTE_HAND_RIGHT = PreferenceConfiguration.VR_PALETTE_HAND_RIGHT_PREF_STRING
     const val KEY_CYLINDER_SUPPORTED = PreferenceConfiguration.VR_CYLINDER_SUPPORTED_PREF_STRING
     const val KEY_ENV_ID = PreferenceConfiguration.VR_ENVIRONMENT_ID_PREF_STRING
     const val KEY_PASSTHROUGH = PreferenceConfiguration.VR_PASSTHROUGH_PREF_STRING
@@ -485,6 +548,7 @@ object StreamSettingsMapper {
             screenFovDeg = fovDeg,
             screenDiagonalInches = diagInches,
             triggerScreenAdjust = cfg.vrTriggerScreenAdjust,
+            paletteHand = if (cfg.vrPaletteOnRightHand) PaletteHand.RIGHT else PaletteHand.LEFT,
             cylinderSupported = cylinderSupported,
             curvatureDisabledReason = curvatureDisabledReason,
         )
@@ -664,8 +728,20 @@ object StreamSettingsMapper {
         store.putBoolean(KEY_TRIGGER_SCREEN_ADJUST, enabled)
     }
 
+    /** Setting: "调色板挂在 左手 / 右手" (§3.8, §6.3). */
+    fun setPaletteHand(store: PrefsStore, hand: PaletteHand) {
+        store.putBoolean(KEY_PALETTE_HAND_RIGHT, hand == PaletteHand.RIGHT)
+    }
+
     fun setEnvironment(store: PrefsStore, preset: VrEnvironmentPreset) {
-        EnvironmentIds.store(store.asSharedPreferences(), preset.envId)
+        if (EnvironmentIds.cellForId(preset.envId) < 0) return
+        store.batch { b ->
+            b.putInt(PreferenceConfiguration.VR_ENVIRONMENT_ID_PREF_STRING, preset.envId)
+            b.putBoolean(
+                PreferenceConfiguration.VR_PASSTHROUGH_PREF_STRING,
+                preset.envId == PreferenceConfiguration.VR_ENV_PASSTHROUGH,
+            )
+        }
     }
 
     fun setAmbilight(store: PrefsStore, enabled: Boolean) {

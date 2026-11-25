@@ -34,6 +34,9 @@
 #define HOVER_RAYBUTTON 16
 #define HOVER_AIMBUTTON 17
 #define HOVER_PADBUTTON 18
+// depth3d G2: local-playback quick palette interior and 1.5 cm edge deadzone
+#define HOVER_PALETTE 19
+#define HOVER_PALETTE_DEADZONE 20
 // How far past each edge that reaches, as a fraction of the screen
 #define HALO_FRAC 0.5f
 

@@ -14,7 +14,7 @@ TESTS := $(OUT)/test_math $(OUT)/test_depthmap $(OUT)/test_atlas $(OUT)/test_roo
          $(OUT)/test_layout $(OUT)/test_audio $(OUT)/test_rate $(OUT)/test_gate \
          $(OUT)/test_pinch $(OUT)/test_notice $(OUT)/test_glow $(OUT)/test_grade \
          $(OUT)/test_keys $(OUT)/test_controller $(OUT)/test_headaim $(OUT)/test_gamepad \
-         $(OUT)/test_screen_ctrl
+         $(OUT)/test_screen_ctrl $(OUT)/test_palette
 
 .PHONY: test clean
 
@@ -112,6 +112,13 @@ $(OUT)/test_screen_ctrl: test_screen_ctrl.c check.h $(SRC)/xr_screen_ctrl.c $(SR
                          $(SRC)/xr_math.c $(SRC)/xr_math.h $(SRC)/xr_shared.h
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ test_screen_ctrl.c $(SRC)/xr_screen_ctrl.c $(SRC)/xr_math.c -lm
+
+# Controller-mounted & pinnable VR Quick Palette spatial math, pose filter,
+# edge deadzone, hover hysteresis, grip/hand drag, and fade/dimming (§6.3-§6.5)
+$(OUT)/test_palette: test_palette.c check.h $(SRC)/xr_palette.c $(SRC)/xr_palette.h \
+                     $(SRC)/xr_math.c $(SRC)/xr_math.h $(SRC)/xr_shared.h
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ test_palette.c $(SRC)/xr_palette.c $(SRC)/xr_math.c -lm
 
 # The audio module ships at -O2 and this test prints what its kernels cost, so
 # it is built the way the app builds it

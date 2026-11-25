@@ -734,46 +734,135 @@ static void readJoints(XrCtx* ctx, int hand, const FrameXform* xform, const XrPo
 // reseeded, since a room holding the screen has to know the placement waiting
 // behind it has changed.
 int updatePlacement(XrCtx* ctx, float distance, float quadWidth, float curvature) {
-    int sliderMoved = ctx->sliderSeen
-            && (fabsf(distance - ctx->lastDistance) > 1e-4f
-                || fabsf(quadWidth - ctx->lastQuadWidth) > 1e-4f);
-    int reseeded = !ctx->placementValid || sliderMoved;
+    ScreenPlacementState ps;
+    ps.placementValid = ctx->placementValid;
+    ps.sliderSeen = ctx->sliderSeen;
+    ps.lastDistance = ctx->lastDistance;
+    ps.lastQuadWidth = ctx->lastQuadWidth;
+    ps.screenPose = ctx->screenPose;
+    ps.screenWidth = ctx->screenWidth;
+    ps.screenRadius = ctx->screenRadius;
+    ps.poseNeedsCurveMigration = ctx->poseNeedsCurveMigration;
+    ps.poseDirty = ctx->poseDirty;
+    ps.grabMode = ctx->grabMode;
 
-    if (reseeded) {
-        memset(&ctx->screenPose, 0, sizeof(ctx->screenPose));
-        ctx->screenPose.orientation.w = 1.0f;
-        ctx->screenPose.position.z = -distance;
-        // Spec §6.12: R = D / c keeping horizontal angular width invariant
-        float fovDeg = screenFovFromFlatWidth(quadWidth, distance);
-        screenPlacementForFov(fovDeg, distance, curvature, ctx->cylinderSupported,
-                              &ctx->screenWidth, &ctx->screenRadius);
-        ctx->placementValid = 1;
-        ctx->poseNeedsCurveMigration = 0;
-        ctx->grabMode = GRAB_NONE;
-        ctx->poseDirty = 1;
+    float oldW = ctx->screenWidth;
+    float oldR = ctx->screenRadius;
+    Vec3 headRef = { ctx->headPos.x, ctx->headPos.y, ctx->headPos.z };
+    int migrated = 0;
+    int reseeded = screenUpdatePlacement(&ps, headRef, distance, quadWidth, curvature,
+                                         ctx->cylinderSupported, &migrated);
+    ctx->placementValid = ps.placementValid;
+    ctx->sliderSeen = ps.sliderSeen;
+    ctx->lastDistance = ps.lastDistance;
+    ctx->lastQuadWidth = ps.lastQuadWidth;
+    ctx->screenPose = ps.screenPose;
+    ctx->screenWidth = ps.screenWidth;
+    ctx->screenRadius = ps.screenRadius;
+    ctx->poseNeedsCurveMigration = ps.poseNeedsCurveMigration;
+    ctx->poseDirty = ps.poseDirty;
+    ctx->grabMode = ps.grabMode;
+    if (migrated) {
+        LOGI("depth3d: migrated legacy screen pose (w %.2f -> %.2f m, r %.2f -> %.2f m)",
+             oldW, ctx->screenWidth, oldR, ctx->screenRadius);
     }
-    else if (ctx->poseNeedsCurveMigration) {
-        ctx->poseNeedsCurveMigration = 0;
-        Vec3 headRef = { ctx->headPos.x, ctx->headPos.y, ctx->headPos.z };
-        float newW = ctx->screenWidth;
-        float newR = ctx->screenRadius;
-        screenMigratePoseGeometry(ctx->screenPose, headRef, ctx->screenWidth,
-                                  ctx->screenRadius, curvature, ctx->cylinderSupported,
-                                  &newW, &newR);
-        if (fabsf(newW - ctx->screenWidth) > 1e-3f
-                || fabsf(newR - ctx->screenRadius) > 1e-3f) {
-            LOGI("depth3d: migrated legacy screen pose (w %.2f -> %.2f m, r %.2f -> %.2f m)",
-                 ctx->screenWidth, newW, ctx->screenRadius, newR);
-            ctx->screenWidth = newW;
-            ctx->screenRadius = newR;
-            ctx->poseDirty = 1;
-        }
-    }
-
-    ctx->lastDistance = distance;
-    ctx->lastQuadWidth = quadWidth;
-    ctx->sliderSeen = 1;
     return reseeded;
+}
+
+// Drains all cross-thread local playback / palette requests enqueued via JNI
+// onto the render thread so palette, stereo, and screen placement state are
+// mutated from a single thread without races.
+void applyPendingLocalCmds(XrCtx* ctx, int allowPlacement) {
+    if (ctx == NULL || !ctx->localCmdLockReady) {
+        return;
+    }
+    struct LocalPendingCmds cmd;
+    pthread_mutex_lock(&ctx->localCmdLock);
+    cmd = ctx->localPending;
+    memset(&ctx->localPending, 0, sizeof(ctx->localPending));
+    if (cmd.hasScreenDims && !allowPlacement) {
+        ctx->localPending.hasScreenDims = 1;
+        ctx->localPending.screenFovDeg = cmd.screenFovDeg;
+        ctx->localPending.screenDistM = cmd.screenDistM;
+        ctx->localPending.screenCurve = cmd.screenCurve;
+        cmd.hasScreenDims = 0;
+    }
+    pthread_mutex_unlock(&ctx->localCmdLock);
+
+    if (cmd.hasHand) {
+        paletteSetHand(&ctx->palette, cmd.handRight);
+        LOGI("depth3d: palette mounted on %s hand", cmd.handRight ? "right" : "left");
+    }
+    if (cmd.hasRowMask) {
+        ctx->paletteActiveRowMask = cmd.rowMask;
+    }
+    if (cmd.close) {
+        ctx->paletteCloseRequested = 1;
+        ctx->paletteBarOpenRequested = 0;
+    }
+    if (cmd.barOpen) {
+        ctx->paletteBarOpenRequested = 1;
+        ctx->paletteCloseRequested = 0;
+    }
+    if (cmd.pinToggle) {
+        ctx->palettePinToggleRequested = 1;
+    }
+    if (cmd.hasPassthroughDim) {
+        ctx->passthroughDim = (ctx->localMedia && cmd.passthroughDim) ? 1 : 0;
+    }
+    if (cmd.hasSourceFormat && ctx->stereoSourceFormat != cmd.sourceFormat) {
+        ctx->stereoSourceFormat = cmd.sourceFormat;
+        if (cmd.sourceFormat != STEREO_SRC_AUTO) {
+            ctx->stereoWaiting = 0;
+        }
+        ctx->warpRedraw = 1;
+        LOGEV("depth3d: stereo source format %d", cmd.sourceFormat);
+    }
+    if (cmd.hasStereoStrength) {
+        if (cmd.stereoSeparation >= 0.0f) {
+            ctx->panelSeparation = cmd.stereoSeparation;
+        }
+        if (cmd.stereoConvergence >= 0.0f && cmd.stereoConvergence <= 1.0f) {
+            ctx->convergence = cmd.stereoConvergence;
+        }
+        if (cmd.stereoDepthLocal > 0.0f) {
+            ctx->depthLocal = cmd.stereoDepthLocal;
+        }
+        if (ctx->localMedia && cmd.stereoOn
+                && ctx->stereoSourceFormat == STEREO_SRC_AUTO
+                && ctx->stereoMode == DEPTH_MODE_OFF) {
+            // Promote to DEPTH_MODE_MODEL lazily on first 3D ON in AUTO mode
+            ctx->stereoMode = DEPTH_MODE_MODEL;
+        }
+        setStereoLive(ctx, cmd.stereoOn, "palette");
+        if (ctx->stereoSourceFormat != STEREO_SRC_AUTO) {
+            ctx->stereoWaiting = 0;
+        }
+        ctx->warpRedraw = 1;
+    }
+    if (cmd.pendingHaptic > PALETTE_HAPTIC_NONE) {
+        ctx->palettePendingHaptic = cmd.pendingHaptic;
+    }
+    if (cmd.hasScreenDims && allowPlacement) {
+        ScreenPlacementState ps;
+        ps.placementValid = ctx->placementValid;
+        ps.sliderSeen = ctx->sliderSeen;
+        ps.lastDistance = ctx->lastDistance;
+        ps.lastQuadWidth = ctx->lastQuadWidth;
+        ps.screenPose = ctx->screenPose;
+        ps.screenWidth = ctx->screenWidth;
+        ps.screenRadius = ctx->screenRadius;
+        ps.poseNeedsCurveMigration = ctx->poseNeedsCurveMigration;
+        ps.poseDirty = ctx->poseDirty;
+        ps.grabMode = ctx->grabMode;
+        Vec3 head = { ctx->headPos.x, ctx->headPos.y, ctx->headPos.z };
+        screenApplyLocalDims(&ps, head, cmd.screenFovDeg, cmd.screenDistM, cmd.screenCurve,
+                             ctx->cylinderSupported, roomEffective(ctx) > 0, &ctx->panelCurve);
+        ctx->screenPose = ps.screenPose;
+        ctx->screenWidth = ps.screenWidth;
+        ctx->screenRadius = ps.screenRadius;
+        ctx->poseDirty = ps.poseDirty;
+    }
 }
 
 // Recentring is the user saying where forward is. The screen comes round to
@@ -1124,7 +1213,9 @@ static void applyGrab(XrCtx* ctx, XrPosef* aims, const int* valid, const float* 
         }
         // Hung now rather than at the end of the frame, so the ray and the
         // bracket it ends on move with the picture
-        applyRoomPlacement(ctx, roomStyle, (float)ctx->videoHeight / (float)ctx->videoWidth, 0);
+        applyRoomPlacement(ctx, roomStyle,
+                           paletteVideoHeightOverWidth(ctx->videoWidth, ctx->videoHeight,
+                                                       ctx->stereoSourceFormat), 0);
         return;
     }
 
@@ -1195,6 +1286,9 @@ static Vec3 furniturePoint(XrCtx* ctx, int hover, float u, float v, XrPosef scre
     }
     if (hover == HOVER_HINT) {
         return screenPoint(u, v, ctx->hintPose, ctx->hintW, ctx->hintH, 0.0f, 0);
+    }
+    if (hover == HOVER_PALETTE || hover == HOVER_PALETTE_DEADZONE) {
+        return screenPoint(u, v, ctx->palettePose.pose, PALETTE_W_M, PALETTE_H_M, 0.0f, 0);
     }
     return screenPoint(u, v, screenPose, ctx->screenWidth, height, radius, curved);
 }
@@ -1420,6 +1514,11 @@ static void releaseInput(XrCtx* ctx, float* out) {
     }
     ctx->uiHapticSecondAtNs = 0;
     screenInputReset(&ctx->screenCtrl);
+    paletteEndDrag(&ctx->palette);
+    ctx->paletteDragHand = -1;
+    ctx->paletteSliderDragging = 0;
+    ctx->paletteSliderHand = -1;
+    ctx->palettePose.visible = 0;
     if (ctx->cogDragSlider >= 0) {
         // Same for a slider: a drag must not survive the trigger it
         // was being held with going unwatched. Ending it here still
@@ -1432,6 +1531,11 @@ static void releaseInput(XrCtx* ctx, float* out) {
 // same point. u and v are on the bar's frame, which is the picture outside a
 // room and a frame under the room's picture inside one.
 static int furnitureHover(XrCtx* ctx, int hover, float u, float v, const BarFrame* bar) {
+    if (ctx->localMedia) {
+        // Local playback replaces the legacy PC-streaming bottom bar & buttons
+        // with TransportBar + VR Quick Palette (§6.3, §6.5). Corners stay live.
+        return hover == HOVER_BAR ? HOVER_HALO : hover;
+    }
     // The button reaches past the left end of the bar's zone, so it is tested
     // here rather than after a hand has been picked. Otherwise the part of it
     // outside that zone belongs to no hand at all.
@@ -2017,9 +2121,8 @@ static void updatePointerWake(XrCtx* ctx, InputFrame* f) {
         ctx->stillFor = 0.0f;
     }
 
-    // The hand lock hint waits on a press, so the pointer stays up under it.
-    // Retiring there would cost the press that puts it away as a waking pinch.
-    if (ctx->hintOpen) {
+    // The hand lock hint and quick palette wait on presses, so the pointer stays up.
+    if (ctx->hintOpen || ctx->palette.open) {
         ctx->pointerAwake = 1;
         ctx->stillFor = 0.0f;
     }
@@ -3232,15 +3335,18 @@ static void updateRumble(XrCtx* ctx, int live) {
     }
 }
 
-// Short single or double UI haptic pulses on the right controller (§4.5, §6.12)
-static void sendUiHapticPulse(XrCtx* ctx, int64_t durationNs, float amp) {
+// Short single or double UI haptic pulses on the operating controller (§4.5, §6.12)
+static void sendUiHapticPulse(XrCtx* ctx, int hand, int64_t durationNs, float amp) {
+    if (hand < 0 || hand >= HAND_COUNT) {
+        hand = HAND_RIGHT;
+    }
     if (ctx->hapticAction == XR_NULL_HANDLE || !ctx->hapticBound || ctx->padAttached
-            || ctx->profileKind[HAND_RIGHT] != PROFILE_CONTROLLER) {
+            || ctx->profileKind[hand] != PROFILE_CONTROLLER) {
         return;
     }
     XrHapticActionInfo info = { XR_TYPE_HAPTIC_ACTION_INFO };
     info.action = ctx->hapticAction;
-    info.subactionPath = ctx->handPaths[HAND_RIGHT];
+    info.subactionPath = ctx->handPaths[hand];
     XrHapticVibration vib = { XR_TYPE_HAPTIC_VIBRATION };
     vib.duration = durationNs;
     vib.frequency = XR_FREQUENCY_UNSPECIFIED;
@@ -3248,33 +3354,212 @@ static void sendUiHapticPulse(XrCtx* ctx, int64_t durationNs, float amp) {
     xrApplyHapticFeedback(ctx->session, &info, (const XrHapticBaseHeader*)&vib);
 }
 
-static void applyUiHaptic(XrCtx* ctx, int hapticEvent, int64_t now) {
+static void applyUiHaptic(XrCtx* ctx, int hapticEvent, int hand, int64_t now) {
     if (ctx->uiHapticSecondAtNs != 0 && now >= ctx->uiHapticSecondAtNs) {
         int64_t dur = ctx->uiHapticSecondDurNs;
         float amp = ctx->uiHapticSecondAmp;
+        int h2 = ctx->uiHapticSecondHand;
         ctx->uiHapticSecondAtNs = 0;
-        sendUiHapticPulse(ctx, dur, amp);
+        sendUiHapticPulse(ctx, h2, dur, amp);
     }
     if (hapticEvent == SCREEN_HAPTIC_HINT) {
-        sendUiHapticPulse(ctx, (int64_t)SCREEN_HAPTIC_HINT_MS * 1000000LL, SCREEN_HAPTIC_HINT_AMP);
+        sendUiHapticPulse(ctx, hand, (int64_t)SCREEN_HAPTIC_HINT_MS * 1000000LL,
+                          SCREEN_HAPTIC_HINT_AMP);
     }
     else if (hapticEvent == SCREEN_HAPTIC_DETENT) {
-        sendUiHapticPulse(ctx, (int64_t)SCREEN_HAPTIC_DETENT_MS * 1000000LL,
+        sendUiHapticPulse(ctx, hand, (int64_t)SCREEN_HAPTIC_DETENT_MS * 1000000LL,
                           SCREEN_HAPTIC_DETENT_AMP);
     }
     else if (hapticEvent == SCREEN_HAPTIC_LIMIT) {
         int64_t pulseNs = (int64_t)SCREEN_HAPTIC_LIMIT_MS * 1000000LL;
-        sendUiHapticPulse(ctx, pulseNs, SCREEN_HAPTIC_LIMIT_AMP);
+        sendUiHapticPulse(ctx, hand, pulseNs, SCREEN_HAPTIC_LIMIT_AMP);
         ctx->uiHapticSecondAtNs = now + pulseNs
                 + (int64_t)SCREEN_HAPTIC_LIMIT_GAP_MS * 1000000LL;
         ctx->uiHapticSecondDurNs = pulseNs;
         ctx->uiHapticSecondAmp = SCREEN_HAPTIC_LIMIT_AMP;
+        ctx->uiHapticSecondHand = hand;
+    }
+}
+
+static void applyPaletteHaptic(XrCtx* ctx, int kind, int hand, int64_t now) {
+    if (kind == PALETTE_HAPTIC_TICK) {
+        sendUiHapticPulse(ctx, hand, (int64_t)PALETTE_HAPTIC_TICK_MS * 1000000LL,
+                          PALETTE_HAPTIC_TICK_AMP);
+    }
+    else if (kind == PALETTE_HAPTIC_DETENT) {
+        sendUiHapticPulse(ctx, hand, (int64_t)PALETTE_HAPTIC_DETENT_MS * 1000000LL,
+                          PALETTE_HAPTIC_DETENT_AMP);
+    }
+    else if (kind == PALETTE_HAPTIC_LIMIT) {
+        int64_t pulseNs = (int64_t)PALETTE_HAPTIC_LIMIT_MS * 1000000LL;
+        sendUiHapticPulse(ctx, hand, pulseNs, PALETTE_HAPTIC_LIMIT_AMP);
+        ctx->uiHapticSecondAtNs = now + pulseNs
+                + (int64_t)PALETTE_HAPTIC_LIMIT_GAP_MS * 1000000LL;
+        ctx->uiHapticSecondDurNs = pulseNs;
+        ctx->uiHapticSecondAmp = PALETTE_HAPTIC_LIMIT_AMP;
+        ctx->uiHapticSecondHand = hand;
+    }
+}
+
+static int locatePaletteGrip(XrCtx* ctx, const InputFrame* f, XrPosef* outGrip) {
+    memset(outGrip, 0, sizeof(*outGrip));
+    outGrip->orientation.w = 1.0f;
+    int palH = paletteMountHand(&ctx->palette);
+    if (ctx->gripSpaces[palH] == XR_NULL_HANDLE
+            || ctx->profileKind[palH] != PROFILE_CONTROLLER) {
+        return 0;
+    }
+    XrSpaceLocation loc = { XR_TYPE_SPACE_LOCATION };
+    const XrSpaceLocationFlags needed = XR_SPACE_LOCATION_POSITION_VALID_BIT
+            | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    if (XR_FAILED(xrLocateSpace(ctx->gripSpaces[palH], ctx->localSpace,
+                                ctx->predictedDisplayTime, &loc))
+            || (loc.locationFlags & needed) != needed
+            || !intoFrame(&f->xform, &loc.pose)) {
+        return 0;
+    }
+    *outGrip = loc.pose;
+    return 1;
+}
+
+static int isPaletteHandTracking(const XrCtx* ctx) {
+    return ctx->profileKind[HAND_LEFT] != PROFILE_CONTROLLER
+            && ctx->profileKind[HAND_RIGHT] != PROFILE_CONTROLLER;
+}
+
+// Runs before pickPointingSource: processes pending Java open/pin/close calls,
+// steps hand-mounted/pinned pose & fade, and suppresses the palette hand's
+// ray/trigger/grip with per-hand release latches preventing phantom edges (§6.3).
+static void updateLocalPalettePre(XrCtx* ctx, InputFrame* f, XrPosef* outGrip,
+                                  int* outGripValid, int* outHandTracking) {
+    int handTracking = isPaletteHandTracking(ctx);
+    int gripValid = locatePaletteGrip(ctx, f, outGrip);
+    *outGripValid = gripValid;
+    *outHandTracking = handTracking;
+
+    PalettePreGlueIn in;
+    memset(&in, 0, sizeof(in));
+    in.headPose = f->headPose;
+    in.gripPose = *outGrip;
+    in.gripValid = gripValid;
+    in.handTracking = handTracking;
+    in.screenAdjustActive = ctx->screenAdjustActive;
+    in.colorScaleSupported = ctx->colorScaleSupported;
+    in.dt = f->dt;
+    in.nowNs = f->now;
+    in.closeRequested = ctx->paletteCloseRequested;
+    in.barOpenRequested = ctx->paletteBarOpenRequested;
+    in.pinToggleRequested = ctx->palettePinToggleRequested;
+    ctx->paletteCloseRequested = 0;
+    ctx->paletteBarOpenRequested = 0;
+    ctx->palettePinToggleRequested = 0;
+    for (int h = 0; h < HAND_COUNT; h++) {
+        in.rawTriggerDown[h] = ctx->triggerDown[h];
+        in.rawTriggerVal[h] = ctx->triggerValue[h];
+        in.rawGripVal[h] = f->grab[h];
+    }
+    in.pressOff = PRESS_OFF;
+
+    PalettePreGlueOut out;
+    paletteGluePreStep(&ctx->palette, &ctx->paletteLatch, &in, &out);
+    ctx->palettePose = out.renderPose;
+    if (out.clearActiveDrags) {
+        ctx->paletteSliderDragging = 0;
+        ctx->paletteSliderHand = -1;
+        ctx->paletteDragHand = -1;
+    }
+    if (in.barOpenRequested) {
+        LOGEV("depth3d: palette opened from control bar (pinned, hands=%d)", handTracking);
+    }
+    if (out.hapticKind > PALETTE_HAPTIC_NONE) {
+        ctx->palettePendingHaptic = out.hapticKind;
+    }
+    for (int h = 0; h < HAND_COUNT; h++) {
+        if (out.suppressRay[h]) {
+            f->hovers[h] = HOVER_NONE;
+            f->aimValid[h] = 0;
+        }
+        if (out.blockTrigger[h]) {
+            ctx->triggerDown[h] = 0;
+            ctx->triggerEdge[h] = 0;
+        }
+        if (out.blockGrip[h]) {
+            f->grab[h] = 0.0f;
+        }
+    }
+}
+
+// Runs after pickPointingSource and before applyGrab / updateLocalMediaInput:
+// delegates ray hit-test (1.5 cm deadzone + 20 px hysteresis), pin/close click,
+// grip/tab-bar drag, controller slider capture, and hand-tracking 8 mm row drag
+// to pure C paletteGluePostStep.
+static void updateLocalPalettePost(XrCtx* ctx, InputFrame* f, int handTracking) {
+    ctx->paletteClickState = 0;
+    ctx->paletteRowStepOut = 0;
+    ctx->paletteRowResetOut = 0;
+    ctx->paletteTabStepOut = 0;
+    ctx->palettePageStepOut = 0;
+
+    PalettePostGlueIn in;
+    memset(&in, 0, sizeof(in));
+    in.headPose = f->headPose;
+    in.handTracking = handTracking;
+    in.screenAdjustActive = ctx->screenCtrl.adjustActive;
+    in.grabMode = ctx->grabMode;
+    in.activeRowMask = ctx->paletteActiveRowMask;
+    in.nowNs = f->now;
+    in.pressOn = PRESS_ON;
+    in.pressOff = PRESS_OFF;
+    for (int s = 0; s < SRC_COUNT; s++) {
+        in.canPoint[s] = canPoint(ctx, f, s);
+        in.aimValid[s] = f->aimValid[s];
+        in.aimPoses[s] = f->aimPoses[s];
+        in.triggerDown[s] = ctx->triggerDown[s];
+        in.triggerEdge[s] = ctx->triggerEdge[s];
+    }
+    for (int h = 0; h < HAND_COUNT; h++) {
+        in.grabVal[h] = f->grab[h];
+        in.grabDown[h] = ctx->grabDown[h];
+        in.handDragPos[h] = gazeHandPos(ctx, f->aimPoses, h);
+    }
+    in.dragHand = ctx->paletteDragHand;
+    in.sliderDragging = ctx->paletteSliderDragging;
+    in.sliderHand = ctx->paletteSliderHand;
+    in.renderPose = ctx->palettePose;
+
+    PalettePostGlueOut out;
+    paletteGluePostStep(&ctx->palette, &in, &out);
+
+    ctx->paletteHit = out.hit;
+    ctx->paletteDragHand = out.nextDragHand;
+    ctx->paletteSliderDragging = out.nextSliderDragging;
+    ctx->paletteSliderHand = out.nextSliderHand;
+    ctx->paletteClickState = out.clickState;
+    ctx->paletteRowStepOut = out.rowStep;
+    if (out.poseUpdated) {
+        ctx->palettePose.pose = out.updatedPose;
+    }
+    if (out.claimed && out.claimedHand >= 0 && out.claimedHand < SRC_COUNT) {
+        f->hand = out.claimedHand;
+        f->hover = out.claimedHover;
+        f->hitU[out.claimedHand] = out.claimedU;
+        f->hitV[out.claimedHand] = out.claimedV;
+    }
+    if (out.swallowHand >= 0 && out.swallowHand < SRC_COUNT) {
+        swallowTrigger(ctx, out.swallowHand);
+    }
+    if (out.hapticKind > PALETTE_HAPTIC_NONE) {
+        ctx->palettePendingHaptic = out.hapticKind;
+    }
+    if (out.clickSound) {
+        ctx->clickPending = 1;
     }
 }
 
 // Applies local-playback screen manipulation, continuous curvature, and §6.4
 // input rules without disturbing PC streaming (!ctx->localMedia).
-static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, int* outSuppressLeft) {
+static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, XrPosef gripPose, int gripValid,
+                                  int handTracking, int* outSuppressLeft) {
     *outSuppressLeft = 0;
 
     ScreenInputFrame in;
@@ -3286,20 +3571,27 @@ static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, int* outSuppressLef
 
     int modalOpen = ctx->pickerOpen || ctx->cogOpen || ctx->exitConfirmOpen
             || ctx->reportOpen || ctx->hintOpen;
-    in.paletteOpen = (ctx->cogOpen || ctx->pickerOpen || ctx->exitConfirmOpen) ? 1 : 0;
-    in.externalGrabActive = screenIsExternalGrabBusy(ctx->grabMode);
+    in.paletteOpen = (ctx->palette.open || ctx->cogOpen || ctx->pickerOpen
+                      || ctx->exitConfirmOpen) ? 1 : 0;
+    in.externalGrabActive = screenIsExternalGrabBusy(ctx->grabMode)
+            || ctx->palette.dragging || ctx->paletteSliderDragging;
 
-    float videoAspect = (float)ctx->videoWidth / (float)(ctx->videoHeight > 0 ? ctx->videoHeight : 1);
+    float videoHOverW = paletteVideoHeightOverWidth(ctx->videoWidth, ctx->videoHeight,
+                                                    ctx->stereoSourceFormat);
+    float videoAspect = videoHOverW > 1e-4f ? (1.0f / videoHOverW) : (16.0f / 9.0f);
     float hitU = (f->hand >= 0 && f->hand < SRC_COUNT) ? f->hitU[f->hand] : -1.0f;
     float hitV = (f->hand >= 0 && f->hand < SRC_COUNT) ? f->hitV[f->hand] : -1.0f;
-    in.target = screenClassifyLocalTarget(modalOpen, f->hover,
-                                          ctx->transportVisible && f->hand >= 0,
-                                          hitU, hitV, videoAspect);
+    in.target = screenClassifyLocalTargetWithPalette(modalOpen, f->hover,
+                                                     ctx->paletteHit.rowAdjustable,
+                                                     ctx->transportVisible && f->hand >= 0,
+                                                     hitU, hitV, videoAspect);
 
     int pointingHands = (f->hand >= 0 && f->hand < HAND_COUNT && ctx->usingHands[f->hand])
             || f->hand == SRC_GAZE
             || (ctx->screenCtrl.adjustActive && ctx->screenCtrl.adjustByHand);
     in.isHandTracking = pointingHands ? 1 : 0;
+
+    int opH = ctx->palette.open ? paletteOpHand(&ctx->palette) : HAND_RIGHT;
 
     if (ctx->screenCtrl.adjustActive && !ctx->screenCtrl.adjustByGrip) {
         in.triggerDown = ctx->triggerDown[HAND_RIGHT] || ctx->triggerDown[HAND_LEFT];
@@ -3311,24 +3603,32 @@ static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, int* outSuppressLef
         in.triggerDown = (ctx->triggerDown[HAND_RIGHT] && !ctx->triggerSwallowed[HAND_RIGHT])
                 || (ctx->triggerDown[HAND_LEFT] && !ctx->triggerSwallowed[HAND_LEFT]);
     }
-    in.gripDown = ctx->grabDown[HAND_RIGHT]
-            || (f->hand == HAND_LEFT && ctx->grabDown[HAND_LEFT]);
+    in.gripDown = ctx->grabDown[opH]
+            || (f->hand >= 0 && f->hand < HAND_COUNT && ctx->grabDown[f->hand]);
 
+    // Mirror operating vs palette-hand sticks when palette is on right hand (§6.3)
+    int isCtrl[HAND_COUNT] = {
+        ctx->profileKind[HAND_LEFT] == PROFILE_CONTROLLER,
+        ctx->profileKind[HAND_RIGHT] == PROFILE_CONTROLLER
+    };
+    int lClick = isCtrl[HAND_LEFT] ? actionBool(ctx, ctx->toggleAction, HAND_LEFT) : 0;
+    int rClick = isCtrl[HAND_RIGHT] ? actionBool(ctx, ctx->toggleAction, HAND_RIGHT) : 0;
+    paletteGlueMirrorSticks(&ctx->palette, isCtrl,
+                            f->stick[HAND_LEFT].x, f->stick[HAND_LEFT].y, lClick,
+                            f->stick[HAND_RIGHT].x, f->stick[HAND_RIGHT].y, rClick,
+                            &in.rStickX, &in.rStickY, &in.rStickClick,
+                            &in.lStickX, &in.lStickY);
+    // Physical face & system buttons remain on their native Quest/Pico controllers
     if (ctx->profileKind[HAND_RIGHT] == PROFILE_CONTROLLER) {
-        in.rStickX = f->stick[HAND_RIGHT].x;
-        in.rStickY = f->stick[HAND_RIGHT].y;
-        in.rStickClick = actionBool(ctx, ctx->toggleAction, HAND_RIGHT);
         in.btnA = actionBool(ctx, ctx->rightClickAction, HAND_RIGHT);
         in.btnB = actionBool(ctx, ctx->middleClickAction, HAND_RIGHT);
     }
     if (ctx->profileKind[HAND_LEFT] == PROFILE_CONTROLLER) {
-        in.lStickX = f->stick[HAND_LEFT].x;
-        in.lStickY = f->stick[HAND_LEFT].y;
         in.btnY = actionBool(ctx, ctx->middleClickAction, HAND_LEFT);
         in.btnMenu = actionBool(ctx, ctx->menuAction, HAND_LEFT);
     }
 
-    int aimHand = (f->hand >= 0 && f->hand < SRC_COUNT) ? f->hand : HAND_RIGHT;
+    int aimHand = (f->hand >= 0 && f->hand < SRC_COUNT) ? f->hand : opH;
     Vec3 fwdLocal = { 0.0f, 0.0f, -1.0f };
     in.aimDir = f->aimValid[aimHand]
             ? quatRotate(f->aimPoses[aimHand].orientation, fwdLocal) : fwdLocal;
@@ -3367,7 +3667,11 @@ static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, int* outSuppressLef
 
     ScreenInputResult res;
     screenInputStep(&ctx->screenCtrl, &in, &res);
-    applyUiHaptic(ctx, res.hapticEvent, f->now);
+    applyUiHaptic(ctx, res.hapticEvent, opH, f->now);
+    if (ctx->palettePendingHaptic != PALETTE_HAPTIC_NONE) {
+        applyPaletteHaptic(ctx, ctx->palettePendingHaptic, opH, f->now);
+        ctx->palettePendingHaptic = PALETTE_HAPTIC_NONE;
+    }
 
     if (res.adjustStarted) {
         ctx->adjustSnapPose = ctx->screenPose;
@@ -3391,7 +3695,7 @@ static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, int* outSuppressLef
         ctx->screenRadius = ctx->adjustSnapRadius;
         ctx->adjustSnapValid = 0;
         f->screenPose = ctx->screenPose;
-        f->height = ctx->screenWidth * (float)ctx->videoHeight / (float)ctx->videoWidth;
+        f->height = ctx->screenWidth * videoHOverW;
         f->radius = ctx->screenRadius;
         f->bar = barFrame(ctx);
         LOGEV("depth3d: screen adjust undone by B");
@@ -3404,7 +3708,7 @@ static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, int* outSuppressLef
         screenPlacementForFov(res.fovDeg, res.distM, curve, ctx->cylinderSupported,
                               &ctx->screenWidth, &ctx->screenRadius);
         f->screenPose = ctx->screenPose;
-        f->height = ctx->screenWidth * (float)ctx->videoHeight / (float)ctx->videoWidth;
+        f->height = ctx->screenWidth * videoHOverW;
         f->radius = ctx->screenRadius;
         f->bar = barFrame(ctx);
         if (res.adjustSaved) {
@@ -3446,10 +3750,21 @@ static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, int* outSuppressLef
     if (res.showHintToast) {
         noticePush(&ctx->notices, TOAST_SCREEN_HINT, 0);
     }
+    int paletteToggled = 0;
     if (res.bAction == SCREEN_B_CLOSE_PALETTE) {
         ctx->cogOpen = 0;
         ctx->pickerOpen = 0;
         ctx->exitConfirmOpen = 0;
+        int clearDrags = 0;
+        if (paletteGlueApplyCloseOnB(&ctx->palette, 1, f->now, &clearDrags)) {
+            if (clearDrags) {
+                ctx->paletteSliderDragging = 0;
+                ctx->paletteSliderHand = -1;
+                ctx->paletteDragHand = -1;
+            }
+            paletteToggled = 1;
+            LOGEV("depth3d: palette closed by B");
+        }
         f->out[IN_LOCAL_B_ACTION] = 2.0f;
     }
     else if (res.bAction == SCREEN_B_CLOSE_CARD) {
@@ -3472,10 +3787,37 @@ static void updateLocalMediaInput(XrCtx* ctx, InputFrame* f, int* outSuppressLef
         f->out[IN_LOCAL_Y_DANMAKU] = 1.0f;
     }
     if (res.menuTogglePalette) {
+        if (ctx->palette.open) {
+            paletteClose(&ctx->palette, f->now);
+            ctx->paletteSliderDragging = 0;
+            ctx->paletteSliderHand = -1;
+            ctx->paletteDragHand = -1;
+            LOGEV("depth3d: palette closed by menu");
+        }
+        else {
+            paletteOpenFromMenu(&ctx->palette, f->headPose, gripPose, gripValid,
+                                handTracking, f->now);
+            LOGEV("depth3d: palette opened by menu (pinned=%d, rightHand=%d)",
+                  ctx->palette.pinned, ctx->palette.onRightHand);
+        }
+        applyPaletteHaptic(ctx, PALETTE_HAPTIC_TICK, paletteOpHand(&ctx->palette), f->now);
+        paletteToggled = 1;
         f->out[IN_LOCAL_MENU] = 1.0f;
     }
 
+    ctx->paletteRowStepOut += res.paletteRowStep;
+    ctx->paletteRowResetOut = res.paletteRowReset ? 1 : 0;
+    ctx->paletteTabStepOut = res.paletteTabStep;
+    ctx->palettePageStepOut = res.palettePageStep;
+
+    int prevAdjust = ctx->screenAdjustActive;
     ctx->screenAdjustActive = res.adjustActive;
+    if (paletteToggled || prevAdjust != ctx->screenAdjustActive) {
+        // Re-evaluate pose/dimming immediately on the same frame (zero 1-frame lag)
+        paletteStepPoseAndFade(&ctx->palette, f->headPose, gripPose, gripValid, handTracking,
+                               ctx->screenAdjustActive, 0.0f, f->now,
+                               ctx->colorScaleSupported, &ctx->palettePose);
+    }
     f->out[IN_ADJUST_ACTIVE] = res.adjustActive ? 1.0f : 0.0f;
     f->out[IN_ADJUST_AXIS] = (float)res.adjustAxis;
     f->out[IN_ADJUST_FOV_TENTHS] = roundf(res.fovDeg * 10.0f);
@@ -3678,7 +4020,32 @@ static void handBack(JNIEnv* env, XrCtx* ctx, float* out, jfloatArray outArr) {
         // Every room keeps its own values, so a room setting says whose it is
         out[IN_SETTING_ROOM] = (float)roomCellForStyle(roomEffective(ctx));
         cogReadouts(ctx, readouts);
-        out[IN_STEREO] = ctx->stereoMode != DEPTH_MODE_OFF && ctx->stereoLive ? 1.0f : 0.0f;
+        out[IN_STEREO] = paletteNeedsDepthInference(ctx->stereoMode, ctx->stereoLive,
+                                                    ctx->stereoSourceFormat) ? 1.0f : 0.0f;
+
+        // depth3d G2: quick palette state & one-shot input events
+        out[IN_PALETTE_OPEN] = ctx->palette.open ? 1.0f : 0.0f;
+        out[IN_PALETTE_PINNED] = ctx->palette.pinned ? 1.0f : 0.0f;
+        out[IN_PALETTE_HAND_MODE] = ctx->palette.handTrackingMode ? 1.0f : 0.0f;
+        int palHoverValid = ctx->paletteHit.zone != PALETTE_HIT_NONE
+                && ctx->paletteHit.zone != PALETTE_HIT_DEADZONE;
+        out[IN_PALETTE_HOVER_X] = palHoverValid ? ctx->paletteHit.px : -1.0f;
+        out[IN_PALETTE_HOVER_Y] = palHoverValid ? ctx->paletteHit.py : -1.0f;
+        out[IN_PALETTE_CLICK] = (float)ctx->paletteClickState;
+        out[IN_PALETTE_ROW_STEP] = (float)ctx->paletteRowStepOut;
+        out[IN_PALETTE_ROW_RESET] = ctx->paletteRowResetOut ? 1.0f : 0.0f;
+        out[IN_PALETTE_TAB_STEP] = (float)ctx->paletteTabStepOut;
+        out[IN_PALETTE_PAGE_STEP] = (float)ctx->palettePageStepOut;
+        out[IN_PALETTE_DIM_FALLBACK] = ctx->palettePose.dimFallback ? 1.0f : 0.0f;
+        ctx->paletteClickState = 0;
+        ctx->paletteRowStepOut = 0;
+        ctx->paletteRowResetOut = 0;
+        ctx->paletteTabStepOut = 0;
+        ctx->palettePageStepOut = 0;
+    }
+    else {
+        out[IN_PALETTE_HOVER_X] = -1.0f;
+        out[IN_PALETTE_HOVER_Y] = -1.0f;
     }
     for (int i = 0; i < READOUT_VALUES; i++) {
         out[IN_READOUT + i] = (float)readouts[i];
@@ -3702,6 +4069,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
     float out[IN_SLOTS];
     memset(out, 0, sizeof(out));
     if (ctx != NULL) {
+        applyPendingLocalCmds(ctx, ctx->placementValid);
         ctx->gazeEnabled = gazeEnabled;
         ctx->pointerSleepOn = pointerSleep;
         ctx->headLockedPref = headLocked;
@@ -3800,7 +4168,9 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
     // and flattens it whatever the preference and the panel say.
     f.roomOn = roomEffective(ctx) > 0;
     f.xform.toHead = headLocked && !f.roomOn;
-    f.height = ctx->screenWidth * (float)ctx->videoHeight / (float)ctx->videoWidth;
+    float videoHOverW = paletteVideoHeightOverWidth(ctx->videoWidth, ctx->videoHeight,
+                                                    ctx->stereoSourceFormat);
+    f.height = ctx->screenWidth * videoHOverW;
     f.curved = !f.roomOn && effectiveCurvature(ctx) > SCREEN_CURVE_EPS && ctx->cylinderSupported;
     f.radius = ctx->screenRadius;
     f.cornerSide = cornerSide(ctx);
@@ -3843,6 +4213,14 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
     updateLockGesture(ctx, &f);
     applyHandLock(ctx, &f);
     updatePointerWake(ctx, &f);
+    XrPosef paletteGrip;
+    memset(&paletteGrip, 0, sizeof(paletteGrip));
+    paletteGrip.orientation.w = 1.0f;
+    int paletteGripValid = 0;
+    int paletteHandTracking = 0;
+    if (ctx->localMedia) {
+        updateLocalPalettePre(ctx, &f, &paletteGrip, &paletteGripValid, &paletteHandTracking);
+    }
     pickPointingSource(ctx, &f);
     clearHotState(ctx);
     updateHintOpening(ctx, &f);
@@ -3869,20 +4247,27 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
     padPutPanelsAway(ctx, out);
     logInputSnapshot(ctx, &f);
 
+    if (ctx->localMedia) {
+        updateLocalPalettePost(ctx, &f, paletteHandTracking);
+    }
+
     // Where the handle is clear of the picture, so a trigger press there cannot
     // have been meant as a click
     int offPicture = f.hand >= 0 && (f.hitU[f.hand] < 0.0f || f.hitU[f.hand] > 1.0f
                                      || f.hitV[f.hand] < 0.0f || f.hitV[f.hand] > 1.0f);
-    applyGrab(ctx, f.aimPoses, f.aimValid, f.grab, f.hand, f.hover, ctx->hoverCorner,
-              offPicture, f.height, f.curved);
+    if (!(ctx->localMedia && ctx->palette.dragging)) {
+        applyGrab(ctx, f.aimPoses, f.aimValid, f.grab, f.hand, f.hover, ctx->hoverCorner,
+                  offPicture, f.height, f.curved);
+    }
     f.screenPose = ctx->screenPose;
-    f.height = ctx->screenWidth * (float)ctx->videoHeight / (float)ctx->videoWidth;
+    f.height = ctx->screenWidth * videoHOverW;
     f.radius = ctx->screenRadius;
     f.bar = barFrame(ctx);
 
     int suppressLeftButton = 0;
     if (ctx->localMedia) {
-        updateLocalMediaInput(ctx, &f, &suppressLeftButton);
+        updateLocalMediaInput(ctx, &f, paletteGrip, paletteGripValid, paletteHandTracking,
+                              &suppressLeftButton);
     }
 
     // A handle stays lit while it is being dragged, however far the ray has
@@ -3938,7 +4323,8 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
             || f.hover == HOVER_KBPANEL || f.hover == HOVER_EXITBUTTON
             || f.hover == HOVER_EXITPROMPT || f.hover == HOVER_STEREOBUTTON
             || f.hover == HOVER_RAYBUTTON || f.hover == HOVER_AIMBUTTON
-            || f.hover == HOVER_PADBUTTON || f.hover == HOVER_REPORT)
+            || f.hover == HOVER_PADBUTTON || f.hover == HOVER_REPORT
+            || f.hover == HOVER_PALETTE || f.hover == HOVER_PALETTE_DEADZONE)
             && f.headValid && f.hand >= 0) {
         beamToFurniture(ctx, &f);
     }

@@ -141,6 +141,12 @@ int createPointerSwapchain(XrCtx* ctx) {
     createArtSwapchain(ctx, CORNER_TEX_W, CORNER_TEX_H, "create corner swapchain",
                        &ctx->cornerSwapchain, &ctx->cornerImages, &ctx->cornerImageCount);
 
+    // G2 VR quick palette (1024x768) & passthrough dimmer (16x16), total 25 swapchains <= 32 cap
+    createArtSwapchain(ctx, PALETTE_TEX_W, PALETTE_TEX_H, "create palette swapchain",
+                       &ctx->paletteSwapchain, &ctx->paletteImages, &ctx->paletteImageCount);
+    createArtSwapchain(ctx, DIMMER_TEX, DIMMER_TEX, "create dimmer swapchain",
+                       &ctx->dimmerSwapchain, &ctx->dimmerImages, &ctx->dimmerImageCount);
+
     LOGEV("swapchains alive %d", ctx->swapchainsAlive);
     return 1;
 }
@@ -311,6 +317,17 @@ static void buildHandleArt(XrCtx* ctx) {
     ok &= uploadArt(ctx, ctx->cornerSwapchain, ctx->cornerImages, corner,
                     CORNER_TEX_W, CORNER_TEX_H);
     ctx->handleArtReady = ok;
+
+    // Static premultiplied dark translucent backdrop for "调暗" passthrough dimming
+    unsigned char* dimmer = calloc((size_t)DIMMER_TEX * DIMMER_TEX * 4, 1);
+    if (dimmer != NULL) {
+        for (int i = 0; i < DIMMER_TEX * DIMMER_TEX; i++) {
+            dimmer[i * 4 + 3] = DIMMER_ALPHA_BYTE;
+        }
+        ctx->dimmerArtReady = uploadArt(ctx, ctx->dimmerSwapchain, ctx->dimmerImages,
+                                        dimmer, DIMMER_TEX, DIMMER_TEX);
+        free(dimmer);
+    }
 
     free(bar);
     free(corner);
@@ -550,6 +567,8 @@ void freeArtSheets(XrCtx* ctx) {
     ctx->buttonAtlas = NULL;
     free(ctx->readoutFlipBuf);
     ctx->readoutFlipBuf = NULL;
+    free(ctx->paletteFlipBuf);
+    ctx->paletteFlipBuf = NULL;
 }
 
 // The thumbnail grid and the button that opens it, both drawn as Bitmaps in
@@ -1077,4 +1096,193 @@ Java_com_limelight_binding_video_XrRenderer_nativeSetLocalMedia(JNIEnv* env, job
         LOGI("local media %s: keyboard and gamepad buttons %s", on ? "on" : "off",
              on ? "hidden" : "shown");
     }
+}
+
+// depth3d G2: uploads the 1024x768 VR Quick Palette sheet on the frame loop
+// using a persistent flip buffer (zero per-update malloc).
+JNIEXPORT void JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeUploadPalette(JNIEnv* env, jobject thiz,
+                                                                jlong handle, jobject sheet) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx == NULL || ctx->paletteSwapchain == XR_NULL_HANDLE || sheet == NULL) {
+        return;
+    }
+    const unsigned char* px = (*env)->GetDirectBufferAddress(env, sheet);
+    if (!artBufferFits(env, sheet, px, PALETTE_TEX_W, PALETTE_TEX_H)) {
+        return;
+    }
+    size_t stride = (size_t)PALETTE_TEX_W * 4;
+    if (ctx->paletteFlipBuf == NULL) {
+        ctx->paletteFlipBuf = malloc(stride * PALETTE_TEX_H);
+        if (ctx->paletteFlipBuf == NULL) {
+            LOGE("depth3d: no memory for palette flip buffer");
+            return;
+        }
+    }
+    for (int y = 0; y < PALETTE_TEX_H; y++) {
+        memcpy(ctx->paletteFlipBuf + stride * y,
+               px + stride * (PALETTE_TEX_H - 1 - y), stride);
+    }
+    if (uploadArt(ctx, ctx->paletteSwapchain, ctx->paletteImages,
+                  ctx->paletteFlipBuf, PALETTE_TEX_W, PALETTE_TEX_H)) {
+        ctx->paletteArtReady = 1;
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeSetPaletteHand(JNIEnv* env, jobject thiz,
+                                                                 jlong handle,
+                                                                 jboolean rightHand) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&ctx->localCmdLock);
+    ctx->localPending.hasHand = 1;
+    ctx->localPending.handRight = rightHand ? 1 : 0;
+    pthread_mutex_unlock(&ctx->localCmdLock);
+}
+
+JNIEXPORT void JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeSetPaletteRowMask(JNIEnv* env, jobject thiz,
+                                                                    jlong handle, jint mask) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&ctx->localCmdLock);
+    ctx->localPending.hasRowMask = 1;
+    ctx->localPending.rowMask = mask & 0xF;
+    pthread_mutex_unlock(&ctx->localCmdLock);
+}
+
+JNIEXPORT void JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeOpenPaletteFromBar(JNIEnv* env, jobject thiz,
+                                                                     jlong handle) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&ctx->localCmdLock);
+    ctx->localPending.barOpen = 1;
+    ctx->localPending.close = 0;
+    pthread_mutex_unlock(&ctx->localCmdLock);
+}
+
+JNIEXPORT void JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeTogglePalettePin(JNIEnv* env, jobject thiz,
+                                                                   jlong handle) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&ctx->localCmdLock);
+    ctx->localPending.pinToggle = 1;
+    pthread_mutex_unlock(&ctx->localCmdLock);
+}
+
+JNIEXPORT void JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeClosePalette(JNIEnv* env, jobject thiz,
+                                                               jlong handle) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&ctx->localCmdLock);
+    ctx->localPending.close = 1;
+    ctx->localPending.barOpen = 0;
+    pthread_mutex_unlock(&ctx->localCmdLock);
+}
+
+JNIEXPORT void JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeSetPassthroughDim(JNIEnv* env, jobject thiz,
+                                                                    jlong handle, jboolean dim) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&ctx->localCmdLock);
+    ctx->localPending.hasPassthroughDim = 1;
+    ctx->localPending.passthroughDim = dim ? 1 : 0;
+    pthread_mutex_unlock(&ctx->localCmdLock);
+}
+
+JNIEXPORT void JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeSetStereoStrength(JNIEnv* env, jobject thiz,
+                                                                    jlong handle, jboolean on,
+                                                                    jfloat separation,
+                                                                    jfloat convergence,
+                                                                    jfloat depthLocal) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&ctx->localCmdLock);
+    ctx->localPending.hasStereoStrength = 1;
+    ctx->localPending.stereoOn = on ? 1 : 0;
+    ctx->localPending.stereoSeparation = separation;
+    ctx->localPending.stereoConvergence = convergence;
+    ctx->localPending.stereoDepthLocal = depthLocal;
+    pthread_mutex_unlock(&ctx->localCmdLock);
+}
+
+JNIEXPORT void JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeSetStereoSourceFormat(JNIEnv* env, jobject thiz,
+                                                                        jlong handle, jint format) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx == NULL) {
+        return;
+    }
+    if (format < STEREO_SRC_AUTO || format > STEREO_SRC_OU) {
+        format = STEREO_SRC_AUTO;
+    }
+    pthread_mutex_lock(&ctx->localCmdLock);
+    ctx->localPending.hasSourceFormat = 1;
+    ctx->localPending.sourceFormat = format;
+    pthread_mutex_unlock(&ctx->localCmdLock);
+}
+
+// Enqueues palette screen settings (FOV, distance, curvature) to be applied on
+// the render thread via screenApplyLocalDims (preserving grabbed pose and never
+// perturbing lastDistance/lastQuadWidth).
+JNIEXPORT void JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeSetLocalScreenDimensions(JNIEnv* env,
+                                                                           jobject thiz,
+                                                                           jlong handle,
+                                                                           jfloat fovDeg,
+                                                                           jfloat distM,
+                                                                           jfloat curvature) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&ctx->localCmdLock);
+    ctx->localPending.hasScreenDims = 1;
+    ctx->localPending.screenFovDeg = fovDeg;
+    ctx->localPending.screenDistM = distM;
+    ctx->localPending.screenCurve = curvature;
+    pthread_mutex_unlock(&ctx->localCmdLock);
+}
+
+JNIEXPORT void JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeTriggerPaletteHaptic(JNIEnv* env, jobject thiz,
+                                                                       jlong handle, jint kind) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx != NULL && kind > PALETTE_HAPTIC_NONE && kind <= PALETTE_HAPTIC_LIMIT) {
+        pthread_mutex_lock(&ctx->localCmdLock);
+        ctx->localPending.pendingHaptic = kind;
+        pthread_mutex_unlock(&ctx->localCmdLock);
+    }
+}
+
+// Render-thread only: lazily builds depth-model EGL contexts, PBOs, and upsample
+// passes the first time local playback turns 3D ON in AUTO mode.
+JNIEXPORT jboolean JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeEnsureDepthModel(JNIEnv* env, jobject thiz,
+                                                                   jlong handle) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx == NULL) {
+        return JNI_FALSE;
+    }
+    return ensureDepthModelGl(ctx) ? JNI_TRUE : JNI_FALSE;
 }
