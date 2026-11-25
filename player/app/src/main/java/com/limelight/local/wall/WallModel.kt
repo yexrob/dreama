@@ -170,6 +170,11 @@ class WallModel(app: Application) : AndroidViewModel(app) {
     fun progress(sourceId: String, itemId: String): Flow<WatchProgress?> =
         WallDatabase.get(getApplication()).progress().observe(sourceId, itemId)
 
+    fun progressMapForSource(sourceId: String): Flow<Map<String, WatchProgress>> =
+        WallDatabase.get(getApplication()).progress().recent(200).mapLatest { rows ->
+            rows.asSequence().filter { it.sourceId == sourceId }.associateBy { it.itemId }
+        }
+
     /**
      * Saves a WebDAV server after checking that it answers, so a wrong
      * password shows up here and not as a broken row on the wall.
