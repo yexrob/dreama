@@ -25,3 +25,6 @@ host/Experiments/depth-offload/*.mlpackage/
 host/Experiments/depth-offload/*.mlmodelc/
 *.xcuserstate
 xcuserdata/
+
+# Agent scratch space (worktrees, settings)
+.claude/
