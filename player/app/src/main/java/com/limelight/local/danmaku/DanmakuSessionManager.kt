@@ -60,6 +60,8 @@ class DanmakuSessionManager(
         clock = { SystemClock.elapsedRealtime() },
         measurer = rasterizer,
         previewStrings = previewStrings,
+        monoClockNs = System::nanoTime,
+        deferSlotRelease = true,
     )
     private val fetcher = DanmakuWindowFetcher(
         onWindowReady = { windowIndex, items ->
@@ -96,8 +98,12 @@ class DanmakuSessionManager(
         post {
             if (renderer != null) {
                 renderer.clearDanmakuAtlas()
-                engine.atlas.clear()
                 engine.onSeek(latestMediaMs)
+                engine.commitPublishedSnapshot()
+                engine.atlas.clear()
+                if (hasActiveSource && engine.currentSettings.on) {
+                    fetcher.hydrateEngineAround(latestMediaMs, engine)
+                }
                 tickOnWorker(forcePush = true)
                 scheduleNextTickIfNeeded()
             }
@@ -203,6 +209,7 @@ class DanmakuSessionManager(
             engine.updateSettings(dm)
             if (dm.on && hasActiveSource) {
                 fetcher.ensureWindowsFor(latestMediaMs)
+                fetcher.hydrateEngineAround(latestMediaMs, engine)
             }
             tickOnWorker(forcePush = true)
             scheduleNextTickIfNeeded()
@@ -272,10 +279,12 @@ class DanmakuSessionManager(
         latestMediaMs = targetMs.coerceAtLeast(0L)
         post {
             rendererRef?.clearDanmakuAtlas()
-            engine.atlas.clear()
             engine.onSeek(latestMediaMs)
+            engine.commitPublishedSnapshot()
+            engine.atlas.clear()
             if (hasActiveSource && engine.currentSettings.on) {
                 fetcher.onSeek(latestMediaMs)
+                fetcher.hydrateEngineAround(latestMediaMs, engine)
             }
             tickOnWorker(forcePush = true)
             scheduleNextTickIfNeeded()
@@ -300,6 +309,12 @@ class DanmakuSessionManager(
         val xr = rendererRef
         engine.updateContentPhi(latestContentPhiDeg)
 
+        // Ensure any cached windows in [curWin-1 .. curWin+1] are resident before stepping
+        // (covers normal forward playback advancing into previously cached windows).
+        if (hasActiveSource && engine.currentSettings.on) {
+            fetcher.hydrateEngineAround(latestMediaMs, engine)
+        }
+
         // Throttle per-tick spawns against remaining native upload ring headroom so bursts
         // never drop patches or exceed DANMAKU_UPLOAD_QUEUE_CAP.
         val pendingUploads = engine.activeItems.count { !it.rasterized }
@@ -311,7 +326,16 @@ class DanmakuSessionManager(
         }
 
         val res = engine.step(latestMediaMs, maxNewSpawns)
-        if (xr == null) return
+        if (res.clockReset && hasActiveSource && engine.currentSettings.on) {
+            // An unannounced forward/backward jump pruned scheduled windows inside step();
+            // re-hydrate cached windows around the new position and ensure missing ones fetch.
+            fetcher.ensureWindowsFor(latestMediaMs)
+            fetcher.hydrateEngineAround(latestMediaMs, engine)
+        }
+        if (xr == null) {
+            engine.commitPublishedSnapshot()
+            return
+        }
 
         // Rasterize and upload ALL un-uploaded active items (retrying any rejected on earlier ticks)
         var anyUploaded = false
@@ -335,12 +359,11 @@ class DanmakuSessionManager(
         if (res.snapshotChanged || anyUploaded || forcePush) {
             val count = engine.packInstances(packedInstances)
             val s = engine.currentSettings
-            val anchorMonoNs = System.nanoTime()
             xr.setDanmakuSnapshot(
                 s.on && hasActiveSource,
                 engine.isPaused,
                 engine.currentTimelineRealMs,
-                anchorMonoNs,
+                res.anchorMonoNs,
                 res.clockReset,
                 res.areaBotFrac,
                 s.opacityPct / 100.0f,
@@ -354,6 +377,9 @@ class DanmakuSessionManager(
                 packedInstances,
                 count,
             )
+            // Release slots freed before this snapshot strictly AFTER publishing it so same-tick
+            // allocations never overwrite atlas pixels still referenced by the previous snapshot.
+            engine.commitPublishedSnapshot()
         }
     }
 

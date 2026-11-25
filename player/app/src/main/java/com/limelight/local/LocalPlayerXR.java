@@ -154,6 +154,7 @@ public class LocalPlayerXR extends Activity
     private volatile StereoSourceFormat savedVideoSourceOverride;
     private volatile StereoSourceFormat activeSourceFormatUi = StereoSourceFormat.AUTO;
     private volatile boolean depthModelUnavailableUi;
+    private volatile boolean danmakuGlUnavailableUi;
     private volatile boolean paletteOpenUi;
     private volatile boolean danmakuSupportedUi;
     private volatile boolean danmakuOnUi = true;
@@ -1467,6 +1468,24 @@ public class LocalPlayerXR extends Activity
     }
 
     @Override
+    public void onVrDanmakuUnavailable() {
+        danmakuGlUnavailableUi = true;
+        final XrRenderer r = renderer;
+        if (r != null) {
+            r.showNotice(getString(R.string.vr_danmaku_unavailable_toast), null);
+        }
+        postToPaletteWorker(() -> {
+            if (palette != null) {
+                palette.setDanmakuGlUnavailable(true);
+                syncDanmakuPreviewOnWorker();
+                if (r != null) {
+                    redrawPaletteOnWorker(r);
+                }
+            }
+        });
+    }
+
+    @Override
     public void onVrContentDepthPhi(float phiDeg) {
         DanmakuSessionManager dm = danmakuManager;
         if (dm != null) {
@@ -1746,7 +1765,10 @@ public class LocalPlayerXR extends Activity
                 getString(R.string.vr_screen_size_disabled_in_room),
                 getString(R.string.vr_screen_dist_disabled_in_room),
                 getString(R.string.vr_hint_screen_gesture),
-                getString(R.string.vr_depth_unavailable_reason));
+                getString(R.string.vr_depth_unavailable_reason),
+                getString(R.string.vr_palette_danmaku_gl_unavailable_title),
+                getString(R.string.vr_palette_danmaku_gl_unavailable_sub),
+                getString(R.string.vr_danmaku_unavailable_toast));
     }
 
     private TrackLabelStrings buildTrackLabelStrings() {
@@ -1801,7 +1823,8 @@ public class LocalPlayerXR extends Activity
             savedAudOverrideApplied = false;
             boolean cylOk = palette == null || palette.getCylinderSupported();
             palette = new PaletteController(
-                    global, video, strings, cylOk, danmakuSupported, false, depthModelUnavailableUi);
+                    global, video, strings, cylOk, danmakuSupported, false,
+                    depthModelUnavailableUi, danmakuGlUnavailableUi);
             if (paletteRenderer != null) {
                 paletteRenderer.invalidate();
             }
@@ -1906,6 +1929,7 @@ public class LocalPlayerXR extends Activity
         boolean wantPreview = palette.isOpen()
                 && palette.getActiveTab() == XrShared.PALETTE_TAB_DANMAKU
                 && palette.getDanmakuSupported()
+                && !palette.getDanmakuGlUnavailable()
                 && !palette.getDanmakuLoadFailed();
         dm.setPreviewRequested(wantPreview);
     }

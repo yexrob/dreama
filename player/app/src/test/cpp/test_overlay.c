@@ -358,6 +358,182 @@ static void testRealProductionLayerBudgetAndDropLadder(void) {
     for (int i = 0; i < 15; i++) CHECK(keep[i] == 1); // core video/UI intact
 }
 
+static DanmakuNativeItem makeTestDanmakuItem(int slotIndex, uint32_t slotGen,
+                                             float u0, float spawnSec, float phiDeg) {
+    DanmakuNativeItem it;
+    memset(&it, 0, sizeof(it));
+    it.x0 = 0.50f;
+    it.y0 = 0.10f;
+    it.w = 0.20f;
+    it.h = 0.08f;
+    it.velXPerSec = -0.10f;
+    it.u0 = u0;
+    it.v0 = 0.01f;
+    it.du = 0.10f;
+    it.dv = 0.03f;
+    it.r = 1.0f;
+    it.g = 1.0f;
+    it.b = 1.0f;
+    it.baseAlpha = 1.0f;
+    it.spawnTimeSec = spawnSec;
+    it.durationSec = 8.0f;
+    it.fadeSec = 0.0f;
+    it.mode = DANMAKU_MODE_SCROLL;
+    it.layerBand = DANMAKU_LAYER_MID;
+    it.fixedPhiDeg = phiDeg;
+    it.slotIndex = slotIndex;
+    it.slotGen = slotGen;
+    return it;
+}
+
+static void testDanmakuPipelineUploadBeforeSnapshotAndGenGating(void) {
+    DanmakuFramePipeline pipe;
+    danmakuPipelineInit(&pipe);
+
+    OverlayDepthLayers depth;
+    overlayComputeDepthLayers(0.20f, 1, 0, 0, 0.30f, 3.0f, &depth);
+
+    DanmakuGpuInstance out[DANMAKU_MAX_ITEMS];
+    int anyParallax = 0;
+    int64_t t0Ns = 200000000000LL;
+
+    // Frame 1: upload (slot=3, gen=1) drains FIRST, then snapshot arrives with BOTH
+    // item A (slot=3, gen=1) AND item B (slot=4, gen=1, NOT uploaded yet).
+    // Production pipeline MUST render item A on the same frame and skip un-uploaded item B!
+    DanmakuUploadSlotEvent up1[1] = { { 0, 3, 1 } };
+    DanmakuNativeItem items1[2] = {
+        makeTestDanmakuItem(3, 1, 0.11f, 5.0f, 0.30f),
+        makeTestDanmakuItem(4, 1, 0.22f, 5.0f, 0.30f)
+    };
+    DanmakuSnapshotInput snap1;
+    memset(&snap1, 0, sizeof(snap1));
+    snap1.hasSnapshot = 1;
+    snap1.enabled = 1;
+    snap1.paused = 0;
+    snap1.anchorTimelineMs = 5000;
+    snap1.anchorMonoNs = t0Ns;
+    snap1.clockReset = 1;
+    snap1.itemCount = 2;
+    snap1.items = items1;
+    snap1.nextDepth = depth;
+
+    int vis1 = danmakuPipelineStepFrame(&pipe, up1, 1, &snap1, t0Ns, 0.0111f,
+                                        out, DANMAKU_MAX_ITEMS, &anyParallax);
+    CHECK(vis1 == 1);
+    CHECK(anyParallax == 1);
+    CHECK_NEAR(out[0].uv[0], 0.11f, 1e-5f); // item A landed on same frame; item B skipped!
+
+    // Frame 2: slot 3 is reused in snapshot with gen=2 BEFORE gen=2 uploads, while item B
+    // (slot=4, gen=1) finally lands. Reused slot 3 gen=2 MUST be skipped (never draws stale gen=1!),
+    // while item B now draws cleanly!
+    DanmakuUploadSlotEvent up2[1] = { { 0, 4, 1 } };
+    DanmakuNativeItem items2[2] = {
+        makeTestDanmakuItem(3, 2, 0.33f, 5.0f, 0.0f),
+        makeTestDanmakuItem(4, 1, 0.22f, 5.0f, 0.0f)
+    };
+    DanmakuSnapshotInput snap2 = snap1;
+    snap2.clockReset = 0;
+    snap2.anchorTimelineMs = 5011;
+    snap2.anchorMonoNs = t0Ns + 11111111LL;
+    snap2.items = items2;
+
+    int vis2 = danmakuPipelineStepFrame(&pipe, up2, 1, &snap2, t0Ns + 11111111LL, 0.0111f,
+                                        out, DANMAKU_MAX_ITEMS, &anyParallax);
+    CHECK(vis2 == 1);
+    CHECK(anyParallax == 0);
+    CHECK_NEAR(out[0].uv[0], 0.22f, 1e-5f); // only item B drawn; slot 3 gen 2 gated out!
+
+    // Frame 3: gen=2 upload lands for slot 3 with NO new snapshot -> both items now draw!
+    DanmakuUploadSlotEvent up3[1] = { { 0, 3, 2 } };
+    DanmakuSnapshotInput noSnap;
+    memset(&noSnap, 0, sizeof(noSnap));
+    noSnap.hasSnapshot = 0;
+    noSnap.nextDepth = depth;
+
+    int vis3 = danmakuPipelineStepFrame(&pipe, up3, 1, &noSnap, t0Ns + 22222222LL, 0.0111f,
+                                        out, DANMAKU_MAX_ITEMS, &anyParallax);
+    CHECK(vis3 == 2);
+    CHECK_NEAR(out[0].uv[0], 0.33f, 1e-5f);
+    CHECK_NEAR(out[1].uv[0], 0.22f, 1e-5f);
+
+    // Frame 4: atlas clear followed by new upload (slot=5, gen=7) in same frame ->
+    // clear wipes earlier slot 3/4 generations; only slot 5 gen=7 draws!
+    DanmakuUploadSlotEvent up4[2] = {
+        { 1, -1, 0 },
+        { 0, 5, 7 }
+    };
+    DanmakuNativeItem items4[2] = {
+        makeTestDanmakuItem(3, 2, 0.33f, 5.0f, 0.20f),
+        makeTestDanmakuItem(5, 7, 0.55f, 5.0f, 0.20f)
+    };
+    DanmakuSnapshotInput snap4 = snap2;
+    snap4.anchorTimelineMs = 5033;
+    snap4.anchorMonoNs = t0Ns + 33333333LL;
+    snap4.items = items4;
+
+    int vis4 = danmakuPipelineStepFrame(&pipe, up4, 2, &snap4, t0Ns + 33333333LL, 0.0111f,
+                                        out, DANMAKU_MAX_ITEMS, &anyParallax);
+    CHECK(vis4 == 1);
+    CHECK_NEAR(out[0].uv[0], 0.55f, 1e-5f);
+}
+
+static void testAnchorClockUnderPublishLatencyS1(void) {
+    // S1 regression: worker steps every 50 ms, alternating 0 ms and 35 ms rasterization/publish
+    // latency. When anchorMonoNs is captured at step() time (BEFORE rasterization), render-thread
+    // speed stays rock-solid (~1.00x, < 1% spread). Compare against buggy late-sampled anchorMonoNs
+    // (AFTER 35 ms rasterization), which introduces ~14% speed wobble!
+    const int64_t t0Ns = 500000000000LL;
+    const double dtSec = 1.0 / 90.0;
+    const int64_t dtNs = 11111111LL;
+
+    DanmakuClockTracker fixedClk;
+    DanmakuClockTracker buggyClk;
+    danmakuClockReset(&fixedClk);
+    danmakuClockReset(&buggyClk);
+    danmakuClockSetAnchor(&fixedClk, 10000, t0Ns, 0, 1);
+    danmakuClockSetAnchor(&buggyClk, 10000, t0Ns, 0, 1);
+
+    float prevFixed = danmakuClockSample(&fixedClk, t0Ns, 0.0f);
+    float prevBuggy = danmakuClockSample(&buggyClk, t0Ns, 0.0f);
+    double minFixedRate = 10.0, maxFixedRate = 0.0;
+    double minBuggyRate = 10.0;
+
+    int nextTickIdx = 1;
+    for (int frame = 1; frame <= 90; frame++) {
+        int64_t nowNs = t0Ns + (int64_t)frame * dtNs;
+        // Worker stepped at tickStepNs = t0Ns + nextTickIdx * 50 ms, but published after
+        // 35 ms lag on odd ticks (burst rasterization) and 0 ms on even ticks.
+        int64_t stepNs = t0Ns + (int64_t)nextTickIdx * 50000000LL;
+        int64_t lagNs = (nextTickIdx % 2 == 1) ? 35000000LL : 0LL;
+        int64_t publishNs = stepNs + lagNs;
+        if (nowNs >= publishNs) {
+            int64_t stepTimelineMs = 10000 + (int64_t)nextTickIdx * 50LL;
+            // Fixed S1: anchorMonoNs captured at step() time (stepNs)
+            danmakuClockSetAnchor(&fixedClk, stepTimelineMs, stepNs, 0, 0);
+            // Old buggy behavior: anchorMonoNs sampled at late publish time (publishNs)
+            danmakuClockSetAnchor(&buggyClk, stepTimelineMs, publishNs, 0, 0);
+            nextTickIdx++;
+        }
+
+        float curFixed = danmakuClockSample(&fixedClk, nowNs, (float)dtSec);
+        float curBuggy = danmakuClockSample(&buggyClk, nowNs, (float)dtSec);
+        double fixedRate = (double)(curFixed - prevFixed) / dtSec;
+        double buggyRate = (double)(curBuggy - prevBuggy) / dtSec;
+        if (fixedRate < minFixedRate) minFixedRate = fixedRate;
+        if (fixedRate > maxFixedRate) maxFixedRate = fixedRate;
+        if (buggyRate < minBuggyRate) minBuggyRate = buggyRate;
+        prevFixed = curFixed;
+        prevBuggy = curBuggy;
+    }
+
+    // With S1 fix: speed stays strictly steady at 1.00x (zero wobble despite 35 ms burst lag!)
+    CHECK(minFixedRate >= 0.99);
+    CHECK(maxFixedRate <= 1.01);
+    CHECK_NEAR(prevFixed, 11.0f, 0.005f);
+    // Contrast: late-sampled anchor dropped rate by > 10% (proving the exact S1 mechanism!)
+    CHECK(minBuggyRate < 0.90);
+}
+
 int main(void) {
     testDisparityDistanceTableAndCeilings();
     testContentDepthSmoothingAndHistogram98();
@@ -366,5 +542,7 @@ int main(void) {
     testSlotGenerationTableGating();
     testAnchorMonotonicSnapshotClock();
     testRealProductionLayerBudgetAndDropLadder();
+    testDanmakuPipelineUploadBeforeSnapshotAndGenGating();
+    testAnchorClockUnderPublishLatencyS1();
     return checksDone("xr_overlay");
 }

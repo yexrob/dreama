@@ -4062,6 +4062,8 @@ static void handBack(JNIEnv* env, XrCtx* ctx, float* out, jfloatArray outArr) {
             unavailMask |= STEREO_UNAVAIL_SWAPCHAIN;
         }
         out[IN_STEREO_UNAVAILABLE] = (float)unavailMask;
+        out[IN_DANMAKU_UNAVAILABLE] = atomic_load_explicit(
+                &ctx->danmaku.glFailed, memory_order_relaxed) ? 1.0f : 0.0f;
         ctx->paletteClickState = 0;
         ctx->paletteRowStepOut = 0;
         ctx->paletteRowResetOut = 0;

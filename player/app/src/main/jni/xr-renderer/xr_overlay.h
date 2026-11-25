@@ -159,6 +159,78 @@ void danmakuClockSetAnchor(DanmakuClockTracker* c, int64_t timelineMs,
                            int64_t anchorMonoNs, int paused, int hardReset);
 float danmakuClockSample(DanmakuClockTracker* c, int64_t nowMonoNs, float dtSec);
 
+// Pure-C danmaku render-frame pipeline shared directly by xr_danmaku.c and host tests:
+// drains upload-landed slot generations FIRST, absorbs snapshots SECOND, and packs ONLY
+// visible GPU instances whose (slotIndex, slotGen) has already landed in slotTable.
+typedef struct {
+    float x0;           // normalized [0..1] start X at spawnTimeSec (top-left of quad)
+    float y0;           // normalized [0..1] top Y within active overlay area [0..areaBotFrac]
+    float w;            // normalized width relative to screen width
+    float h;            // normalized height relative to active overlay area height
+    float velXPerSec;   // normalized screen-width units/sec (negative for scroll left)
+    float u0, v0;       // atlas top-left UV [0..1] (half-texel inset)
+    float du, dv;       // atlas UV span (half-texel inset)
+    float r, g, b;      // linear/sRGB text color [0..1] (baked in RGBA8 atlas; alpha in baseAlpha)
+    float baseAlpha;    // 0..1 base opacity
+    float spawnTimeSec; // item spawn time on native danmaku timeline
+    float durationSec;  // item lifetime in real seconds
+    float fadeSec;      // linear fade-in/fade-out duration (0.15s for top/bottom, 0 for scroll)
+    int mode;           // DANMAKU_MODE_SCROLL / TOP / BOTTOM
+    int layerBand;      // DANMAKU_LAYER_FAR / MID / NEAR
+    float fixedPhiDeg;  // item's disparity at spawn (frozen unless user drags Float/Layer)
+    float animFromPhi;  // start disparity for 200 ms user-drag transition
+    float animToPhi;    // target disparity for 200 ms user-drag transition
+    int slotIndex;      // atlas slot index in [0, DANMAKU_MAX_SLOTS)
+    uint32_t slotGen;   // expected generation; skipped until GPU upload of this gen lands
+} DanmakuNativeItem;
+
+// Packed per-instance GPU vertex buffer struct (13 floats = 52 bytes)
+typedef struct {
+    float rect[4];      // x0, y0, w, h in [0..1] overlay area coords
+    float uv[4];        // u0, v0, du, dv in [0..1] atlas coords
+    float colorAlpha[4];// r, g, b, alpha
+    float phiDeg;       // effective crossed disparity in degrees
+} DanmakuGpuInstance;
+
+typedef struct {
+    int isClear;        // 1 -> atlas cleared (resets DanmakuSlotTable)
+    int slotIndex;      // [0, DANMAKU_MAX_SLOTS) when !isClear
+    uint32_t slotGen;   // >= 1 when !isClear
+} DanmakuUploadSlotEvent;
+
+typedef struct {
+    int enabled;
+    int paused;
+    DanmakuClockTracker clockTracker;
+    DanmakuSlotTable slotTable;
+    int depthAnimActive;
+    float depthAnimElapsedS;
+    int itemCount;
+    DanmakuNativeItem items[DANMAKU_MAX_ITEMS];
+    OverlayDepthLayers currentDepth;
+} DanmakuFramePipeline;
+
+typedef struct {
+    int hasSnapshot;
+    int enabled;
+    int paused;
+    int64_t anchorTimelineMs;
+    int64_t anchorMonoNs;
+    int clockReset;
+    int animateDepth;
+    int itemCount;
+    const DanmakuNativeItem* items;
+    OverlayDepthLayers nextDepth;
+} DanmakuSnapshotInput;
+
+void danmakuPipelineInit(DanmakuFramePipeline* pipe);
+int danmakuPipelineStepFrame(DanmakuFramePipeline* pipe,
+                             const DanmakuUploadSlotEvent* uploads, int uploadCount,
+                             const DanmakuSnapshotInput* snapshot,
+                             int64_t frameMonoNs, float dtSec,
+                             DanmakuGpuInstance* outInst, int maxOut,
+                             int* outAnyParallax);
+
 // Real composition-layer categories used by xr_layers.c and its §6.5 drop ladder.
 typedef enum {
     OVERLAY_SLOT_OTHER = 0,

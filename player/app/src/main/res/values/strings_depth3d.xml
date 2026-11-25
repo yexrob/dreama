@@ -691,7 +691,10 @@
     <string name="vr_palette_block_color">彩色</string>
     <string name="vr_palette_danmaku_unsupported_title">这个片源不提供弹幕</string>
     <string name="vr_palette_danmaku_unsupported_sub">插件声明了弹幕能力才有</string>
+    <string name="vr_palette_danmaku_gl_unavailable_title">弹幕渲染不可用</string>
+    <string name="vr_palette_danmaku_gl_unavailable_sub">图形资源初始化失败，不影响正常看片</string>
     <string name="vr_palette_danmaku_failed_title">弹幕没加载出来</string>
+    <string name="vr_danmaku_unavailable_toast">弹幕图形初始化失败，本次播放暂不可用</string>
 
     <string name="vr_palette_row_subtitle">字幕</string>
     <string name="vr_palette_row_audio">音轨</string>

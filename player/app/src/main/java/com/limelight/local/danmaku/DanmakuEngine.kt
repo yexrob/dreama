@@ -23,6 +23,7 @@ data class DanmakuStepResult(
     val clockReset: Boolean,
     val activeCount: Int,
     val areaBotFrac: Float,
+    val anchorMonoNs: Long = 0L,
 )
 
 /**
@@ -44,6 +45,8 @@ class DanmakuEngine(
     val atlas: DanmakuAtlasAllocator = DanmakuAtlasAllocator(),
     private val previewStrings: DanmakuPreviewStrings = DanmakuPreviewStrings(),
     private val windowMs: Long = DanmakuWindowFetcher.WINDOW_MS,
+    private val monoClockNs: () -> Long = System::nanoTime,
+    private val deferSlotRelease: Boolean = false,
 ) {
     private data class WaitingItem(
         val raw: DanmakuRawItem,
@@ -76,6 +79,7 @@ class DanmakuEngine(
     // Pending timeline items from active windows [cur-1 .. cur+1], strictly sorted by (timeMs, id)
     private var scheduled = ArrayList<DanmakuRawItem>()
     private val scheduledIds = HashSet<Long>()
+    private val loadedWindowIndices = HashSet<Int>()
     private var scheduledCursor: Int = 0
 
     // Bounded 1 s wait queue when tracks, density cap, atlas, or upload queue are temporarily full
@@ -83,6 +87,9 @@ class DanmakuEngine(
 
     // Currently live items on screen (or 3 stationary previews)
     private val active = ArrayList<ActiveDanmakuItem>()
+    // Slots removed during the current tick when deferSlotRelease is true; recycled only AFTER
+    // the new snapshot drops their references so same-tick spawns never overwrite live pixels.
+    private val deferredSlotReleases = ArrayList<DanmakuAtlasSlot>()
     private var nextRuntimeId: Long = 1L
 
     private var pendingDepthAnim: Boolean = false
@@ -107,6 +114,22 @@ class DanmakuEngine(
 
     val currentSettings: DanmakuSettings
         get() = settings
+
+    /** Returns true if [windowIndex] is currently resident in this engine's bounded window set. */
+    fun hasWindowLoaded(windowIndex: Int): Boolean = loadedWindowIndices.contains(windowIndex)
+
+    /**
+     * Releases atlas slots freed by removals before the snapshot just published to native GL.
+     * Calling this strictly AFTER publishing the updated snapshot prevents same-tick reuse
+     * from overwriting pixels still referenced by the render thread's previous snapshot.
+     */
+    fun commitPublishedSnapshot() {
+        if (deferredSlotReleases.isEmpty()) return
+        for (slot in deferredSlotReleases) {
+            atlas.release(slot)
+        }
+        deferredSlotReleases.clear()
+    }
 
     /** Computes current usable vertical band and track counts matching §6.10 exactly. */
     fun computeLayoutMetrics(): TrackLayoutMetrics {
@@ -162,6 +185,7 @@ class DanmakuEngine(
         }
         if (windowIndex >= 0) {
             removeWindowFromScheduled(windowIndex)
+            loadedWindowIndices.add(windowIndex)
         }
         if (items.isEmpty()) {
             if (mediaCursorReady) {
@@ -312,8 +336,14 @@ class DanmakuEngine(
 
     /** Seek handler (§6.10): drops active/waiting items and jumps cursor with ZERO backfill. */
     fun onSeek(newMediaMs: Long) {
+        applySeekInternal(newMediaMs, advanceClock = true)
+    }
+
+    private fun applySeekInternal(newMediaMs: Long, advanceClock: Boolean) {
         val pos = newMediaMs.coerceAtLeast(0L)
-        advanceTimelineClock()
+        if (advanceClock) {
+            advanceTimelineClock()
+        }
         clearActiveItems()
         waitQueue.clear()
         previewActive = false
@@ -328,9 +358,11 @@ class DanmakuEngine(
     /** Full reset for switching video / episode (clears cache, atlas, active, wait queue, timeline). */
     fun resetForNewItem(startMediaMs: Long = 0L) {
         clearActiveItems()
+        deferredSlotReleases.clear()
         waitQueue.clear()
         scheduled.clear()
         scheduledIds.clear()
+        loadedWindowIndices.clear()
         scheduledCursor = 0
         lastPrunedWindow = Int.MIN_VALUE
         atlas.clear()
@@ -348,11 +380,13 @@ class DanmakuEngine(
     /**
      * Advances the danmaku engine for the current video [mediaTimeMs] and virtual/monotonic clock.
      * [maxNewSpawns] caps newly spawned items in this tick so bursts never overflow the native
-     * atlas upload queue.
+     * atlas upload queue. Captures `anchorMonoNs` atomically with `timelineRealMs` BEFORE any
+     * worker-thread rasterization runs so publish latency never introduces speed wobble.
      */
     fun step(mediaTimeMs: Long, maxNewSpawns: Int = Int.MAX_VALUE): DanmakuStepResult {
         val newlySpawned = ArrayList<ActiveDanmakuItem>()
         val nowWall = clock.nowRealMs()
+        val anchorMonoNs = monoClockNs()
         val dt = if (!paused) {
             (nowWall - lastWallRealMs).coerceIn(0L, MAX_STEP_DT_MS).also { timelineRealMs += it }
         } else {
@@ -373,7 +407,9 @@ class DanmakuEngine(
             dirtySnapshot = false
             pendingDepthAnim = false
             pendingClockReset = false
-            return DanmakuStepResult(changed, newlySpawned, anim, reset, 0, metrics.areaBotFrac)
+            return DanmakuStepResult(
+                changed, newlySpawned, anim, reset, 0, metrics.areaBotFrac, anchorMonoNs,
+            )
         }
 
         val mediaPos = mediaTimeMs.coerceAtLeast(0L)
@@ -389,19 +425,19 @@ class DanmakuEngine(
             if (jumpedBackward || jumpedForward) {
                 // Any unexpected backward OR forward jump > (expected + 1.5 s) is treated as a clean
                 // seek so resume/refresh/external jumps NEVER backfill skipped danmaku.
-                onSeek(mediaPos)
+                applySeekInternal(mediaPos, advanceClock = false)
             }
         }
 
         pruneScheduledAround(mediaPos)
 
-        // 1. Reap expired active items and immediately recycle their atlas slots
+        // 1. Reap expired active items and recycle (or defer recycling of) their atlas slots
         if (!previewActive && !paused) {
             val it = active.iterator()
             while (it.hasNext()) {
                 val item = it.next()
                 if (item.isExpiredAt(timelineRealMs)) {
-                    item.atlasSlot?.let { slot -> atlas.release(slot) }
+                    item.atlasSlot?.let(::releaseSlot)
                     it.remove()
                     dirtySnapshot = true
                 }
@@ -479,7 +515,9 @@ class DanmakuEngine(
         dirtySnapshot = false
         pendingDepthAnim = false
         pendingClockReset = false
-        return DanmakuStepResult(changed, newlySpawned, anim, reset, active.size, metrics.areaBotFrac)
+        return DanmakuStepResult(
+            changed, newlySpawned, anim, reset, active.size, metrics.areaBotFrac, anchorMonoNs,
+        )
     }
 
     /**
@@ -735,9 +773,17 @@ class DanmakuEngine(
         lastWallRealMs = nowWall
     }
 
+    private fun releaseSlot(slot: DanmakuAtlasSlot) {
+        if (deferSlotRelease) {
+            deferredSlotReleases.add(slot)
+        } else {
+            atlas.release(slot)
+        }
+    }
+
     private fun clearActiveItems() {
         for (it in active) {
-            it.atlasSlot?.let { slot -> atlas.release(slot) }
+            it.atlasSlot?.let(::releaseSlot)
         }
         active.clear()
     }
@@ -747,7 +793,7 @@ class DanmakuEngine(
         while (it.hasNext()) {
             val item = it.next()
             if (predicate(item)) {
-                item.atlasSlot?.let { slot -> atlas.release(slot) }
+                item.atlasSlot?.let(::releaseSlot)
                 it.remove()
                 dirtySnapshot = true
             }
@@ -758,6 +804,7 @@ class DanmakuEngine(
         (mediaMs.coerceAtLeast(0L) / windowMs).toInt()
 
     private fun removeWindowFromScheduled(windowIndex: Int) {
+        loadedWindowIndices.remove(windowIndex)
         if (scheduled.isEmpty()) return
         val kept = ArrayList<DanmakuRawItem>(scheduled.size)
         for (it in scheduled) {
@@ -775,9 +822,10 @@ class DanmakuEngine(
         val curWin = windowIndexFor(mediaMs)
         if (curWin == lastPrunedWindow) return
         lastPrunedWindow = curWin
-        if (scheduled.isEmpty()) return
         val minKeep = curWin - 1
         val maxKeep = curWin + 1
+        loadedWindowIndices.removeAll { it < minKeep || it > maxKeep }
+        if (scheduled.isEmpty()) return
         var anyDropped = false
         for (it in scheduled) {
             if (it.windowIndex >= 0 && (it.windowIndex < minKeep || it.windowIndex > maxKeep)) {

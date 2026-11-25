@@ -432,7 +432,10 @@ float danmakuClockSample(DanmakuClockTracker* c, int64_t nowMonoNs, float dtSec)
         elapsedSinceAnchor = (double)(nowMonoNs - c->anchorMonoNs) / 1e9;
     }
     double targetSec = c->anchorTimelineSec + elapsedSinceAnchor;
-    double err = targetSec - c->currentSec;
+    // Compare targetSec at nowMonoNs against the end-of-frame predicted time (currentSec + dt)
+    // so steady-state tracking has err == 0 (rate == 1.00) with zero +1-frame lead bias.
+    double predictedSec = c->currentSec + dt;
+    double err = targetSec - predictedSec;
 
     // Large discontinuity (> 0.5 s, e.g. long pause resume or missed reset): snap forward only
     if (err > 0.50) {
@@ -455,6 +458,180 @@ float danmakuClockSample(DanmakuClockTracker* c, int64_t nowMonoNs, float dtSec)
     }
     c->currentSec = nextSec;
     return (float)c->currentSec;
+}
+
+static float overlayPhiForBand(const OverlayDepthLayers* d, int band) {
+    if (band == DANMAKU_LAYER_NEAR) return d->nearPhiDeg;
+    if (band == DANMAKU_LAYER_MID)  return d->midPhiDeg;
+    return d->farPhiDeg;
+}
+
+void danmakuPipelineInit(DanmakuFramePipeline* pipe) {
+    if (pipe == NULL) {
+        return;
+    }
+    memset(pipe, 0, sizeof(*pipe));
+    danmakuSlotTableClear(&pipe->slotTable);
+    danmakuClockReset(&pipe->clockTracker);
+}
+
+int danmakuPipelineStepFrame(DanmakuFramePipeline* pipe,
+                             const DanmakuUploadSlotEvent* uploads, int uploadCount,
+                             const DanmakuSnapshotInput* snapshot,
+                             int64_t frameMonoNs, float dtSec,
+                             DanmakuGpuInstance* outInst, int maxOut,
+                             int* outAnyParallax) {
+    if (outAnyParallax != NULL) {
+        *outAnyParallax = 0;
+    }
+    if (pipe == NULL) {
+        return 0;
+    }
+
+    // 1. Apply drained atlas clear / upload slot-generation landings FIRST so an incoming
+    //    snapshot referencing those newly uploaded slots draws cleanly on the exact same frame.
+    if (uploads != NULL && uploadCount > 0) {
+        for (int i = 0; i < uploadCount; i++) {
+            if (uploads[i].isClear) {
+                danmakuSlotTableClear(&pipe->slotTable);
+            }
+            else {
+                danmakuSlotTableMarkUploaded(&pipe->slotTable,
+                                             uploads[i].slotIndex, uploads[i].slotGen);
+            }
+        }
+    }
+
+    // 2. Absorb latest snapshot (when dirty) and update monotonic anchor clock & depth animation.
+    if (snapshot != NULL && snapshot->hasSnapshot) {
+        float prevFar = pipe->currentDepth.farPhiDeg;
+        float prevMid = pipe->currentDepth.midPhiDeg;
+        float prevNear = pipe->currentDepth.nearPhiDeg;
+
+        pipe->enabled = snapshot->enabled ? 1 : 0;
+        pipe->paused = snapshot->paused ? 1 : 0;
+        int count = snapshot->itemCount;
+        if (count < 0) count = 0;
+        if (count > DANMAKU_MAX_ITEMS) count = DANMAKU_MAX_ITEMS;
+        if (count > 0 && snapshot->items != NULL) {
+            pipe->itemCount = count;
+            memcpy(pipe->items, snapshot->items, (size_t)count * sizeof(DanmakuNativeItem));
+        }
+        else {
+            pipe->itemCount = 0;
+        }
+
+        danmakuClockSetAnchor(&pipe->clockTracker, snapshot->anchorTimelineMs,
+                              snapshot->anchorMonoNs, pipe->paused, snapshot->clockReset);
+        pipe->currentDepth = snapshot->nextDepth;
+
+        if (snapshot->animateDepth && pipe->itemCount > 0) {
+            pipe->depthAnimActive = 1;
+            pipe->depthAnimElapsedS = 0.0f;
+            for (int i = 0; i < pipe->itemCount; i++) {
+                float from = pipe->items[i].layerBand == DANMAKU_LAYER_NEAR ? prevNear
+                        : (pipe->items[i].layerBand == DANMAKU_LAYER_MID ? prevMid : prevFar);
+                pipe->items[i].animFromPhi = from;
+                pipe->items[i].animToPhi = overlayPhiForBand(&pipe->currentDepth,
+                                                             pipe->items[i].layerBand);
+            }
+        }
+        else {
+            pipe->depthAnimActive = 0;
+            pipe->depthAnimElapsedS = 0.0f;
+        }
+    }
+    else if (snapshot != NULL) {
+        pipe->currentDepth = snapshot->nextDepth;
+    }
+
+    if (!pipe->enabled || pipe->itemCount <= 0 || outInst == NULL || maxOut <= 0) {
+        return 0;
+    }
+
+    // 3. Sample anchor-driven monotonic clock (zero snapshot jitter)
+    float clockSec = danmakuClockSample(&pipe->clockTracker, frameMonoNs, dtSec);
+
+    float animT = 1.0f;
+    if (pipe->depthAnimActive) {
+        pipe->depthAnimElapsedS += (dtSec > 0.0f ? dtSec : 0.0f);
+        if (pipe->depthAnimElapsedS >= OVERLAY_DEPTH_ANIM_S) {
+            pipe->depthAnimActive = 0;
+            animT = 1.0f;
+        }
+        else {
+            float t = pipe->depthAnimElapsedS / OVERLAY_DEPTH_ANIM_S;
+            float u = 1.0f - t;
+            animT = 1.0f - u * u * u;
+        }
+    }
+
+    // 4. Pack visible instances — strictly skip any item whose slot generation has not landed!
+    int cap = maxOut < DANMAKU_MAX_ITEMS ? maxOut : DANMAKU_MAX_ITEMS;
+    int visible = 0;
+    int anyParallax = 0;
+    for (int i = 0; i < pipe->itemCount && visible < cap; i++) {
+        const DanmakuNativeItem* it = &pipe->items[i];
+        if (!danmakuSlotTableIsReady(&pipe->slotTable, it->slotIndex, it->slotGen)) {
+            continue;
+        }
+        float elapsed = clockSec - it->spawnTimeSec;
+        if (elapsed < -0.05f || (it->durationSec > 0.0f && elapsed > it->durationSec)) {
+            continue;
+        }
+        if (elapsed < 0.0f) {
+            elapsed = 0.0f;
+        }
+
+        float x = it->x0 + it->velXPerSec * elapsed;
+        if (x + it->w < -0.05f || x > 1.05f) {
+            continue;
+        }
+
+        float alpha = it->baseAlpha;
+        if (it->fadeSec > 0.001f && it->durationSec > 0.0f) {
+            float fadeIn = clampf(elapsed / it->fadeSec, 0.0f, 1.0f);
+            float fadeOut = clampf((it->durationSec - elapsed) / it->fadeSec, 0.0f, 1.0f);
+            alpha *= (fadeIn < fadeOut ? fadeIn : fadeOut);
+        }
+        if (alpha <= 0.004f) {
+            continue;
+        }
+
+        float phi = it->fixedPhiDeg;
+        if (pipe->depthAnimActive) {
+            phi = it->animFromPhi + (it->animToPhi - it->animFromPhi) * animT;
+        }
+        if (phi > pipe->currentDepth.maxPhiDeg) {
+            phi = pipe->currentDepth.maxPhiDeg;
+        }
+        if (phi < 0.0f) {
+            phi = 0.0f;
+        }
+        if (phi > 0.002f) {
+            anyParallax = 1;
+        }
+
+        DanmakuGpuInstance* dst = &outInst[visible++];
+        dst->rect[0] = x;
+        dst->rect[1] = it->y0;
+        dst->rect[2] = it->w;
+        dst->rect[3] = it->h;
+        dst->uv[0] = it->u0;
+        dst->uv[1] = it->v0;
+        dst->uv[2] = it->du;
+        dst->uv[3] = it->dv;
+        dst->colorAlpha[0] = it->r;
+        dst->colorAlpha[1] = it->g;
+        dst->colorAlpha[2] = it->b;
+        dst->colorAlpha[3] = alpha;
+        dst->phiDeg = phi;
+    }
+
+    if (outAnyParallax != NULL) {
+        *outAnyParallax = anyParallax;
+    }
+    return visible;
 }
 
 int overlayApplyLayerBudget(const int* slotKinds, int count, int maxLayers, int* keepOut) {

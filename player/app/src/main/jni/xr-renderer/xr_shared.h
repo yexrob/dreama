@@ -317,7 +317,9 @@
 #define IN_CONTENT_PHI_CENTI (IN_PALETTE_DIM_FALLBACK + 1)
 // Bitmask of stereo unavailability reasons latched on native side (G2 residual)
 #define IN_STEREO_UNAVAILABLE (IN_CONTENT_PHI_CENTI + 1)
-#define IN_SLOTS    (IN_STEREO_UNAVAILABLE + 1)
+// Latched 1 when danmaku GPU atlas/swapchain initialization failed (G4 R3)
+#define IN_DANMAKU_UNAVAILABLE (IN_STEREO_UNAVAILABLE + 1)
+#define IN_SLOTS    (IN_DANMAKU_UNAVAILABLE + 1)
 
 #define STEREO_UNAVAIL_DEPTH     1
 #define STEREO_UNAVAIL_SWAPCHAIN 2

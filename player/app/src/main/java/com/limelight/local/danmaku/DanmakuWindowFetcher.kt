@@ -176,6 +176,29 @@ class DanmakuWindowFetcher(
         cache[windowIndex]
     }
 
+    /**
+     * Re-ingests any cached windows in `[curWin - 1, curWin + 1]` that [engine] does not
+     * currently hold (after seeking back into already-cached history, after an unannounced
+     * `clockReset` jump, or when forward playback approaches a previously cached window).
+     * Returns `true` if at least one cached window was hydrated into [engine].
+     */
+    fun hydrateEngineAround(mediaTimeMs: Long, engine: DanmakuEngine): Boolean {
+        val curWin = windowIndexFor(mediaTimeMs)
+        val startWin = maxOf(0, curWin - 1)
+        val endWin = curWin + 1
+        var hydratedAny = false
+        for (w in startWin..endWin) {
+            if (!engine.hasWindowLoaded(w)) {
+                val cached = getCachedWindow(w)
+                if (cached != null) {
+                    engine.ingestWindowItems(cached, w)
+                    hydratedAny = true
+                }
+            }
+        }
+        return hydratedAny
+    }
+
     fun queryCachedRange(fromMs: Long, toMs: Long): List<DanmakuRawItem> {
         if (toMs <= fromMs) return emptyList()
         val startWin = windowIndexFor(fromMs.coerceAtLeast(0L))

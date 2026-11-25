@@ -6,6 +6,7 @@ import com.limelight.local.DanmakuBlockFlags
 import com.limelight.local.DanmakuSpeed
 import com.limelight.local.DepthLayerLevel
 import com.limelight.local.GlobalPaletteSettings
+import com.limelight.local.PaletteController
 import com.limelight.local.PaletteStore
 import com.limelight.local.StereoSourceFormat
 import com.limelight.local.TextSizeTier
@@ -747,5 +748,238 @@ class DanmakuEngineAndFetcherTest {
         for (i in 0 until cA * XrShared.DANMAKU_INSTANCE_FLOATS) {
             assertEquals(bA[i], bB[i], 0.0f)
         }
+    }
+
+    // ---- 9. Round-2 Regression N1: Backward Seek > 1 Window & Forward Play Into Cached Windows ----
+
+    @Test
+    fun cachedWindowsHydrateOnBackwardSeekForwardCrossingAndUnannouncedClockReset() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val clock = VirtualClock(0L)
+        val engine = DanmakuEngine(clock)
+        val fetchCounts = HashMap<Int, Int>()
+
+        val fetcher = DanmakuWindowFetcher(
+            ioDispatcher = dispatcher,
+            windowMs = 60_000L,
+            prefetchLeadMs = 10_000L,
+            maxCachedWindows = 20,
+            defaultMaxConcurrentFetches = 1,
+            onWindowReady = { windowIndex, items ->
+                engine.ingestWindowItems(items, windowIndex)
+            },
+        )
+        fetcher.setDataSource(
+            source = DanmakuDataSource { fromMs, _ ->
+                val w = (fromMs / 60_000L).toInt()
+                fetchCounts[w] = (fetchCounts[w] ?: 0) + 1
+                DanmakuFetchResult.Loaded(
+                    listOf(
+                        DanmakuItem(fromMs + 2_000L, "W$w-2s", "#FFFFFF", DanmakuMode.SCROLL),
+                        DanmakuItem(fromMs + 30_000L, "W$w-30s", "#FFFFFF", DanmakuMode.SCROLL),
+                    ),
+                )
+            },
+            mergeDuplicates = true,
+            maxConcurrency = 1,
+        )
+
+        // Exact production tick sequence used by DanmakuSessionManager:
+        fun stepLikeSessionManager(mediaPosMs: Long, dtRealMs: Long = 200L) {
+            clock.advance(dtRealMs)
+            fetcher.ensureWindowsFor(mediaPosMs)
+            advanceUntilIdle()
+            fetcher.hydrateEngineAround(mediaPosMs, engine)
+            val res = engine.step(mediaPosMs)
+            if (res.clockReset) {
+                fetcher.ensureWindowsFor(mediaPosMs)
+                advanceUntilIdle()
+                fetcher.hydrateEngineAround(mediaPosMs, engine)
+            }
+        }
+
+        fun seekLikeSessionManager(targetMs: Long) {
+            engine.onSeek(targetMs)
+            fetcher.onSeek(targetMs)
+            advanceUntilIdle()
+            fetcher.hydrateEngineAround(targetMs, engine)
+            engine.step(targetMs)
+        }
+
+        // 1. Play through 0:00 -> 10:00 (windows 0..9 fetched and cached in fetcher; engine prunes 0..7)
+        for (w in 0..9) {
+            val baseMs = w * 60_000L
+            seekLikeSessionManager(baseMs)
+            // Step forward smoothly at 1.0x (12 * 250 ms = 3.0 s) so forward-jump guard does not trigger
+            for (step in 1..12) {
+                stepLikeSessionManager(baseMs + step * 250L, dtRealMs = 250L)
+            }
+            assertTrue("Window $w must spawn on initial pass", engine.activeItems.any { it.displayText == "W$w-2s" })
+        }
+        // At window 9, window 2 is cached in fetcher (20-window LRU) but pruned from engine!
+        assertNotNull(fetcher.getCachedWindow(2))
+        assertFalse("Engine must have pruned window 2 while at window 9", engine.hasWindowLoaded(2))
+        val win2FetchesBeforeSeek = fetchCounts[2] ?: 0
+        assertEquals(1, win2FetchesBeforeSeek)
+
+        // 2. N1 core scenario: seek back from 10:00 to 2:00 (window 2, > 1 window back!)
+        seekLikeSessionManager(120_000L)
+        assertEquals("Cache hit must NOT re-fetch window 2", win2FetchesBeforeSeek, fetchCounts[2] ?: 0)
+        assertTrue("Window 2 must be hydrated back into engine after seek", engine.hasWindowLoaded(2))
+
+        for (i in 1..15) {
+            stepLikeSessionManager(120_000L + i * 200L)
+        }
+        assertTrue(
+            "N1 regression: window 2 danmaku MUST spawn after seeking back from 10:00 to 2:00",
+            engine.activeItems.any { it.displayText == "W2-2s" },
+        )
+
+        // 3. N1 forward crossing into an already-cached window:
+        //    Currently at window 2 (engine holds windows 1..3, NOT window 4; window 4 is cached in fetcher!).
+        //    Play forward monotonically from 2:59 -> 4:03 without calling onSeek.
+        assertFalse("Engine does not hold window 4 while at window 2", engine.hasWindowLoaded(4))
+        assertNotNull("Fetcher already caches window 4", fetcher.getCachedWindow(4))
+        val win4FetchesBefore = fetchCounts[4] ?: 0
+
+        var posMs = 179_000L
+        seekLikeSessionManager(posMs)
+        // Walk forward 64 s in 500 ms real/media steps across window 3 (3:00) into cached window 4 (4:00)
+        repeat(128) {
+            posMs += 500L
+            stepLikeSessionManager(posMs, dtRealMs = 500L)
+        }
+        assertEquals("Forward crossing into cached window 4 must NOT re-fetch", win4FetchesBefore, fetchCounts[4] ?: 0)
+        assertTrue(
+            "Forward playback crossing into already-cached window 4 MUST spawn W4-2s",
+            engine.activeItems.any { it.displayText == "W4-2s" },
+        )
+
+        // 4. Unannounced jump (clockReset inside step(), WITHOUT calling onSeek!) back to cached window 1
+        assertFalse(engine.hasWindowLoaded(1))
+        stepLikeSessionManager(60_000L, dtRealMs = 200L)
+        assertTrue("Unannounced jump clockReset must re-hydrate cached window 1", engine.hasWindowLoaded(1))
+        for (i in 1..15) {
+            stepLikeSessionManager(60_000L + i * 200L)
+        }
+        assertTrue(
+            "Window 1 danmaku must spawn after unannounced clockReset jump into cached window",
+            engine.activeItems.any { it.displayText == "W1-2s" },
+        )
+
+        fetcher.close()
+    }
+
+    // ---- 10. Round-2 Regressions: S1 Anchor Clock, MF1 Deferred Slot Release, ZWNJ, R3 Palette Unavailable ----
+
+    @Test
+    fun stepSamplesAnchorMonoNsBeforeRasterizationAndDefersSlotReleaseUntilCommit() {
+        val clock = VirtualClock(1_000L)
+        var fakeMonoNs = 10_000_000_000L
+        val tinyAtlas = DanmakuAtlasAllocator(atlasWidth = 1024, atlasHeight = 2048, gutterPx = 2, maxSlots = 2)
+        val engine = DanmakuEngine(
+            clock = clock,
+            atlas = tinyAtlas,
+            monoClockNs = { fakeMonoNs },
+            deferSlotRelease = true,
+        )
+        engine.ingestWindowItems(
+            listOf(
+                DanmakuRawItem(1L, 1_100L, "彩色弹幕A", colorRgb = 0xFF6699, mode = DanmakuMode.SCROLL, windowIndex = 0),
+                DanmakuRawItem(2L, 1_200L, "白色弹幕B", colorRgb = 0xFFFFFF, mode = DanmakuMode.SCROLL, windowIndex = 0),
+                DanmakuRawItem(3L, 1_300L, "白色弹幕C", colorRgb = 0xFFFFFF, mode = DanmakuMode.SCROLL, windowIndex = 0),
+            ),
+            windowIndex = 0,
+        )
+        engine.step(1_000L)
+
+        // S1: step() must capture anchorMonoNs atomically BEFORE subsequent 35 ms rasterization delay
+        clock.advance(100L)
+        fakeMonoNs += 100_000_000L
+        val stepMonoAtCall = fakeMonoNs
+        val res1 = engine.step(1_100L)
+        fakeMonoNs += 35_000_000L // simulate slow worker rasterization AFTER step()
+        assertEquals(stepMonoAtCall, res1.anchorMonoNs)
+        assertEquals(1, engine.activeItems.size)
+        val slotA = engine.activeItems[0].atlasSlot!!
+        engine.commitPublishedSnapshot()
+
+        // MF1 residual: block COLOR removes item A, but its slot MUST remain held until
+        // commitPublishedSnapshot() so a same-tick spawn (item B) NEVER reuses slotA's slot or pixels!
+        engine.updateSettings(engine.currentSettings.copy(blockMask = DanmakuBlockFlags.COLOR))
+        assertTrue("Item A immediately removed from active list", engine.activeItems.isEmpty())
+        assertEquals("Slot A stays reserved until new snapshot publishes", 1, tinyAtlas.activeSlotCount)
+
+        clock.advance(100L)
+        fakeMonoNs += 100_000_000L
+        engine.step(1_200L)
+        assertEquals(1, engine.activeItems.size)
+        val slotB = engine.activeItems[0].atlasSlot!!
+        assertTrue(
+            "Same-tick spawn B must NOT reuse deferred slot A before snapshot publish",
+            slotB.slotIndex != slotA.slotIndex,
+        )
+        val rectsOverlap = slotB.x < slotA.x + slotA.width && slotA.x < slotB.x + slotB.width
+            && slotB.y < slotA.y + slotA.height && slotA.y < slotB.y + slotB.height
+        assertFalse("Same-tick spawn B must NOT overlap deferred slot A atlas pixels", rectsOverlap)
+        assertEquals("Both slot A (deferred) and slot B (live) occupied pre-commit", 2, tinyAtlas.activeSlotCount)
+
+        // Once snapshot #2 publishes -> commitPublishedSnapshot() releases slot A cleanly
+        engine.commitPublishedSnapshot()
+        assertEquals("Only slot B remains active after snapshot publish commit", 1, tinyAtlas.activeSlotCount)
+
+        // Next tick recycles the freed region cleanly for item C
+        clock.advance(100L)
+        fakeMonoNs += 100_000_000L
+        engine.step(1_300L)
+        assertEquals(2, engine.activeItems.size)
+        assertEquals(2, tinyAtlas.activeSlotCount)
+    }
+
+    @Test
+    fun sanitizeTextPreservesZwnjForPersianAndIndicScriptsWhileStrippingBidiAndControls() {
+        val persian = "می\u200Cخواهم"
+        assertEquals(persian, DanmakuDepthMath.sanitizeText(persian))
+
+        val mixed = "\uFEFFمی\u200Cخواهم\u200B\u202E\uFFFC"
+        assertEquals(persian, DanmakuDepthMath.sanitizeText(mixed))
+    }
+
+    @Test
+    fun paletteDanmakuGlUnavailableDisablesControlsHidesRetryAndBlocksQuickToggle() {
+        val ctrl = PaletteController(
+            danmakuSupported = true,
+            danmakuLoadFailed = true,
+            danmakuGlUnavailable = false,
+        )
+        ctrl.selectTab(XrShared.PALETTE_TAB_DANMAKU)
+        val hashBefore = ctrl.renderHash()
+
+        ctrl.danmakuGlUnavailable = true
+        assertTrue("renderHash must reflect danmakuGlUnavailable change", ctrl.renderHash() != hashBefore)
+        for (row in 0 until XrShared.PALETTE_MAX_ROWS) {
+            assertFalse("Row $row must not be adjustable when GL unavailable", ctrl.isRowAdjustable(XrShared.PALETTE_TAB_DANMAKU, 0, row))
+            assertFalse("Row $row must not show reset when GL unavailable", ctrl.isRowResetVisible(XrShared.PALETTE_TAB_DANMAKU, 0, row))
+        }
+
+        // Clicking where the network-failure Retry button sits must NOT trigger retry when GL failed
+        val retryClickX = XrShared.PALETTE_ROW_X + 660f
+        val retryClickY = XrShared.PALETTE_ROW_Y0 + 30f
+        val clickRes = ctrl.processFrameInput(
+            open = true, pinned = false, handTrackingMode = false, dimFallback = false,
+            hoverX = retryClickX, hoverY = retryClickY, clickState = 1,
+            rowStep = 0, rowReset = false, tabStep = 0, pageStep = 0,
+        )
+        assertFalse("GL unavailable state must never emit danmakuRetryRequested", clickRes.danmakuRetryRequested)
+        assertTrue(ctrl.danmakuLoadFailed)
+
+        // Quick toggle via Y / TransportBar must refuse cleanly with toast & limit haptic
+        val wasOn = ctrl.global.danmakuOn
+        val quick = ctrl.toggleDanmakuQuick()
+        assertFalse(quick.changed)
+        assertFalse(quick.danmakuChanged)
+        assertEquals(wasOn, ctrl.global.danmakuOn)
+        assertEquals(ctrl.strings.toastDanmakuUnavailable, quick.toastMessage)
+        assertEquals(XrShared.PALETTE_HAPTIC_LIMIT, quick.hapticKind)
     }
 }

@@ -188,6 +188,9 @@ data class PaletteStrings(
     val screenDistDisabledInRoom: String = "影院房间里距离固定",
     val screenGestureHint: String = "指着画面按住扳机，再推右摇杆：前后调远近 · 左右调大小",
     val depthModelUnavailableReason: String = "深度模型不可用，仅支持原生 3D",
+    val danmakuGlUnavailableTitle: String = "弹幕渲染不可用",
+    val danmakuGlUnavailableSub: String = "图形资源初始化失败，不影响正常看片",
+    val toastDanmakuUnavailable: String = "弹幕图形初始化失败，本次播放暂不可用",
 )
 
 /** Per-video persisted overrides (only the 4 per-video items per §6.3). */
@@ -275,6 +278,7 @@ class PaletteController(
     var danmakuSupported: Boolean = false,
     var danmakuLoadFailed: Boolean = false,
     var depthModelUnavailable: Boolean = false,
+    var danmakuGlUnavailable: Boolean = false,
 ) {
     var global: GlobalPaletteSettings = initialGlobal
         private set
@@ -547,7 +551,7 @@ class PaletteController(
             else -> false
         }
         XrShared.PALETTE_TAB_DANMAKU -> when {
-            !danmakuSupported || danmakuLoadFailed -> false
+            !danmakuSupported || danmakuGlUnavailable || danmakuLoadFailed -> false
             page == 0 -> when (row) {
                 0 -> true
                 1, 2 -> global.danmakuOn
@@ -584,7 +588,7 @@ class PaletteController(
             else -> false
         }
         XrShared.PALETTE_TAB_DANMAKU -> when {
-            !danmakuSupported || danmakuLoadFailed -> false
+            !danmakuSupported || danmakuGlUnavailable || danmakuLoadFailed -> false
             page == 0 -> when (row) {
                 0 -> !global.danmakuOn
                 1 -> global.danmakuOn && global.danmakuArea != DanmakuArea.HALF
@@ -641,7 +645,7 @@ class PaletteController(
     /** Left-stick Y secondary-page switch on Danmaku tab (dir < 0 = down to page 1, dir > 0 = up to page 0). */
     fun stepPage(dir: Int): PaletteActionResult {
         if (dir == 0 || activeTab != XrShared.PALETTE_TAB_DANMAKU
-            || !danmakuSupported || danmakuLoadFailed || !global.danmakuOn
+            || !danmakuSupported || danmakuGlUnavailable || danmakuLoadFailed || !global.danmakuOn
         ) {
             return PaletteActionResult()
         }
@@ -663,6 +667,12 @@ class PaletteController(
         if (!danmakuSupported) {
             return PaletteActionResult(
                 toastMessage = strings.toastNoDanmaku,
+                hapticKind = XrShared.PALETTE_HAPTIC_LIMIT,
+            )
+        }
+        if (danmakuGlUnavailable) {
+            return PaletteActionResult(
+                toastMessage = strings.toastDanmakuUnavailable,
                 hapticKind = XrShared.PALETTE_HAPTIC_LIMIT,
             )
         }
@@ -714,14 +724,18 @@ class PaletteController(
             return PaletteHover.Row(index = row, onReset = true)
         }
 
-        // Danmaku load-failed Retry button on Row 0
-        if (activeTab == XrShared.PALETTE_TAB_DANMAKU && danmakuSupported && danmakuLoadFailed && row == 0) {
+        // Danmaku load-failed Retry button on Row 0 (never active when GPU init itself failed)
+        if (activeTab == XrShared.PALETTE_TAB_DANMAKU && danmakuSupported
+            && !danmakuGlUnavailable && danmakuLoadFailed && row == 0
+        ) {
             val onRetry = localX >= RETRY_BTN_LOCAL_X && localX <= RETRY_BTN_LOCAL_X + RETRY_BTN_W
             return PaletteHover.Row(index = row, onRetry = onRetry)
         }
 
         // Special nav rows (More / Back)
-        if (activeTab == XrShared.PALETTE_TAB_DANMAKU && danmakuSupported && !danmakuLoadFailed && row == 3) {
+        if (activeTab == XrShared.PALETTE_TAB_DANMAKU && danmakuSupported
+            && !danmakuGlUnavailable && !danmakuLoadFailed && row == 3
+        ) {
             return PaletteHover.Row(index = row)
         }
 
@@ -824,7 +838,7 @@ class PaletteController(
                     clickSound = true,
                 )
             } else if (activeTab == XrShared.PALETTE_TAB_DANMAKU && danmakuSupported
-                && !danmakuLoadFailed && global.danmakuOn && row == 3
+                && !danmakuGlUnavailable && !danmakuLoadFailed && global.danmakuOn && row == 3
             ) {
                 danmakuPage = if (danmakuPage == 0) 1 else 0
                 PaletteActionResult(
@@ -1543,6 +1557,7 @@ class PaletteController(
         mixBool(danmakuSupported)
         mixBool(danmakuLoadFailed)
         mixBool(depthModelUnavailable)
+        mixBool(danmakuGlUnavailable)
 
         when (val hv = hover) {
             PaletteHover.None -> mixInt(0)
@@ -1628,7 +1643,7 @@ class PaletteController(
             3 -> RowControlKind.CHIPS
             else -> RowControlKind.NONE
         }
-        XrShared.PALETTE_TAB_DANMAKU -> if (!danmakuSupported || danmakuLoadFailed) {
+        XrShared.PALETTE_TAB_DANMAKU -> if (!danmakuSupported || danmakuGlUnavailable || danmakuLoadFailed) {
             RowControlKind.NONE
         } else if (page == 0) {
             when (row) {

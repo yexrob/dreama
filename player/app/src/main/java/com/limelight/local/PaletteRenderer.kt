@@ -321,6 +321,11 @@ class PaletteRenderer {
             drawInfoRow(1, s.danmakuUnsupportedSub, primary = false)
             return
         }
+        if (c.danmakuGlUnavailable) {
+            drawInfoRow(0, s.danmakuGlUnavailableTitle, primary = true)
+            drawInfoRow(1, s.danmakuGlUnavailableSub, primary = false)
+            return
+        }
         if (c.danmakuLoadFailed) {
             drawDanmakuFailedRow(c)
             return

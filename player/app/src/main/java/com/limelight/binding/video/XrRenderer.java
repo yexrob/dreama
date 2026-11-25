@@ -361,6 +361,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                                       int tabStep, int pageStep) { }
         default void onVrScreenDimensionsSaved(float fovDeg, float distM) { }
         default void onVrDepthModelUnavailable() { }
+        default void onVrDanmakuUnavailable() { }
         default void onVrContentDepthPhi(float phiDeg) { }
     }
 
@@ -652,6 +653,8 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     private volatile boolean initialStereoLive = true;
     private volatile int initialSourceFormat = STEREO_SRC_AUTO;
     private final java.util.concurrent.atomic.AtomicBoolean depthUnavailableNotified =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private final java.util.concurrent.atomic.AtomicBoolean danmakuUnavailableNotified =
             new java.util.concurrent.atomic.AtomicBoolean(false);
     private volatile boolean stereoRequestedThisSession;
 
@@ -2076,6 +2079,10 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                 if ((stereoUnavail & STEREO_UNAVAIL_SWAPCHAIN) != 0
                         || ((stereoUnavail & STEREO_UNAVAIL_DEPTH) != 0 && stereoRequestedThisSession)) {
                     markDepthModelUnavailable();
+                }
+                if (inputState[IN_DANMAKU_UNAVAILABLE] != 0.0f
+                        && danmakuUnavailableNotified.compareAndSet(false, true)) {
+                    inputListener.onVrDanmakuUnavailable();
                 }
             }
         }

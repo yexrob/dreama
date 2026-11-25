@@ -5,6 +5,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PorterDuff
+import android.graphics.PorterDuffColorFilter
 import android.graphics.Typeface
 import android.os.Build
 import java.nio.ByteBuffer
@@ -44,13 +45,19 @@ class DanmakuRasterizer : DanmakuTextMeasurer {
     private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
         typeface = cjkBoldTypeface
         color = STROKE_COLOR_ARGB
+        // SRC_IN tint ensures color-bitmap glyphs (NotoColorEmoji) draw a dark outline
+        // silhouette rather than an unfiltered colored duplicate underneath.
+        colorFilter = PorterDuffColorFilter(STROKE_COLOR_ARGB, PorterDuff.Mode.SRC_IN)
         style = Paint.Style.STROKE
         strokeJoin = Paint.Join.ROUND
         strokeCap = Paint.Cap.ROUND
     }
     private val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
         typeface = cjkBoldTypeface
-        color = SHADOW_COLOR_ARGB
+        // Keep paint color opaque so SRC_IN applies SHADOW_COLOR_ARGB alpha once (not squared)
+        // for both standard text glyphs and full-color bitmap emoji.
+        color = STROKE_COLOR_ARGB
+        colorFilter = PorterDuffColorFilter(SHADOW_COLOR_ARGB, PorterDuff.Mode.SRC_IN)
         style = Paint.Style.FILL_AND_STROKE
         strokeJoin = Paint.Join.ROUND
     }

@@ -1,12 +1,15 @@
 // GPU-accelerated instanced danmaku compositor with 2048x2048 premultiplied RGBA8
 // glyph/emoji/stroke atlas, slot-generation gating, anchor-based monotonic 72/90 Hz
-// clock, bounded incremental glTexSubImage2D uploads, and per-eye stereoscopic rendering.
-// Strictly gated on ctx->localMedia so PC streaming allocates zero resources.
+// clock, bounded incremental glTexSubImage2D uploads, staggered 4-stage lazy GL init,
+// and per-eye stereoscopic rendering.
+// Strictly gated on ctx->localMedia AND active enabled danmaku so PC streaming and
+// videos without active danmaku allocate zero GPU resources.
 
 #ifndef XR_DANMAKU_H
 #define XR_DANMAKU_H
 
 #include <stdint.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <GLES3/gl3.h>
 #include <openxr/openxr.h>
@@ -27,36 +30,6 @@ typedef struct {
     uint32_t slotGen;
     unsigned char* data; // lazily allocated up to DANMAKU_PATCH_MAX_BYTES, reused forever
 } DanmakuAtlasPatch;
-
-typedef struct {
-    float x0;           // normalized [0..1] start X at spawnTimeSec (top-left of quad)
-    float y0;           // normalized [0..1] top Y within active overlay area [0..areaBotFrac]
-    float w;            // normalized width relative to screen width
-    float h;            // normalized height relative to active overlay area height
-    float velXPerSec;   // normalized screen-width units/sec (negative for scroll left)
-    float u0, v0;       // atlas top-left UV [0..1] (half-texel inset)
-    float du, dv;       // atlas UV span (half-texel inset)
-    float r, g, b;      // linear/sRGB text color [0..1] (baked in RGBA8 atlas; alpha in baseAlpha)
-    float baseAlpha;    // 0..1 base opacity
-    float spawnTimeSec; // item spawn time on native danmaku timeline
-    float durationSec;  // item lifetime in real seconds
-    float fadeSec;      // linear fade-in/fade-out duration (0.15s for top/bottom, 0 for scroll)
-    int mode;           // DANMAKU_MODE_SCROLL / TOP / BOTTOM
-    int layerBand;      // DANMAKU_LAYER_FAR / MID / NEAR
-    float fixedPhiDeg;  // item's disparity at spawn (frozen unless user drags Float/Layer)
-    float animFromPhi;  // start disparity for 200 ms user-drag transition
-    float animToPhi;    // target disparity for 200 ms user-drag transition
-    int slotIndex;      // atlas slot index in [0, DANMAKU_MAX_SLOTS)
-    uint32_t slotGen;   // expected generation; skipped until GPU upload of this gen lands
-} DanmakuNativeItem;
-
-// Packed per-instance GPU vertex buffer struct (13 floats = 52 bytes)
-typedef struct {
-    float rect[4];      // x0, y0, w, h in [0..1] overlay area coords
-    float uv[4];        // u0, v0, du, dv in [0..1] atlas coords
-    float colorAlpha[4];// r, g, b, alpha
-    float phiDeg;       // effective crossed disparity in degrees
-} DanmakuGpuInstance;
 
 typedef struct {
     pthread_mutex_t lock;
@@ -88,11 +61,8 @@ typedef struct {
     int pendingCount;
     DanmakuNativeItem pendingItems[DANMAKU_MAX_ITEMS];
 
-    // Render-thread-only active playback state
-    int enabled;
-    int paused;
-    DanmakuClockTracker clockTracker;
-    DanmakuSlotTable slotTable;
+    // Render-thread-only active playback state & shared pure-C frame pipeline
+    DanmakuFramePipeline pipe;
     float areaBotFrac;
     float globalOpacity;
     int curveMode;
@@ -101,16 +71,11 @@ typedef struct {
     int floatAutoOffset;
     int floatFixedSteps;
     float layerSpreadDeg;
-    int itemCount;
-    DanmakuNativeItem items[DANMAKU_MAX_ITEMS];
 
-    // Smooth 200 ms depth transition when user drags Float/Layer in palette
-    int depthAnimActive;
-    float depthAnimElapsedS;
-
-    // Render-thread GL & OpenXR resources (pre-warmed behind startup splash for localMedia)
+    // Render-thread GL & OpenXR resources (staggered 4-stage lazy init only when enabled)
+    int glInitStage; // 0: shaders/VAO, 1: atlas/FBO, 2: left eye chain, 3: right eye chain+scratch, 4: ready
     int glReady;
-    int glFailed;
+    atomic_int glFailed; // latched 1 on any GL/swapchain init error; never retries per frame
     GLuint program;
     GLuint vao;
     GLuint quadVbo;
@@ -129,19 +94,18 @@ typedef struct {
 
     // Pre-allocated CPU staging buffers (zero per-frame render-thread malloc)
     unsigned char* uploadScratch; // render-thread copy target for race-free glTexSubImage2D
+    DanmakuNativeItem snapScratch[DANMAKU_MAX_ITEMS];
     DanmakuGpuInstance gpuInst[DANMAKU_MAX_ITEMS];
 
     // Output state read by addDanmakuLayers() in xr_layers.c
     int drawnEyes;       // 0 = hidden (submit 0 layers), 1 = flat mono (1 layer), 2 = stereo (2 layers)
     int drawnTexH;       // cropped height in [1..DANMAKU_TEX_H] matching areaBotFrac
     float drawnAreaBotFrac;
-    OverlayDepthLayers currentDepth;
 } DanmakuState;
 
 struct XrCtx;
 
 void danmakuInit(struct XrCtx* ctx);
-int danmakuPrewarmGl(struct XrCtx* ctx);
 void danmakuDestroy(struct XrCtx* ctx);
 void danmakuRenderEyes(struct XrCtx* ctx, float screenFovDeg, float screenDistM,
                        float dt, int64_t frameMonoNs, int stereoActive);

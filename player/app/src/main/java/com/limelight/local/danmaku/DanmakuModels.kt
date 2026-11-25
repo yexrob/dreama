@@ -323,8 +323,8 @@ object DanmakuDepthMath {
      * Sanitizes danmaku text per §6.10:
      * - Maps `\n`, `\r`, `\t` to spaces and collapses runs of spaces.
      * - Strips C0/DEL/C1 control characters, BiDi overrides/isolates/marks (U+202A–202E,
-     *   U+2066–2069, U+200E, U+200F, U+061C), zero-width chars (U+200B, U+200C, U+FEFF),
-     *   and Object Replacement Character (U+FFFC).
+     *   U+2066–2069, U+200E, U+200F, U+061C), zero-width chars (U+200B, U+FEFF; preserves
+     *   U+200C ZWNJ required by Persian/Indic scripts), and Object Replacement Character (U+FFFC).
      * - Truncates strictly on Unicode grapheme-cluster boundaries (`maxGraphemes = 40` + `…`)
      *   so surrogate pairs and ZWJ emoji sequences are NEVER split mid-sequence.
      */
@@ -364,7 +364,7 @@ object DanmakuDepthMath {
             code in 0x202A..0x202E ||
             code in 0x2066..0x2069 ||
             code == 0x200E || code == 0x200F || code == 0x061C ||
-            code == 0x200B || code == 0x200C || code == 0xFEFF ||
+            code == 0x200B || code == 0xFEFF ||
             code == 0xFFFC
 
     /** Returns grapheme-cluster end indices in [text] via [BreakIterator]. */

@@ -327,9 +327,10 @@ int initGl(XrCtx* ctx) {
             ctx->depthModelGlFailed = 1;
             atomic_store_explicit(&ctx->depthGaveUp, 1, memory_order_relaxed);
         }
-        // Pre-warm danmaku RGBA8 atlas + 2x eye swapchains behind startup splash so
-        // the first danmaku causes zero mid-playback hitch (PC streaming skips this).
-        danmakuPrewarmGl(ctx);
+        // Danmaku GPU resources (~56-72 MB: 2048x2048 RGBA8 atlas + 2 eye swapchains) are NOT
+        // pre-warmed here so videos with danmaku OFF or no danmaku source allocate 0 VRAM.
+        // Instead, danmakuRenderEyes() runs a 4-stage staggered lazy init (1 stage/frame)
+        // ONLY once an active danmaku source is enabled (dm->enabled == 1).
     }
     else if (ctx->stereoMode == DEPTH_MODE_MODEL && ctx->stereoLive) {
         if (!ensureDepthModelGl(ctx)) {
@@ -490,6 +491,10 @@ void renderVideoFrame(XrCtx* ctx, const float* texMatrix, float separation) {
     uint32_t imageIndex = 0;
     XrSwapchainImageAcquireInfo acquireInfo = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
     if (!checkXr(xrAcquireSwapchainImage(ctx->swapchain, &acquireInfo, &imageIndex), "acquire image")) {
+        // S3: warpRedraw was cleared at the top of renderVideoFrame; re-arm it so a paused
+        // video (especially right after a stereo swapchain upgrade with swapchainHasFrame == 0)
+        // retries rendering on the next frame instead of remaining black.
+        ctx->warpRedraw = 1;
         // The query opened above must not be left standing on this early out,
         // or the next frame's begin would nest inside it
         if (timing && !ctx->timerPending[ctx->timerSlot]) {
