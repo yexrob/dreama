@@ -59,6 +59,10 @@ class WallModel(app: Application) : AndroidViewModel(app) {
         .mapLatest { (rows, srcs) -> Load.Ready(resolve(rows, srcs)) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), Load.Loading)
 
+    val streaming = com.limelight.local.stream.StreamingController(app) {
+        reloadSavedWebDav()
+    }
+
     init {
         refreshAll()
         if (webdav.value == null) {
@@ -67,6 +71,18 @@ class WallModel(app: Application) : AndroidViewModel(app) {
                 LimeLog.info("depth3d: webdav discovery -> ${discovered.value}")
             }
         }
+    }
+
+    override fun onCleared() {
+        streaming.onDestroy()
+        super.onCleared()
+    }
+
+    fun reloadSavedWebDav() {
+        val loaded = WebDav.load(getApplication()) ?: return
+        webdav.value = WebDavSource(loaded)
+        discovered.value = null
+        refresh(WebDavSource.ID)
     }
 
     fun source(id: String): MediaSource? = sources.value.firstOrNull { it.source.id == id }

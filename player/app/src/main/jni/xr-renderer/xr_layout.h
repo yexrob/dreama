@@ -34,7 +34,6 @@
 #define HOVER_RAYBUTTON 16
 #define HOVER_AIMBUTTON 17
 #define HOVER_PADBUTTON 18
-#define HOVER_KOFI      19
 // How far past each edge that reaches, as a fraction of the screen
 #define HALO_FRAC 0.5f
 
@@ -205,10 +204,8 @@ int cogStepIndex(float t, int steps, int dir);
 // is one of the COG_TAB_ values, or anything past them for the Room tab.
 int cogTrackSteps(int tab, int row);
 
-// Whether a point on the settings panel is on the About tab's report button,
-// or its Ko-fi button
+// Whether a point on the settings panel is on the report button
 int cogReportButtonAt(float pu, float pv);
-int cogKofiButtonAt(float pu, float pv);
 
 // Which part of the report sheet a point on it is over, one of the
 // REPORT_ZONE_ values, u and v across the sheet from its top left
@@ -217,10 +214,6 @@ int reportZone(float u, float v);
 // Which of the hand lock hint's two buttons a point on it is over, one of the
 // HINT_ZONE_ values, u and v across the sheet from its top left
 int handHintZone(float u, float v);
-
-// Whether a point on the Ko-fi sheet is on its Close button, one of the
-// KOFI_ZONE_ values, u and v across the sheet from its top left
-int kofiSheetZone(float u, float v);
 
 // The 3D tab's depth track. A separation, as a fraction of frame width, in the
 // tenths of a percent the preference stores, which is also the step the track

@@ -43,7 +43,6 @@ class DlnaService : Service(), RendererHost {
         private const val HTTP_PORT = 49494
         private const val TICK_MS = 250L
         private const val NET_CHECK_MS = 3000L
-        private const val UNTITLED = "手机投屏"
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -141,15 +140,17 @@ class DlnaService : Service(), RendererHost {
         try {
             val nm = getSystemService(NotificationManager::class.java)
             if (Build.VERSION.SDK_INT >= 26) {
-                nm.createNotificationChannel(NotificationChannel(CHANNEL, "投屏接收", NotificationManager.IMPORTANCE_LOW))
+                nm.createNotificationChannel(
+                    NotificationChannel(CHANNEL, getString(R.string.airplay_notif_channel), NotificationManager.IMPORTANCE_LOW),
+                )
             }
             val open = PendingIntent.getActivity(this, 0,
                 Intent(this, WallActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
             val n = NotificationCompat.Builder(this, CHANNEL)
                 .setSmallIcon(R.drawable.ic_cast_receiver)
-                .setContentTitle("正在等待投屏")
-                .setContentText("手机和头显连同一个 Wi-Fi，在视频 App 里点「投屏」")
+                .setContentTitle(getString(R.string.cast_waiting))
+                .setContentText(getString(R.string.dlna_notif_text))
                 .setOngoing(true)
                 .setContentIntent(open)
                 .setCategory(NotificationCompat.CATEGORY_SERVICE)
@@ -184,7 +185,7 @@ class DlnaService : Service(), RendererHost {
         val snap = renderer.snapshot()
         val live = snap.transportState == MediaRenderer.PLAYING || snap.transportState == MediaRenderer.PAUSED ||
             snap.transportState == MediaRenderer.TRANSITIONING
-        val casting = if (live) snap.title ?: UNTITLED else null
+        val casting = if (live) snap.title ?: getString(R.string.dlna_untitled) else null
         CastReceiver.update { if (it.casting == casting) it else it.copy(casting = casting) }
     }
 
@@ -251,7 +252,7 @@ class DlnaService : Service(), RendererHost {
         main.post {
             val intent = Intent(this, LocalPlayerXR::class.java)
                 .setData(Uri.parse(media.uri))
-                .putExtra(LocalPlayerXR.EXTRA_TITLE, media.title ?: UNTITLED)
+                .putExtra(LocalPlayerXR.EXTRA_TITLE, media.title ?: getString(R.string.dlna_untitled))
                 .putExtra(LocalPlayerXR.EXTRA_START_MS, media.startMs)
                 .putExtra(LocalPlayerXR.EXTRA_CAST_ID, media.castId)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)

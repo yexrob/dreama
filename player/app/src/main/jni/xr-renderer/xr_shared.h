@@ -271,6 +271,10 @@
 // HEAD_AIM_ lanes below
 #define SETTING_HEAD_AIM_SENSITIVITY 22
 #define SETTING_HEAD_AIM_DEADZONE 23
+// Stream quick-menu options on tab 4 (persisted for the next connection)
+#define SETTING_STREAM_RES 24
+#define SETTING_STREAM_BITRATE 25
+#define SETTING_STREAM_MOUSE 26
 
 // The lanes the Room tab's rows move along, in the units the preferences
 // hold. Brightness is the room's own in hundredths of the room as baked, from
@@ -504,14 +508,20 @@
 // with a tick at the picture as streamed, over the reset button. Live in
 // every session and every room, since the grade only changes colours.
 
-// About tab: the app and its version, and no rows, only two buttons: the one
-// that opens the Ko-fi sheet with the page's QR code, with a line under it
-// saying it is optional, over the one that puts the panel away for the report
-// sheet. Where the buttons sit on the panel.
-#define COG_KOFI_L 0.25f
-#define COG_KOFI_R 0.75f
-#define COG_KOFI_T 0.45f
-#define COG_KOFI_B 0.57f
+// About / Stream tab: in streaming mode carries three rows of selectable
+// cells (resolution, bitrate, mouse mode) that persist for the next
+// connection; in local playback displays app version and log path only.
+#define COG_STREAM_ROW_RES     0
+#define COG_STREAM_ROW_BITRATE 1
+#define COG_STREAM_ROW_MOUSE   2
+#define COG_STREAM_ROW_COUNT   3
+#define COG_STREAM_RES_CELLS     4
+#define COG_STREAM_BITRATE_CELLS 3
+#define COG_STREAM_MOUSE_CELLS   2
+#define COG_STREAM_ROW_V0   0.42f
+#define COG_STREAM_ROW_STEP 0.13f
+
+// Report button geometry retained for report sheet layout tests
 #define COG_REPORT_L 0.25f
 #define COG_REPORT_R 0.75f
 #define COG_REPORT_T 0.69f
@@ -669,24 +679,5 @@
 #define HINT_ZONE_NONE  0
 #define HINT_ZONE_OK    1
 #define HINT_ZONE_NEVER 2
-
-// The Ko-fi sheet the About tab's button opens, in the exit prompt's style:
-// the title, the page's QR code on the left, its address and a line on the
-// right, and one Close button. Drawn once in Java at the start of a session,
-// with the ring over the button a quad of its own. The code goes on a pixel
-// for a pixel, its quiet zone included, with its top left corner where these
-// say; the button sits where these say, all as fractions of the sheet.
-#define KOFI_TEX_W 1024
-#define KOFI_TEX_H 512
-#define KOFI_QR_PX 296
-#define KOFI_QR_L 0.05f
-#define KOFI_QR_T 0.22f
-#define KOFI_BTN_T 0.76f
-#define KOFI_BTN_B 0.92f
-#define KOFI_CLOSE_L 0.64f
-#define KOFI_CLOSE_R 0.95f
-// Whether a point is on its button
-#define KOFI_ZONE_NONE  0
-#define KOFI_ZONE_CLOSE 1
 
 #endif

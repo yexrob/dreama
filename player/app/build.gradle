@@ -295,7 +295,7 @@ android {
         debug {
             applicationIdSuffix ".debug"
             resValue "string", "app_label", "depth3d (Debug)"
-            resValue "string", "app_label_root", "Moonlight XR (Root Debug)"
+            resValue "string", "app_label_root", "depth3d (Root Debug)"
 
             // The renderer's setprop tuning knobs and frame capture live in
             // debug builds only
@@ -313,7 +313,7 @@ android {
             // This fork ships under its own applicationId, so the unofficial
             // suffix upstream asks forks to keep is no longer needed.
             resValue "string", "app_label", "depth3d"
-            resValue "string", "app_label_root", "Moonlight XR (Root)"
+            resValue "string", "app_label_root", "depth3d (Root)"
 
             if (canSign) {
                 signingConfig signingConfigs.release

@@ -1,5 +1,6 @@
 package com.limelight.local.wall
 
+import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -11,22 +12,21 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import com.limelight.LimeLog
-import com.limelight.PcView
 import com.limelight.local.LocalPlayerXR
 import com.limelight.local.WebDav
-import com.limelight.local.dlna.CastReceiver
 import com.limelight.local.airplay.AirPlayService
+import com.limelight.local.dlna.CastReceiver
 import com.limelight.local.media.LocalVideoSource
 import com.limelight.local.media.PlaybackInfo
-import com.limelight.preferences.StreamSettings
+import com.limelight.local.stream.StreamSessionBridge
+import kotlinx.coroutines.flow.MutableStateFlow
 
 /**
- * depth3d's front door: the play wall on the 2D panel. Picking something
- * starts [LocalPlayerXR]; Moonlight's host list (PcView) and its settings
- * stay reachable from 投屏 and the gear.
+ * depth3d's single 2D entry point: Home, Library, Cast & PC Streaming, and Settings.
  */
 class WallActivity : ComponentActivity(), WallActions {
     private val model: WallModel by viewModels()
+    private val pendingTab = MutableStateFlow<Tab?>(null)
 
     // The storage prompt can be asked for from the wall, and Android stops
     // showing it once refused twice; then the wall's button opens app info
@@ -43,27 +43,40 @@ class WallActivity : ComponentActivity(), WallActions {
     private var loggedHover = false
     private var loggedTouch = false
 
+    override val hostActivity: Activity get() = this
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // adb can still hand over a server, as with the old Google Drive page:
         //   am start -n …/com.limelight.local.wall.WallActivity --es base http://… --es pass …
         intent.getStringExtra("base")?.let {
-            WebDav.save(this, WebDav.Server(it, intent.getStringExtra("user") ?: "depth3d",
-                intent.getStringExtra("pass") ?: ""))
+            WebDav.save(
+                this,
+                WebDav.Server(it, intent.getStringExtra("user") ?: "depth3d", intent.getStringExtra("pass") ?: ""),
+            )
         }
+        applyInitialTab(intent)
         if (savedInstanceState == null && !LocalVideoSource.hasPermission(this)) {
             storage.launch(LocalVideoSource.permission)
         }
-        setContent { WallApp(model, this) }
+        setContent { WallApp(model, this, pendingTab) }
         // The AirPlay receiver runs while the wall is open
         AirPlayService.start(this)
         // The mockups assume a 1280 wide panel at about 24 px per degree;
         // what the headset really gives is worth knowing (ux-spec §8 #1)
         window.decorView.post {
             val v = window.decorView
-            LimeLog.info("depth3d: wall window ${v.width}x${v.height} px, density ${resources.displayMetrics.density}, " +
-                "${v.width / DESIGN_WIDTH} px per design unit")
+            LimeLog.info(
+                "depth3d: wall window ${v.width}x${v.height} px, density ${resources.displayMetrics.density}, " +
+                    "${v.width / DESIGN_WIDTH} px per design unit",
+            )
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        applyInitialTab(intent)
     }
 
     // The DLNA cast receiver runs while the wall is in front (and the player
@@ -71,10 +84,12 @@ class WallActivity : ComponentActivity(), WallActions {
     override fun onStart() {
         super.onStart()
         CastReceiver.hold(this)
+        model.streaming.onStart()
     }
 
     override fun onStop() {
         super.onStop()
+        model.streaming.onStop()
         CastReceiver.release(this)
     }
 
@@ -87,9 +102,19 @@ class WallActivity : ComponentActivity(), WallActions {
 
     override fun onRestart() {
         super.onRestart()
-        // Back from the player, PcView or system settings: files may have
+        // Back from the player, streaming session or system settings: files may have
         // been added and a server may have come up
         model.refreshAll()
+    }
+
+    private fun applyInitialTab(intent: Intent?) {
+        if (intent?.getStringExtra(StreamSessionBridge.EXTRA_INITIAL_TAB) == StreamSessionBridge.TAB_CAST) {
+            pendingTab.value = Tab.Cast
+        }
+    }
+
+    override fun consumePendingTab() {
+        pendingTab.value = null
     }
 
     // Whether the controller ray reaches Compose as hover at all is the one
@@ -121,14 +146,6 @@ class WallActivity : ComponentActivity(), WallActions {
         // The player takes one header, which is all WebDAV needs
         info.headers["Authorization"]?.let { play.putExtra(LocalPlayerXR.EXTRA_AUTH, it) }
         startActivity(play)
-    }
-
-    override fun openStreaming() {
-        startActivity(Intent(this, PcView::class.java))
-    }
-
-    override fun openSettings() {
-        startActivity(Intent(this, StreamSettings::class.java))
     }
 
     override fun requestStorage() {

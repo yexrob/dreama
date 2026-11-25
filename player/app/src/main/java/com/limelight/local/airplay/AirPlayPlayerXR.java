@@ -125,11 +125,14 @@ public class AirPlayPlayerXR extends Activity
             return;
         }
         if (v == null) {
-            r.showNotice("画面解码没有准备好", null);
+            r.showNotice(getString(com.limelight.R.string.airplay_err_decoder), null);
             return;
         }
         String who = AirPlayState.current().getClient();
-        r.showNotice(AirPlayState.phrase("正在显示", who, "的屏幕"), null);
+        r.showNotice(AirPlayState.phrase(
+                getString(com.limelight.R.string.airplay_notif_showing_prefix),
+                who,
+                getString(com.limelight.R.string.airplay_notif_showing_suffix)), null);
     }
 
     private static float[] waitForSize() {
@@ -186,7 +189,7 @@ public class AirPlayPlayerXR extends Activity
     public void onVrUnavailable(XrStartFailure failure) {
         LimeLog.warning("AirPlay: VR unavailable: " + failure);
         main.post(() -> {
-            Toast.makeText(this, "无法进入 VR：" + failure, Toast.LENGTH_LONG).show();
+            Toast.makeText(this, getString(com.limelight.R.string.player_vr_unavailable), Toast.LENGTH_LONG).show();
             finish();
         });
     }

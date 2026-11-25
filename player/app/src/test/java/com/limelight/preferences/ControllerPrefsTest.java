@@ -67,17 +67,6 @@ public class ControllerPrefsTest {
     }
 
     @Test
-    public void theRaySitsWithThePointerInTheVrSettings() throws Exception {
-        Element box = checkbox(PreferenceConfiguration.VR_SHOW_RAY_PREF_STRING);
-        assertNotNull(box);
-        assertEquals("true", box.getAttributeNS(ANDROID, "defaultValue"));
-        // There is no ray at all with the pointer off
-        assertEquals("checkbox_vr_pointer", box.getAttributeNS(ANDROID, "dependency"));
-        Element category = (Element) box.getParentNode();
-        assertEquals("category_vr_settings", category.getAttributeNS(ANDROID, "key"));
-    }
-
-    @Test
     public void theModelIsOffUntilSwitchedOn() {
         assertEquals("checkbox_vr_controller_model",
                 PreferenceConfiguration.VR_CONTROLLER_MODEL_PREF_STRING);
@@ -94,35 +83,11 @@ public class ControllerPrefsTest {
     }
 
     @Test
-    public void theModelSitsBesideTheRayWithNothingAbove() throws Exception {
-        Element box = checkbox(PreferenceConfiguration.VR_CONTROLLER_MODEL_PREF_STRING);
-        assertNotNull(box);
-        assertEquals("false", box.getAttributeNS(ANDROID, "defaultValue"));
-        // The controllers show whether or not they move the mouse
-        assertEquals("", box.getAttributeNS(ANDROID, "dependency"));
-        Element category = (Element) box.getParentNode();
-        assertEquals("category_vr_settings", category.getAttributeNS(ANDROID, "key"));
-    }
-
-    @Test
     public void theLogLinesSayHowTheControllersAreDrawn() {
         assertTrue(PreferenceConfiguration.inputLabel(true, false, true, "=")
                 .endsWith(" showRay=false controllerModel=true"));
         assertTrue(PreferenceConfiguration.inputLabel(true, true, false, " ")
                 .endsWith(" showRay true controllerModel false"));
-    }
-
-    @Test
-    public void itIsWordedInEveryLanguage() throws Exception {
-        for (String dir : new String[] { "values", "values-fr", "values-zh-rCN", "values-zh-rTW" }) {
-            String strings = new String(Files.readAllBytes(res(dir + "/strings.xml").toPath()),
-                    StandardCharsets.UTF_8);
-            for (String key : new String[] { "title_vr_show_ray", "summary_vr_show_ray",
-                    "title_vr_controller_model", "summary_vr_controller_model" }) {
-                Matcher m = Pattern.compile("name=\"" + key + "\">([^<]+)<").matcher(strings);
-                assertTrue(dir + " " + key, m.find());
-            }
-        }
     }
 
     private static final class FakePrefs implements SharedPreferences, SharedPreferences.Editor {

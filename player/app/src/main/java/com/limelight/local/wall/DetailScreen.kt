@@ -23,8 +23,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.limelight.R
 import com.limelight.local.media.Artworks
 
 /**
@@ -49,7 +51,8 @@ fun DetailScreen(model: WallModel, nav: WallNav, page: Page.Detail) {
         Box(Modifier.offset(64.dp, 32.dp)) { RoundButton(WallIcons.ChevL, { nav.back() }, filled = true) }
         Column(Modifier.offset(64.dp, 140.dp).width(640.dp)) {
             Text(item.title, style = WallType.Display, maxLines = 3, overflow = TextOverflow.Ellipsis)
-            val meta = listOfNotNull(src?.source?.name, item.year?.toString(), item.durationMs?.let(::duration),
+            val durText = item.durationMs?.let { formatDuration(it) }
+            val meta = listOfNotNull(src?.source?.name, item.year?.toString(), durText,
                 item.subtitle?.takeIf { it.isNotEmpty() })
             Text(meta.joinToString(" · "), style = WallType.Caption, color = Wall.Text2, maxLines = 1,
                 overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 14.dp))
@@ -58,15 +61,15 @@ fun DetailScreen(model: WallModel, nav: WallNav, page: Page.Detail) {
                     modifier = Modifier.padding(top = 14.dp))
             }
             if (src == null) {
-                Box(Modifier.padding(top = 32.dp)) { Notice("这个播放源已经不在了") }
+                Box(Modifier.padding(top = 32.dp)) { Notice(stringResource(R.string.library_source_missing)) }
             } else {
                 Row(Modifier.padding(top = 32.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                     if (resume != null) {
-                        WallButton("继续播放", { nav.play(src, item, resume.positionMs) },
+                        WallButton(stringResource(R.string.home_action_resume), { nav.play(src, item, resume.positionMs) },
                             icon = WallIcons.Play, kind = ButtonKind.Primary)
-                        WallButton("从头播放", { nav.play(src, item, 0) }, icon = WallIcons.Restart)
+                        WallButton(stringResource(R.string.detail_restart), { nav.play(src, item, 0) }, icon = WallIcons.Restart)
                     } else {
-                        WallButton("播放", { nav.play(src, item, 0) }, icon = WallIcons.Play, kind = ButtonKind.Primary)
+                        WallButton(stringResource(R.string.home_action_play), { nav.play(src, item, 0) }, icon = WallIcons.Play, kind = ButtonKind.Primary)
                     }
                 }
             }
@@ -78,7 +81,11 @@ fun DetailScreen(model: WallModel, nav: WallNav, page: Page.Detail) {
                         Box(Modifier.fillMaxHeight().fillMaxWidth(resume.positionMs.toFloat() / resume.durationMs)
                             .clip(RoundedCornerShape(3.dp)).background(Wall.Accent))
                     }
-                    Text("剩余 ${minutesLeft(resume.remainingMs)} 分钟", style = WallType.Caption, color = Wall.Text2)
+                    Text(
+                        stringResource(R.string.home_hero_remaining_min, minutesLeft(resume.remainingMs)),
+                        style = WallType.Caption,
+                        color = Wall.Text2,
+                    )
                 }
             }
         }

@@ -90,6 +90,24 @@ object CastReceiver {
     fun name(context: Context): String =
         prefs(context).getString(KEY_NAME, null)?.trim()?.ifEmpty { null } ?: DEFAULT_NAME
 
+    /** Updates the shared cast device name and restarts active receivers so it takes effect immediately. */
+    @JvmStatic
+    fun setName(context: Context, newName: String) {
+        val clean = newName.trim().take(48).ifEmpty { DEFAULT_NAME }
+        val c = context.applicationContext
+        prefs(c).edit().putString(KEY_NAME, clean).apply()
+        update { it.copy(name = clean) }
+        if (holds > 0) {
+            c.stopService(Intent(c, DlnaService::class.java))
+            try {
+                ContextCompat.startForegroundService(c, Intent(c, DlnaService::class.java))
+            } catch (e: Exception) {
+                Log.w(TAG, "receiver restart after rename", e)
+            }
+        }
+        com.limelight.local.airplay.AirPlayService.reloadName(c)
+    }
+
     /** The device's UPnP identity, made once and kept so phones remember the headset. */
     internal fun udn(context: Context): String {
         val p = prefs(context)

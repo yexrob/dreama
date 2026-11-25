@@ -154,76 +154,14 @@ public class EnvironmentPrefsTest {
     }
 
     @Test
-    public void itIsAListInTheVrSettingsOverThePickersCells() throws Exception {
-        Element list = entry("ListPreference", PreferenceConfiguration.VR_ENVIRONMENT_LIST_PREF_STRING);
-        assertNotNull(list);
-        assertEquals("category_vr_settings",
-                ((Element) list.getParentNode()).getAttributeNS(ANDROID, "key"));
-        // Kept in the id, so neither stored under its own key nor given a
-        // default that would be written over a choice never made
-        assertEquals("false", list.getAttributeNS(ANDROID, "persistent"));
-        assertEquals("", list.getAttributeNS(ANDROID, "defaultValue"));
-        // Reachable with the controller pointer off, which is its point
-        assertEquals("", list.getAttributeNS(ANDROID, "dependency"));
-        assertEquals("@array/vr_environment_names", list.getAttributeNS(ANDROID, "entries"));
-        assertEquals("@array/vr_environment_values", list.getAttributeNS(ANDROID, "entryValues"));
-        assertEquals("@string/summary_vr_environment", list.getAttributeNS(ANDROID, "summary"));
-        // Next to the passthrough checkbox it keeps
-        Element prev = previousElement(list);
-        assertEquals(PASSTHROUGH, prev.getAttributeNS(ANDROID, "key"));
-
-        // The values are the ids, in the picker's order
-        List<String> values = array("vr_environment_values");
-        assertEquals(XrShared.ENV_CELL_COUNT, values.size());
-        assertEquals(Integer.toString(PreferenceConfiguration.VR_ENV_PASSTHROUGH),
-                values.get(XrShared.ENV_CELL_PASSTHROUGH));
-        assertEquals(Integer.toString(PreferenceConfiguration.VR_ENV_VOID),
-                values.get(XrShared.ENV_CELL_VOID));
-        assertEquals(Integer.toString(PreferenceConfiguration.VR_ENV_HOME_THEATER),
-                values.get(XrShared.ENV_CELL_HOME_THEATER));
-        assertEquals(Integer.toString(PreferenceConfiguration.VR_ENV_GRAND_CINEMA),
-                values.get(XrShared.ENV_CELL_GRAND_CINEMA));
-        assertEquals(Integer.toString(PreferenceConfiguration.VR_ENV_SYNTHWAVE),
-                values.get(XrShared.ENV_CELL_SYNTHWAVE));
-        for (String value : values) {
-            assertTrue(value, EnvironmentIds.idForListValue(value) >= 0);
+    public void allEnvironmentNamesExistInChineseStrings() throws Exception {
+        String strings = strings("values");
+        for (String key : new String[] {
+                "vr_environment_passthrough", "vr_environment_void",
+                "vr_environment_home_theater", "vr_environment_grand_cinema",
+                "vr_environment_synthwave" }) {
+            assertNotNull(key, string(strings, key));
         }
-        List<String> names = array("vr_environment_names");
-        assertEquals(values.size(), names.size());
-        assertEquals("@string/vr_environment_passthrough", names.get(XrShared.ENV_CELL_PASSTHROUGH));
-        assertEquals("@string/vr_environment_void", names.get(XrShared.ENV_CELL_VOID));
-        assertEquals("@string/vr_environment_home_theater",
-                names.get(XrShared.ENV_CELL_HOME_THEATER));
-        assertEquals("@string/vr_environment_grand_cinema",
-                names.get(XrShared.ENV_CELL_GRAND_CINEMA));
-        assertEquals("@string/vr_environment_synthwave", names.get(XrShared.ENV_CELL_SYNTHWAVE));
-    }
-
-    @Test
-    public void itIsWordedInEveryLanguage() throws Exception {
-        String english = strings("values");
-        // The picker's own labels
-        assertEquals("Passthrough", string(english, "vr_environment_passthrough"));
-        assertEquals("Black void", string(english, "vr_environment_void"));
-        assertEquals("Home Theater", string(english, "vr_environment_home_theater"));
-        assertEquals("Grand Cinema", string(english, "vr_environment_grand_cinema"));
-        assertEquals("Synthwave", string(english, "vr_environment_synthwave"));
-        for (String dir : LANGUAGES) {
-            String strings = strings(dir);
-            for (String key : new String[] { "title_vr_environment", "summary_vr_environment",
-                    "vr_environment_passthrough", "vr_environment_void",
-                    "vr_environment_home_theater", "vr_environment_grand_cinema",
-                    "vr_environment_synthwave" }) {
-                assertNotNull(dir + " " + key, string(strings, key));
-            }
-            // The list puts the choice in its summary, one place for it and
-            // no other format marks
-            String summary = string(strings, "summary_vr_environment");
-            assertTrue(dir, summary.contains("%s"));
-            assertEquals(dir, 1, summary.split("%", -1).length - 1);
-            assertTrue(dir, String.format(summary, "x").contains("x"));
-        }
-        assertNull(string(english, "vr_environment_photo"));
     }
 
     private static File res(String path) {

@@ -52,12 +52,14 @@ import com.limelight.nvstream.ConnectionContext;
 import com.limelight.nvstream.http.PairingManager.PairState;
 import com.limelight.nvstream.jni.MoonBridge;
 
+import okhttp3.Call;
 import okhttp3.ConnectionPool;
 import okhttp3.HttpUrl;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
 import okhttp3.ResponseBody;
+import java.util.concurrent.atomic.AtomicReference;
 
 
 public class NvHTTP {
@@ -80,6 +82,33 @@ public class NvHTTP {
     private OkHttpClient httpClientLongConnectTimeout;
     private OkHttpClient httpClientLongConnectNoReadTimeout;
     private OkHttpClient httpClientShortConnectTimeout;
+    private final AtomicReference<Call> activeCall = new AtomicReference<>();
+    private volatile boolean cancelled;
+
+    /** Immediately interrupts any blocking HTTP/pairing request on this NvHTTP instance. */
+    public void cancel() {
+        cancelled = true;
+        Call c = activeCall.getAndSet(null);
+        if (c != null) {
+            c.cancel();
+        }
+        if (httpClientLongConnectTimeout != null) {
+            httpClientLongConnectTimeout.dispatcher().cancelAll();
+            httpClientLongConnectTimeout.connectionPool().evictAll();
+        }
+        if (httpClientLongConnectNoReadTimeout != null) {
+            httpClientLongConnectNoReadTimeout.dispatcher().cancelAll();
+            httpClientLongConnectNoReadTimeout.connectionPool().evictAll();
+        }
+        if (httpClientShortConnectTimeout != null) {
+            httpClientShortConnectTimeout.dispatcher().cancelAll();
+            httpClientShortConnectTimeout.connectionPool().evictAll();
+        }
+    }
+
+    public boolean isCancelled() {
+        return cancelled;
+    }
 
     private X509TrustManager defaultTrustManager;
     private X509TrustManager trustManager;
@@ -293,12 +322,95 @@ public class NvHTTP {
                 // Special case handling an audio capture error which GFE doesn't
                 // provide any useful status message for.
                 statusCode = 418;
-                statusMsg = "Missing audio capture device. Reinstall GeForce Experience.";
+                statusMsg = "Missing audio capture device on host computer.";
             }
             throw new HostHttpResponseException(statusCode, statusMsg);
         }
     }
     
+    /**
+     * Strictly verifies over HTTPS ONLY (no HTTP fallback, no system CA fallback) that the
+     * GameStream server at this address presents the exact pinned {@link #serverCert}, reports
+     * PairStatus == PAIRED, and matches {@code expectedUuid} when provided (#2).
+     */
+    public boolean verifyPinnedPairedServer(String expectedUuid) {
+        if (serverCert == null || cancelled) {
+            return false;
+        }
+        final X509Certificate pinned = serverCert;
+        X509TrustManager exactTrust = new X509TrustManager() {
+            @Override
+            public void checkClientTrusted(X509Certificate[] chain, String authType) {
+                throw new IllegalStateException("Should never be called");
+            }
+
+            @Override
+            public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+                if (chain == null || chain.length == 0 || !pinned.equals(chain[0])) {
+                    throw new CertificateException("Server certificate does not match pinned paired cert");
+                }
+            }
+
+            @Override
+            public X509Certificate[] getAcceptedIssuers() {
+                return new X509Certificate[0];
+            }
+        };
+        HostnameVerifier exactHv = new HostnameVerifier() {
+            @Override
+            public boolean verify(String hostname, SSLSession session) {
+                try {
+                    Certificate[] certs = session.getPeerCertificates();
+                    return certs.length >= 1 && pinned.equals(certs[0]);
+                } catch (SSLPeerUnverifiedException e) {
+                    return false;
+                }
+            }
+        };
+
+        try {
+            HttpUrl httpsUrl = getHttpsUrl(true);
+            SSLContext sc = SSLContext.getInstance("TLS");
+            sc.init(new KeyManager[] { keyManager }, new TrustManager[] { exactTrust }, new SecureRandom());
+            OkHttpClient strictClient = httpClientLongConnectTimeout.newBuilder()
+                    .sslSocketFactory(sc.getSocketFactory(), exactTrust)
+                    .hostnameVerifier(exactHv)
+                    .build();
+
+            HttpUrl completeUrl = getCompleteUrl(httpsUrl, "serverinfo", null);
+            Request request = new Request.Builder().url(completeUrl).get().build();
+            Call call = strictClient.newCall(request);
+            activeCall.set(call);
+            if (cancelled) {
+                call.cancel();
+                activeCall.compareAndSet(call, null);
+                return false;
+            }
+            String resp;
+            try (Response response = call.execute()) {
+                if (!response.isSuccessful() || response.body() == null) {
+                    return false;
+                }
+                resp = response.body().string();
+            } finally {
+                activeCall.compareAndSet(call, null);
+            }
+
+            if (getPairState(resp) != PairingManager.PairState.PAIRED) {
+                return false;
+            }
+            if (expectedUuid != null && !expectedUuid.isEmpty()) {
+                String actualUuid = getXmlString(resp, "uniqueid", false);
+                if (actualUuid == null || !expectedUuid.equalsIgnoreCase(actualUuid)) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     public String getServerInfo(boolean likelyOnline) throws IOException, XmlPullParserException {
         String resp;
 
@@ -428,9 +540,24 @@ public class NvHTTP {
     // The initial pair query does require outside action (user entering a PIN) but subsequent pairing
     // queries do not.
     private ResponseBody openHttpConnection(OkHttpClient client, HttpUrl baseUrl, String path, String query) throws IOException {
+        if (cancelled) {
+            throw new IOException("Cancelled");
+        }
         HttpUrl completeUrl = getCompleteUrl(baseUrl, path, query);
         Request request = new Request.Builder().url(completeUrl).get().build();
-        Response response = performAndroidTlsHack(client).newCall(request).execute();
+        Call call = performAndroidTlsHack(client).newCall(request);
+        activeCall.set(call);
+        if (cancelled) {
+            call.cancel();
+            activeCall.compareAndSet(call, null);
+            throw new IOException("Cancelled");
+        }
+        Response response;
+        try {
+            response = call.execute();
+        } finally {
+            activeCall.compareAndSet(call, null);
+        }
 
         ResponseBody body = response.body();
         

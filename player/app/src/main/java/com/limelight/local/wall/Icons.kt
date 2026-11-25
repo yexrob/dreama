@@ -21,6 +21,7 @@ object WallIcons {
     val ChevL = stroked("chev-l", "M14.5 5.5 8 12l6.5 6.5")
     val ChevR = stroked("chev-r", "M9.5 5.5 16 12l-6.5 6.5")
     val Plus = stroked("plus", "M12 5v14M5 12h14")
+    val Minus = stroked("minus", "M5 12h14")
     val Close = stroked("close", "M6.5 6.5l11 11M17.5 6.5l-11 11")
     val Restart = stroked("restart", "M5 12a7 7 0 1 0 2.1-5", "M5 4.8V9h4.2")
     val Cast = stroked("cast", "M9 4.5h10a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-5", rect(3f, 10f, 7f, 10.5f, 1.8f))
@@ -36,6 +37,26 @@ object WallIcons {
     val Refresh = stroked("refresh", "M19 12a7 7 0 1 1-2.1-5", "M19 4.8V9h-4.2")
     val Alert = stroked("alert", circle(12f, 12f, 8.6f), "M12 7.6v5.2M12 16.3h.01")
     val Spinner = stroked("spinner", "M12 3.5a8.5 8.5 0 1 1-8.5 8.5")
+    val Wifi = stroked("wifi",
+        "M3.5 9.6a12 12 0 0 1 17 0M6.6 12.9a7.6 7.6 0 0 1 10.8 0M9.6 16.1a3.3 3.3 0 0 1 4.8 0",
+        "M12 19.4h.01")
+    val More = stroked("more", "M6 12h.01M12 12h.01M18 12h.01")
+    val Power = stroked("power", "M12 4v7", "M7.5 6.8a7.5 7.5 0 1 0 9 0")
+    val Trash = stroked("trash", "M4.5 7h15M9.5 4.5h5M7 7l1 12.5a1.5 1.5 0 0 0 1.5 1.5h5a1.5 1.5 0 0 0 1.5-1.5L17 7")
+    val Grid = stroked("grid",
+        rect(4f, 4f, 6.5f, 6.5f, 1.5f),
+        rect(13.5f, 4f, 6.5f, 6.5f, 1.5f),
+        rect(4f, 13.5f, 6.5f, 6.5f, 1.5f),
+        rect(13.5f, 13.5f, 6.5f, 6.5f, 1.5f))
+    val Shield = stroked("shield", "M12 3.5l7 2.8v5.2c0 4.6-3 7.8-7 9-4-1.2-7-4.4-7-9V6.3l7-2.8z")
+    val Eye = stroked("eye", "M3 12s3.5-6 9-6 9 6 9 6-3.5 6-9 6-9-6-9-6z", circle(12f, 12f, 2.5f))
+    val Gamepad = stroked("gamepad",
+        rect(3f, 7f, 18f, 10f, 4.5f),
+        "M8 10v4M6 12h4M15.5 11h.01M17.5 13h.01")
+    val Info = stroked("info", circle(12f, 12f, 8.6f), "M12 11v5M12 8h.01")
+    val Keyboard = stroked("keyboard",
+        rect(3f, 6f, 18f, 12f, 2.2f),
+        "M7 10h.01M10.3 10h.01M13.7 10h.01M17 10h.01M8.5 14h7")
 
     private fun stroked(name: String, vararg paths: String) = build(name, paths, filled = false)
 

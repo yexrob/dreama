@@ -17,7 +17,7 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class WebDavSource(private val server: WebDav.Server) : MediaSource {
 
-    override val source = Source(ID, "Google Drive", SourceKind.WEBDAV,
+    override val source = Source(ID, server.name ?: "Google Drive", SourceKind.WEBDAV,
         "WebDAV · " + server.base.substringAfter("://"))
 
     // What each id looked like when last listed, so detail() needs no request

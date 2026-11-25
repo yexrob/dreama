@@ -47,11 +47,11 @@ public class FileLog {
     public static final int BASIC = XrShared.FILE_LOG_BASIC;
     public static final int VERBOSE = XrShared.FILE_LOG_VERBOSE;
 
-    private static final String TAG = "moonlight";
-    private static final String PUBLIC_DIR = "MoonlightXR";
+    private static final String TAG = "depth3d";
+    private static final String PUBLIC_DIR = "depth3d";
     private static final String LOG_DIR = "logs";
-    private static final String LOG_NAME = "moonlight.log";
-    private static final String PREVIOUS_LOG_NAME = "moonlight.previous.log";
+    private static final String LOG_NAME = "depth3d.log";
+    private static final String PREVIOUS_LOG_NAME = "depth3d.previous.log";
 
     // Rotated once at this size and never further, so nothing accumulates on
     // a user's device. Big enough to hold a long session, small enough to
@@ -236,7 +236,7 @@ public class FileLog {
     // the top of a fresh log and again after a wipe
     private static String[] buildHeader(Context context) {
         return new String[] {
-                "moonlight " + BuildConfig.VERSION_NAME + " " + context.getPackageName()
+                "depth3d " + BuildConfig.VERSION_NAME + " " + context.getPackageName()
                         + (BuildConfig.ROOT_BUILD ? " root" : ""),
                 "device " + Build.MANUFACTURER + " " + Build.MODEL + " (" + Build.DEVICE + ")",
                 "android " + Build.VERSION.RELEASE + " sdk " + Build.VERSION.SDK_INT,

@@ -196,9 +196,6 @@ static inline int64_t nowNs(void) {
 #define HINT_WIDTH_FRAC 0.40f
 #define HINT_POINTING_NS 500000000L
 
-// The Ko-fi sheet, over the middle of the picture like the hint and as wide
-#define KOFI_WIDTH_FRAC 0.40f
-
 // The panels that fade in and out, each with a fade of its own
 #define FADE_COG 0
 #define FADE_PICKER 1
@@ -206,9 +203,8 @@ static inline int64_t nowNs(void) {
 #define FADE_EXIT 3
 #define FADE_REPORT 4
 #define FADE_HINT 5
-#define FADE_KOFI 6
-#define FADE_PANELS 7
-// And the layers a colour scale is chained onto: those seven, then the splash
+#define FADE_PANELS 6
+// And the layers a colour scale is chained onto: those six, then the splash
 // and the toast
 #define FADE_SLOT_SPLASH FADE_PANELS
 #define FADE_SLOT_TOAST (FADE_PANELS + 1)
@@ -1593,18 +1589,10 @@ typedef struct {
     int cogReportHot;
     XrPosef reportPose;
     float reportW, reportH;
-    // The About tab's Ko-fi button being under the ray
-    int cogKofiHot;
-    // The sheet that button opens: its art, whether it is up, whether its
-    // Close button is under the ray, and the pose frozen when it opened
-    int kofiOpen;
-    XrSwapchain kofiSwapchain;
-    uint32_t kofiImageCount;
-    XrSwapchainImageOpenGLESKHR* kofiImages;
-    int kofiReady;
-    int kofiHoverZone;
-    XrPosef kofiPose;
-    float kofiW, kofiH;
+    // Stream quick-menu cell selections on tab 4 (res 0..3 or -1, bitrate 0..2 or -1, mouse 0..1)
+    int streamResCell;
+    int streamBitrateCell;
+    int streamMouseCell;
 
     // Curvature the panel asked for, or -1 while the preference still owns it,
     // alongside the preference itself so both are readable away from the JNI
@@ -1765,7 +1753,6 @@ XrPosef exitPromptPose(XrCtx* ctx, float* outWidth, float* outHeight);
 int exitPromptZone(float u, float v);
 XrPosef reportSheetPose(XrCtx* ctx, float* outWidth, float* outHeight);
 XrPosef handHintPose(XrCtx* ctx, float* outWidth, float* outHeight);
-XrPosef kofiSheetPose(XrCtx* ctx, float* outWidth, float* outHeight);
 int cogTabRowCount(int face);
 int cogRowIsTrack(int face, int row);
 int cogRowLive(XrCtx* ctx, int face, int row);

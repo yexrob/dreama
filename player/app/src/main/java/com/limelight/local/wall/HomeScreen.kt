@@ -32,28 +32,35 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.limelight.R
 import com.limelight.local.media.Artworks
 import com.limelight.local.media.Item
 import com.limelight.local.media.LocalVideoSource
 import com.limelight.local.media.MediaSource
 import com.limelight.local.media.Shelf
 import com.limelight.local.media.SourceNeedsSetupException
+import com.limelight.local.stream.ComputerListMerger
+import com.limelight.local.stream.StreamingComputer
 
 /** The hero: the last thing watched, or failing that the newest video. */
 private data class Hero(val source: MediaSource, val item: Item, val resume: Resume?)
 
 /**
  * 首页 (design-opus home.html). The hero and 继续观看 share the first screen;
- * below them each source gets a row per shelf. A source that fails only
- * changes its own row.
+ * below them each source gets a row per shelf, followed by paired & online PCs
+ * when available so desktop streaming is one click away.
  */
 @Composable
 fun HomeScreen(model: WallModel, nav: WallNav) {
     val sources by model.sources.collectAsState()
     val watching by model.continueWatching.collectAsState()
+    val allComputers by model.streaming.computers.collectAsState()
+    val homeComputers = remember(allComputers) { ComputerListMerger.homeScreenComputers(allComputers) }
+
     val resumes = (watching as? Load.Ready)?.value
     val shelves = sources.map { it to model.shelves[it.source.id] }
     val list = nav.keep(Page.Tabs(Tab.Home), "list") { LazyListState() }
@@ -61,7 +68,6 @@ fun HomeScreen(model: WallModel, nav: WallNav) {
 
     val hasContent = shelves.any { (_, s) -> s is Load.Ready && s.value.any { it.items.isNotEmpty() } }
     val settled = shelves.none { (_, s) -> s == null || s is Load.Loading } && resumes != null
-    // A source that is down still gets its row saying so, rather than the wall claiming there is nothing
     val down = shelves.any { (_, s) -> s is Load.Failed && s.error !is SourceNeedsSetupException }
     val hero = resumes?.firstOrNull()?.let { Hero(it.source, it.item, it) } ?: shelves.firstNotNullOfOrNull { (src, s) ->
         (s as? Load.Ready)?.value?.firstNotNullOfOrNull { sh -> sh.items.firstOrNull { !it.isFolder } }?.let { Hero(src, it, null) }
@@ -69,13 +75,15 @@ fun HomeScreen(model: WallModel, nav: WallNav) {
 
     Box(Modifier.fillMaxSize()) {
         when {
-            settled && !hasContent && !down && resumes.isNullOrEmpty() -> EmptyState(model, nav)
-            !settled && !hasContent && resumes.isNullOrEmpty() -> HomeSkeleton()
+            settled && !hasContent && !down && resumes.isNullOrEmpty() && homeComputers.isEmpty() ->
+                EmptyState(model, nav)
+            !settled && !hasContent && resumes.isNullOrEmpty() && homeComputers.isEmpty() ->
+                HomeSkeleton()
             else -> LazyColumn(Modifier.fillMaxSize(), state = list, contentPadding = PaddingValues(bottom = 64.dp)) {
                 if (hero != null) {
                     item("hero") { HeroBlock(hero, resumes.orEmpty(), nav) }
                 } else {
-                    item("top") { Spacer(Modifier.height(72.dp)) }
+                    item("top") { Spacer(Modifier.height(96.dp)) }
                 }
                 for ((src, state) in shelves) {
                     when (state) {
@@ -86,16 +94,45 @@ fun HomeScreen(model: WallModel, nav: WallNav) {
                         else -> item("${src.source.id}/loading") { SkeletonRow() }
                     }
                 }
+                if (homeComputers.isNotEmpty()) {
+                    item("home-computers") { HomeComputersRow(homeComputers, nav) }
+                }
             }
         }
-        NavBar(Tab.Home, nav::tab, nav.settings, solid = scrolled || hero == null)
+        NavBar(Tab.Home, nav::tab, nav::openSettings, solid = scrolled || hero == null)
+    }
+}
+
+@Composable
+private fun HomeComputersRow(computers: List<StreamingComputer>, nav: WallNav) {
+    Column(Modifier.padding(top = 44.dp)) {
+        SectionTitle(stringResource(R.string.stream_home_section_title), Modifier.padding(start = Wall.Margin)) {
+            nav.tab(Tab.Cast)
+        }
+        Spacer(Modifier.height(14.dp))
+        val row = rememberLazyListState()
+        LazyRow(
+            state = row,
+            flingBehavior = rememberSnapFlingBehavior(row),
+            contentPadding = PaddingValues(horizontal = Wall.Margin),
+            horizontalArrangement = Arrangement.spacedBy(24.dp),
+        ) {
+            items(computers, key = { it.id }) { pc ->
+                PcCard(
+                    computer = pc,
+                    onPrimaryClick = {
+                        nav.tab(Tab.Cast)
+                        nav.connectComputer(pc)
+                    },
+                )
+            }
+        }
     }
 }
 
 @Composable
 private fun HeroBlock(hero: Hero, resumes: List<Resume>, nav: WallNav) {
     val r = hero.resume
-    // The continue row sits on the hero's lower edge, as on the mockup; without it the hero stands alone
     Box(Modifier.fillMaxWidth().height(if (resumes.isEmpty()) 560.dp else 700.dp)) {
         ArtBox(hero.item.backdrop ?: hero.item.poster, hero.item.title, Artworks.Size.BACKDROP,
             Modifier.fillMaxWidth().height(560.dp)) {
@@ -107,36 +144,48 @@ private fun HeroBlock(hero: Hero, resumes: List<Resume>, nav: WallNav) {
                 .background(Brush.verticalGradient(listOf(Wall.Bg.copy(alpha = 0.62f), Color.Transparent))))
         }
         Column(Modifier.offset(64.dp, 128.dp).width(640.dp)) {
-            Text(if (r != null) "上次看到 · 来自 ${hero.source.source.name}" else "最近添加 · 来自 ${hero.source.source.name}",
-                style = WallType.Caption, color = Wall.Text2)
+            Text(
+                if (r != null) stringResource(R.string.home_hero_resume_from, hero.source.source.name)
+                else stringResource(R.string.home_hero_recent_from, hero.source.source.name),
+                style = WallType.Caption,
+                color = Wall.Text2,
+            )
             Text(hero.item.title, style = WallType.Display, maxLines = 2, overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(top = 6.dp))
-            val meta = listOfNotNull(hero.item.subtitle?.takeIf { it.isNotEmpty() },
-                r?.let { "剩余 ${minutesLeft(it.progress.remainingMs)} 分钟" }
-                    ?: hero.item.durationMs?.let(::duration))
+            val meta = listOfNotNull(
+                hero.item.subtitle?.takeIf { it.isNotEmpty() },
+                r?.let { stringResource(R.string.home_hero_remaining_min, minutesLeft(it.progress.remainingMs)) }
+                    ?: hero.item.durationMs?.let { formatDuration(it) },
+            )
             if (meta.isNotEmpty()) {
                 Text(meta.joinToString(" · "), style = WallType.Caption, color = Wall.Text2, maxLines = 1,
                     overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 12.dp))
             }
             Row(Modifier.padding(top = 28.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                WallButton(if (r != null) "继续播放" else "播放", {
-                    nav.play(hero.source, hero.item, r?.progress?.positionMs ?: 0)
-                }, icon = WallIcons.Play, kind = ButtonKind.Primary)
-                WallButton("详情", { nav.detail(hero.source, hero.item) })
+                WallButton(
+                    stringResource(if (r != null) R.string.home_action_resume else R.string.home_action_play),
+                    { nav.play(hero.source, hero.item, r?.progress?.positionMs ?: 0) },
+                    icon = WallIcons.Play,
+                    kind = ButtonKind.Primary,
+                )
+                WallButton(stringResource(R.string.home_action_detail), { nav.detail(hero.source, hero.item) })
             }
         }
         if (resumes.isNotEmpty()) {
-            SectionTitle("继续观看", Modifier.offset(64.dp, 424.dp))
+            SectionTitle(stringResource(R.string.home_section_continue), Modifier.offset(64.dp, 424.dp))
             val row = rememberLazyListState()
             LazyRow(Modifier.offset(y = 482.dp).fillMaxWidth(), state = row,
                 flingBehavior = rememberSnapFlingBehavior(row),
                 contentPadding = PaddingValues(horizontal = Wall.Margin),
                 horizontalArrangement = Arrangement.spacedBy(24.dp)) {
                 items(resumes, key = { "${it.source.source.id}/${it.item.id}" }) { c ->
-                    ContinueCard(c.item.title, "剩 ${minutesLeft(c.progress.remainingMs)} 分钟",
+                    ContinueCard(
+                        c.item.title,
+                        stringResource(R.string.home_continue_left_min, minutesLeft(c.progress.remainingMs)),
                         c.item.backdrop ?: c.item.poster,
                         c.progress.positionMs.toFloat() / c.progress.durationMs,
-                        { nav.play(c.source, c.item, c.progress.positionMs) })
+                        { nav.play(c.source, c.item, c.progress.positionMs) },
+                    )
                 }
             }
         }
@@ -160,7 +209,9 @@ private fun ShelfRow(src: MediaSource, shelf: Shelf, nav: WallNav) {
             horizontalArrangement = Arrangement.spacedBy(24.dp)) {
             items(shelf.items, key = { it.id }) { item ->
                 if (item.isFolder) {
-                    FolderTile(item.title, item.childCount?.let { "$it 个" } ?: "文件夹", item.previews,
+                    val caption = item.childCount?.let { stringResource(R.string.home_folder_count, it) }
+                        ?: stringResource(R.string.home_folder_label)
+                    FolderTile(item.title, caption, item.previews,
                         { nav.item(src, item) }, Modifier.size(168.dp, 252.dp))
                 } else {
                     Poster(item.title, item.poster, { nav.item(src, item) })
@@ -170,10 +221,6 @@ private fun ShelfRow(src: MediaSource, shelf: Shelf, nav: WallNav) {
     }
 }
 
-/**
- * The one row that speaks when its source has a problem. There is no cache
- * yet, so unlike the mockup there is nothing to show dimmed under it.
- */
 @Composable
 private fun FailedRow(src: MediaSource, error: Throwable, model: WallModel, nav: WallNav) {
     val setup = error is SourceNeedsSetupException
@@ -181,12 +228,15 @@ private fun FailedRow(src: MediaSource, error: Throwable, model: WallModel, nav:
         horizontalArrangement = Arrangement.spacedBy(20.dp)) {
         SectionTitle(src.source.name)
         if (setup) {
-            Notice(error.message ?: "需要设置", danger = false)
-            WallButton("允许访问", { if (src.source.id == LocalVideoSource.ID) nav.storage() else nav.editWebDav() },
-                small = true)
+            Notice(error.message ?: stringResource(R.string.home_source_needs_setup), danger = false)
+            WallButton(
+                stringResource(R.string.home_source_allow_access),
+                { if (src.source.id == LocalVideoSource.ID) nav.storage() else nav.editWebDav() },
+                small = true,
+            )
         } else {
-            Notice("连不上 ${src.source.name}")
-            WallButton("重试", { model.refresh(src.source.id) }, icon = WallIcons.Refresh, small = true)
+            Notice(stringResource(R.string.home_source_unreachable, src.source.name))
+            WallButton(stringResource(R.string.action_retry), { model.refresh(src.source.id) }, icon = WallIcons.Refresh, small = true)
         }
     }
 }
@@ -202,7 +252,6 @@ private fun SkeletonRow() {
     }
 }
 
-// The same blocks as the real first screen, so nothing jumps when it arrives
 @Composable
 private fun HomeSkeleton() {
     Box(Modifier.fillMaxSize()) {
@@ -219,10 +268,6 @@ private fun HomeSkeleton() {
     }
 }
 
-/**
- * Nothing to watch yet. A WebDAV server already found on the network comes
- * first, since adding it is one click; casting is not built yet and says so.
- */
 @Composable
 private fun EmptyState(model: WallModel, nav: WallNav) {
     val found by model.discovered.collectAsState()
@@ -230,22 +275,34 @@ private fun EmptyState(model: WallModel, nav: WallNav) {
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxWidth().padding(horizontal = Wall.Margin).offset(y = 148.dp),
             horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("还没有可以看的片子", style = WallType.Title, textAlign = TextAlign.Center)
-            Text("添加一个播放源，或者把视频拷进头显。", style = WallType.Body, color = Wall.Text2,
+            Text(stringResource(R.string.home_empty_title), style = WallType.Title, textAlign = TextAlign.Center)
+            Text(stringResource(R.string.home_empty_body), style = WallType.Body, color = Wall.Text2,
                 textAlign = TextAlign.Center, modifier = Modifier.padding(top = 12.dp))
         }
         Row(Modifier.offset(88.dp, 318.dp), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-            OptionTile("局域网网盘",
-                found?.let { "找到 ${it.substringAfter("://")}（WebDAV）" } ?: "WebDAV，比如 Mac 上的 Google Drive",
-                WallIcons.Server, { nav.editWebDav(found) }, Modifier.size(352.dp, 216.dp))
-            OptionTile("头显里的视频", if (storage) "拷进头显的视频会出现在这里" else "需要允许访问存储",
-                WallIcons.Headset, { if (!storage) nav.storage() }, Modifier.size(352.dp, 216.dp))
-            OptionTile("投屏", "iPad、手机 · 即将支持", WallIcons.Cast, {}, Modifier.size(352.dp, 216.dp),
-                enabled = false)
-        }
-        Box(Modifier.fillMaxWidth().offset(y = 584.dp), contentAlignment = Alignment.Center) {
-            WallButton("片子在 Google Drive 里？在 Mac 上运行 scripts/serve-gdrive.sh", { nav.editWebDav(found) },
-                kind = ButtonKind.Ghost, small = true, trailing = WallIcons.ChevR)
+            OptionTile(
+                stringResource(R.string.home_empty_webdav_title),
+                found?.let { stringResource(R.string.home_empty_webdav_found, it.substringAfter("://")) }
+                    ?: stringResource(R.string.home_empty_webdav_sub),
+                WallIcons.Server,
+                { nav.editWebDav(found) },
+                Modifier.size(352.dp, 216.dp),
+            )
+            OptionTile(
+                stringResource(R.string.home_empty_local_title),
+                stringResource(if (storage) R.string.home_empty_local_ready else R.string.home_empty_local_perm),
+                WallIcons.Headset,
+                { if (!storage) nav.storage() },
+                Modifier.size(352.dp, 216.dp),
+            )
+            OptionTile(
+                stringResource(R.string.home_empty_cast_title),
+                stringResource(R.string.home_empty_cast_sub),
+                WallIcons.Cast,
+                { nav.tab(Tab.Cast) },
+                Modifier.size(352.dp, 216.dp),
+                enabled = true,
+            )
         }
     }
 }

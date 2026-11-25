@@ -44,11 +44,17 @@ public final class WebDav {
         public final String base;  // http://host:port, no trailing slash
         public final String user;
         public final String pass;
+        public final String name;  // what the wall calls it; null when the user typed the address
 
         public Server(String base, String user, String pass) {
+            this(base, user, pass, null);
+        }
+
+        public Server(String base, String user, String pass, String name) {
             this.base = base.replaceAll("/+$", "");
             this.user = user;
             this.pass = pass;
+            this.name = name == null || name.trim().isEmpty() ? null : name.trim();
         }
 
         public String auth() {
@@ -108,13 +114,33 @@ public final class WebDav {
         SharedPreferences p = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         String base = p.getString("base", null);
         return base == null ? null
-                : new Server(base, p.getString("user", "depth3d"), p.getString("pass", ""));
+                : new Server(base, p.getString("user", "depth3d"), p.getString("pass", ""),
+                        p.getString("name", null));
     }
 
     public static void save(Context c, Server s) {
         c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                 .putString("base", s.base).putString("user", s.user).putString("pass", s.pass)
+                .putString("name", s.name)
                 .apply();
+    }
+
+    /** Typed WebDAV error so UI layers render localized Chinese copy without raw codes/exceptions. */
+    public static final class WebDavException extends IOException {
+        public enum Reason {
+            UNAUTHORIZED,
+            HTTP_ERROR,
+            PARSE_ERROR,
+        }
+
+        public final Reason reason;
+        public final int statusCode;
+
+        public WebDavException(Reason reason, int statusCode, String debugMessage, Throwable cause) {
+            super(debugMessage, cause);
+            this.reason = reason;
+            this.statusCode = statusCode;
+        }
     }
 
     /** Files and folders directly under path (which starts with "/"). Network, not on main. */
@@ -128,16 +154,16 @@ public final class WebDav {
                 .build();
         try (Response r = HTTP.newCall(req).execute()) {
             if (r.code() == 401) {
-                throw new IOException("用户名或密码不对");
+                throw new WebDavException(WebDavException.Reason.UNAUTHORIZED, 401, "HTTP 401", null);
             }
             if (r.code() != 207) {
-                throw new IOException("服务器返回 " + r.code());
+                throw new WebDavException(WebDavException.Reason.HTTP_ERROR, r.code(), "HTTP " + r.code(), null);
             }
             List<Item> items = parse(r.body().byteStream(), path);
             Collections.sort(items);
             return items;
         } catch (org.xmlpull.v1.XmlPullParserException e) {
-            throw new IOException("目录解析失败: " + e.getMessage());
+            throw new WebDavException(WebDavException.Reason.PARSE_ERROR, 0, "XML parse error", e);
         }
     }
 

@@ -80,6 +80,20 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private String glRenderer;
     private boolean foreground = true;
     private PerfOverlayListener perfListener;
+    private StreamStatsListener streamStatsListener;
+    private String streamHostName;
+
+    public interface StreamStatsListener {
+        void onStreamStats(int rttMs, float packetLossPercent);
+    }
+
+    public void setStreamStatsListener(StreamStatsListener listener) {
+        this.streamStatsListener = listener;
+    }
+
+    public void setStreamHostName(String hostName) {
+        this.streamHostName = hostName;
+    }
 
     private static final int CR_MAX_TRIES = 10;
     private static final int CR_RECOVERY_TYPE_NONE = 0;
@@ -519,6 +533,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 && !activity.isFinishing() && !activity.isDestroyed()) {
             if (xrRenderer == null) {
                 XrRenderer renderer = new XrRenderer();
+                renderer.setStreamHostName(streamHostName);
                 if (activity instanceof XrRenderer.InputListener) {
                     // The activity owns the connection, so controller events
                     // go back out through it
@@ -1476,6 +1491,17 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         // Flip stats windows roughly every second
         if (SystemClock.uptimeMillis() >= activeWindowVideoStats.measurementStartTimestamp + 1000) {
+            StreamStatsListener statsCb = streamStatsListener;
+            if (statsCb != null) {
+                VideoStats combined = new VideoStats();
+                combined.add(lastWindowVideoStats);
+                combined.add(activeWindowVideoStats);
+                long rttInfo = MoonBridge.getEstimatedRttInfo();
+                int rttMs = rttInfo > 0 ? Math.max(0, (int)(rttInfo >> 32)) : 0;
+                float lossPct = combined.totalFrames > 0
+                        ? (float)combined.framesLost / combined.totalFrames * 100.0f : 0.0f;
+                statsCb.onStreamStats(rttMs, lossPct);
+            }
             if (prefs.enablePerfOverlay) {
                 VideoStats lastTwo = new VideoStats();
                 lastTwo.add(lastWindowVideoStats);

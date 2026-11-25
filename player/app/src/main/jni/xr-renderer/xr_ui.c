@@ -334,11 +334,11 @@ void setRayOn(XrCtx* ctx, int on, const char* from) {
 }
 
 // Whether one of the panels is up: the settings panel, the picker, the
-// keyboard, the exit prompt, the report sheet, the hand lock hint or the Ko-fi
-// sheet. The ray comes back for them while it is switched off.
+// keyboard, the exit prompt, the report sheet or the hand lock hint. The ray
+// comes back for them while it is switched off.
 int panelUp(XrCtx* ctx) {
     return ctx->cogOpen || ctx->pickerOpen || ctx->kbOpen || ctx->exitConfirmOpen
-            || ctx->reportOpen || ctx->hintOpen || ctx->kofiOpen;
+            || ctx->reportOpen || ctx->hintOpen;
 }
 
 // The 3D on or off for the rest of the session, from the bar or the 3D tab.
@@ -430,23 +430,6 @@ XrPosef handHintPose(XrCtx* ctx, float* outWidth, float* outHeight) {
     return pose;
 }
 
-// The Ko-fi sheet stands where the hint does, over the middle of the picture
-// and a little in front of it. Frozen while it is up, like the prompt.
-XrPosef kofiSheetPose(XrCtx* ctx, float* outWidth, float* outHeight) {
-    float width = furnitureWidth(ctx) * KOFI_WIDTH_FRAC;
-    float height = width * (float)KOFI_TEX_H / (float)KOFI_TEX_W;
-    *outWidth = width;
-    *outHeight = height;
-
-    Vec3 local = { 0.0f, 0.0f, 0.06f };
-    XrPosef pose = furniturePose(ctx);
-    Vec3 offset = quatRotate(pose.orientation, local);
-    pose.position.x += offset.x;
-    pose.position.y += offset.y;
-    pose.position.z += offset.z;
-    return pose;
-}
-
 // Which of the prompt's two buttons a point is on, in the sheet's own
 // coordinates. Everything else on it is a question and a background.
 int exitPromptZone(float u, float v) {
@@ -477,7 +460,7 @@ int cogTabRowCount(int face) {
         return PICTURE_VALUES;
     }
     if (face == COG_TAB_ABOUT) {
-        return 0;
+        return COG_STREAM_ROW_COUNT;
     }
     // The option rows, then the glow level track under them
     return COG_DISPLAY_SLIDER_ROW + 1;
@@ -494,6 +477,9 @@ int cogRowIsTrack(int face, int row) {
     if (face == COG_TAB_3D) {
         return row == COG_ROW3D_SEPARATION || row == COG_ROW3D_CONVERGENCE;
     }
+    if (face == COG_TAB_ABOUT) {
+        return 0;
+    }
     return 1;
 }
 
@@ -504,6 +490,15 @@ int cogRowCells(int face, int row) {
     }
     if (face == COG_TAB_3D) {
         return row == COG_ROW3D_PRESET ? COG_PRESET_CELLS : COG_STEREO_CELLS;
+    }
+    if (face == COG_TAB_ABOUT) {
+        if (row == COG_STREAM_ROW_RES) {
+            return COG_STREAM_RES_CELLS;
+        }
+        if (row == COG_STREAM_ROW_BITRATE) {
+            return COG_STREAM_BITRATE_CELLS;
+        }
+        return COG_STREAM_MOUSE_CELLS;
     }
     return cogOptionCells(row);
 }
@@ -527,6 +522,10 @@ int cogRowLive(XrCtx* ctx, int face, int row) {
     // With stereo off there is nothing for any 3D row to move or switch
     if (face == COG_TAB_3D) {
         return ctx->stereoMode != DEPTH_MODE_OFF;
+    }
+    // Tab 4's streaming quick-menu options are only live in PC streaming mode
+    if (face == COG_TAB_ABOUT) {
+        return !ctx->localMedia;
     }
     // A room built around its picture keeps it at the whole of its anchor
     if (face == COG_FACE_ROOM && row == COG_ROOM_ROW_SIZE) {
@@ -956,9 +955,9 @@ void cogApplyRoomCell(XrCtx* ctx, int row, int cell, float* out) {
     out[IN_SETTING_VALUE] = (float)cell;
 }
 
-// Which cell of a row of cells on the Room or 3D tab is in force, or -1 where
-// none is. A separation dragged to somewhere between the presets is none of
-// them, so their row carries no ring.
+// Which cell of a row of cells on the Room, 3D or Stream tab is in force,
+// or -1 where none is. A separation dragged to somewhere between the presets
+// is none of them, so their row carries no ring.
 int cogCellInForce(XrCtx* ctx, int face, int row) {
     if (face == COG_FACE_ROOM) {
         return cogRoomCellValue(ctx, row);
@@ -968,6 +967,17 @@ int cogCellInForce(XrCtx* ctx, int face, int row) {
     }
     if (face == COG_TAB_3D && row == COG_ROW3D_SWITCH) {
         return ctx->stereoLive ? 1 : 0;
+    }
+    if (face == COG_TAB_ABOUT) {
+        if (row == COG_STREAM_ROW_RES) {
+            return ctx->streamResCell;
+        }
+        if (row == COG_STREAM_ROW_BITRATE) {
+            return ctx->streamBitrateCell;
+        }
+        if (row == COG_STREAM_ROW_MOUSE) {
+            return ctx->streamMouseCell;
+        }
     }
     return -1;
 }
@@ -1005,6 +1015,27 @@ void cogApplyCell(XrCtx* ctx, int face, int row, int cell, float* out) {
     }
     if (face == COG_TAB_3D) {
         cogApply3dCell(ctx, row, cell, out);
+        return;
+    }
+    if (face == COG_TAB_ABOUT) {
+        if (row == COG_STREAM_ROW_RES && cell >= 0 && cell < COG_STREAM_RES_CELLS) {
+            ctx->streamResCell = cell;
+            out[IN_SETTING] = (float)SETTING_STREAM_RES;
+            out[IN_SETTING_VALUE] = (float)cell;
+            LOGEV("stream resolution cell %d from the panel (takes effect next connect)", cell);
+        }
+        else if (row == COG_STREAM_ROW_BITRATE && cell >= 0 && cell < COG_STREAM_BITRATE_CELLS) {
+            ctx->streamBitrateCell = cell;
+            out[IN_SETTING] = (float)SETTING_STREAM_BITRATE;
+            out[IN_SETTING_VALUE] = (float)cell;
+            LOGEV("stream bitrate cell %d from the panel (takes effect next connect)", cell);
+        }
+        else if (row == COG_STREAM_ROW_MOUSE && cell >= 0 && cell < COG_STREAM_MOUSE_CELLS) {
+            ctx->streamMouseCell = cell;
+            out[IN_SETTING] = (float)SETTING_STREAM_MOUSE;
+            out[IN_SETTING_VALUE] = (float)cell;
+            LOGEV("stream mouse cell %d from the panel (takes effect next connect)", cell);
+        }
         return;
     }
     int id = cogApplyOption(ctx, row, cell);

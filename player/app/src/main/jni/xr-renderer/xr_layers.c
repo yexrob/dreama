@@ -58,11 +58,9 @@
 // modal the same way: it sheds the furniture and adds its sheet and the ring
 // on the button under the ray, which takes the hover ring's slot and so goes
 // with it, so the room, the glow, both eyes, the stats, the sheet, the ring,
-// ray and cursor: 9, with the models and the toast 11. The Ko-fi sheet is the
-// same again with the cog button kept up beside it: 10, 12 with both. A panel
-// fading out keeps the bar furniture down until it has gone, and one opening
-// cuts any other's fade short, so a fade never stacks two of these. The launch
-// splash is two layers and all the frame carries while it is fully up; as it
+// ray and cursor: 9, with the models and the toast 11. A panel fading out
+// keeps the bar furniture down until it has gone, and one opening cuts any
+// other's fade short, so a fade never stacks two of these. The launch splash is two layers and all the frame carries while it is fully up; as it
 // fades the room, the glow, the eyes and the stats come up under it, five
 // more, with no furniture and no toast, since neither input nor notices move
 // until it has gone.
@@ -97,7 +95,6 @@ typedef struct {
     XrCompositionLayerQuad exitPrompt;
     XrCompositionLayerQuad report;
     XrCompositionLayerQuad hint;
-    XrCompositionLayerQuad kofi;
     XrCompositionLayerQuad picker;
     XrCompositionLayerQuad outline[2];
     XrCompositionLayerQuad cogPanel;
@@ -527,12 +524,14 @@ static void addOverlayLayer(XrCtx* ctx, const FrameView* view, FrameLayers* laye
     }
 }
 
-// depth3d: the transport strip along the bottom of the picture, in front of
-// it like the stats. Java decides when it shows and hit tests it off the
-// pointer's place on the picture, so its geometry here has to match
-// TRANSPORT_* in LocalPlayerXR: full width less a margin, flush to the bottom.
+// depth3d: the transport / streaming status strip along the bottom of the
+// picture, in front of it like the stats. In local playback Java controls its
+// visibility explicitly; in PC streaming it shows automatically whenever the
+// VR control bar is visible (view->barArea) AND whenever Java turns it on for
+// a red network-degradation warning (ctx->transportVisible).
 static void addTransportLayer(XrCtx* ctx, const FrameView* view, FrameLayers* layers) {
-    if (!ctx->transportHasContent || !ctx->transportVisible
+    int show = ctx->localMedia ? ctx->transportVisible : (ctx->transportVisible || view->barArea);
+    if (!ctx->transportHasContent || !show
             || ctx->transportSwapchain == XR_NULL_HANDLE) {
         return;
     }
@@ -691,14 +690,11 @@ static void addBarButtonLayers(XrCtx* ctx, const FrameView* view, FrameLayers* l
     }
 
     // The cog that opens the settings panel, right of the move bar. Same
-    // rules as the environment button on the other side, and it stays up with
-    // the Ko-fi sheet the panel opens, which a press on it puts away.
-    int kofi = ctx->kofiOpen || ctx->panelFades[FADE_KOFI].level > 0.0f;
+    // rules as the environment button on the other side.
     if (ctx->cogButtonReady
-            && panelButton(ctx, view, layers, kofi ? FADE_KOFI : FADE_COG,
-                           ctx->cogOpen || ctx->kofiOpen, &next)) {
+            && panelButton(ctx, view, layers, FADE_COG, ctx->cogOpen, &next)) {
         addBarButton(ctx, view, layers, &layers->cogButton, BTN_CELL_COG,
-                     BAR_SLOT_COG, ctx->cogButtonHot || ctx->cogOpen || ctx->kofiOpen, next);
+                     BAR_SLOT_COG, ctx->cogButtonHot || ctx->cogOpen, next);
     }
 
     // The keyboard button, one place further out. Unlike the cog it goes
@@ -807,35 +803,6 @@ static void addHandHintLayers(XrCtx* ctx, const FrameView* view, FrameLayers* la
               XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT, ctx->outlineSwapchain,
               OUTLINE_TEX, OUTLINE_TEX, view->space, poseOffset(ctx->hintPose, local),
               (r - l) * ctx->hintW * 1.04f, (HINT_BTN_B - HINT_BTN_T) * ctx->hintH * 1.12f);
-    pushLayer(ctx, layers, mark);
-}
-
-// The Ko-fi sheet, on the pose frozen when it opened, and the ring on its
-// Close button under the ray in the hover ring's slot. Sharpened, since it is
-// text and a code to be read.
-static void addKofiLayers(XrCtx* ctx, const FrameView* view, FrameLayers* layers) {
-    float level = ctx->panelFades[FADE_KOFI].level;
-    if (level <= 0.0f || !ctx->kofiReady) {
-        return;
-    }
-    quadLayer(&layers->kofi, fadeNext(ctx, layers, FADE_KOFI, 1, level),
-              XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT, ctx->kofiSwapchain,
-              KOFI_TEX_W, KOFI_TEX_H, view->space, ctx->kofiPose, ctx->kofiW, ctx->kofiH);
-    pushLayer(ctx, layers, &layers->kofi);
-
-    if (!ctx->kofiOpen || ctx->kofiHoverZone != KOFI_ZONE_CLOSE || !ctx->outlineReady) {
-        return;
-    }
-    Vec3 local;
-    local.x = ((KOFI_CLOSE_L + KOFI_CLOSE_R) * 0.5f - 0.5f) * ctx->kofiW;
-    local.y = (0.5f - (KOFI_BTN_T + KOFI_BTN_B) * 0.5f) * ctx->kofiH;
-    local.z = 0.004f;
-    XrCompositionLayerQuad* mark = &layers->cogMark[COG_OPTION_COUNT];
-    quadLayer(mark, fadeNext(ctx, layers, FADE_KOFI, 0, level),
-              XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT, ctx->outlineSwapchain,
-              OUTLINE_TEX, OUTLINE_TEX, view->space, poseOffset(ctx->kofiPose, local),
-              (KOFI_CLOSE_R - KOFI_CLOSE_L) * ctx->kofiW * 1.04f,
-              (KOFI_BTN_B - KOFI_BTN_T) * ctx->kofiH * 1.12f);
     pushLayer(ctx, layers, mark);
 }
 
@@ -963,10 +930,10 @@ static void addCogLayers(XrCtx* ctx, const FrameView* view, FrameLayers* layers)
                            ctx->cogHoverCell, cogOptionCells(option), 1.12f);
             }
         }
-        else if ((face == COG_FACE_ROOM || face == COG_TAB_3D) && ctx->outlineReady) {
-            // The Room and 3D tabs mix cells with tracks. Each live row of
-            // cells rings the one in force, where there is one: the presets
-            // ring none once the depth track is dragged off all three.
+        else if ((face == COG_FACE_ROOM || face == COG_TAB_3D || face == COG_TAB_ABOUT)
+                && ctx->outlineReady) {
+            // The Room, 3D and Stream tabs ring each live cell row in force
+            // (and the hovered cell, if any).
             int marks = 0;
             int rowCount = cogTabRowCount(face);
             for (int row = 0; row < rowCount && marks < COG_OPTION_COUNT; row++) {
@@ -984,27 +951,6 @@ static void addCogLayers(XrCtx* ctx, const FrameView* view, FrameLayers* layers)
                 addCogRing(ctx, view, layers, &layers->cogMark[COG_OPTION_COUNT], face,
                            hoverRow, ctx->cogHoverCell, cogRowCells(face, hoverRow), 1.12f);
             }
-        }
-
-        // The About tab's buttons get the hover ring the cells do, in the
-        // same slot, since the ray is on one of them at most
-        if (face == COG_TAB_ABOUT && (ctx->cogReportHot || ctx->cogKofiHot)
-                && ctx->outlineReady) {
-            float l = ctx->cogKofiHot ? COG_KOFI_L : COG_REPORT_L;
-            float r = ctx->cogKofiHot ? COG_KOFI_R : COG_REPORT_R;
-            float t = ctx->cogKofiHot ? COG_KOFI_T : COG_REPORT_T;
-            float b = ctx->cogKofiHot ? COG_KOFI_B : COG_REPORT_B;
-            Vec3 local;
-            local.x = ((l + r) * 0.5f - 0.5f) * ctx->cogW;
-            local.y = (0.5f - (t + b) * 0.5f) * ctx->cogH;
-            local.z = 0.004f;
-            XrCompositionLayerQuad* mark = &layers->cogMark[COG_OPTION_COUNT];
-            quadLayer(mark, fadeNext(ctx, layers, FADE_COG, 0, level),
-                      XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
-                      ctx->outlineSwapchain, OUTLINE_TEX, OUTLINE_TEX, view->space,
-                      poseOffset(ctx->cogPose, local), (r - l) * ctx->cogW * 1.04f,
-                      (b - t) * ctx->cogH * 1.12f);
-            pushLayer(ctx, layers, mark);
         }
 
         // A step button under the ray gets the same hover ring a cell does,
@@ -1269,11 +1215,10 @@ static void addToastLayer(XrCtx* ctx, FrameLayers* layers, int64_t now) {
 // and the keyboard stands down at once for a modal the way it always has.
 static void stepPanelFades(XrCtx* ctx, int64_t now) {
     static const char* const NAMES[FADE_PANELS] = {
-        "settings panel", "picker", "keyboard", "exit prompt", "report sheet", "hand lock hint",
-        "Ko-fi sheet"
+        "settings panel", "picker", "keyboard", "exit prompt", "report sheet", "hand lock hint"
     };
     int modal = ctx->pickerOpen || ctx->cogOpen || ctx->exitConfirmOpen || ctx->reportOpen
-            || ctx->hintOpen || ctx->kofiOpen;
+            || ctx->hintOpen;
     int shown[FADE_PANELS];
     shown[FADE_COG] = ctx->cogOpen;
     shown[FADE_PICKER] = ctx->pickerOpen;
@@ -1282,7 +1227,6 @@ static void stepPanelFades(XrCtx* ctx, int64_t now) {
     shown[FADE_EXIT] = ctx->exitConfirmOpen;
     shown[FADE_REPORT] = ctx->reportOpen;
     shown[FADE_HINT] = ctx->hintOpen;
-    shown[FADE_KOFI] = ctx->kofiOpen;
     ctx->panelFadingOut = 0;
     for (int p = 0; p < FADE_PANELS; p++) {
         Fade* fade = &ctx->panelFades[p];
@@ -1536,7 +1480,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
     stepSplash(ctx, frameNs);
     int splashUp = ctx->splash.phase == SPLASH_UP;
     view.barArea = !ctx->pickerOpen && !ctx->cogOpen && !ctx->kbOpen
-            && !ctx->exitConfirmOpen && !ctx->reportOpen && !ctx->hintOpen && !ctx->kofiOpen
+            && !ctx->exitConfirmOpen && !ctx->reportOpen && !ctx->hintOpen
             && !ctx->panelFadingOut
             && (ctx->hoverKind == HOVER_BAR || ctx->hoverKind == HOVER_ENVBUTTON
                 || ctx->hoverKind == HOVER_COGBUTTON
@@ -1590,7 +1534,6 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
         addCogLayers(ctx, &view, &layers);
         addReportLayer(ctx, &view, &layers);
         addHandHintLayers(ctx, &view, &layers);
-        addKofiLayers(ctx, &view, &layers);
         addKeyboardLayers(ctx, &view, &layers);
         addModelLayer(ctx, &layers);
         addPointerLayers(ctx, &view, &layers);

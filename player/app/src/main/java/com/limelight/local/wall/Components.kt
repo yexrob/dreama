@@ -122,29 +122,35 @@ fun WallButton(
     kind: ButtonKind = ButtonKind.Plain,
     small: Boolean = false,
     trailing: ImageVector? = null,
+    enabled: Boolean = true,
 ) {
     val source = remember { MutableInteractionSource() }
     val hovered by rememberRayHover(source)
+    val effectiveHover = hovered && enabled
     val bg by animateColorAsState(
         when (kind) {
-            ButtonKind.Primary -> if (hovered) Color.White else Wall.Text
-            ButtonKind.Plain -> if (hovered) Wall.FillHi else Wall.Fill
-            ButtonKind.Ghost -> if (hovered) Wall.Fill else Color.Transparent
+            ButtonKind.Primary -> if (effectiveHover) Color.White else Wall.Text
+            ButtonKind.Plain -> if (effectiveHover) Wall.FillHi else Wall.Fill
+            ButtonKind.Ghost -> if (effectiveHover) Wall.Fill else Color.Transparent
         }, tween(120), label = "btn")
     val fg = when (kind) {
         ButtonKind.Primary -> Wall.Bg
         ButtonKind.Plain -> Wall.Text
-        ButtonKind.Ghost -> if (hovered) Wall.Text else Wall.Text2
+        ButtonKind.Ghost -> if (effectiveHover) Wall.Text else Wall.Text2
     }
-    val scale = hoverScale(hovered, 1.04f, 120)
+    val scale = hoverScale(effectiveHover, 1.04f, 120)
     val iconSize = if (small) 24.dp else 28.dp
     Row(
         modifier
-            .graphicsLayer { scaleX = scale; scaleY = scale }
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+                alpha = if (enabled) 1f else 0.45f
+            }
             .height(if (small) 60.dp else 64.dp)
             .clip(RoundedCornerShape(Wall.Radius))
             .background(bg)
-            .ray(source, onClick)
+            .then(if (enabled) Modifier.ray(source, onClick) else Modifier)
             .padding(horizontal = if (small) 24.dp else 32.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
@@ -185,14 +191,24 @@ fun RoundButton(icon: ImageVector, onClick: () -> Unit, modifier: Modifier = Mod
     }
 }
 
-enum class Tab(val label: String) { Home("首页"), Library("媒体库"), Cast("投屏") }
+enum class Tab(val labelRes: Int) {
+    Home(com.limelight.R.string.nav_home),
+    Library(com.limelight.R.string.nav_library),
+    Cast(com.limelight.R.string.nav_cast),
+}
 
 /**
  * The bar across the top of every page. Transparent over the home hero so
  * the backdrop runs to the edge, solid everywhere else.
  */
 @Composable
-fun NavBar(selected: Tab, onTab: (Tab) -> Unit, onSettings: () -> Unit, solid: Boolean) {
+fun NavBar(
+    selected: Tab?,
+    onTab: (Tab) -> Unit,
+    onSettings: () -> Unit,
+    solid: Boolean,
+    settingsSelected: Boolean = false,
+) {
     val bg by animateColorAsState(if (solid) Wall.Bg else Color.Transparent, tween(240), label = "nav")
     Row(
         Modifier.fillMaxWidth().height(96.dp).background(bg).padding(horizontal = Wall.Margin),
@@ -200,10 +216,10 @@ fun NavBar(selected: Tab, onTab: (Tab) -> Unit, onSettings: () -> Unit, solid: B
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         for (t in Tab.entries) {
-            TabChip(t.label, t == selected) { onTab(t) }
+            TabChip(androidx.compose.ui.res.stringResource(t.labelRes), t == selected) { onTab(t) }
         }
         Spacer(Modifier.weight(1f))
-        RoundButton(WallIcons.Gear, onSettings)
+        RoundButton(WallIcons.Gear, onSettings, selected = settingsSelected)
     }
 }
 
@@ -491,6 +507,139 @@ fun OptionTile(title: String, sub: String?, icon: ImageVector, onClick: () -> Un
             Icon(icon, null, Modifier.size(iconSize), tint = Wall.Text2)
             Spacer(Modifier.height(22.dp))
             body()
+        }
+    }
+}
+
+/** One turn a second linear spinner matching cast.html .spin. */
+@Composable
+fun WallSpinner(modifier: Modifier = Modifier, size: Dp = 40.dp, tint: Color = Wall.Text) {
+    val turn = rememberInfiniteTransition(label = "wall-spin")
+    val angle by turn.animateFloat(
+        0f,
+        360f,
+        infiniteRepeatable(tween(1000, easing = androidx.compose.animation.core.LinearEasing)),
+        label = "wall-spin",
+    )
+    Icon(WallIcons.Spinner, null, modifier.size(size).graphicsLayer { rotationZ = angle }, tint = tint)
+}
+
+/** 14px pulsing waiting dot matching cast.html .breath. */
+@Composable
+fun BreathingDot(color: Color = Wall.Text2) {
+    val pulse = rememberInfiniteTransition(label = "wall-breath")
+    val a by pulse.animateFloat(1f, 0.35f, infiniteRepeatable(tween(1200), RepeatMode.Reverse), label = "wall-breath")
+    Box(Modifier.size(26.dp), contentAlignment = Alignment.Center) {
+        Box(Modifier.size(14.dp).graphicsLayer { alpha = a }.clip(CircleShape).background(color))
+    }
+}
+
+/** Segmented pill group matching settings.html .seg / .seg-b. */
+@Composable
+fun <T> SegmentedControl(
+    options: List<Pair<T, String>>,
+    selected: T?,
+    onSelect: (T) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier
+            .clip(RoundedCornerShape(16.dp))
+            .background(Wall.Surface)
+            .padding(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        for ((value, label) in options) {
+            val isSel = value == selected
+            val source = remember { MutableInteractionSource() }
+            val hovered by rememberRayHover(source)
+            val bg by animateColorAsState(
+                when {
+                    isSel -> Wall.Sel
+                    hovered -> Wall.Fill
+                    else -> Color.Transparent
+                },
+                tween(120),
+                label = "seg",
+            )
+            Box(
+                Modifier
+                    .height(52.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(bg)
+                    .ray(source) { onSelect(value) }
+                    .padding(horizontal = 20.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    label,
+                    style = WallType.ButtonSmall.copy(
+                        fontWeight = if (isSel) FontWeight.SemiBold else FontWeight.Medium,
+                    ),
+                    color = if (isSel || hovered) Wall.Text else Wall.Text2,
+                    maxLines = 1,
+                )
+            }
+        }
+    }
+}
+
+/** Amber toggle switch matching settings.html .sw / .sw.on (68x40 with 30dp thumb). */
+@Composable
+fun WallSwitch(checked: Boolean, modifier: Modifier = Modifier, onToggle: (Boolean) -> Unit) {
+    val source = remember { MutableInteractionSource() }
+    val hovered by rememberRayHover(source)
+    val track by animateColorAsState(
+        when {
+            checked -> Wall.Accent
+            hovered -> Wall.FillHi
+            else -> Wall.Fill
+        },
+        tween(160),
+        label = "sw-track",
+    )
+    val thumbX by animateFloatAsState(if (checked) 28f else 0f, tween(160, easing = Wall.Ease), label = "sw-x")
+    Box(
+        modifier
+            .size(68.dp, 40.dp)
+            .clip(CircleShape)
+            .background(track)
+            .ray(source) { onToggle(!checked) }
+            .padding(5.dp),
+        contentAlignment = Alignment.CenterStart,
+    ) {
+        Box(
+            Modifier
+                .offset(x = thumbX.dp)
+                .size(30.dp)
+                .clip(CircleShape)
+                .background(if (checked) Wall.Bg else Wall.Text),
+        )
+    }
+}
+
+/** Crisp black-on-white QR code rendered from [com.limelight.local.stream.QrCodeMatrix]. */
+@Composable
+fun QrCodeView(matrix: com.limelight.local.stream.QrCodeMatrix, size: Dp, modifier: Modifier = Modifier) {
+    androidx.compose.foundation.Canvas(
+        modifier
+            .size(size)
+            .clip(RoundedCornerShape(16.dp))
+            .background(Color.White),
+    ) {
+        val quiet = 3
+        val total = matrix.size + quiet * 2
+        val cell = this.size.width / total
+        for (y in 0 until matrix.size) {
+            for (x in 0 until matrix.size) {
+                if (matrix[x, y]) {
+                    drawRect(
+                        color = Color.Black,
+                        topLeft = androidx.compose.ui.geometry.Offset((x + quiet) * cell, (y + quiet) * cell),
+                        size = androidx.compose.ui.geometry.Size(cell + 0.5f, cell + 0.5f),
+                    )
+                }
+            }
         }
     }
 }
