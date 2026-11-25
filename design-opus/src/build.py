@@ -8,7 +8,7 @@ import os, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from lib import BASE_CSS
-import pages, vr, palette
+import pages, vr, palette, search
 
 OUT = os.path.normpath(os.path.join(HERE, '..', 'mockups'))
 os.makedirs(OUT, exist_ok=True)
@@ -21,6 +21,7 @@ PAGES = [
     ('sources', '播放源与插件', pages.sources, [('default', '播放源'), ('plugins', '插件'), ('add', '添加'), ('phone', '用手机输入')]),
     ('cast', '投屏接收', pages.cast, [('default', '等待投屏'), ('confirm', '首次确认'), ('connecting', '连接中'), ('pin', '电脑配对'), ('nowifi', '没有网络')]),
     ('onboarding', '首次使用引导', pages.onboarding, [('welcome', '欢迎'), ('sources', '片源'), ('mac', '装 Host'), ('controls', '操作')]),
+    ('search', '搜索', search.search_page, [(s, l) for s, l, _ in search.STATES]),
     ('settings', '设置', pages.settings, [('default', '播放与 3D'), ('screen', '屏幕与环境'), ('about', '关于')]),
     ('vr-player', 'VR 播放中', vr.vr_page, [('menu', '快捷菜单（旧）'), ('bar', '控制条'), ('paused', '暂停'), ('toast', '提示'), ('next', '下一集'), ('cast', '投屏请求'), ('buffer', '缓冲'), ('clean', '沉浸'), ('measure', '尺寸标注')]),
     ('vr-palette', 'VR 调色板与弹幕', palette.palette_page, [(s, l) for s, l, _ in palette.STATES]),

@@ -1,6 +1,8 @@
-# depth3d
+# Dreama（原 depth3d）
 
 在 PICO 4（骁龙 XR2 Gen 1）上把普通 2D 视频实时转成立体 3D。
+
+> 2026-11-25 起 App 对外名称改为 **Dreama**，Android applicationId 由 `dev.depth3d.player` 改为 `dev.dreama.player`。协议级标识保持不变：mDNS 服务类型 `_depth3d-host._tcp`、插件 id `dev.depth3d.*`、日志目录 `Download/depth3d`，Mac 伴侣应用仍叫 `depth3d Host`。
 
 ## 参照
 

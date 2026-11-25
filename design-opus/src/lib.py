@@ -55,6 +55,10 @@ ICONS = {
     'wifi': '<path d="M3.5 9.6a12 12 0 0 1 17 0M6.6 12.9a7.6 7.6 0 0 1 10.8 0M9.6 16.1a3.3 3.3 0 0 1 4.8 0"/><path d="M12 19.4h.01"/>',
     'spinner': '<path d="M12 3.5a8.5 8.5 0 1 1-8.5 8.5"/>',
     'dim': '<circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor" stroke="none"/>',
+    'clock': '<circle cx="12" cy="12" r="8.6"/><path d="M12 7.4V12l3.2 2.1"/>',
+    'mic': '<rect x="9" y="3.4" width="6" height="11.2" rx="3"/><path d="M5.6 11.4a6.4 6.4 0 0 0 12.8 0M12 17.8v2.8"/>',
+    'user': '<circle cx="12" cy="8.4" r="3.7"/><path d="M4.8 19.8a7.2 7.2 0 0 1 14.4 0"/>',
+    'fill-in': '<path d="M17.5 17.5 7.4 7.4M7 15.2V7h8.2"/>',
 }
 
 
@@ -198,10 +202,12 @@ def annos(title, sub, states):
             f'<div class="anno st">状态：{links}</div>{notes}')
 
 
-def panel_page(title, sub, states, inner, css='', default=None):
+def panel_page(title, sub, states, inner, css='', default=None, outside=''):
+    """`outside` is drawn in front of the panel in canvas coordinates (e.g. the
+    system keyboard, which floats in front of the window and is not clipped by it)."""
     default = default or states[0][0]
     body = (ROOM + '<div class="stage"><div class="panel">' + inner + '</div><div class="handle"></div></div>'
-            + annos(title, sub, states))
+            + outside + annos(title, sub, states))
     return page(f'depth3d · {title}', body, default, css)
 
 
