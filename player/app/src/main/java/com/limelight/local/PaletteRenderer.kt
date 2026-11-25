@@ -33,25 +33,31 @@ class PaletteRenderer {
         ByteBuffer.allocateDirect(width * height * 4).order(ByteOrder.nativeOrder())
     }
     private var nextBuf = 0
-    private var lastSignature: String? = null
+    private var hasDrawn = false
+    private var lastHashLo = 0L
+    private var lastHashHi = 0L
+    private val hashScratch = LongArray(2)
 
     private val regularTypeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
     private val boldTypeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
 
     /**
-     * Redraws ONLY if [controller.renderSignature] differs from the last uploaded sheet.
+     * Redraws ONLY if [controller.computeRenderHash] differs from the last uploaded sheet.
+     * Zero heap allocations when unchanged.
      * Returns the ready-to-upload top-down RGBA [ByteBuffer], or `null` if unchanged.
      */
     fun drawIfChanged(controller: PaletteController): ByteBuffer? {
-        val sig = controller.renderSignature()
-        if (sig == lastSignature) return null
-        lastSignature = sig
+        controller.computeRenderHash(hashScratch)
+        if (hasDrawn && hashScratch[0] == lastHashLo && hashScratch[1] == lastHashHi) return null
+        hasDrawn = true
+        lastHashLo = hashScratch[0]
+        lastHashHi = hashScratch[1]
         return drawNow(controller)
     }
 
     /** Forces a fresh render on next call (e.g., when session restarts). */
     fun invalidate() {
-        lastSignature = null
+        hasDrawn = false
     }
 
     private fun drawNow(c: PaletteController): ByteBuffer {
@@ -179,22 +185,32 @@ class PaletteRenderer {
 
     private fun drawTabScreen(c: PaletteController) {
         val s = c.strings
-        drawSliderRow(
-            c, 0, s.rowScreenSize,
-            progress = c.sliderNormalized(XrShared.PALETTE_TAB_SCREEN, 0, 0),
-            valueText = c.formatSizeValue(),
-            onDetent = PaletteController.isFovDetent(c.global.screenFovDeg),
-            ticks = ScreenReadout.SIZE_TICK_POSITIONS,
-            enabled = true,
-        )
-        drawSliderRow(
-            c, 1, s.rowScreenDist,
-            progress = c.sliderNormalized(XrShared.PALETTE_TAB_SCREEN, 0, 1),
-            valueText = c.formatDistValue(),
-            onDetent = PaletteController.isDistDetent(c.global.screenDistM),
-            ticks = ScreenReadout.DIST_TICK_POSITIONS,
-            enabled = true,
-        )
+        val sizeErr = c.screenSizeDisabledMessage
+        if (sizeErr != null) {
+            drawDisabledRow(c, 0, s.rowScreenSize, sizeErr)
+        } else {
+            drawSliderRow(
+                c, 0, s.rowScreenSize,
+                progress = c.sliderNormalized(XrShared.PALETTE_TAB_SCREEN, 0, 0),
+                valueText = c.formatSizeValue(),
+                onDetent = PaletteController.isFovDetent(c.global.screenFovDeg),
+                ticks = ScreenReadout.SIZE_TICK_POSITIONS,
+                enabled = true,
+            )
+        }
+        val distErr = c.screenDistDisabledMessage
+        if (distErr != null) {
+            drawDisabledRow(c, 1, s.rowScreenDist, distErr)
+        } else {
+            drawSliderRow(
+                c, 1, s.rowScreenDist,
+                progress = c.sliderNormalized(XrShared.PALETTE_TAB_SCREEN, 0, 1),
+                valueText = c.formatDistValue(),
+                onDetent = PaletteController.isDistDetent(c.global.screenDistM),
+                ticks = ScreenReadout.DIST_TICK_POSITIONS,
+                enabled = true,
+            )
+        }
         val curveErr = c.curvatureDisabledMessage
         if (curveErr != null) {
             drawDisabledRow(c, 2, s.rowScreenCurve, curveErr)
@@ -208,11 +224,89 @@ class PaletteRenderer {
                 enabled = true,
             )
         }
-        drawChipsRow(
-            c, 3, s.rowScreenEnv,
+        drawScreenEnvRowWithHint(
+            c,
             arrayOf(s.envPassthrough, s.envDim, s.envTheater, s.envVoid),
-            c.global.environment.ordinal, enabled = true,
+            c.global.environment.ordinal,
         )
+    }
+
+    /**
+     * Draws Row 3 (Environment) slightly compact vertically on the Screen tab so a crisp,
+     * unobstructed gesture hint strip sits along the bottom edge (y = 714..760).
+     */
+    private fun drawScreenEnvRowWithHint(c: PaletteController, options: Array<String>, selected: Int) {
+        val rx = XrShared.PALETTE_ROW_X.toFloat()
+        val ry = (XrShared.PALETTE_ROW_Y0 + 3 * XrShared.PALETTE_ROW_H).toFloat() // 600
+        val rw = XrShared.PALETTE_ROW_W.toFloat()
+        val rowTop = ry + 6f   // 606
+        val rowBot = ry + 106f // 706
+        val rowMid = (rowTop + rowBot) * 0.5f // 656
+        val hovered = rowHover(c, 3) != null
+        if (hovered) {
+            paint.style = Paint.Style.FILL
+            paint.color = COLOR_ROW_HOVER
+            rect.set(rx, rowTop, rx + rw, rowBot)
+            canvas.drawRoundRect(rect, ROW_RADIUS, ROW_RADIUS, paint)
+        }
+        textPaint.typeface = regularTypeface
+        textPaint.textSize = 32f
+        textPaint.textAlign = Paint.Align.LEFT
+        textPaint.color = if (hovered) COLOR_TEXT else COLOR_TEXT2
+        canvas.drawText(c.strings.rowScreenEnv, rx + XrShared.PALETTE_LABEL_OFFSET_X, rowMid + 11f, textPaint)
+
+        val startX = rx + XrShared.PALETTE_CTRL_OFFSET_X
+        val totalW = XrShared.PALETTE_CTRL_W.toFloat()
+        val count = options.size
+        val chipW = (totalW - PaletteController.CHIP_GAP * (count - 1)) / count
+        val chipH = 76f
+        val chipY = rowMid - chipH * 0.5f
+        val hoverChip = rowHover(c, 3)?.chipIndex ?: -1
+        for (i in 0 until count) {
+            val cx = startX + i * (chipW + PaletteController.CHIP_GAP)
+            val isSel = i == selected
+            val isHot = i == hoverChip
+            paint.style = Paint.Style.FILL
+            paint.color = when {
+                isSel -> COLOR_AMBER
+                isHot -> COLOR_CHIP_HOVER_BG
+                else -> COLOR_CHIP_BG
+            }
+            rect.set(cx, chipY, cx + chipW, chipY + chipH)
+            canvas.drawRoundRect(rect, CHIP_RADIUS, CHIP_RADIUS, paint)
+
+            textPaint.typeface = if (isSel) boldTypeface else regularTypeface
+            textPaint.textSize = 28f
+            textPaint.textAlign = Paint.Align.CENTER
+            textPaint.color = when {
+                isSel -> COLOR_ON_AMBER
+                isHot -> COLOR_TEXT
+                else -> COLOR_TEXT2
+            }
+            canvas.drawText(options[i], cx + chipW * 0.5f, chipY + chipH * 0.5f + 10f, textPaint)
+        }
+
+        if (c.isRowResetVisible(c.activeTab, c.danmakuPage, 3)) {
+            val hitCx = rx + XrShared.PALETTE_RESET_OFFSET_X + XrShared.PALETTE_RESET_SIZE * 0.5f
+            val visSize = 76f
+            val hot = rowHover(c, 3)?.onReset == true
+            paint.style = Paint.Style.FILL
+            paint.color = if (hot) COLOR_CHIP_HOVER_BG else COLOR_CHIP_BG
+            rect.set(hitCx - visSize * 0.5f, rowMid - visSize * 0.5f, hitCx + visSize * 0.5f, rowMid + visSize * 0.5f)
+            canvas.drawRoundRect(rect, 20f, 20f, paint)
+            drawResetIcon(hitCx, rowMid, if (hot) COLOR_TEXT else COLOR_TEXT2)
+        }
+
+        // Subtle divider + screen manipulation gesture hint line
+        paint.style = Paint.Style.FILL
+        paint.color = COLOR_DIVIDER
+        canvas.drawRect(36f, 712f, width - 36f, 714f, paint)
+
+        textPaint.typeface = regularTypeface
+        textPaint.textSize = 26f
+        textPaint.textAlign = Paint.Align.CENTER
+        textPaint.color = COLOR_TEXT3
+        canvas.drawText(ellipsize(c.strings.screenGestureHint, width - 72f), width * 0.5f, 748f, textPaint)
     }
 
     private fun drawTabDanmaku(c: PaletteController) {

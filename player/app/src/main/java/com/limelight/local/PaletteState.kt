@@ -182,6 +182,9 @@ data class PaletteStrings(
     val toastNoDanmaku: String = "这个片源没有弹幕",
     val toastDanmakuOn: String = "弹幕 已开",
     val toastDanmakuOff: String = "弹幕 已关",
+    val screenSizeDisabledInRoom: String = "影院房间里画面固定在银幕上",
+    val screenDistDisabledInRoom: String = "影院房间里距离固定",
+    val screenGestureHint: String = "指着画面按住扳机，再推右摇杆：前后调远近 · 左右调大小",
 )
 
 /** Per-video persisted overrides (only the 4 per-video items per §6.3). */
@@ -200,7 +203,7 @@ data class GlobalPaletteSettings(
     val floatAutoOffsetSteps: Int = 0, // -2..+6 -> -0.10°..+0.30° in 0.05° steps
     val floatFixedSteps: Int = 0,      // 0..12 -> 0.00°..0.60° in 0.05° steps
     val depthLayer: DepthLayerLevel = DepthLayerLevel.MEDIUM,
-    val screenFovDeg: Float = 62f,
+    val screenFovDeg: Float = 50f,
     val screenDistM: Float = 3.0f,
     val screenCurvaturePct: Int = 0,
     val environment: PaletteEnvironment = PaletteEnvironment.PASSTHROUGH,
@@ -289,16 +292,22 @@ class PaletteController(
         private set
     var audioTracks: List<PaletteAudioTrack> = emptyList()
         private set
-    private var defaultSubtitleId: String? = null
-    private var defaultAudioId: String? = null
+    var defaultSourceFormat: StereoSourceFormat = StereoSourceFormat.AUTO
+        private set
+    var defaultSubtitleId: String? = null
+        private set
+    var defaultAudioId: String? = null
+        private set
+    private var subtitleDefaultCaptured: Boolean = false
+    private var audioDefaultCaptured: Boolean = false
 
     /** Effective 3D strength (per-video override, else 2D Settings default). */
     val effectiveStrength: DepthStrength
         get() = video.strength ?: global.defaultStrength
 
-    /** Effective stereo source format (per-video override, else AUTO). */
+    /** Effective stereo source format (explicit per-video override, else plugin/container hint, else AUTO). */
     val effectiveSourceFormat: StereoSourceFormat
-        get() = video.sourceFormat ?: StereoSourceFormat.AUTO
+        get() = video.sourceFormat ?: defaultSourceFormat
 
     /** Selected subtitle index: 0 = OFF, 1..N = subtitleTracks[i - 1]. */
     val selectedSubtitleIndex: Int
@@ -334,6 +343,14 @@ class PaletteController(
     val selectedAudioTrack: PaletteAudioTrack?
         get() = audioTracks.getOrNull(selectedAudioIndex)
 
+    /** Why screen size is disabled right now (3D theater room fixes screen to wall), or null if enabled. */
+    val screenSizeDisabledMessage: String?
+        get() = if (global.environment == PaletteEnvironment.THEATER) strings.screenSizeDisabledInRoom else null
+
+    /** Why screen distance is disabled right now (3D theater room fixes screen to wall), or null if enabled. */
+    val screenDistDisabledMessage: String?
+        get() = if (global.environment == PaletteEnvironment.THEATER) strings.screenDistDisabledInRoom else null
+
     /** Why curvature is disabled right now, or null if enabled. */
     val curvatureDisabledMessage: String?
         get() = when {
@@ -342,24 +359,45 @@ class PaletteController(
             else -> null
         }
 
-    /** Updates available ExoPlayer subtitle & audio tracks cleanly. */
+    /**
+     * Updates available ExoPlayer subtitle & audio tracks.
+     * Captures the natural default track ID ONCE per media item (the first non-empty track list
+     * observed before any user override is applied), so subsequent `onTracksChanged` callbacks
+     * triggered by switching tracks NEVER overwrite the default or hide the reset button.
+     */
+    @JvmOverloads
     fun setTracks(
         subtitles: List<PaletteSubtitleTrack>,
         audios: List<PaletteAudioTrack>,
         defaultSubId: String? = subtitles.firstOrNull()?.id,
         defaultAudId: String? = audios.firstOrNull()?.id,
+        forceResetDefaults: Boolean = false,
     ) {
+        if (forceResetDefaults) {
+            subtitleDefaultCaptured = false
+            audioDefaultCaptured = false
+            defaultSubtitleId = null
+            defaultAudioId = null
+        }
         subtitleTracks = subtitles
         audioTracks = audios
-        defaultSubtitleId = defaultSubId
-        defaultAudioId = defaultAudId
+        if (!subtitleDefaultCaptured && subtitles.isNotEmpty()) {
+            defaultSubtitleId = defaultSubId ?: SUBTITLE_OFF_ID
+            subtitleDefaultCaptured = true
+        }
+        if (!audioDefaultCaptured && audios.isNotEmpty()) {
+            defaultAudioId = defaultAudId ?: audios.first().id
+            audioDefaultCaptured = true
+        }
     }
 
-    /** Seeds a plugin/container stereo hint if the user has no explicit override for this video. */
+    /**
+     * Records a plugin/container stereo hint as this video's default source format WITHOUT
+     * writing it into [video] overrides, so explicit user selection of AUTO persists and
+     * row reset restores the plugin hint.
+     */
     fun seedDefaultSourceFormat(format: StereoSourceFormat) {
-        if (video.sourceFormat == null && format != StereoSourceFormat.AUTO) {
-            video = video.copy(sourceFormat = format)
-        }
+        defaultSourceFormat = format
     }
 
     /** Syncs screen size & distance saved externally by G1 trigger+stick adjustment. */
@@ -461,8 +499,10 @@ class PaletteController(
     fun isRowAdjustable(tab: Int, page: Int, row: Int): Boolean = when (tab) {
         XrShared.PALETTE_TAB_3D -> row in 0..3
         XrShared.PALETTE_TAB_SCREEN -> when (row) {
-            0, 1, 3 -> true
+            0 -> screenSizeDisabledMessage == null
+            1 -> screenDistDisabledMessage == null
             2 -> curvatureDisabledMessage == null
+            3 -> true
             else -> false
         }
         XrShared.PALETTE_TAB_DANMAKU -> when {
@@ -490,14 +530,14 @@ class PaletteController(
     fun isRowResetVisible(tab: Int, page: Int, row: Int): Boolean = when (tab) {
         XrShared.PALETTE_TAB_3D -> when (row) {
             0 -> effectiveStrength != global.defaultStrength
-            1 -> effectiveSourceFormat != StereoSourceFormat.AUTO
+            1 -> effectiveSourceFormat != defaultSourceFormat
             2 -> !global.floatAuto || global.floatAutoOffsetSteps != 0
             3 -> global.depthLayer != DepthLayerLevel.MEDIUM
             else -> false
         }
         XrShared.PALETTE_TAB_SCREEN -> when (row) {
-            0 -> abs(global.screenFovDeg - DEFAULT_FOV_DEG) > 0.4f
-            1 -> abs(global.screenDistM - DEFAULT_DIST_M) > 0.04f
+            0 -> screenSizeDisabledMessage == null && abs(global.screenFovDeg - DEFAULT_FOV_DEG) > 0.4f
+            1 -> screenDistDisabledMessage == null && abs(global.screenDistM - DEFAULT_DIST_M) > 0.04f
             2 -> curvatureDisabledMessage == null && global.screenCurvaturePct != 0
             3 -> global.environment != PaletteEnvironment.PASSTHROUGH
             else -> false
@@ -518,7 +558,8 @@ class PaletteController(
             }
         }
         XrShared.PALETTE_TAB_SUBTITLE -> when (row) {
-            0 -> subtitleTracks.isNotEmpty() && selectedSubtitleTrack?.id != defaultSubtitleId
+            0 -> subtitleTracks.isNotEmpty()
+                && (selectedSubtitleTrack?.id ?: SUBTITLE_OFF_ID) != (defaultSubtitleId ?: SUBTITLE_OFF_ID)
             1 -> audioTracks.size > 1 && selectedAudioTrack?.id != defaultAudioId
             2 -> subtitleTracks.isNotEmpty() && selectedSubtitleIndex > 0 && (
                 if (selectedSubtitleIsBitmap) global.subtitleBitmapScalePct != DEFAULT_SUB_BITMAP_SCALE
@@ -990,9 +1031,9 @@ class PaletteController(
             else -> PaletteActionResult()
         }
         XrShared.PALETTE_TAB_SCREEN -> when (row) {
-            0 -> setScreenFov(DEFAULT_FOV_DEG, hitDetent = true)
-            1 -> setScreenDist(DEFAULT_DIST_M, hitDetent = true)
-            2 -> setScreenCurvature(0)
+            0 -> if (screenSizeDisabledMessage == null) setScreenFov(DEFAULT_FOV_DEG, hitDetent = true) else PaletteActionResult()
+            1 -> if (screenDistDisabledMessage == null) setScreenDist(DEFAULT_DIST_M, hitDetent = true) else PaletteActionResult()
+            2 -> if (curvatureDisabledMessage == null) setScreenCurvature(0) else PaletteActionResult()
             3 -> setEnvironment(PaletteEnvironment.PASSTHROUGH)
             else -> PaletteActionResult()
         }
@@ -1071,7 +1112,7 @@ class PaletteController(
 
     private fun setSourceFormat(value: StereoSourceFormat): PaletteActionResult {
         if (value == effectiveSourceFormat) return PaletteActionResult()
-        video = video.copy(sourceFormat = if (value == StereoSourceFormat.AUTO) null else value)
+        video = video.copy(sourceFormat = if (value == defaultSourceFormat) null else value)
         return PaletteActionResult(
             changed = true,
             sourceFormatChanged = true,
@@ -1324,7 +1365,8 @@ class PaletteController(
         val next = ((cur + steps) % total + total) % total
         if (next == cur) return PaletteActionResult()
         val id = if (next == 0) SUBTITLE_OFF_ID else subtitleTracks[next - 1].id
-        video = video.copy(subtitleId = if (id == defaultSubtitleId) null else id)
+        val naturalDef = defaultSubtitleId ?: SUBTITLE_OFF_ID
+        video = video.copy(subtitleId = if (id == naturalDef) null else id)
         return PaletteActionResult(
             changed = true,
             subtitleTrackChanged = true,
@@ -1429,55 +1471,100 @@ class PaletteController(
     }
 
     /**
-     * Change-gated render key: only changes when visual state actually changes,
-     * ensuring ZERO redundant 1024x768 Canvas redraws or GPU texture uploads on idle frames.
+     * Zero-allocation 128-bit visual state hash written into a 2-element [LongArray].
+     * Replaces per-frame String building so idle/unchanged frames allocate zero heap objects.
      */
-    fun renderSignature(): String = buildString(192) {
-        append(activeTab).append('|').append(danmakuPage).append('|')
-        append(isPinned).append('|').append(isHandTrackingMode).append('|')
-        append(isDimFallback).append('|').append(cylinderSupported).append('|')
-        append(danmakuSupported).append('|').append(danmakuLoadFailed).append('|')
-        append(hover).append('|')
-        when (activeTab) {
-            XrShared.PALETTE_TAB_3D -> {
-                append(effectiveStrength.ordinal).append(',')
-                append(effectiveSourceFormat.ordinal).append(',')
-                append(global.defaultStrength.ordinal).append(',')
-                append(global.floatAuto).append(',')
-                append(global.floatAutoOffsetSteps).append(',')
-                append(global.floatFixedSteps).append(',')
-                append((global.screenDistM * 10f).roundToInt()).append(',')
-                append(global.depthLayer.ordinal)
+    fun computeRenderHash(out: LongArray) {
+        var h1 = -3750763034362895579L // FNV-1a 64-bit offset basis
+        var h2 = 0x9E3779B97F4A7C15uL.toLong()
+        fun mix(v: Long) {
+            h1 = (h1 xor v) * 1099511628211L
+            var z = h2 + v + 0x9E3779B97F4A7C15uL.toLong()
+            z = (z xor (z ushr 30)) * -4658895280553007687L
+            z = (z xor (z ushr 27)) * -7723592293110705685L
+            h2 = z xor (z ushr 31)
+        }
+        fun mixInt(v: Int) = mix(v.toLong())
+        fun mixBool(v: Boolean) = mix(if (v) 1L else 0L)
+
+        mixInt(activeTab)
+        mixInt(danmakuPage)
+        mixBool(isPinned)
+        mixBool(isHandTrackingMode)
+        mixBool(isDimFallback)
+        mixBool(cylinderSupported)
+        mixBool(danmakuSupported)
+        mixBool(danmakuLoadFailed)
+
+        when (val hv = hover) {
+            PaletteHover.None -> mixInt(0)
+            is PaletteHover.Tab -> {
+                mixInt(1)
+                mixInt(hv.index)
             }
-            XrShared.PALETTE_TAB_SCREEN -> {
-                append(global.screenFovDeg.roundToInt()).append(',')
-                append((global.screenDistM * 100f).roundToInt()).append(',')
-                append(global.screenCurvaturePct).append(',')
-                append(global.environment.ordinal)
-            }
-            XrShared.PALETTE_TAB_DANMAKU -> {
-                append(global.danmakuOn).append(',')
-                append(global.danmakuArea.ordinal).append(',')
-                append(global.danmakuOpacityPct).append(',')
-                append(global.danmakuSize.ordinal).append(',')
-                append(global.danmakuSpeed.ordinal).append(',')
-                append(global.danmakuBlockMask)
-            }
-            XrShared.PALETTE_TAB_SUBTITLE -> {
-                append(subtitleTracks.size).append(',')
-                append(selectedSubtitleIndex).append(',')
-                append(selectedSubtitleTrack?.label.orEmpty()).append(',')
-                append(selectedSubtitleIsBitmap).append(',')
-                append(audioTracks.size).append(',')
-                append(selectedAudioIndex).append(',')
-                append(selectedAudioTrack?.label.orEmpty()).append(',')
-                append(global.subtitleTextSize.ordinal).append(',')
-                append(global.subtitleBitmapScalePct).append(',')
-                append((global.subtitlePosDeg * 10f).roundToInt()).append(',')
-                append(defaultSubtitleId.orEmpty()).append(',')
-                append(defaultAudioId.orEmpty())
+            PaletteHover.Pin -> mixInt(2)
+            is PaletteHover.Row -> {
+                mixInt(3)
+                mixInt(hv.index)
+                mixInt(hv.chipIndex)
+                mixBool(hv.onReset)
+                mixBool(hv.onSlider)
+                mixBool(hv.onFloatAutoChip)
+                mixInt(hv.stepperDir)
+                mixBool(hv.onRetry)
             }
         }
+
+        when (activeTab) {
+            XrShared.PALETTE_TAB_3D -> {
+                mixInt(effectiveStrength.ordinal)
+                mixInt(effectiveSourceFormat.ordinal)
+                mixInt(defaultSourceFormat.ordinal)
+                mixInt(global.defaultStrength.ordinal)
+                mixBool(global.floatAuto)
+                mixInt(global.floatAutoOffsetSteps)
+                mixInt(global.floatFixedSteps)
+                mixInt((global.screenDistM * 10f).roundToInt())
+                mixInt(global.depthLayer.ordinal)
+            }
+            XrShared.PALETTE_TAB_SCREEN -> {
+                mixInt(global.screenFovDeg.roundToInt())
+                mixInt((global.screenDistM * 100f).roundToInt())
+                mixInt(global.screenCurvaturePct)
+                mixInt(global.environment.ordinal)
+            }
+            XrShared.PALETTE_TAB_DANMAKU -> {
+                mixBool(global.danmakuOn)
+                mixInt(global.danmakuArea.ordinal)
+                mixInt(global.danmakuOpacityPct)
+                mixInt(global.danmakuSize.ordinal)
+                mixInt(global.danmakuSpeed.ordinal)
+                mixInt(global.danmakuBlockMask)
+            }
+            XrShared.PALETTE_TAB_SUBTITLE -> {
+                mixInt(subtitleTracks.size)
+                mixInt(selectedSubtitleIndex)
+                mixInt(selectedSubtitleTrack?.label?.hashCode() ?: 0)
+                mixBool(selectedSubtitleIsBitmap)
+                mixInt(audioTracks.size)
+                mixInt(selectedAudioIndex)
+                mixInt(selectedAudioTrack?.label?.hashCode() ?: 0)
+                mixInt(global.subtitleTextSize.ordinal)
+                mixInt(global.subtitleBitmapScalePct)
+                mixInt((global.subtitlePosDeg * 10f).roundToInt())
+                mixInt(defaultSubtitleId?.hashCode() ?: 0)
+                mixInt(defaultAudioId?.hashCode() ?: 0)
+            }
+        }
+        out[0] = h1
+        out[1] = h2
+    }
+
+    /** Convenience 64-bit visual hash for tests. */
+    fun renderHash(): Long {
+        val buf = LongArray(2)
+        computeRenderHash(buf)
+        return buf[0] xor buf[1]
     }
 
     internal enum class RowControlKind { CHIPS, SLIDER, FLOAT_SLIDER, STEPPER, NONE }
@@ -1546,8 +1633,22 @@ class PaletteController(
         const val FLOAT_AUTO_MIN_STEPS = -2
         const val FLOAT_AUTO_MAX_STEPS = 6
         const val FLOAT_FIXED_MAX_STEPS = 12
-        const val DEFAULT_FOV_DEG = 62f
+        const val DEFAULT_FOV_DEG = 50f
         const val DEFAULT_DIST_M = 3.0f
+        const val FULL_SBS_MIN_RATIO = 2.60f
+        const val FULL_OU_MAX_RATIO = 1.25f
+
+        /** Effective per-eye display aspect (width / height), matching native paletteVideoHeightOverWidth. */
+        @JvmStatic
+        fun effectiveVideoAspect(videoW: Int, videoH: Int, format: StereoSourceFormat): Float {
+            if (videoW <= 0 || videoH <= 0) return 16f / 9f
+            val raw = videoW.toFloat() / videoH.toFloat()
+            return when {
+                format == StereoSourceFormat.SBS && raw >= FULL_SBS_MIN_RATIO -> raw * 0.5f
+                format == StereoSourceFormat.OU && raw <= FULL_OU_MAX_RATIO -> raw * 2.0f
+                else -> raw
+            }
+        }
         const val DEFAULT_DANMAKU_OPACITY = 80
         const val DEFAULT_SUB_BITMAP_SCALE = 100
         const val DEFAULT_SUB_POS_DEG = 2.0f

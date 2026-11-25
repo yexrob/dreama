@@ -187,4 +187,123 @@ int paletteHandRowDragStep(PaletteState* st, int pinchingOnRow, int rowIdx,
 // Predicate matching xr_layers.c single-layer submission
 int paletteShowLayer(int localMedia, int paletteVisible, int paletteArtReady, float alpha);
 
+// Predicate matching xr_layers.c passthrough dimmer submission (strictly localMedia only)
+int paletteShowDimmerLayer(int localMedia, int roomOn, int passthrough,
+                           int passthroughDim, int dimmerArtReady);
+
+// Whether depth model inference should run (false for native SBS/OU stereo sources)
+int paletteNeedsDepthInference(int stereoMode, int stereoLive, int stereoSourceFormat);
+
+// Aspect-ratio heuristic separating Half-SBS (<=2.55) from Full-SBS (>=2.67) and
+// Full-OU (<=1.20) from Half-OU (>=1.33) for standard 4:3 / 16:9 / 2.39:1 sources.
+#define PALETTE_FULL_SBS_MIN_RATIO 2.60f
+#define PALETTE_FULL_OU_MAX_RATIO  1.25f
+
+// Effective per-eye display height / width ratio accounting for Full-SBS & Full-OU.
+float paletteVideoHeightOverWidth(int videoW, int videoH, int stereoSourceFormat);
+
+// Per-hand release latch preventing phantom trigger/grip edges when palette-hand
+// suppression lifts while a button is still physically held down.
+typedef struct {
+    int triggerWaitRelease[2];
+    int gripWaitRelease[2];
+} PaletteSuppressLatch;
+
+void paletteSuppressLatchReset(PaletteSuppressLatch* latch);
+
+void paletteStepSuppressLatch(int suppressed, int rawTriggerDown, float rawTriggerVal,
+                              float rawGripVal, float pressOff,
+                              int* triggerLatch, int* gripLatch,
+                              int* outBlockTrigger, int* outBlockGrip);
+
+// ---- Pure-C glue matching xr_input.c updateLocalPalettePre / Post / stick mirror ----
+
+typedef struct {
+    XrPosef headPose;
+    XrPosef gripPose;
+    int gripValid;
+    int handTracking;
+    int screenAdjustActive;
+    int colorScaleSupported;
+    float dt;
+    int64_t nowNs;
+    int closeRequested;
+    int barOpenRequested;
+    int pinToggleRequested;
+    int rawTriggerDown[2];
+    float rawTriggerVal[2];
+    float rawGripVal[2];
+    float pressOff;
+} PalettePreGlueIn;
+
+typedef struct {
+    PaletteRenderPose renderPose;
+    int clearActiveDrags;
+    int hapticKind;
+    int suppressRay[2];
+    int blockTrigger[2];
+    int blockGrip[2];
+} PalettePreGlueOut;
+
+void paletteGluePreStep(PaletteState* st, PaletteSuppressLatch* latch,
+                        const PalettePreGlueIn* in, PalettePreGlueOut* out);
+
+typedef struct {
+    XrPosef headPose;
+    int handTracking;
+    int screenAdjustActive;
+    int grabMode;
+    int activeRowMask;
+    int64_t nowNs;
+    float pressOn;
+    float pressOff;
+    int canPoint[3];
+    int aimValid[3];
+    XrPosef aimPoses[3];
+    int triggerDown[3];
+    int triggerEdge[3];
+    float grabVal[2];
+    int grabDown[2];
+    Vec3 handDragPos[2];
+    int dragHand;
+    int sliderDragging;
+    int sliderHand;
+    PaletteRenderPose renderPose;
+} PalettePostGlueIn;
+
+typedef struct {
+    PaletteHit hit;
+    int claimed;
+    int claimedHand;
+    int claimedHover; // HOVER_PALETTE or HOVER_PALETTE_DEADZONE
+    float claimedU;
+    float claimedV;
+    int clickState;   // 0=none, 1=down edge, 2=slider hold
+    int rowStep;
+    int hapticKind;
+    int clickSound;
+    int swallowHand;  // -1 if none, else src index
+    int nextDragHand;
+    int nextSliderDragging;
+    int nextSliderHand;
+    XrPosef updatedPose;
+    int poseUpdated;
+} PalettePostGlueOut;
+
+void paletteGluePostStep(PaletteState* st, const PalettePostGlueIn* in, PalettePostGlueOut* out);
+
+// Mirrors operating vs palette-hand sticks when palette is open on right hand (§6.3).
+// `profileIsController[2]` indicates whether each physical hand is a controller.
+void paletteGlueMirrorSticks(const PaletteState* st, const int profileIsController[2],
+                             float leftX, float leftY, int leftStickClick,
+                             float rightX, float rightY, int rightStickClick,
+                             float* outOpX, float* outOpY, int* outOpStickClick,
+                             float* outPalX, float* outPalY);
+
+// Applies a local-playback B-button decision to the palette: closes the palette and
+// signals drag clearing iff `isClosePaletteB` is set (higher-priority B actions such
+// as adjust-undo or card-close leave the palette open). Returns 1 if palette closed.
+int paletteGlueApplyCloseOnB(PaletteState* st, int isClosePaletteB, int64_t nowNs,
+                             int* outClearDrags);
+
 #endif

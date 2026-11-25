@@ -593,8 +593,11 @@ static int initSwapchain(XrCtx* ctx) {
     }
     free(formats);
 
-    // Stereo renders left and right eye views side by side in one swapchain
-    int chainWidth = ctx->stereoMode != DEPTH_MODE_OFF ? ctx->videoWidth * 2 : ctx->videoWidth;
+    // Stereo renders left and right eye views side by side in one swapchain.
+    // Local playback always allocates double-wide so SBS/OU or lazy 3D turn-on
+    // works mid-session without tearing down the OpenXR session.
+    int chainWidth = (ctx->stereoMode != DEPTH_MODE_OFF || ctx->localMedia)
+            ? ctx->videoWidth * 2 : ctx->videoWidth;
     if (!createArtSwapchain(ctx, chainWidth, ctx->videoHeight, "xrCreateSwapchain",
                             &ctx->swapchain, &ctx->swapchainImages, &ctx->swapchainImageCount)) {
         startStoppedAtLast(ctx, "swapchain");
@@ -872,6 +875,10 @@ static void destroyCtx(JNIEnv* env, XrCtx* ctx) {
     if (ctx->activity != NULL) {
         (*env)->DeleteGlobalRef(env, ctx->activity);
     }
+    if (ctx->localCmdLockReady) {
+        pthread_mutex_destroy(&ctx->localCmdLock);
+        ctx->localCmdLockReady = 0;
+    }
     free(ctx->start);
     free(ctx);
 }
@@ -886,8 +893,12 @@ Java_com_limelight_binding_video_XrRenderer_nativeInit(JNIEnv* env, jobject thiz
                                                        jint supersampleMode,
                                                        jboolean perfOverlay, jboolean ambilight,
                                                        jint ambiLevel, jboolean roomLight,
-                                                       jint envResTier) {
+                                                       jint envResTier, jboolean localMedia,
+                                                       jboolean startStereoLive) {
     XrCtx* ctx = calloc(1, sizeof(XrCtx));
+    pthread_mutex_init(&ctx->localCmdLock, NULL);
+    ctx->localCmdLockReady = 1;
+    ctx->localMedia = localMedia ? 1 : 0;
     ctx->handsEnabled = handTracking;
     // EnvResTier: 0 low, 1 standard, 2 high, 3 ultra
     ctx->envResTier = envResTier;
@@ -900,9 +911,9 @@ Java_com_limelight_binding_video_XrRenderer_nativeInit(JNIEnv* env, jobject thiz
     ctx->depthRateSetting = DEPTH_RATE_DEFAULT;
     depthGovernorStart(&ctx->depthGov, DEPTH_RATE_DEFAULT);
     ctx->stereoMode = stereoMode;
-    // Every session with stereo starts with it on, and the switch only lasts
-    // the session
-    ctx->stereoLive = stereoMode != DEPTH_MODE_OFF;
+    // Streaming sessions with stereo start with it on; local playback honors
+    // initial 3D state so starting OFF or SBS/OU skips loading the depth model.
+    ctx->stereoLive = (stereoMode != DEPTH_MODE_OFF) && (!ctx->localMedia || startStereoLive);
     ctx->drawnEyes = ctx->stereoLive ? 2 : 1;
     // The size the depth map runs at, from the model Java picked. Everything
     // the depth path allocates is sized from it, so it is settled before any
@@ -1008,6 +1019,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeInit(JNIEnv* env, jobject thiz
     ctx->triggerScreenAdjustOn = 1;
     screenInputInit(&ctx->screenCtrl);
     paletteInit(&ctx->palette);
+    paletteSuppressLatchReset(&ctx->paletteLatch);
     ctx->paletteActiveRowMask = 0xF;
     ctx->paletteDragHand = -1;
     ctx->paletteSliderHand = -1;

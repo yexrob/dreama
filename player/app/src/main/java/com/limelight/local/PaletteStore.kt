@@ -2,6 +2,7 @@ package com.limelight.local
 
 import android.content.Context
 import com.limelight.binding.video.EnvironmentIds
+import com.limelight.binding.video.ScreenReadout
 import com.limelight.local.stream.AndroidPrefsStore
 import com.limelight.local.stream.DepthStrength
 import com.limelight.local.stream.PrefsStore
@@ -106,53 +107,81 @@ object PaletteStore {
 
     @JvmStatic
     fun saveGlobal(store: PrefsStore, settings: GlobalPaletteSettings) {
-        store.putBoolean(KEY_FLOAT_AUTO, settings.floatAuto)
-        store.putInt(KEY_FLOAT_AUTO_OFFSET, settings.floatAutoOffsetSteps)
-        store.putInt(KEY_FLOAT_FIXED_STEPS, settings.floatFixedSteps)
-        store.putInt(KEY_DEPTH_LAYER, settings.depthLayer.ordinal)
-
-        // Sync Screen tab directly with 2D Settings keys
-        StreamSettingsMapper.setScreenDistanceMeters(store, settings.screenDistM)
-        StreamSettingsMapper.setScreenFovDeg(store, settings.screenFovDeg)
-        StreamSettingsMapper.setCurvaturePercent(store, settings.screenCurvaturePct)
-
-        // Environment mapping: remember last-used 3D room when entering/leaving 影院
+        // Resolve current environment/room BEFORE opening batch editor so reads see committed state
         val currentEnvId = EnvironmentIds.listValue(store.asSharedPreferences()).toIntOrNull()
             ?: PreferenceConfiguration.VR_ENV_VOID
-        if (PreferenceConfiguration.isRoomEnvironment(currentEnvId)) {
-            store.putInt(KEY_LAST_ROOM_ENV_ID, currentEnvId)
+        val targetRoomId = if (settings.environment == PaletteEnvironment.THEATER) {
+            rememberedRoomEnvId(store)
+        } else {
+            PreferenceConfiguration.VR_ENV_HOME_THEATER
         }
-        when (settings.environment) {
-            PaletteEnvironment.PASSTHROUGH -> {
-                store.putBoolean(PreferenceConfiguration.VR_PASSTHROUGH_DIM_PREF_STRING, false)
-                StreamSettingsMapper.setEnvironment(store, VrEnvironmentPreset.PASSTHROUGH)
+        val clampedDist = ScreenReadout.clampDist(settings.screenDistM)
+        val clampedFov = ScreenReadout.clampFov(settings.screenFovDeg)
+        val distDm = (clampedDist * 10f).roundToInt()
+            .coerceIn(ScreenReadout.MIN_SCREEN_DIST_DM, ScreenReadout.MAX_SCREEN_DIST_DM)
+        val sizeDm = (ScreenReadout.flatWidthMeters(clampedFov, clampedDist) * 10f).roundToInt()
+            .coerceIn(ScreenReadout.MIN_SCREEN_SIZE_DM, ScreenReadout.MAX_SCREEN_SIZE_DM)
+        val curvePct = ScreenReadout.quantizeCurvature(settings.screenCurvaturePct)
+
+        store.batch { b ->
+            b.putBoolean(KEY_FLOAT_AUTO, settings.floatAuto)
+            b.putInt(KEY_FLOAT_AUTO_OFFSET, settings.floatAutoOffsetSteps)
+            b.putInt(KEY_FLOAT_FIXED_STEPS, settings.floatFixedSteps)
+            b.putInt(KEY_DEPTH_LAYER, settings.depthLayer.ordinal)
+
+            // Sync Screen tab directly with 2D Settings keys in one atomic batch
+            b.putInt(PreferenceConfiguration.VR_DISTANCE_PREF_STRING, distDm)
+            b.putInt(PreferenceConfiguration.VR_SCREEN_SIZE_PREF_STRING, sizeDm)
+            b.putInt(PreferenceConfiguration.VR_CURVATURE_PREF_STRING, curvePct)
+
+            if (PreferenceConfiguration.isRoomEnvironment(currentEnvId)) {
+                b.putInt(KEY_LAST_ROOM_ENV_ID, currentEnvId)
             }
-            PaletteEnvironment.DIM -> {
-                store.putBoolean(PreferenceConfiguration.VR_PASSTHROUGH_DIM_PREF_STRING, true)
-                StreamSettingsMapper.setEnvironment(store, VrEnvironmentPreset.PASSTHROUGH)
+            val envPreset = when (settings.environment) {
+                PaletteEnvironment.PASSTHROUGH -> {
+                    b.putBoolean(PreferenceConfiguration.VR_PASSTHROUGH_DIM_PREF_STRING, false)
+                    VrEnvironmentPreset.PASSTHROUGH
+                }
+                PaletteEnvironment.DIM -> {
+                    b.putBoolean(PreferenceConfiguration.VR_PASSTHROUGH_DIM_PREF_STRING, true)
+                    VrEnvironmentPreset.PASSTHROUGH
+                }
+                PaletteEnvironment.THEATER -> {
+                    b.putBoolean(PreferenceConfiguration.VR_PASSTHROUGH_DIM_PREF_STRING, false)
+                    VrEnvironmentPreset.fromEnvId(targetRoomId)
+                }
+                PaletteEnvironment.VOID -> {
+                    b.putBoolean(PreferenceConfiguration.VR_PASSTHROUGH_DIM_PREF_STRING, false)
+                    VrEnvironmentPreset.VOID
+                }
             }
-            PaletteEnvironment.THEATER -> {
-                store.putBoolean(PreferenceConfiguration.VR_PASSTHROUGH_DIM_PREF_STRING, false)
-                val roomId = rememberedRoomEnvId(store)
-                StreamSettingsMapper.setEnvironment(store, VrEnvironmentPreset.fromEnvId(roomId))
-            }
-            PaletteEnvironment.VOID -> {
-                store.putBoolean(PreferenceConfiguration.VR_PASSTHROUGH_DIM_PREF_STRING, false)
-                StreamSettingsMapper.setEnvironment(store, VrEnvironmentPreset.VOID)
-            }
+            b.putInt(PreferenceConfiguration.VR_ENVIRONMENT_ID_PREF_STRING, envPreset.envId)
+            b.putBoolean(
+                PreferenceConfiguration.VR_PASSTHROUGH_PREF_STRING,
+                envPreset.envId == PreferenceConfiguration.VR_ENV_PASSTHROUGH,
+            )
+
+            // Danmaku & subtitle global prefs
+            b.putBoolean(KEY_DANMAKU_ON, settings.danmakuOn)
+            b.putInt(KEY_DANMAKU_AREA, settings.danmakuArea.ordinal)
+            b.putInt(KEY_DANMAKU_OPACITY, settings.danmakuOpacityPct)
+            b.putInt(KEY_DANMAKU_SIZE, settings.danmakuSize.ordinal)
+            b.putInt(KEY_DANMAKU_SPEED, settings.danmakuSpeed.ordinal)
+            b.putInt(KEY_DANMAKU_BLOCK_MASK, settings.danmakuBlockMask and DanmakuBlockFlags.ALL_MASK)
+
+            b.putInt(KEY_SUB_TEXT_SIZE, settings.subtitleTextSize.ordinal)
+            b.putInt(KEY_SUB_BITMAP_SCALE, settings.subtitleBitmapScalePct)
+            b.putInt(KEY_SUB_POS_TENTHS, (settings.subtitlePosDeg * 10f).roundToInt())
         }
+    }
 
-        // Danmaku & subtitle global prefs
-        store.putBoolean(KEY_DANMAKU_ON, settings.danmakuOn)
-        store.putInt(KEY_DANMAKU_AREA, settings.danmakuArea.ordinal)
-        store.putInt(KEY_DANMAKU_OPACITY, settings.danmakuOpacityPct)
-        store.putInt(KEY_DANMAKU_SIZE, settings.danmakuSize.ordinal)
-        store.putInt(KEY_DANMAKU_SPEED, settings.danmakuSpeed.ordinal)
-        store.putInt(KEY_DANMAKU_BLOCK_MASK, settings.danmakuBlockMask and DanmakuBlockFlags.ALL_MASK)
+    @JvmStatic
+    fun isScreenGestureHintSeen(store: PrefsStore): Boolean =
+        store.getBoolean(PreferenceConfiguration.VR_SCREEN_GESTURE_HINT_SEEN_PREF_STRING, false)
 
-        store.putInt(KEY_SUB_TEXT_SIZE, settings.subtitleTextSize.ordinal)
-        store.putInt(KEY_SUB_BITMAP_SCALE, settings.subtitleBitmapScalePct)
-        store.putInt(KEY_SUB_POS_TENTHS, (settings.subtitlePosDeg * 10f).roundToInt())
+    @JvmStatic
+    fun markScreenGestureHintSeen(store: PrefsStore) {
+        store.putBoolean(PreferenceConfiguration.VR_SCREEN_GESTURE_HINT_SEEN_PREF_STRING, true)
     }
 
     /** Resolves which OpenXR environment cell ID `PaletteEnvironment.THEATER` activates. */
@@ -211,19 +240,21 @@ object PaletteStore {
         val audioKey = "${prefix}audio"
         val noticeKey = "${prefix}strength_notice"
 
-        if (overrides.strength != null) videoStore.putInt(strengthKey, overrides.strength.ordinal)
-        else videoStore.remove(strengthKey)
+        videoStore.batch { b ->
+            if (overrides.strength != null) b.putInt(strengthKey, overrides.strength.ordinal)
+            else b.remove(strengthKey)
 
-        if (overrides.sourceFormat != null) videoStore.putInt(sourceKey, overrides.sourceFormat.nativeCode)
-        else videoStore.remove(sourceKey)
+            if (overrides.sourceFormat != null) b.putInt(sourceKey, overrides.sourceFormat.nativeCode)
+            else b.remove(sourceKey)
 
-        if (overrides.subtitleId != null) videoStore.putString(subKey, overrides.subtitleId)
-        else videoStore.remove(subKey)
+            if (overrides.subtitleId != null) b.putString(subKey, overrides.subtitleId)
+            else b.remove(subKey)
 
-        if (overrides.audioId != null) videoStore.putString(audioKey, overrides.audioId)
-        else videoStore.remove(audioKey)
+            if (overrides.audioId != null) b.putString(audioKey, overrides.audioId)
+            else b.remove(audioKey)
 
-        if (overrides.strengthNoticeShown) videoStore.putBoolean(noticeKey, true)
-        else videoStore.remove(noticeKey)
+            if (overrides.strengthNoticeShown) b.putBoolean(noticeKey, true)
+            else b.remove(noticeKey)
+        }
     }
 }

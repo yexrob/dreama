@@ -635,4 +635,20 @@
     <string name="vr_toast_no_danmaku">这个片源没有弹幕</string>
     <string name="vr_toast_danmaku_on">弹幕 已开</string>
     <string name="vr_toast_danmaku_off">弹幕 已关</string>
+
+    <!-- G2 review: first-time screen gesture hint, room disabled reasons & localized track labels -->
+    <string name="vr_hint_screen_gesture">指着画面按住扳机，再推右摇杆：前后调远近 · 左右调大小</string>
+    <string name="vr_screen_size_disabled_in_room">影院房间里画面固定在银幕上</string>
+    <string name="vr_screen_dist_disabled_in_room">影院房间里距离固定</string>
+    <string name="vr_track_subtitle_ordinal">字幕 %1$d</string>
+    <string name="vr_track_audio_ordinal">音轨 %1$d</string>
+    <string name="vr_lang_zh_hant">繁體中文</string>
+    <string name="vr_lang_zh_hans">简体中文</string>
+    <string name="vr_lang_en">英语</string>
+    <string name="vr_lang_ja">日语</string>
+    <string name="vr_lang_ko">韩语</string>
+    <string name="vr_lang_fr">法语</string>
+    <string name="vr_lang_de">德语</string>
+    <string name="vr_lang_es">西班牙语</string>
+    <string name="vr_lang_ru">俄语</string>
 </resources>

@@ -1134,55 +1134,77 @@ Java_com_limelight_binding_video_XrRenderer_nativeSetPaletteHand(JNIEnv* env, jo
                                                                  jlong handle,
                                                                  jboolean rightHand) {
     XrCtx* ctx = (XrCtx*)(intptr_t)handle;
-    if (ctx != NULL) {
-        paletteSetHand(&ctx->palette, rightHand ? 1 : 0);
-        LOGI("depth3d: palette mounted on %s hand", rightHand ? "right" : "left");
+    if (ctx == NULL) {
+        return;
     }
+    pthread_mutex_lock(&ctx->localCmdLock);
+    ctx->localPending.hasHand = 1;
+    ctx->localPending.handRight = rightHand ? 1 : 0;
+    pthread_mutex_unlock(&ctx->localCmdLock);
 }
 
 JNIEXPORT void JNICALL
 Java_com_limelight_binding_video_XrRenderer_nativeSetPaletteRowMask(JNIEnv* env, jobject thiz,
                                                                     jlong handle, jint mask) {
     XrCtx* ctx = (XrCtx*)(intptr_t)handle;
-    if (ctx != NULL) {
-        ctx->paletteActiveRowMask = mask & 0xF;
+    if (ctx == NULL) {
+        return;
     }
+    pthread_mutex_lock(&ctx->localCmdLock);
+    ctx->localPending.hasRowMask = 1;
+    ctx->localPending.rowMask = mask & 0xF;
+    pthread_mutex_unlock(&ctx->localCmdLock);
 }
 
 JNIEXPORT void JNICALL
 Java_com_limelight_binding_video_XrRenderer_nativeOpenPaletteFromBar(JNIEnv* env, jobject thiz,
                                                                      jlong handle) {
     XrCtx* ctx = (XrCtx*)(intptr_t)handle;
-    if (ctx != NULL) {
-        ctx->paletteBarOpenRequested = 1;
+    if (ctx == NULL) {
+        return;
     }
+    pthread_mutex_lock(&ctx->localCmdLock);
+    ctx->localPending.barOpen = 1;
+    ctx->localPending.close = 0;
+    pthread_mutex_unlock(&ctx->localCmdLock);
 }
 
 JNIEXPORT void JNICALL
 Java_com_limelight_binding_video_XrRenderer_nativeTogglePalettePin(JNIEnv* env, jobject thiz,
                                                                    jlong handle) {
     XrCtx* ctx = (XrCtx*)(intptr_t)handle;
-    if (ctx != NULL) {
-        ctx->palettePinToggleRequested = 1;
+    if (ctx == NULL) {
+        return;
     }
+    pthread_mutex_lock(&ctx->localCmdLock);
+    ctx->localPending.pinToggle = 1;
+    pthread_mutex_unlock(&ctx->localCmdLock);
 }
 
 JNIEXPORT void JNICALL
 Java_com_limelight_binding_video_XrRenderer_nativeClosePalette(JNIEnv* env, jobject thiz,
                                                                jlong handle) {
     XrCtx* ctx = (XrCtx*)(intptr_t)handle;
-    if (ctx != NULL) {
-        ctx->paletteCloseRequested = 1;
+    if (ctx == NULL) {
+        return;
     }
+    pthread_mutex_lock(&ctx->localCmdLock);
+    ctx->localPending.close = 1;
+    ctx->localPending.barOpen = 0;
+    pthread_mutex_unlock(&ctx->localCmdLock);
 }
 
 JNIEXPORT void JNICALL
 Java_com_limelight_binding_video_XrRenderer_nativeSetPassthroughDim(JNIEnv* env, jobject thiz,
                                                                     jlong handle, jboolean dim) {
     XrCtx* ctx = (XrCtx*)(intptr_t)handle;
-    if (ctx != NULL) {
-        ctx->passthroughDim = dim ? 1 : 0;
+    if (ctx == NULL) {
+        return;
     }
+    pthread_mutex_lock(&ctx->localCmdLock);
+    ctx->localPending.hasPassthroughDim = 1;
+    ctx->localPending.passthroughDim = dim ? 1 : 0;
+    pthread_mutex_unlock(&ctx->localCmdLock);
 }
 
 JNIEXPORT void JNICALL
@@ -1195,17 +1217,13 @@ Java_com_limelight_binding_video_XrRenderer_nativeSetStereoStrength(JNIEnv* env,
     if (ctx == NULL) {
         return;
     }
-    if (separation >= 0.0f) {
-        ctx->panelSeparation = separation;
-    }
-    if (convergence >= 0.0f && convergence <= 1.0f) {
-        ctx->convergence = convergence;
-    }
-    if (depthLocal > 0.0f) {
-        ctx->depthLocal = depthLocal;
-    }
-    setStereoLive(ctx, on ? 1 : 0, "palette");
-    ctx->warpRedraw = 1;
+    pthread_mutex_lock(&ctx->localCmdLock);
+    ctx->localPending.hasStereoStrength = 1;
+    ctx->localPending.stereoOn = on ? 1 : 0;
+    ctx->localPending.stereoSeparation = separation;
+    ctx->localPending.stereoConvergence = convergence;
+    ctx->localPending.stereoDepthLocal = depthLocal;
+    pthread_mutex_unlock(&ctx->localCmdLock);
 }
 
 JNIEXPORT void JNICALL
@@ -1218,18 +1236,15 @@ Java_com_limelight_binding_video_XrRenderer_nativeSetStereoSourceFormat(JNIEnv* 
     if (format < STEREO_SRC_AUTO || format > STEREO_SRC_OU) {
         format = STEREO_SRC_AUTO;
     }
-    if (ctx->stereoSourceFormat != format) {
-        ctx->stereoSourceFormat = format;
-        if (format != STEREO_SRC_AUTO) {
-            ctx->stereoWaiting = 0;
-        }
-        ctx->warpRedraw = 1;
-        LOGEV("depth3d: stereo source format %d", format);
-    }
+    pthread_mutex_lock(&ctx->localCmdLock);
+    ctx->localPending.hasSourceFormat = 1;
+    ctx->localPending.sourceFormat = format;
+    pthread_mutex_unlock(&ctx->localCmdLock);
 }
 
-// Applies exact palette screen settings (FOV, distance, curvature) using the
-// same unified geometry helper as trigger+stick adjustment (G1 #7/#8).
+// Enqueues palette screen settings (FOV, distance, curvature) to be applied on
+// the render thread via screenApplyLocalDims (preserving grabbed pose and never
+// perturbing lastDistance/lastQuadWidth).
 JNIEXPORT void JNICALL
 Java_com_limelight_binding_video_XrRenderer_nativeSetLocalScreenDimensions(JNIEnv* env,
                                                                            jobject thiz,
@@ -1241,26 +1256,12 @@ Java_com_limelight_binding_video_XrRenderer_nativeSetLocalScreenDimensions(JNIEn
     if (ctx == NULL) {
         return;
     }
-    float fov = screenClampFov(fovDeg);
-    float dist = screenClampDist(distM);
-    float curve = screenQuantizeCurve(curvature);
-    ctx->panelCurve = curve;
-    if (ctx->placementValid && roomEffective(ctx) <= 0) {
-        Vec3 head = { ctx->headPos.x, ctx->headPos.y, ctx->headPos.z };
-        Vec3 sp = { ctx->screenPose.position.x, ctx->screenPose.position.y,
-                    ctx->screenPose.position.z };
-        Vec3 diff = vecSub(sp, head);
-        float len = sqrtf(vecDot(diff, diff));
-        Vec3 dir = len > 0.05f ? vecNorm(diff) : (Vec3){ 0.0f, 0.0f, -1.0f };
-        ctx->screenPose.position.x = head.x + dir.x * dist;
-        ctx->screenPose.position.y = head.y + dir.y * dist;
-        ctx->screenPose.position.z = head.z + dir.z * dist;
-        screenPlacementForFov(fov, dist, curve, ctx->cylinderSupported,
-                              &ctx->screenWidth, &ctx->screenRadius);
-        ctx->sliderSeen = 1;
-        ctx->lastDistance = dist;
-        ctx->lastQuadWidth = screenFlatWidth(fov, dist);
-    }
+    pthread_mutex_lock(&ctx->localCmdLock);
+    ctx->localPending.hasScreenDims = 1;
+    ctx->localPending.screenFovDeg = fovDeg;
+    ctx->localPending.screenDistM = distM;
+    ctx->localPending.screenCurve = curvature;
+    pthread_mutex_unlock(&ctx->localCmdLock);
 }
 
 JNIEXPORT void JNICALL
@@ -1268,6 +1269,20 @@ Java_com_limelight_binding_video_XrRenderer_nativeTriggerPaletteHaptic(JNIEnv* e
                                                                        jlong handle, jint kind) {
     XrCtx* ctx = (XrCtx*)(intptr_t)handle;
     if (ctx != NULL && kind > PALETTE_HAPTIC_NONE && kind <= PALETTE_HAPTIC_LIMIT) {
-        ctx->palettePendingHaptic = kind;
+        pthread_mutex_lock(&ctx->localCmdLock);
+        ctx->localPending.pendingHaptic = kind;
+        pthread_mutex_unlock(&ctx->localCmdLock);
     }
+}
+
+// Render-thread only: lazily builds depth-model EGL contexts, PBOs, and upsample
+// passes the first time local playback turns 3D ON in AUTO mode.
+JNIEXPORT jboolean JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeEnsureDepthModel(JNIEnv* env, jobject thiz,
+                                                                   jlong handle) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx == NULL) {
+        return JNI_FALSE;
+    }
+    return ensureDepthModelGl(ctx) ? JNI_TRUE : JNI_FALSE;
 }

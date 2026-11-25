@@ -339,6 +339,34 @@ void screenMigratePoseGeometry(XrPosef screenPose, Vec3 refPos,
                                float curve, int cylinderSupported,
                                float* outWidth, float* outRadius);
 
+// Placement state shared by xr_input.c updatePlacement and local palette set-dims
+// so host unit tests directly verify that palette size/distance/curve updates
+// preserve custom grabbed orientation & never trigger a false sliderMoved reseed.
+typedef struct {
+    int placementValid;
+    int sliderSeen;
+    float lastDistance;
+    float lastQuadWidth;
+    XrPosef screenPose;
+    float screenWidth;
+    float screenRadius;
+    int poseNeedsCurveMigration;
+    int poseDirty;
+    int grabMode;
+} ScreenPlacementState;
+
+// Applies VR Quick Palette screen size/distance/curve changes while preserving
+// current screen direction/orientation and WITHOUT touching lastDistance/lastQuadWidth
+// (so the next frame's updatePlacement does not falsely reseed & snap back).
+void screenApplyLocalDims(ScreenPlacementState* st, Vec3 headPos,
+                          float fovDeg, float distM, float curve,
+                          int cylinderSupported, int roomOn, float* outPanelCurve);
+
+// Pure placement update matching xr_input.c updatePlacement. Returns 1 if reseeded.
+int screenUpdatePlacement(ScreenPlacementState* st, Vec3 headPos,
+                          float distance, float quadWidth, float curvature,
+                          int cylinderSupported, int* outMigrated);
+
 // Coaxial curved strip geometry for bottom-aligned overlays (transport bar)
 int screenCurvedStrip(XrPosef screenPose, float screenWidth, float screenHeight,
                       float screenRadius, float marginFrac, float texAspect,

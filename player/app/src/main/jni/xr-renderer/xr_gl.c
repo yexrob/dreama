@@ -317,12 +317,26 @@ int initGl(XrCtx* ctx) {
         return 0;
     }
 
-    if (ctx->stereoMode == DEPTH_MODE_MODEL) {
-        if (!initDepthModel(ctx) || !initUpsample(ctx)) {
+    if (ctx->stereoMode == DEPTH_MODE_MODEL && ctx->stereoLive) {
+        if (!ensureDepthModelGl(ctx)) {
             return 0;
         }
     }
 
+    return 1;
+}
+
+// Initializes GL/EGL depth-model staging and upsample passes once on the render
+// thread. Deferred when local playback starts with 3D OFF so zero model RAM or
+// GL contexts are allocated until the user turns 3D ON in AUTO mode.
+int ensureDepthModelGl(XrCtx* ctx) {
+    if (ctx->depthModelGlReady) {
+        return 1;
+    }
+    if (!initDepthModel(ctx) || !initUpsample(ctx)) {
+        return 0;
+    }
+    ctx->depthModelGlReady = 1;
     return 1;
 }
 
@@ -391,11 +405,17 @@ void renderVideoFrame(XrCtx* ctx, const float* texMatrix, float separation) {
     // stereo sources bypass the depth model and draw left/right halves directly.
     int nativeStereoSrc = ctx->stereoSourceFormat == STEREO_SRC_SBS
             || ctx->stereoSourceFormat == STEREO_SRC_OU;
+    int depthMapReady = ctx->stereoMode == DEPTH_MODE_MODEL
+            ? (ctx->depthModelGlReady
+               && atomic_load_explicit(&ctx->depthMapsStaged, memory_order_acquire) > 0)
+            : (ctx->stereoMode != DEPTH_MODE_OFF);
     int warping = nativeStereoSrc
-            ? (ctx->stereoMode != DEPTH_MODE_OFF && ctx->stereoLive)
-            : (ctx->stereoMode != DEPTH_MODE_OFF && ctx->stereoLive && !ctx->stereoWaiting);
+            ? ctx->stereoLive
+            : (ctx->stereoMode != DEPTH_MODE_OFF && ctx->stereoLive
+               && !ctx->stereoWaiting && depthMapReady);
     int upsampling = !nativeStereoSrc && warping
-            && ctx->stereoMode == DEPTH_MODE_MODEL && ctx->upsampleEnabled;
+            && ctx->stereoMode == DEPTH_MODE_MODEL && ctx->depthModelGlReady
+            && ctx->upsampleEnabled;
     int occluding = upsampling && ctx->occlusionEnabled && separation > 0.0f;
 
     // Capture frames do readbacks and file writes inside what would be the

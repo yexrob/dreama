@@ -2,6 +2,7 @@
 // hover hysteresis, dragging, and fade/dimming controller (ux-spec.md §6.3-§6.5).
 
 #include "xr_palette.h"
+#include "xr_layout.h"
 #include <math.h>
 #include <string.h>
 
@@ -721,4 +722,328 @@ int paletteHandRowDragStep(PaletteState* st, int pinchingOnRow, int rowIdx,
 
 int paletteShowLayer(int localMedia, int paletteVisible, int paletteArtReady, float alpha) {
     return localMedia && paletteVisible && paletteArtReady && alpha > 0.001f ? 1 : 0;
+}
+
+int paletteShowDimmerLayer(int localMedia, int roomOn, int passthrough,
+                           int passthroughDim, int dimmerArtReady) {
+    return (localMedia && !roomOn && passthrough && passthroughDim && dimmerArtReady) ? 1 : 0;
+}
+
+int paletteNeedsDepthInference(int stereoMode, int stereoLive, int stereoSourceFormat) {
+    return (stereoMode != DEPTH_MODE_OFF && stereoLive
+            && stereoSourceFormat == STEREO_SRC_AUTO) ? 1 : 0;
+}
+
+float paletteVideoHeightOverWidth(int videoW, int videoH, int stereoSourceFormat) {
+    if (videoW <= 0 || videoH <= 0) {
+        return 9.0f / 16.0f;
+    }
+    float rawRatio = (float)videoW / (float)videoH;
+    if (stereoSourceFormat == STEREO_SRC_SBS && rawRatio >= PALETTE_FULL_SBS_MIN_RATIO) {
+        return (2.0f * (float)videoH) / (float)videoW;
+    }
+    if (stereoSourceFormat == STEREO_SRC_OU && rawRatio <= PALETTE_FULL_OU_MAX_RATIO) {
+        return (0.5f * (float)videoH) / (float)videoW;
+    }
+    return (float)videoH / (float)videoW;
+}
+
+void paletteSuppressLatchReset(PaletteSuppressLatch* latch) {
+    memset(latch, 0, sizeof(*latch));
+}
+
+void paletteStepSuppressLatch(int suppressed, int rawTriggerDown, float rawTriggerVal,
+                              float rawGripVal, float pressOff,
+                              int* triggerLatch, int* gripLatch,
+                              int* outBlockTrigger, int* outBlockGrip) {
+    int trigHeld = rawTriggerDown || rawTriggerVal > pressOff;
+    int gripHeld = rawGripVal > pressOff;
+    if (suppressed) {
+        *triggerLatch = trigHeld ? 1 : 0;
+        *gripLatch = gripHeld ? 1 : 0;
+        *outBlockTrigger = 1;
+        *outBlockGrip = 1;
+        return;
+    }
+    if (*triggerLatch) {
+        if (trigHeld) {
+            *outBlockTrigger = 1;
+        }
+        else {
+            *triggerLatch = 0;
+            *outBlockTrigger = 0;
+        }
+    }
+    else {
+        *outBlockTrigger = 0;
+    }
+    if (*gripLatch) {
+        if (gripHeld) {
+            *outBlockGrip = 1;
+        }
+        else {
+            *gripLatch = 0;
+            *outBlockGrip = 0;
+        }
+    }
+    else {
+        *outBlockGrip = 0;
+    }
+}
+
+void paletteGluePreStep(PaletteState* st, PaletteSuppressLatch* latch,
+                        const PalettePreGlueIn* in, PalettePreGlueOut* out) {
+    memset(out, 0, sizeof(*out));
+    Vec3 head = { in->headPose.position.x, in->headPose.position.y, in->headPose.position.z };
+
+    if (in->closeRequested) {
+        paletteClose(st, in->nowNs);
+        out->clearActiveDrags = 1;
+    }
+    if (in->barOpenRequested) {
+        paletteOpenFromBar(st, in->headPose, in->handTracking, in->nowNs);
+        out->hapticKind = PALETTE_HAPTIC_TICK;
+    }
+    if (in->pinToggleRequested) {
+        paletteTogglePin(st, head, in->handTracking, in->nowNs);
+        out->hapticKind = PALETTE_HAPTIC_TICK;
+    }
+
+    paletteStepPoseAndFade(st, in->headPose, in->gripPose, in->gripValid, in->handTracking,
+                           in->screenAdjustActive, in->dt, in->nowNs, in->colorScaleSupported,
+                           &out->renderPose);
+
+    for (int h = 0; h < 2; h++) {
+        int suppressed = paletteShouldSuppressHand(st, h, in->handTracking);
+        out->suppressRay[h] = suppressed;
+        paletteStepSuppressLatch(suppressed, in->rawTriggerDown[h], in->rawTriggerVal[h],
+                                 in->rawGripVal[h], in->pressOff,
+                                 &latch->triggerWaitRelease[h], &latch->gripWaitRelease[h],
+                                 &out->blockTrigger[h], &out->blockGrip[h]);
+    }
+}
+
+void paletteGluePostStep(PaletteState* st, const PalettePostGlueIn* in, PalettePostGlueOut* out) {
+    memset(out, 0, sizeof(*out));
+    out->hit.zone = PALETTE_HIT_NONE;
+    out->hit.index = -1;
+    out->hit.px = -1.0f;
+    out->hit.py = -1.0f;
+    out->claimedHand = -1;
+    out->swallowHand = -1;
+    out->nextDragHand = in->dragHand;
+    out->nextSliderDragging = in->sliderDragging;
+    out->nextSliderHand = in->sliderHand;
+    out->updatedPose = in->renderPose.pose;
+
+    Vec3 zero = { 0.0f, 0.0f, 0.0f };
+    if (!st->open) {
+        out->nextSliderDragging = 0;
+        out->nextSliderHand = -1;
+        out->nextDragHand = -1;
+        paletteHandRowDragStep(st, 0, -1, zero, zero);
+        return;
+    }
+
+    Vec3 head = { in->headPose.position.x, in->headPose.position.y, in->headPose.position.z };
+
+    // 1. Active reposition drag continuation (controller grip or hand-tracking tab bar)
+    if (st->dragging) {
+        int dh = in->dragHand;
+        int held = dh >= 0 && dh < 3 && in->aimValid[dh]
+                && (st->dragByGrip ? (dh < 2 && in->grabVal[dh] > in->pressOff)
+                                   : in->triggerDown[dh]);
+        if (held) {
+            paletteStepDrag(st, in->aimPoses[dh], head);
+            out->updatedPose = st->currentPose;
+            out->poseUpdated = 1;
+            out->claimed = 1;
+            out->claimedHand = dh;
+            out->claimedHover = HOVER_PALETTE;
+            out->claimedU = 0.5f;
+            out->claimedV = 0.5f;
+            out->swallowHand = dh;
+            return;
+        }
+        paletteEndDrag(st);
+        out->nextDragHand = -1;
+    }
+
+    // 2. Active controller slider drag continuation (even if ray drifts past edge)
+    if (in->sliderDragging && !in->handTracking) {
+        int sh = in->sliderHand;
+        float u = 0.0f, v = 0.0f;
+        if (sh >= 0 && sh < 2 && in->triggerDown[sh]
+                && in->renderPose.inputAllowed && in->aimValid[sh]
+                && screenProject(in->aimPoses[sh], in->renderPose.pose,
+                                 PALETTE_W_M, PALETTE_H_M, 0.0f, 0, &u, &v)) {
+            float cu = clampf(u, 0.0f, 1.0f);
+            float cv = clampf(v, 0.0f, 1.0f);
+            out->hit.zone = PALETTE_HIT_ROW;
+            out->hit.index = st->hoverIndex;
+            out->hit.rowAdjustable = 1;
+            out->hit.u = cu;
+            out->hit.v = cv;
+            out->hit.px = cu * (float)PALETTE_TEX_W;
+            out->hit.py = cv * (float)PALETTE_TEX_H;
+            out->clickState = 2;
+            out->claimed = 1;
+            out->claimedHand = sh;
+            out->claimedHover = HOVER_PALETTE;
+            out->claimedU = cu;
+            out->claimedV = cv;
+            return;
+        }
+        out->nextSliderDragging = 0;
+        out->nextSliderHand = -1;
+    }
+
+    if (!in->renderPose.inputAllowed || in->screenAdjustActive || in->grabMode != 0) {
+        paletteHandRowDragStep(st, 0, -1, zero, zero);
+        return;
+    }
+
+    // 3. Candidate sources that can point at the palette
+    int cands[3];
+    int candCount = 0;
+    if (in->handTracking) {
+        cands[candCount++] = 1; // HAND_RIGHT
+        cands[candCount++] = 0; // HAND_LEFT
+        cands[candCount++] = 2; // SRC_GAZE
+    }
+    else {
+        int opH = paletteOpHand(st);
+        int palH = paletteMountHand(st);
+        cands[candCount++] = opH;
+        if (st->pinned) {
+            cands[candCount++] = palH;
+        }
+    }
+
+    int hitAnyInterior = 0;
+    for (int i = 0; i < candCount; i++) {
+        int src = cands[i];
+        if (!in->canPoint[src] || !in->aimValid[src]) {
+            continue;
+        }
+        PaletteHit hit;
+        paletteRayHit(st, in->renderPose.pose, in->aimPoses[src], in->activeRowMask, &hit);
+        if (hit.zone == PALETTE_HIT_NONE) {
+            continue;
+        }
+        out->hit = hit;
+        out->claimed = 1;
+        out->claimedHand = src;
+        out->claimedU = hit.u;
+        out->claimedV = hit.v;
+        if (hit.zone == PALETTE_HIT_DEADZONE) {
+            out->claimedHover = HOVER_PALETTE_DEADZONE;
+            if (in->triggerEdge[src]) {
+                out->swallowHand = src;
+            }
+            break;
+        }
+
+        hitAnyInterior = 1;
+        out->claimedHover = HOVER_PALETTE;
+
+        // Controller grip on palette: detach from hand & drag reposition (§6.3)
+        int gripEdge = !in->handTracking && src < 2
+                && in->grabVal[src] > in->pressOn && !in->grabDown[src];
+        if (gripEdge) {
+            paletteStartDrag(st, in->aimPoses[src], head, 1, in->nowNs);
+            out->nextDragHand = src;
+            out->hapticKind = PALETTE_HAPTIC_TICK;
+            out->clickSound = 1;
+            break;
+        }
+
+        // Hand-tracking pinch on top blank bar: drag reposition
+        if (in->handTracking && hit.zone == PALETTE_HIT_DRAGBAR && in->triggerEdge[src]) {
+            paletteStartDrag(st, in->aimPoses[src], head, 0, in->nowNs);
+            out->nextDragHand = src;
+            out->swallowHand = src;
+            break;
+        }
+
+        // Pin / Unpin (controller) or Close x (hand tracking)
+        if (hit.zone == PALETTE_HIT_PIN && in->triggerEdge[src]) {
+            paletteTogglePin(st, head, in->handTracking, in->nowNs);
+            out->clickSound = 1;
+            out->hapticKind = PALETTE_HAPTIC_TICK;
+            out->swallowHand = src;
+            break;
+        }
+
+        // Interior click (tabs, chips, sliders, steppers, reset buttons, more/back)
+        if (in->triggerEdge[src]) {
+            out->clickState = 1;
+            out->swallowHand = src;
+            if (!in->handTracking && hit.zone == PALETTE_HIT_ROW && src < 2) {
+                out->nextSliderDragging = 1;
+                out->nextSliderHand = src;
+            }
+        }
+
+        // Hand-tracking horizontal row value drag: 8 mm = 1 discrete step (§6.3)
+        if (in->handTracking && hit.zone == PALETTE_HIT_ROW && hit.rowAdjustable && src < 2) {
+            Vec3 rxLocal = { 1.0f, 0.0f, 0.0f };
+            Vec3 paletteRight = quatRotate(in->renderPose.pose.orientation, rxLocal);
+            out->rowStep = paletteHandRowDragStep(st, in->triggerDown[src], hit.index,
+                                                  in->handDragPos[src], paletteRight);
+        }
+        else {
+            paletteHandRowDragStep(st, 0, -1, zero, zero);
+        }
+        break;
+    }
+    if (!hitAnyInterior) {
+        paletteHandRowDragStep(st, 0, -1, zero, zero);
+    }
+}
+
+void paletteGlueMirrorSticks(const PaletteState* st, const int profileIsController[2],
+                             float leftX, float leftY, int leftStickClick,
+                             float rightX, float rightY, int rightStickClick,
+                             float* outOpX, float* outOpY, int* outOpStickClick,
+                             float* outPalX, float* outPalY) {
+    int opH = st->open ? paletteOpHand(st) : 1;
+    int palH = st->open ? paletteMountHand(st) : 0;
+    float xs[2] = { leftX, rightX };
+    float ys[2] = { leftY, rightY };
+    int clicks[2] = { leftStickClick, rightStickClick };
+
+    if (profileIsController[opH]) {
+        *outOpX = xs[opH];
+        *outOpY = ys[opH];
+        *outOpStickClick = clicks[opH];
+    }
+    else {
+        *outOpX = 0.0f;
+        *outOpY = 0.0f;
+        *outOpStickClick = 0;
+    }
+    if (profileIsController[palH]) {
+        *outPalX = xs[palH];
+        *outPalY = ys[palH];
+    }
+    else {
+        *outPalX = 0.0f;
+        *outPalY = 0.0f;
+    }
+}
+
+int paletteGlueApplyCloseOnB(PaletteState* st, int isClosePaletteB, int64_t nowNs,
+                             int* outClearDrags) {
+    if (outClearDrags != NULL) {
+        *outClearDrags = 0;
+    }
+    if (!isClosePaletteB || !st->open) {
+        return 0;
+    }
+    paletteClose(st, nowNs);
+    if (outClearDrags != NULL) {
+        *outClearDrags = 1;
+    }
+    return 1;
 }

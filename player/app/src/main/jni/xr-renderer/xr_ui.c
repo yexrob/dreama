@@ -25,7 +25,9 @@ float furnitureWidth(XrCtx* ctx) {
 // The same shape as the picture, so the furniture keeps the proportions it has
 // outside a room at the same size
 float furnitureHeight(XrCtx* ctx) {
-    return furnitureWidth(ctx) * (float)ctx->videoHeight / (float)ctx->videoWidth;
+    return furnitureWidth(ctx)
+            * paletteVideoHeightOverWidth(ctx->videoWidth, ctx->videoHeight,
+                                          ctx->stereoSourceFormat);
 }
 
 // The frame the bar's row is laid out in. In a room, under the room's picture
@@ -34,7 +36,8 @@ float furnitureHeight(XrCtx* ctx) {
 // cylinder held under a full turn that is smaller than the placement, and the
 // row follows it there too.
 BarFrame barFrame(XrCtx* ctx) {
-    float aspect = (float)ctx->videoHeight / (float)ctx->videoWidth;
+    float aspect = paletteVideoHeightOverWidth(ctx->videoWidth, ctx->videoHeight,
+                                               ctx->stereoSourceFormat);
     if (roomEffective(ctx) > 0) {
         return roomBarFrame(ctx->screenPose, ctx->screenWidth * aspect, aspect);
     }

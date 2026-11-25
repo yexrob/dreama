@@ -146,19 +146,19 @@ class PaletteStateAndPersistenceTest {
         val c = PaletteController(cylinderSupported = true)
         c.selectTab(XrShared.PALETTE_TAB_SCREEN)
 
-        // Default 62° 大, 3.0 m, 0% 平面, 透视 -> all reset buttons hidden
-        assertEquals("62° 大", c.formatSizeValue())
+        // Default 50° 中 (§3.8 / §6.12), 3.0 m, 0% 平面, 透视 -> all reset buttons hidden
+        assertEquals("50° 中", c.formatSizeValue())
         assertEquals("3.0 m", c.formatDistValue())
         assertEquals("平面", c.formatCurveValue())
         for (r in 0..3) {
             assertFalse("row $r reset should be hidden at default", c.isRowResetVisible(XrShared.PALETTE_TAB_SCREEN, 0, r))
         }
 
-        // Step size down to 50° detent -> detent haptic
-        c.stepRow(0, -11) // 51°
-        assertEquals("51°", c.formatSizeValue())
-        val detentHit = c.stepRow(0, -1) // 50° 中
-        assertEquals("50° 中", c.formatSizeValue())
+        // Step size up to 62° 大 detent -> detent haptic
+        c.stepRow(0, 11) // 61°
+        assertEquals("61°", c.formatSizeValue())
+        val detentHit = c.stepRow(0, 1) // 62° 大
+        assertEquals("62° 大", c.formatSizeValue())
         assertEquals(XrShared.PALETTE_HAPTIC_DETENT, detentHit.hapticKind)
 
         // Curvature 5% steps
@@ -168,17 +168,31 @@ class PaletteStateAndPersistenceTest {
         assertTrue(c.isRowResetVisible(XrShared.PALETTE_TAB_SCREEN, 0, 2))
         assertEquals(0xF, c.activeRowMask())
 
-        // Switch to 影院: curvature row disables with spec reason, remembers 45%, hides reset, clears mask bit 2
+        // Switch to 影院: size, distance & curvature rows ALL disable with clear reasons,
+        // remembered values are preserved, reset buttons hidden, only row 3 (环境) active!
         c.selectChip(3, PaletteEnvironment.THEATER.ordinal)
+        assertEquals("影院房间里画面固定在银幕上", c.screenSizeDisabledMessage)
+        assertEquals("影院房间里距离固定", c.screenDistDisabledMessage)
         assertEquals("影院房间里屏幕是平的", c.curvatureDisabledMessage)
+        assertEquals(62f, c.global.screenFovDeg, 0.01f)
         assertEquals(45, c.global.screenCurvaturePct)
+        assertFalse(c.isRowResetVisible(XrShared.PALETTE_TAB_SCREEN, 0, 0))
+        assertFalse(c.isRowResetVisible(XrShared.PALETTE_TAB_SCREEN, 0, 1))
         assertFalse(c.isRowResetVisible(XrShared.PALETTE_TAB_SCREEN, 0, 2))
-        assertEquals(0xB, c.activeRowMask()) // bit 2 = 0
+        assertEquals(0b1000, c.activeRowMask()) // only Environment row active
+        // Trying to step size/dist in room is ignored and does not mutate saved values
+        assertFalse(c.stepRow(0, 5).changed)
+        assertFalse(c.stepRow(1, 3).changed)
+        assertEquals(62f, c.global.screenFovDeg, 0.01f)
+        assertEquals(3.0f, c.global.screenDistM, 0.01f)
 
-        // Unsupported headset reason when back outside room
+        // Leaving room restores size/dist/curvature rows; unsupported headset disables curvature only
         c.selectChip(3, PaletteEnvironment.DIM.ordinal)
+        assertNull(c.screenSizeDisabledMessage)
+        assertNull(c.screenDistDisabledMessage)
         assertNull(c.curvatureDisabledMessage)
         assertEquals(45, c.global.screenCurvaturePct)
+        assertEquals(0xF, c.activeRowMask())
         c.cylinderSupported = false
         assertEquals("这台头显不支持曲面", c.curvatureDisabledMessage)
         assertEquals(0xB, c.activeRowMask())
@@ -251,7 +265,7 @@ class PaletteStateAndPersistenceTest {
         )
         assertEquals(0, c.activeRowMask())
 
-        // Add text + bitmap subtitles and 2 audio tracks
+        // Add text + bitmap subtitles and 2 audio tracks (resetting defaults for new item)
         c.setTracks(
             subtitles = listOf(
                 PaletteSubtitleTrack("sub:text", "简体中文", isBitmap = false),
@@ -263,6 +277,7 @@ class PaletteStateAndPersistenceTest {
             ),
             defaultSubId = "sub:text",
             defaultAudId = "aud:0",
+            forceResetDefaults = true,
         )
         assertEquals(0xF, c.activeRowMask())
         assertFalse(c.selectedSubtitleIsBitmap)
@@ -292,18 +307,18 @@ class PaletteStateAndPersistenceTest {
     }
 
     @Test
-    fun renderSignatureSuppressesIdleRedrawsAndChangesOnAnyVisualDelta() {
+    fun renderHashSuppressesIdleRedrawsAndChangesOnAnyVisualDelta() {
         val c = PaletteController(danmakuSupported = true)
-        val s0 = c.renderSignature()
-        // Identical idle frame -> exact same signature (0 redraws)
+        val h0 = c.renderHash()
+        // Identical idle frame -> exact same 128-bit hash (0 redraws, 0 String allocations)
         c.processFrameInput(
             open = true, pinned = false, handTrackingMode = false, dimFallback = false,
             hoverX = -1f, hoverY = -1f, clickState = 0,
             rowStep = 0, rowReset = false, tabStep = 0, pageStep = 0,
         )
-        assertEquals(s0, c.renderSignature())
+        assertEquals(h0, c.renderHash())
 
-        // Hovering Tab 1 changes signature
+        // Hovering Tab 1 changes hash
         val tab1X = PaletteController.TAB_X[1] + 20f
         val tabY = XrShared.PALETTE_TAB_Y + 20f
         c.processFrameInput(
@@ -311,12 +326,12 @@ class PaletteStateAndPersistenceTest {
             hoverX = tab1X, hoverY = tabY, clickState = 0,
             rowStep = 0, rowReset = false, tabStep = 0, pageStep = 0,
         )
-        val sHover = c.renderSignature()
-        assertNotEquals(s0, sHover)
+        val hHover = c.renderHash()
+        assertNotEquals(h0, hHover)
 
-        // Pinning or dim fallback also updates signature
+        // Pinning or dim fallback also updates hash
         c.syncNativeVisualState(open = true, pinned = true, handTrackingMode = false, dimFallback = true)
-        assertNotEquals(sHover, c.renderSignature())
+        assertNotEquals(hHover, c.renderHash())
     }
 
     @Test
@@ -350,29 +365,200 @@ class PaletteStateAndPersistenceTest {
         val g1 = PaletteStore.readGlobal(store)
         assertEquals(PaletteEnvironment.THEATER, g1.environment)
 
+        store.resetApplyCount()
         PaletteStore.saveGlobal(store, g1.copy(environment = PaletteEnvironment.DIM))
+        // G2 review #6: entire saveGlobal commits in ONE single batched apply()!
+        assertEquals(1, store.applyCount)
         val gDim = PaletteStore.readGlobal(store)
         assertEquals(PaletteEnvironment.DIM, gDim.environment)
         assertTrue(PreferenceConfiguration.passthroughDimOn(store))
 
         // Switching back to 影院 restores remembered GRAND_CINEMA!
+        store.resetApplyCount()
         PaletteStore.saveGlobal(store, gDim.copy(environment = PaletteEnvironment.THEATER))
+        assertEquals(1, store.applyCount)
         assertEquals(VrEnvironmentPreset.GRAND_CINEMA, StreamSettingsMapper.read(store, false).environment)
         assertFalse(PreferenceConfiguration.passthroughDimOn(store))
     }
 
     @Test
-    fun bitmapSubtitleMimeAndLanguageHelpersMatchExpectedLabels() {
-        assertTrue(LocalPlayerXR.isBitmapSubtitleMime("application/pgs"))
-        assertTrue(LocalPlayerXR.isBitmapSubtitleMime("application/vobsub"))
-        assertTrue(LocalPlayerXR.isBitmapSubtitleMime("application/dvbsubs"))
-        assertFalse(LocalPlayerXR.isBitmapSubtitleMime("application/x-subrip"))
-        assertFalse(LocalPlayerXR.isBitmapSubtitleMime("text/x-ssa"))
+    fun bitmapSubtitleMimeAndLocalizedLanguageHelpersMatchExpectedLabels() {
+        val labels = TrackLabelStrings()
+        assertTrue(PaletteTrackManager.isBitmapSubtitleMime("application/pgs"))
+        assertTrue(PaletteTrackManager.isBitmapSubtitleMime("application/vobsub"))
+        assertTrue(PaletteTrackManager.isBitmapSubtitleMime("application/dvbsubs"))
+        assertFalse(PaletteTrackManager.isBitmapSubtitleMime("application/x-subrip"))
+        assertFalse(PaletteTrackManager.isBitmapSubtitleMime("text/x-ssa"))
 
-        assertEquals("简体中文", LocalPlayerXR.friendlyLanguageName("zh-CN"))
-        assertEquals("繁體中文", LocalPlayerXR.friendlyLanguageName("zh-TW"))
-        assertEquals("英语", LocalPlayerXR.friendlyLanguageName("en"))
-        assertEquals("日语", LocalPlayerXR.friendlyLanguageName("ja"))
-        assertEquals("", LocalPlayerXR.friendlyLanguageName("und"))
+        assertEquals("简体中文", PaletteTrackManager.friendlyLanguageName("zh-CN", labels))
+        assertEquals("繁體中文", PaletteTrackManager.friendlyLanguageName("zh-TW", labels))
+        assertEquals("英语", PaletteTrackManager.friendlyLanguageName("en", labels))
+        assertEquals("日语", PaletteTrackManager.friendlyLanguageName("ja", labels))
+        assertEquals("", PaletteTrackManager.friendlyLanguageName("und", labels))
+    }
+
+    @Test
+    fun pluginStereoHintSeparateFromUserOverrideAndExplicitAutoPersists() {
+        val videoStore = MapPrefsStore()
+        val key = PaletteStore.videoKey("plugin:demo", "sbs_movie", null)
+
+        // Plugin hints SBS -> stored as defaultSourceFormat, NOT written into video overrides!
+        val c1 = PaletteController(initialVideo = PaletteStore.readVideoOverrides(videoStore, key))
+        c1.seedDefaultSourceFormat(StereoSourceFormat.SBS)
+        assertEquals(StereoSourceFormat.SBS, c1.effectiveSourceFormat)
+        assertNull(c1.video.sourceFormat)
+        assertFalse(c1.isRowResetVisible(XrShared.PALETTE_TAB_3D, 0, 1))
+
+        // User explicitly overrides to AUTO -> persisted as AUTO in videoStore!
+        val rAuto = c1.selectChip(1, StereoSourceFormat.AUTO.ordinal)
+        assertTrue(rAuto.sourceFormatChanged)
+        assertTrue(rAuto.saveVideoOverrides)
+        assertEquals(StereoSourceFormat.AUTO, c1.effectiveSourceFormat)
+        assertEquals(StereoSourceFormat.AUTO, c1.video.sourceFormat)
+        assertTrue(c1.isRowResetVisible(XrShared.PALETTE_TAB_3D, 0, 1))
+        PaletteStore.saveVideoOverrides(videoStore, key, c1.video)
+
+        // Reload same video with same plugin SBS hint -> user's explicit AUTO wins!
+        val c2 = PaletteController(initialVideo = PaletteStore.readVideoOverrides(videoStore, key))
+        c2.seedDefaultSourceFormat(StereoSourceFormat.SBS)
+        assertEquals(StereoSourceFormat.AUTO, c2.effectiveSourceFormat)
+        assertTrue(c2.isRowResetVisible(XrShared.PALETTE_TAB_3D, 0, 1))
+
+        // Reset row 1 restores plugin hint (SBS) and clears persisted override
+        c2.resetRow(1)
+        assertEquals(StereoSourceFormat.SBS, c2.effectiveSourceFormat)
+        assertNull(c2.video.sourceFormat)
+        assertFalse(c2.isRowResetVisible(XrShared.PALETTE_TAB_3D, 0, 1))
+    }
+
+    @Test
+    fun trackResetPreventsSubtitleOffLeakAndDefaultsStayFixedAcrossSubsequentTracksChanged() {
+        val labels = TrackLabelStrings()
+        val rawSubsVideoA = listOf(
+            RawTrackInfo(0, 0, "s1", "zh-CN", "简体", "application/x-subrip", isSelected = true, isDefaultFlag = true),
+            RawTrackInfo(1, 0, "s2", "en", "English", "application/x-subrip", isSelected = false),
+        )
+        val rawAudsVideoA = listOf(
+            RawTrackInfo(2, 0, "a1", "zh", "国语", "audio/ac3", channelCount = 6, isSelected = true, isDefaultFlag = true),
+            RawTrackInfo(3, 0, "a2", "en", "English", "audio/ac3", channelCount = 6, isSelected = false),
+        )
+
+        // 1. Video A opens: capture natural defaults ONCE (zh sub, zh audio)
+        val snapA1 = PaletteTrackManager.buildTracks(rawSubsVideoA, rawAudsVideoA, labels)
+        val cA = PaletteController()
+        cA.selectTab(XrShared.PALETTE_TAB_SUBTITLE)
+        cA.setTracks(snapA1.subtitles, snapA1.audios, snapA1.naturalDefaultSubId, snapA1.naturalDefaultAudId)
+        assertEquals("简体中文 · 简体", cA.selectedSubtitleTrack?.label)
+        assertFalse(cA.isRowResetVisible(XrShared.PALETTE_TAB_SUBTITLE, 0, 0))
+        assertFalse(cA.isRowResetVisible(XrShared.PALETTE_TAB_SUBTITLE, 0, 1))
+
+        // 2. User switches Video A subtitle to English, then ExoPlayer fires follow-up onTracksChanged
+        //    with English marked isSelected=true! Default MUST NOT follow current selection!
+        cA.stepRow(0, 1)
+        assertEquals("英语 · English", cA.selectedSubtitleTrack?.label)
+        val rawSubsAfterSwitch = listOf(
+            rawSubsVideoA[0].copy(isSelected = false),
+            rawSubsVideoA[1].copy(isSelected = true),
+        )
+        val snapA2 = PaletteTrackManager.buildTracks(rawSubsAfterSwitch, rawAudsVideoA, labels)
+        cA.setTracks(snapA2.subtitles, snapA2.audios, snapA2.naturalDefaultSubId, snapA2.naturalDefaultAudId)
+        assertTrue("Reset button must stay visible after ExoPlayer onTracksChanged",
+            cA.isRowResetVisible(XrShared.PALETTE_TAB_SUBTITLE, 0, 0))
+
+        // Reset restores the original Chinese default!
+        cA.resetRow(0)
+        assertEquals("简体中文 · 简体", cA.selectedSubtitleTrack?.label)
+        assertFalse(cA.isRowResetVisible(XrShared.PALETTE_TAB_SUBTITLE, 0, 0))
+
+        // 3. User disables subtitles on Video A (plan disables TEXT)
+        cA.stepRow(0, -1) // OFF
+        assertNull(cA.selectedSubtitleTrack)
+        val disablePlan = PaletteTrackManager.planSelection(true, cA.selectedSubtitleTrack, cA.selectedAudioTrack)
+        assertTrue(disablePlan.disableText)
+
+        // 4. Switching to Video B MUST issue planNewItemReset() (clears disableText & overrides)
+        val resetPlan = PaletteTrackManager.planNewItemReset()
+        assertTrue(resetPlan.resetAll)
+        assertFalse(resetPlan.disableText)
+
+        // Video B loads with its own natural default subtitle active (no leakage from Video A!)
+        val cB = PaletteController()
+        cB.selectTab(XrShared.PALETTE_TAB_SUBTITLE)
+        val snapB = PaletteTrackManager.buildTracks(rawSubsVideoA, rawAudsVideoA, labels)
+        cB.setTracks(snapB.subtitles, snapB.audios, snapB.naturalDefaultSubId, snapB.naturalDefaultAudId)
+        assertNotNull(cB.selectedSubtitleTrack)
+        assertEquals("简体中文 · 简体", cB.selectedSubtitleTrack?.label)
+
+        // 5. Stable track IDs match across group-index reordering on relaunch
+        val savedSubId = snapA1.subtitles[1].id // English track originally at group 1
+        assertFalse("Stable track ID should not be pure index", savedSubId.contains("|idx:"))
+        val reorderedSubs = listOf(
+            rawSubsVideoA[1].copy(groupIndex = 5, trackIndex = 0),
+            rawSubsVideoA[0].copy(groupIndex = 6, trackIndex = 0),
+        )
+        val snapReordered = PaletteTrackManager.buildTracks(reorderedSubs, rawAudsVideoA, labels)
+        val cReload = PaletteController(initialVideo = VideoPaletteOverrides(subtitleId = savedSubId))
+        cReload.setTracks(snapReordered.subtitles, snapReordered.audios,
+            snapReordered.naturalDefaultSubId, snapReordered.naturalDefaultAudId)
+        assertEquals("英语 · English", cReload.selectedSubtitleTrack?.label)
+        assertEquals(5, cReload.selectedSubtitleTrack?.groupIndex)
+    }
+
+    @Test
+    fun mailboxCoalescingAndDebouncerPreventPerFrameSavesAndAllocations() {
+        val mailbox = PaletteInputMailbox()
+        val drained = PaletteDrainedInput()
+
+        // Idle frames with identical state do not wake worker
+        assertFalse(mailbox.offerFromRenderThread(false, false, false, false, -1f, -1f, 0, 0, false, 0, 0))
+        assertFalse(mailbox.drainOnWorker(drained))
+
+        // Multiple discrete steps while worker is busy coalesce without dropping any step
+        assertTrue(mailbox.offerFromRenderThread(true, false, false, false, 400f, 240f, 1, 1, false, 0, 0))
+        // Second & third offers while drain is already scheduled return false (no redundant Handler posts)
+        assertFalse(mailbox.offerFromRenderThread(true, false, false, false, 405f, 242f, 0, 1, false, 1, 0))
+        assertFalse(mailbox.offerFromRenderThread(true, false, false, false, 410f, 244f, 0, 1, true, 0, -1))
+
+        assertTrue(mailbox.drainOnWorker(drained))
+        assertEquals(1, drained.clickState)
+        assertEquals(400f, drained.clickX, 0.01f) // Click preserved original click coords!
+        assertEquals(240f, drained.clickY, 0.01f)
+        assertEquals(3, drained.rowStep)
+        assertTrue(drained.rowReset)
+        assertEquals(1, drained.tabStep)
+        assertEquals(-1, drained.pageStep)
+
+        // Save debouncer: 10 frames of slider drag (clickState == 2) trigger ZERO flushes!
+        val debouncer = PaletteSaveDebouncer()
+        for (i in 0 until 10) {
+            val flags = debouncer.onFrameResult(isOpen = true, clickState = 2, saveGlobal = true, saveVideo = false)
+            assertEquals(0, flags and PaletteSaveDebouncer.FLAG_FLUSH_GLOBAL)
+            assertTrue((flags and PaletteSaveDebouncer.FLAG_SCHEDULE_DEBOUNCE) != 0)
+        }
+        // Releasing slider drag flushes global ONCE
+        val releaseFlags = debouncer.onFrameResult(isOpen = true, clickState = 0, saveGlobal = false, saveVideo = false)
+        assertTrue((releaseFlags and PaletteSaveDebouncer.FLAG_FLUSH_GLOBAL) != 0)
+        // Subsequent idle frame flushes nothing
+        assertEquals(0, debouncer.onFrameResult(isOpen = true, clickState = 0, saveGlobal = false, saveVideo = false))
+    }
+
+    @Test
+    fun firstPlayGestureHintPersistsOnceAndSplitsCleanlyAndStereoAspectMatchesNative() {
+        val store = MapPrefsStore()
+        assertFalse(PaletteStore.isScreenGestureHintSeen(store))
+        PaletteStore.markScreenGestureHintSeen(store)
+        assertTrue(PaletteStore.isScreenGestureHintSeen(store))
+
+        val lines = PaletteTrackManager.splitGestureHintForToast(
+            "指着画面按住扳机，再推右摇杆：前后调远近 · 左右调大小"
+        )
+        assertEquals("指着画面按住扳机，再推右摇杆", lines[0])
+        assertEquals("前后调远近 · 左右调大小", lines[1])
+
+        // Full-SBS 3840x1080 -> 16:9, Half-SBS 1920x1080 -> 16:9, Full-OU 1920x2160 -> 16:9
+        assertEquals(16f / 9f, PaletteController.effectiveVideoAspect(3840, 1080, StereoSourceFormat.SBS), 1e-3f)
+        assertEquals(16f / 9f, PaletteController.effectiveVideoAspect(1920, 1080, StereoSourceFormat.SBS), 1e-3f)
+        assertEquals(16f / 9f, PaletteController.effectiveVideoAspect(1920, 2160, StereoSourceFormat.OU), 1e-3f)
+        assertEquals(16f / 9f, PaletteController.effectiveVideoAspect(1920, 1080, StereoSourceFormat.OU), 1e-3f)
     }
 }

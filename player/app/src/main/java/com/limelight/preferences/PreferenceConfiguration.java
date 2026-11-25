@@ -68,6 +68,8 @@ public class PreferenceConfiguration {
     public static final String VR_PALETTE_HAND_RIGHT_PREF_STRING = "checkbox_vr_palette_hand_right";
     // Passthrough dimmer ("调暗" environment mode in VR quick palette, §6.3)
     public static final String VR_PASSTHROUGH_DIM_PREF_STRING = "checkbox_vr_passthrough_dim";
+    // First-time local-playback screen adjustment gesture hint (shown once ever)
+    public static final String VR_SCREEN_GESTURE_HINT_SEEN_PREF_STRING = "vr_screen_gesture_hint_seen";
     // Cached runtime support for XR_KHR_composition_layer_cylinder so 2D settings
     // can grey out curvature with the spec reason when the headset lacks support.
     public static final String VR_CYLINDER_SUPPORTED_PREF_STRING = "vr_cylinder_supported";

@@ -52,7 +52,7 @@ final class TransportBar {
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final ByteBuffer[] buffers = new ByteBuffer[2];
     private int next;
-    private final float aspect;  // video width over height
+    private volatile float aspect;  // effective display width over height
 
     TransportBar(int videoWidth, int videoHeight) {
         aspect = (float) videoWidth / Math.max(1, videoHeight);
@@ -60,6 +60,13 @@ final class TransportBar {
             buffers[i] = ByteBuffer.allocateDirect(TEX_W * TEX_H * 4).order(ByteOrder.nativeOrder());
         }
         paint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+    }
+
+    /** Updates effective per-eye display aspect (e.g. Full-SBS 3840x1080 -> 16:9). */
+    void setDisplayAspect(float widthOverHeight) {
+        if (widthOverHeight > 0.1f && widthOverHeight < 10.0f) {
+            aspect = widthOverHeight;
+        }
     }
 
     // ---- where the strip is on the picture, u and v in 0..1, v down ----
@@ -127,14 +134,8 @@ final class TransportBar {
 
     /**
      * Draws the strip and returns the buffer to post. hover is the track
-     * fraction under the pointer, or NaN.
+     * fraction under the pointer, or NaN. Labels must be supplied from Android string resources.
      */
-    ByteBuffer draw(boolean playing, int posMs, int durMs, float hover, boolean buttonHot,
-                    String title) {
-        return draw(playing, posMs, durMs, hover, buttonHot, title,
-                "调整", "弹", false, false, false, false, false);
-    }
-
     ByteBuffer draw(boolean playing, int posMs, int durMs, float hover, boolean buttonHot,
                     String title, String adjustLabel, String danmakuLabel,
                     boolean showDanmakuToggle, boolean danmakuOn, boolean paletteOpen,

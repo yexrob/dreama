@@ -378,10 +378,11 @@ static void addRoomLayer(XrCtx* ctx, const FrameView* view, FrameLayers* layers)
 }
 
 // depth3d G2: passthrough dimmer ("调暗" environment), mutually exclusive with
-// the 3D room layer and occupying its single §6.5 background slot.
+// the 3D room layer and strictly gated on localMedia so PC streaming is unaffected.
 static void addDimmerLayer(XrCtx* ctx, const FrameView* view, FrameLayers* layers) {
-    if (!view->roomOn && ctx->passthrough && ctx->passthroughDim
-            && ctx->dimmerArtReady && ctx->dimmerSwapchain != XR_NULL_HANDLE) {
+    if (paletteShowDimmerLayer(ctx->localMedia, view->roomOn, ctx->passthrough,
+                               ctx->passthroughDim, ctx->dimmerArtReady)
+            && ctx->dimmerSwapchain != XR_NULL_HANDLE) {
         XrPosef pose;
         memset(&pose, 0, sizeof(pose));
         pose.orientation.w = 1.0f;
@@ -1466,6 +1467,10 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
         return;
     }
 
+    // Drain cross-thread local playback / palette commands on the render thread
+    // even when nativeUpdateInput returned early (e.g. during splash).
+    applyPendingLocalCmds(ctx, ctx->placementValid);
+
     ctx->passthrough = passthrough;
     ctx->prefCurvature = curvature;
     pollCaptureRequest(ctx);
@@ -1497,6 +1502,13 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
         ctx->stereoWaiting = 0;
         ctx->warpRedraw = 1;
         LOGI("3d warping again after %.0f ms", (nowNs() - ctx->stereoWaitNs) / 1e6);
+    }
+    if (ctx->stereoLive && ctx->stereoMode == DEPTH_MODE_MODEL
+            && ctx->stereoSourceFormat == STEREO_SRC_AUTO
+            && !ctx->depthReadyRendered && ctx->depthModelGlReady
+            && atomic_load_explicit(&ctx->depthMapsStaged, memory_order_acquire) > 0) {
+        ctx->depthReadyRendered = 1;
+        ctx->warpRedraw = 1;
     }
 
     // Where the controllers are this frame, before anything draws them
@@ -1533,8 +1545,10 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
     }
 
     FrameView view;
-    view.aspect = (float)ctx->videoHeight / (float)ctx->videoWidth;
-    view.stereo = ctx->stereoMode != DEPTH_MODE_OFF;
+    view.aspect = paletteVideoHeightOverWidth(ctx->videoWidth, ctx->videoHeight,
+                                              ctx->stereoSourceFormat);
+    view.stereo = (ctx->stereoMode != DEPTH_MODE_OFF)
+            || (ctx->localMedia && ctx->stereoSourceFormat != STEREO_SRC_AUTO && ctx->stereoLive);
     int roomStyle = roomEffective(ctx);
     view.roomOn = roomStyle > 0;
     view.headLocked = headLocked;

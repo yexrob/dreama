@@ -371,6 +371,238 @@ static void testScreenAdjustDimmingAndLayerPredicate(void) {
     CHECK(paletteShowLayer(1, 1, 1, 0.0f) == 0);
 }
 
+// G2 review #4 & Should-Fix #3/#4: dimmer gated on localMedia, SBS/OU stops depth
+// inference, and Full-SBS / Full-OU single-eye aspect ratio heuristic.
+static void testDimmerDepthGatingAndStereoAspect(void) {
+    // Passthrough dimmer MUST NOT fire in PC streaming (localMedia == 0)
+    CHECK(paletteShowDimmerLayer(0, 0, 1, 1, 1) == 0);
+    CHECK(paletteShowDimmerLayer(1, 0, 1, 1, 1) == 1);
+    CHECK(paletteShowDimmerLayer(1, 1, 1, 1, 1) == 0); // mutually exclusive with 3D room
+    CHECK(paletteShowDimmerLayer(1, 0, 0, 1, 1) == 0); // void/non-passthrough
+    CHECK(paletteShowDimmerLayer(1, 0, 1, 0, 1) == 0); // dim off
+    CHECK(paletteShowDimmerLayer(1, 0, 1, 1, 0) == 0); // art not ready
+
+    // Depth inference only runs when stereoMode != OFF, stereoLive == 1, and source == AUTO
+    CHECK(paletteNeedsDepthInference(DEPTH_MODE_MODEL, 1, STEREO_SRC_AUTO) == 1);
+    CHECK(paletteNeedsDepthInference(DEPTH_MODE_MODEL, 1, STEREO_SRC_SBS) == 0);
+    CHECK(paletteNeedsDepthInference(DEPTH_MODE_MODEL, 1, STEREO_SRC_OU) == 0);
+    CHECK(paletteNeedsDepthInference(DEPTH_MODE_MODEL, 0, STEREO_SRC_AUTO) == 0);
+    CHECK(paletteNeedsDepthInference(DEPTH_MODE_OFF, 1, STEREO_SRC_AUTO) == 0);
+
+    // Aspect ratio: Full-SBS 3840x1080 -> 16:9 per eye (0.5625), Half-SBS 1920x1080 -> 0.5625
+    CHECK_NEAR(paletteVideoHeightOverWidth(3840, 1080, STEREO_SRC_SBS), 9.0f / 16.0f, 1e-4f);
+    CHECK_NEAR(paletteVideoHeightOverWidth(1920, 1080, STEREO_SRC_SBS), 9.0f / 16.0f, 1e-4f);
+    // Full-OU 1920x2160 -> 16:9 per eye (0.5625), Half-OU 1920x1080 -> 0.5625
+    CHECK_NEAR(paletteVideoHeightOverWidth(1920, 2160, STEREO_SRC_OU), 9.0f / 16.0f, 1e-4f);
+    CHECK_NEAR(paletteVideoHeightOverWidth(1920, 1080, STEREO_SRC_OU), 9.0f / 16.0f, 1e-4f);
+    // AUTO uses raw frame aspect
+    CHECK_NEAR(paletteVideoHeightOverWidth(3840, 1080, STEREO_SRC_AUTO), 1080.0f / 3840.0f, 1e-4f);
+    // 2.39:1 cinema Half-SBS (2560x1072, ratio ~2.388 < 2.60) stays Half-SBS; Full-SBS (5120x1072) halves width
+    CHECK_NEAR(paletteVideoHeightOverWidth(2560, 1072, STEREO_SRC_SBS), 1072.0f / 2560.0f, 1e-4f);
+    CHECK_NEAR(paletteVideoHeightOverWidth(5120, 1072, STEREO_SRC_SBS), 2144.0f / 5120.0f, 1e-4f);
+}
+
+// G2 review #7: lifting palette-hand suppression while trigger or grip is still held
+// MUST NOT produce a phantom click/grab until physically released below PRESS_OFF.
+static void testSuppressReleaseLatchNoPhantomEdge(void) {
+    PaletteState st;
+    PaletteSuppressLatch latch;
+    paletteInit(&st);
+    paletteSuppressLatchReset(&latch);
+
+    XrPosef head = identityPose(0.0f, 0.0f, 0.0f);
+    XrPosef grip = identityPose(-0.15f, -0.20f, -0.45f);
+    paletteOpenFromMenu(&st, head, grip, 1, 0, MS(1000));
+
+    // Frame 1: palette open on left hand (0), user holds BOTH left trigger and left grip
+    PalettePreGlueIn in;
+    PalettePreGlueOut out;
+    memset(&in, 0, sizeof(in));
+    in.headPose = head;
+    in.gripPose = grip;
+    in.gripValid = 1;
+    in.colorScaleSupported = 1;
+    in.dt = 0.016f;
+    in.nowNs = MS(1200);
+    in.rawTriggerDown[0] = 1;
+    in.rawTriggerVal[0] = 0.95f;
+    in.rawGripVal[0] = 0.90f;
+    in.pressOff = 0.35f;
+    paletteGluePreStep(&st, &latch, &in, &out);
+    CHECK(out.suppressRay[0] == 1);
+    CHECK(out.blockTrigger[0] == 1);
+    CHECK(out.blockGrip[0] == 1);
+    CHECK(latch.triggerWaitRelease[0] == 1);
+    CHECK(latch.gripWaitRelease[0] == 1);
+
+    // Frame 2: palette closes (or pins) while left trigger & left grip are STILL held!
+    in.nowNs = MS(1216);
+    in.closeRequested = 1;
+    paletteGluePreStep(&st, &latch, &in, &out);
+    CHECK(st.open == 0);
+    CHECK(out.suppressRay[0] == 0);
+    // Latched: MUST stay blocked so readSources/applyGrab cannot emit phantom edges!
+    CHECK(out.blockTrigger[0] == 1);
+    CHECK(out.blockGrip[0] == 1);
+
+    // Frame 3: trigger dips to 0.50 (> PRESS_OFF) and grip stays 0.45 (> PRESS_OFF) -> still blocked
+    in.closeRequested = 0;
+    in.nowNs = MS(1232);
+    in.rawTriggerDown[0] = 0;
+    in.rawTriggerVal[0] = 0.50f;
+    in.rawGripVal[0] = 0.45f;
+    paletteGluePreStep(&st, &latch, &in, &out);
+    CHECK(out.blockTrigger[0] == 1);
+    CHECK(out.blockGrip[0] == 1);
+
+    // Frame 4: user releases both below PRESS_OFF -> latches clear cleanly
+    in.nowNs = MS(1248);
+    in.rawTriggerDown[0] = 0;
+    in.rawTriggerVal[0] = 0.10f;
+    in.rawGripVal[0] = 0.05f;
+    paletteGluePreStep(&st, &latch, &in, &out);
+    CHECK(out.blockTrigger[0] == 0);
+    CHECK(out.blockGrip[0] == 0);
+    CHECK(latch.triggerWaitRelease[0] == 0);
+    CHECK(latch.gripWaitRelease[0] == 0);
+
+    // Frame 5: fresh deliberate press after release goes through immediately!
+    in.nowNs = MS(1264);
+    in.rawTriggerDown[0] = 1;
+    in.rawTriggerVal[0] = 0.90f;
+    in.rawGripVal[0] = 0.90f;
+    paletteGluePreStep(&st, &latch, &in, &out);
+    CHECK(out.blockTrigger[0] == 0);
+    CHECK(out.blockGrip[0] == 0);
+}
+
+// Pure-C xr_input.c glue tests: updateLocalPalettePost (click, slider drag continuation,
+// deadzone swallow, grip detach drag, pin toggle) and right-hand stick mirroring.
+static void testPaletteGluePostAndStickMirror(void) {
+    PaletteState st;
+    paletteInit(&st);
+    XrPosef head = identityPose(0.0f, 0.0f, 0.0f);
+    XrPosef panel = identityPose(0.0f, 0.0f, -0.50f);
+    paletteOpenFromBar(&st, head, 0, MS(1000));
+    st.pinnedPose = panel;
+    st.currentPose = panel;
+    st.poseValid = 1;
+
+    PaletteRenderPose rp;
+    memset(&rp, 0, sizeof(rp));
+    rp.visible = 1;
+    rp.inputAllowed = 1;
+    rp.pose = panel;
+    rp.alpha = 1.0f;
+
+    // 1. Right controller clicks row 0 -> clickState == 1, swallows trigger, starts slider drag
+    float vRow0 = (PALETTE_ROW_Y0 + 0.5f * PALETTE_ROW_H) / (float)PALETTE_TEX_H;
+    Vec3 eye = { 0.0f, 0.0f, 0.0f };
+    Vec3 dirRow0 = { 0.0f, (0.5f - vRow0) * PALETTE_H_M, -0.50f };
+
+    PalettePostGlueIn pin;
+    PalettePostGlueOut pout;
+    memset(&pin, 0, sizeof(pin));
+    pin.headPose = head;
+    pin.activeRowMask = 0xF;
+    pin.nowNs = MS(1200);
+    pin.pressOn = 0.65f;
+    pin.pressOff = 0.35f;
+    pin.canPoint[1] = 1;
+    pin.aimValid[1] = 1;
+    pin.aimPoses[1] = aimToward(eye, dirRow0);
+    pin.triggerDown[1] = 1;
+    pin.triggerEdge[1] = 1;
+    pin.dragHand = -1;
+    pin.sliderHand = -1;
+    pin.renderPose = rp;
+
+    paletteGluePostStep(&st, &pin, &pout);
+    CHECK(pout.claimed == 1);
+    CHECK(pout.claimedHand == 1);
+    CHECK(pout.clickState == 1);
+    CHECK(pout.swallowHand == 1);
+    CHECK(pout.nextSliderDragging == 1);
+    CHECK(pout.nextSliderHand == 1);
+
+    // 2. While holding trigger and drifting slightly past right edge, slider drag continues (clickState == 2)
+    Vec3 dirRightEdge = { 0.12f, (0.5f - vRow0) * PALETTE_H_M, -0.50f };
+    pin.aimPoses[1] = aimToward(eye, dirRightEdge);
+    pin.triggerEdge[1] = 0;
+    pin.triggerDown[1] = 1;
+    pin.sliderDragging = pout.nextSliderDragging;
+    pin.sliderHand = pout.nextSliderHand;
+    paletteGluePostStep(&st, &pin, &pout);
+    CHECK(pout.claimed == 1);
+    CHECK(pout.clickState == 2);
+    CHECK_NEAR(pout.hit.u, 1.0f, 1e-4f);
+
+    // 3. Release trigger -> slider drag terminates cleanly
+    pin.triggerDown[1] = 0;
+    pin.sliderDragging = pout.nextSliderDragging;
+    pin.sliderHand = pout.nextSliderHand;
+    paletteGluePostStep(&st, &pin, &pout);
+    CHECK(pout.nextSliderDragging == 0);
+    CHECK(pout.nextSliderHand == -1);
+
+    // 4. Deadzone trigger click is swallowed (does not leak to video)
+    Vec3 dirDead = { 0.108f, 0.0f, -0.50f };
+    pin.sliderDragging = 0;
+    pin.sliderHand = -1;
+    pin.aimPoses[1] = aimToward(eye, dirDead);
+    pin.triggerDown[1] = 1;
+    pin.triggerEdge[1] = 1;
+    paletteGluePostStep(&st, &pin, &pout);
+    CHECK(pout.claimed == 1);
+    CHECK(pout.hit.zone == PALETTE_HIT_DEADZONE);
+    CHECK(pout.swallowHand == 1);
+    CHECK(pout.clickState == 0);
+
+    // 5. Stick mirroring when palette is open on left hand vs right hand (§6.3)
+    int bothCtrl[2] = { 1, 1 };
+    float opX = 0, opY = 0, palX = 0, palY = 0;
+    int opClick = 0;
+    // Left-mounted (default): right stick operates (0.8, -0.4, click=1), left stick switches tabs (-0.7, 0.6)
+    paletteSetHand(&st, 0);
+    paletteGlueMirrorSticks(&st, bothCtrl, -0.7f, 0.6f, 0, 0.8f, -0.4f, 1,
+                            &opX, &opY, &opClick, &palX, &palY);
+    CHECK_NEAR(opX, 0.8f, 1e-5f);
+    CHECK_NEAR(opY, -0.4f, 1e-5f);
+    CHECK(opClick == 1);
+    CHECK_NEAR(palX, -0.7f, 1e-5f);
+    CHECK_NEAR(palY, 0.6f, 1e-5f);
+
+    // Right-mounted: mirrored! Left stick operates (-0.7, 0.6, click=1), right stick switches tabs (0.8, -0.4)
+    paletteSetHand(&st, 1);
+    paletteGlueMirrorSticks(&st, bothCtrl, -0.7f, 0.6f, 1, 0.8f, -0.4f, 0,
+                            &opX, &opY, &opClick, &palX, &palY);
+    CHECK_NEAR(opX, -0.7f, 1e-5f);
+    CHECK_NEAR(opY, 0.6f, 1e-5f);
+    CHECK(opClick == 1);
+    CHECK_NEAR(palX, 0.8f, 1e-5f);
+    CHECK_NEAR(palY, -0.4f, 1e-5f);
+
+    // 6. B-button glue: non-close B (e.g. adjust undo / card close) keeps palette open;
+    //    close-palette B closes palette and requests clearing active drags.
+    int clearDrags = 0;
+    CHECK(paletteGlueApplyCloseOnB(&st, 0, MS(1900), &clearDrags) == 0);
+    CHECK(st.open == 1);
+    CHECK(clearDrags == 0);
+
+    CHECK(paletteGlueApplyCloseOnB(&st, 1, MS(1950), &clearDrags) == 1);
+    CHECK(st.open == 0);
+    CHECK(clearDrags == 1);
+    // Repeated close on already-closed palette is a clean no-op
+    CHECK(paletteGlueApplyCloseOnB(&st, 1, MS(1960), &clearDrags) == 0);
+    CHECK(clearDrags == 0);
+
+    // Closed palette: right stick always operates regardless of right-hand mount setting
+    paletteGlueMirrorSticks(&st, bothCtrl, -0.7f, 0.6f, 1, 0.8f, -0.4f, 0,
+                            &opX, &opY, &opClick, &palX, &palY);
+    CHECK_NEAR(opX, 0.8f, 1e-5f);
+    CHECK(opClick == 0);
+}
+
 int main(void) {
     testHandMountPoseAndRightHandMirror();
     testAngleCullAndFade();
@@ -378,5 +610,8 @@ int main(void) {
     testDeadzoneAndHoverHysteresis();
     testHandSuppressionAndDragging();
     testScreenAdjustDimmingAndLayerPredicate();
+    testDimmerDepthGatingAndStereoAspect();
+    testSuppressReleaseLatchNoPhantomEdge();
+    testPaletteGluePostAndStickMirror();
     return checksDone("xr_palette");
 }

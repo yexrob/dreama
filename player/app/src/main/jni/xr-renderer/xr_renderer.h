@@ -1418,6 +1418,7 @@ typedef struct {
 
     // depth3d G2: controller-mounted & pinnable VR quick palette (single quad layer)
     PaletteState palette;
+    PaletteSuppressLatch paletteLatch;
     PaletteRenderPose palettePose;
     PaletteHit paletteHit;
     int paletteActiveRowMask;
@@ -1438,6 +1439,38 @@ typedef struct {
     XrSwapchainImageOpenGLESKHR* paletteImages;
     int paletteArtReady;
     unsigned char* paletteFlipBuf;
+
+    // depth3d G2: lazy depth-model GL readiness (deferred when local playback starts 3D OFF)
+    int depthModelGlReady;
+    int depthReadyRendered;
+
+    // depth3d G2: mutex-guarded pending commands from non-render threads, applied
+    // exclusively on the render thread at the start of nativeUpdateInput / nativeEndFrame.
+    pthread_mutex_t localCmdLock;
+    int localCmdLockReady;
+    struct LocalPendingCmds {
+        int hasHand;
+        int handRight;
+        int hasRowMask;
+        int rowMask;
+        int barOpen;
+        int pinToggle;
+        int close;
+        int hasPassthroughDim;
+        int passthroughDim;
+        int hasStereoStrength;
+        int stereoOn;
+        float stereoSeparation;
+        float stereoConvergence;
+        float stereoDepthLocal;
+        int hasSourceFormat;
+        int sourceFormat;
+        int hasScreenDims;
+        float screenFovDeg;
+        float screenDistM;
+        float screenCurve;
+        int pendingHaptic;
+    } localPending;
 
     // depth3d G2: passthrough dimmer layer ("调暗" environment, 1 quad layer)
     XrSwapchain dimmerSwapchain;
@@ -1735,6 +1768,7 @@ GLuint compileShader(GLenum type, const char* src);
 void setGradeUniforms(XrCtx* ctx, GLint onUniform, GLint gradeUniform, int on);
 int linkProgram(GLuint* out, const char* fragmentSrc, const char* what);
 int initGl(XrCtx* ctx);
+int ensureDepthModelGl(XrCtx* ctx);
 void renderVideoFrame(XrCtx* ctx, const float* texMatrix, float separation);
 
 // xr_depth.c: the depth model staging and the stage thread's uploads
@@ -1773,6 +1807,7 @@ int initXrInput(XrCtx* ctx);
 void destroyXrInput(XrCtx* ctx);
 void refreshInputSource(XrCtx* ctx);
 int updatePlacement(XrCtx* ctx, float distance, float quadWidth, float curvature);
+void applyPendingLocalCmds(XrCtx* ctx, int allowPlacement);
 void recentreScreen(XrCtx* ctx);
 
 // xr_ui.c: where the furniture and the panels sit, and what the ray is over
