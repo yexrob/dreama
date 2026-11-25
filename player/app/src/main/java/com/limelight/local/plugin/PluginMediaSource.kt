@@ -367,6 +367,8 @@ class PluginMediaSource(
         runtime.verifyInitialized()
     }
 
+    internal fun collectLiveSecretValues(): List<String> = runtime.collectLiveSecretValues()
+
     suspend fun shutdown() {
         runtime.shutdown()
     }

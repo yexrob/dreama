@@ -21,10 +21,12 @@ import com.limelight.local.plugin.SoftwareAesSecretBox
 import com.limelight.local.stream.PhoneInputCopy
 import com.limelight.local.stream.PhoneInputErrorHelper
 import com.limelight.local.stream.PhoneInputServer
+import com.limelight.local.stream.PhoneSubmitResult
 import com.limelight.local.stream.UdpDiscoveryProtocol
 import com.limelight.local.stream.UdpDiscoveryWindow
 import com.limelight.local.stream.UdpLanServerDiscovery
 import com.limelight.local.stream.XmlStringLookup
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -33,10 +35,14 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import kotlinx.serialization.json.JsonPrimitive
+import okhttp3.FormBody
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -1766,6 +1772,531 @@ class PluginDevAndFileInstallTest {
                     "1.1.0",
                 ),
             )
+        } finally {
+            pm.shutdownAll()
+        }
+    }
+
+    @Test
+    fun installCriticalSectionResistsCancellationAndKeepsConsistentState() = runBlocking {
+        val rootDir = tempFolder.newFolder("cancel-safety")
+        val store = InMemoryPluginStore()
+        val pm = PluginPackageManager(
+            rootDir = rootDir,
+            store = store,
+            secretBox = SoftwareAesSecretBox(),
+            appVersion = "1.0.0",
+            deviceInfo = DeviceInfo.detect("1.0.0"),
+        )
+        val pluginId = "com.example.cancelsafe"
+        val devUrl = "http://192.168.1.50:8787"
+        val repoUrl = "https://repo.example.com/index.json"
+
+        try {
+            // 1. Cancellation injected AFTER upsertPackage and BEFORE shutdownRuntimesForPlugin:
+            //    NonCancellable ensures runtime shutdown + cleanup complete so DB & cached runtime BOTH match V2.
+            val v1Zip = buildZip(makeManifest(id = pluginId, version = "1.0.0"), simpleMainJs("Cancel-V1"))
+            val v2Zip = buildZip(makeManifest(id = pluginId, version = "1.0.0"), simpleMainJs("Cancel-V2"))
+            pm.installFromBytes(v1Zip, sourceUrl = "$devUrl/plugin.d3plugin", devServerUrl = devUrl)
+            val inst = pm.createInstance(pluginId, "Cancel Inst", emptyMap())
+            assertEquals("Cancel-V1", pm.openSource(inst.instanceId).home().first().category.title)
+
+            val reloadJobRef = AtomicReference<kotlinx.coroutines.Job?>()
+            val hookFired = AtomicBoolean(false)
+            pm.afterUpsertBeforeShutdownHookForTesting = {
+                hookFired.set(true)
+                reloadJobRef.get()?.cancel()
+                yield()
+            }
+            val reloadJob = launch(Dispatchers.IO) {
+                pm.installFromBytes(v2Zip, sourceUrl = "$devUrl/plugin.d3plugin", devServerUrl = devUrl)
+            }
+            reloadJobRef.set(reloadJob)
+            reloadJob.join()
+            pm.afterUpsertBeforeShutdownHookForTesting = null
+
+            assertTrue("Cancellation hook between upsert and runtime shutdown must have run", hookFired.get())
+            val afterReloadPkg = store.getPackage(pluginId)
+            assertNotNull(afterReloadPkg)
+            assertEquals(PluginRepositoryClient.sha256Hex(v2Zip), afterReloadPkg!!.sha256)
+            assertEquals(
+                "Cached runtime MUST be invalidated even when cancelled right after upsertPackage",
+                "Cancel-V2",
+                pm.openSource(inst.instanceId).home().first().category.title,
+            )
+            val stagingLeftAfterReload = File(rootDir, "packages/$pluginId")
+                .listFiles()
+                ?.filter { it.name.startsWith(".staging-") }
+                .orEmpty()
+            assertTrue("No staging dirs left after cancelled reload: $stagingLeftAfterReload", stagingLeftAfterReload.isEmpty())
+
+            // 2. Cancellation injected AFTER wiping old instances and BEFORE atomic delete+upsert replacement:
+            //    NonCancellable + replacePackageAtomic ensure the plugin NEVER disappears!
+            val repoZip = buildZip(makeManifest(id = pluginId, version = "2.0.0"), simpleMainJs("Repo-V2"))
+            val replaceJobRef = AtomicReference<kotlinx.coroutines.Job?>()
+            val wipeHookFired = AtomicBoolean(false)
+            pm.afterWipeBeforeReplaceHookForTesting = {
+                wipeHookFired.set(true)
+                replaceJobRef.get()?.cancel()
+                yield()
+            }
+            val replaceJob = launch(Dispatchers.IO) {
+                pm.installFromBytes(
+                    zipBytes = repoZip,
+                    sourceUrl = "https://repo.example.com/pkg-2.0.0.d3plugin",
+                    repoUrl = repoUrl,
+                    confirmReplaceFromDifferentSource = true,
+                )
+            }
+            replaceJobRef.set(replaceJob)
+            replaceJob.join()
+            pm.afterWipeBeforeReplaceHookForTesting = null
+
+            assertTrue("Cancellation hook between instance wipe and atomic replacement must have run", wipeHookFired.get())
+            val afterReplacePkg = store.getPackage(pluginId)
+            assertNotNull("Plugin MUST NOT disappear when cancelled during cross-source replacement", afterReplacePkg)
+            assertEquals(PluginRepositoryClient.sha256Hex(repoZip), afterReplacePkg!!.sha256)
+            assertEquals("2.0.0", afterReplacePkg.version)
+            assertFalse(PluginPackageManager.isDevOrigin(afterReplacePkg.sourceOrigin))
+            assertTrue("Old dev instances must be wiped on cross-source replacement", store.listInstancesForPlugin(pluginId).isEmpty())
+            assertTrue("New package main.js must exist on disk", File(afterReplacePkg.packagePath, "main.js").isFile)
+
+            // Startup orphan cleanup MUST keep the replaced package intact
+            pm.cleanupOrphanedFiles()
+            assertTrue("Orphan cleanup must keep committed replacement files", File(afterReplacePkg.packagePath, "main.js").isFile)
+            val newInst = pm.createInstance(pluginId, "Repo Inst", emptyMap())
+            assertEquals("Repo-V2", pm.openSource(newInst.instanceId).home().first().category.title)
+        } finally {
+            pm.afterUpsertBeforeShutdownHookForTesting = null
+            pm.afterWipeBeforeReplaceHookForTesting = null
+            pm.shutdownAll()
+        }
+    }
+
+    @Test
+    fun permissionConfirmationRejectsStaleShaAndApprovesAtomicallyUnderLock() = runBlocking {
+        val store = InMemoryPluginStore()
+        val pm = PluginPackageManager(
+            rootDir = tempFolder.newFolder("perm-toctou"),
+            store = store,
+            secretBox = SoftwareAesSecretBox(),
+            appVersion = "1.0.0",
+            deviceInfo = DeviceInfo.detect("1.0.0"),
+        )
+        val pluginId = "com.example.permrace"
+        val devUrl = "http://192.168.1.50:8787"
+
+        try {
+            // Install baseline v1 with narrow permissions
+            val v1Zip = buildZip(
+                makeManifest(id = pluginId, version = "1.0.0", hosts = listOf("a.example.com"), lan = false),
+                simpleMainJs("Perm-V1"),
+            )
+            pm.installFromBytes(v1Zip, sourceUrl = "$devUrl/plugin.d3plugin", devServerUrl = devUrl)
+
+            // Reload v2 expanding hosts -> lands in needsPermissionReconfirm = true
+            val v2Zip = buildZip(
+                makeManifest(id = pluginId, version = "1.0.0", hosts = listOf("a.example.com", "b.example.com"), lan = false),
+                simpleMainJs("Perm-V2"),
+            )
+            val r2 = pm.installFromBytes(v2Zip, sourceUrl = "$devUrl/plugin.d3plugin", devServerUrl = devUrl)
+            assertTrue(r2.needsPermissionReconfirm)
+            val shaV2 = r2.entity.sha256
+
+            // Another reload v3 sneaks in with EVEN MORE permissions (lan = true + evil host)
+            val v3Zip = buildZip(
+                makeManifest(id = pluginId, version = "1.0.0", hosts = listOf("a.example.com", "evil.example.com"), lan = true),
+                simpleMainJs("Perm-V3"),
+            )
+            val r3 = pm.installFromBytes(v3Zip, sourceUrl = "$devUrl/plugin.d3plugin", devServerUrl = devUrl)
+            assertTrue(r3.needsPermissionReconfirm)
+            val shaV3 = r3.entity.sha256
+            assertNotEquals(shaV2, shaV3)
+
+            // Confirming with stale shaV2 MUST BE REJECTED so v3's unshown permissions are NEVER silently approved!
+            try {
+                pm.confirmPermissions(pluginId, expectedSha256 = shaV2)
+                fail("confirmPermissions with stale SHA-256 MUST fail")
+            } catch (e: PackageInstallException) {
+                assertTrue(e.message!!.contains("已变更"))
+            }
+            assertTrue(
+                "v3 must remain pending permission reconfirmation after rejected stale confirm",
+                store.getPackage(pluginId)!!.needsPermissionReconfirm,
+            )
+
+            // Confirming with matching shaV3 succeeds
+            pm.confirmPermissions(pluginId, expectedSha256 = shaV3)
+            assertFalse(store.getPackage(pluginId)!!.needsPermissionReconfirm)
+
+            // Atomic approval inside installFromBytes via confirmInstall(confirmExpandedPermissionsOnInstall = true):
+            // even MORE permissions approved atomically under pluginLockFor without a separate post-unlock call!
+            val v4Zip = buildZip(
+                makeManifest(
+                    id = pluginId,
+                    version = "1.0.0",
+                    hosts = listOf("a.example.com", "evil.example.com", "c.example.com"),
+                    lan = true,
+                ),
+                simpleMainJs("Perm-V4"),
+            )
+            val previewV4 = pm.previewPackage(v4Zip, sourceUrl = "$devUrl/plugin.d3plugin", devServerUrl = devUrl)
+            assertTrue(previewV4.needsPermissionReconfirm)
+            val pendingV4 = PendingPluginInstall(
+                bytes = v4Zip,
+                sourceUrl = "$devUrl/plugin.d3plugin",
+                repoUrl = null,
+                expectedId = pluginId,
+                expectedVersion = "1.0.0",
+                expectedSha256 = previewV4.sha256,
+                preview = previewV4,
+                devServerUrl = devUrl,
+                devDisplayAddress = "192.168.1.50:8787",
+                confirmExpandedPermissionsOnInstall = true,
+            )
+            val atomicResult = PluginInstallGuard.confirmInstall(pm, pendingV4)
+            assertFalse(
+                "Atomic installFromBytes approval must return needsPermissionReconfirm=false directly",
+                atomicResult.needsPermissionReconfirm,
+            )
+            assertFalse(atomicResult.entity.needsPermissionReconfirm)
+            assertFalse(store.getPackage(pluginId)!!.needsPermissionReconfirm)
+        } finally {
+            pm.shutdownAll()
+        }
+    }
+
+    @Test
+    fun verifyInstalledPluginLoadSurvivesConcurrentReloadDirectorySwap() = runBlocking {
+        val store = InMemoryPluginStore()
+        val pm = PluginPackageManager(
+            rootDir = tempFolder.newFolder("verify-load-race"),
+            store = store,
+            secretBox = SoftwareAesSecretBox(),
+            appVersion = "1.0.0",
+            deviceInfo = DeviceInfo.detect("1.0.0"),
+        )
+        val pluginId = "com.example.verifyrace"
+        val devUrl = "http://192.168.1.50:8787"
+
+        try {
+            val v0 = buildZip(makeManifest(id = pluginId, version = "1.0.0"), simpleMainJs("Load-0"))
+            pm.installFromBytes(v0, sourceUrl = "$devUrl/plugin.d3plugin", devServerUrl = devUrl)
+
+            // 1. No-instance probe path hammered concurrently with same-version reloads deleting old dirs
+            val unexpectedErrors = java.util.concurrent.CopyOnWriteArrayList<String>()
+            val stop = AtomicBoolean(false)
+            val verifyJobsNoInst = (1..3).map {
+                async(Dispatchers.IO) {
+                    while (!stop.get()) {
+                        val err = pm.verifyInstalledPluginLoad(pluginId)
+                        if (err != null) unexpectedErrors.add(err)
+                    }
+                }
+            }
+            for (i in 1..8) {
+                val nextZip = buildZip(makeManifest(id = pluginId, version = "1.0.0"), simpleMainJs("Load-$i"))
+                pm.installFromBytes(nextZip, sourceUrl = "$devUrl/plugin.d3plugin", devServerUrl = devUrl)
+            }
+            stop.set(true)
+            verifyJobsNoInst.awaitAll()
+            assertTrue(
+                "No-instance verifyInstalledPluginLoad must not hit spurious FileNotFoundException: $unexpectedErrors",
+                unexpectedErrors.isEmpty(),
+            )
+
+            // 2. With-instance path hammered concurrently with same-version reloads
+            pm.createInstance(pluginId, "Verify Inst", emptyMap())
+            stop.set(false)
+            val verifyJobsWithInst = (1..3).map {
+                async(Dispatchers.IO) {
+                    while (!stop.get()) {
+                        val err = pm.verifyInstalledPluginLoad(pluginId)
+                        if (err != null) unexpectedErrors.add(err)
+                    }
+                }
+            }
+            for (i in 9..16) {
+                val nextZip = buildZip(makeManifest(id = pluginId, version = "1.0.0"), simpleMainJs("Load-$i"))
+                pm.installFromBytes(nextZip, sourceUrl = "$devUrl/plugin.d3plugin", devServerUrl = devUrl)
+            }
+            stop.set(true)
+            verifyJobsWithInst.awaitAll()
+            assertTrue(
+                "With-instance verifyInstalledPluginLoad must not hit spurious FileNotFoundException: $unexpectedErrors",
+                unexpectedErrors.isEmpty(),
+            )
+        } finally {
+            pm.shutdownAll()
+        }
+    }
+
+    @Test
+    fun developerAndPhoneErrorPathRedactsCookiesAndStorageTokensAndNeverLeaksToPhone() = runBlocking {
+        val store = InMemoryPluginStore()
+        val pm = PluginPackageManager(
+            rootDir = tempFolder.newFolder("dev-phone-redact"),
+            store = store,
+            secretBox = SoftwareAesSecretBox(),
+            appVersion = "1.0.0",
+            deviceInfo = DeviceInfo.detect("1.0.0"),
+        )
+        val pluginId = "com.example.fullredact"
+        val devUrl = "http://192.168.1.50:8787"
+        val dns: (String) -> List<InetAddress> = { listOf(InetAddress.getByName(it)) }
+
+        val cfgPassword = "CfgSecretPwd!987"
+        val cookieSecret = "CookieJarVal_456XYZ"
+        val storageToken = "StorageTokVal_321ABC"
+        val nestedRefresh = "NestedRefreshTok_654DEF"
+        val jwtSecret = "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyIjoiZGV2In0.JwtSigSecret_999"
+
+        try {
+            val manifest = """
+                {
+                  "api": 1,
+                  "id": "$pluginId",
+                  "name": "Full Redact Dev",
+                  "version": "1.0.0",
+                  "minApp": "1.0.0",
+                  "permissions": { "hosts": ["api.example.com"], "userHosts": false, "lan": false },
+                  "config": [
+                    { "key": "password", "type": "password", "label": "密码", "required": true }
+                  ],
+                  "auth": "none"
+                }
+            """.trimIndent()
+            val setupJs = """
+                export default {
+                  async home(ctx) {
+                    await ctx.cookies.set('https://api.example.com/', 'sid=$cookieSecret; Path=/; Secure');
+                    await ctx.storage.set('sessionToken', '$storageToken');
+                    await ctx.storage.set('auth', { refresh_token: '$nestedRefresh', user: 'alice' });
+                    await ctx.storage.set('opaqueCache', '$jwtSecret');
+                    return [];
+                  },
+                  async browse() { return { items: [], next: null }; },
+                  async detail() { return { id: '1', kind: 'movie', title: '1' }; },
+                  async playback() { return { url: 'https://api.example.com/1.mp4' }; }
+                };
+            """.trimIndent()
+            pm.installFromBytes(buildZip(manifest, setupJs), sourceUrl = "$devUrl/plugin.d3plugin", devServerUrl = devUrl)
+            val inst = pm.createInstance(
+                pluginId = pluginId,
+                displayName = "Redact Inst",
+                config = mapOf("password" to JsonPrimitive(cfgPassword)),
+            )
+            // Persist cookies and ctx.storage tokens through real QuickJS execution
+            pm.openSource(inst.instanceId, dnsResolver = dns).home()
+
+            // 1. Developer Screen error formatting path (PluginInstallGuard.formatDeveloperScreenError)
+            //    with an error echoing raw secrets WITHOUT any "password="/"Cookie:" label prefix!
+            val rawLeakyException = PluginInternalException(
+                "TypeError at main.js:42: failed [$cfgPassword] [$cookieSecret] [$storageToken] [$nestedRefresh] [$jwtSecret]",
+            )
+            val devRes = PluginInstallGuard.formatDeveloperScreenError(
+                error = rawLeakyException,
+                packageManager = pm,
+                pluginId = pluginId,
+                isReload = false,
+                strings = strings,
+            )
+            assertNotNull(devRes.devTechnicalError)
+            val tech = devRes.devTechnicalError!!
+            assertTrue("Line number must remain for Developer screen: $tech", tech.contains(":42"))
+            for (secret in listOf(cfgPassword, cookieSecret, storageToken, nestedRefresh, jwtSecret)) {
+                assertFalse("Developer screen error leaked secret '$secret': $tech", tech.contains(secret))
+                assertFalse("Developer summary leaked secret '$secret': ${devRes.devSummary}", devRes.devSummary.contains(secret))
+                assertFalse("Phone error leaked secret '$secret': ${devRes.phoneError.detail}", devRes.phoneError.detail.contains(secret))
+            }
+            assertFalse(
+                "Phone error must NEVER include raw technical stack/error: ${devRes.phoneError.detail}",
+                devRes.phoneError.detail.contains("TypeError") || devRes.phoneError.detail.contains(":42"),
+            )
+
+            // Even when pluginId is null (e.g., phone submit before selecting a dev plugin), secrets are STILL redacted!
+            val devResNullId = PluginInstallGuard.formatDeveloperScreenError(
+                error = rawLeakyException,
+                packageManager = pm,
+                pluginId = null,
+                isReload = false,
+                strings = strings,
+            )
+            for (secret in listOf(cfgPassword, cookieSecret, storageToken, nestedRefresh, jwtSecret)) {
+                assertFalse(
+                    "Redaction with pluginId=null leaked secret '$secret': ${devResNullId.devTechnicalError}",
+                    devResNullId.devTechnicalError!!.contains(secret),
+                )
+            }
+
+            // 2. End-to-end PhoneInputServer HTTP submit path (exact path used by PluginDeveloperScreen's PhoneInputSheet)
+            val capturedDevTech = AtomicReference<String?>()
+            val phoneServer = PhoneInputServer(
+                copy = PhoneInputCopy.from(strings, PhoneInputServer.Mode.PLUGIN_DEV_SERVER),
+                displayHost = "127.0.0.1",
+                bindAddress = InetAddress.getByName("127.0.0.1"),
+                port = 0,
+                onSubmitted = { _ ->
+                    val outcome = runBlocking {
+                        PluginInstallGuard.formatDeveloperScreenError(
+                            error = RepositoryVerificationException(
+                                message = "开发服务器打包失败",
+                                technicalDetail = "SyntaxError at main.js:17: unexpected $cookieSecret $storageToken $cfgPassword",
+                            ),
+                            packageManager = pm,
+                            pluginId = pluginId,
+                            isReload = false,
+                            strings = strings,
+                        )
+                    }
+                    capturedDevTech.set(outcome.devTechnicalError)
+                    PhoneSubmitResult.Rejected(PhoneInputErrorHelper.formatRejectedReason(strings, outcome.phoneError))
+                },
+            ).start()
+            try {
+                val client = OkHttpClient.Builder().proxy(Proxy.NO_PROXY).build()
+                val req = Request.Builder()
+                    .url("http://127.0.0.1:${phoneServer.boundPort}/submit-qr")
+                    .post(
+                        FormBody.Builder()
+                            .add("token", phoneServer.token)
+                            .add("value", "192.168.1.50:8787")
+                            .build(),
+                    )
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    assertEquals(400, resp.code)
+                    val html = resp.body.string()
+                    assertTrue("Phone HTML must show Chinese summary: $html", html.contains("开发诊断信息") || html.contains("插件加载失败"))
+                    assertFalse("Phone HTML must NEVER contain raw SyntaxError: $html", html.contains("SyntaxError"))
+                    assertFalse("Phone HTML must NEVER contain line number ':17': $html", html.contains(":17"))
+                    for (secret in listOf(cfgPassword, cookieSecret, storageToken)) {
+                        assertFalse("Phone HTML leaked secret '$secret'", html.contains(secret))
+                    }
+                }
+                val devTechOnHeadset = capturedDevTech.get()
+                assertNotNull(devTechOnHeadset)
+                assertTrue("Headset Developer screen keeps line number ':17': $devTechOnHeadset", devTechOnHeadset!!.contains(":17"))
+                for (secret in listOf(cfgPassword, cookieSecret, storageToken)) {
+                    assertFalse("Headset Developer screen leaked secret '$secret': $devTechOnHeadset", devTechOnHeadset.contains(secret))
+                }
+            } finally {
+                phoneServer.close()
+            }
+
+            // 3. Also verify reload with broken init() after cookies/storage exist redacts cookie & storage tokens
+            val brokenInitJs = """
+                export default {
+                  async init(ctx) {
+                    const tok = await ctx.storage.get('sessionToken');
+                    const ck = await ctx.cookies.get('https://api.example.com/');
+                    throw new Error('init boom raw=' + tok + ' rawCk=' + ck);
+                  },
+                  async home() { return []; },
+                  async browse() { return { items: [], next: null }; },
+                  async detail() { return { id: '1', kind: 'movie', title: '1' }; },
+                  async playback() { return { url: 'https://api.example.com/1.mp4' }; }
+                };
+            """.trimIndent()
+            pm.installFromBytes(buildZip(manifest, brokenInitJs), sourceUrl = "$devUrl/plugin.d3plugin", devServerUrl = devUrl)
+            val initErr = pm.verifyInstalledPluginLoad(pluginId, dnsResolver = dns)
+            assertNotNull(initErr)
+            assertFalse("verifyInstalledPluginLoad leaked storage token: $initErr", initErr!!.contains(storageToken))
+            assertFalse("verifyInstalledPluginLoad leaked cookie value: $initErr", initErr.contains(cookieSecret))
+        } finally {
+            pm.shutdownAll()
+        }
+    }
+
+    @Test
+    fun round3SmallItemsTotalTimeoutDevSwitchCopyCreateInstanceLockAndConcurrentDoubleInstall() = runBlocking {
+        val rootDir = tempFolder.newFolder("round3-small")
+        val store = InMemoryPluginStore()
+        val pm = PluginPackageManager(
+            rootDir = rootDir,
+            store = store,
+            secretBox = SoftwareAesSecretBox(),
+            appVersion = "1.0.0",
+            deviceInfo = DeviceInfo.detect("1.0.0"),
+        )
+        val pluginId = "com.example.doubleinstall"
+        val devUrl = "http://192.168.1.50:8787"
+
+        try {
+            // 6a. Total download duration limit ("下载总耗时超过 30 秒上限") is classified as connection failure
+            val totalTimeoutErr = RepositoryVerificationException("下载总耗时超过 30 秒上限")
+            assertTrue(
+                "Total download duration timeout must be classified as connection failure",
+                PluginInstallGuard.isConnectionFailure(totalTimeoutErr),
+            )
+            val (reloadMsg, reloadTech) = PluginInstallGuard.formatDevReloadError(totalTimeoutErr, strings)
+            assertNull(reloadTech)
+            assertTrue(
+                "Total download timeout must show offline/IP-change hint, got: $reloadMsg",
+                reloadMsg.contains("暂时连不上") && reloadMsg.contains("更换了 IP") && reloadMsg.contains("保留当前安装的版本"),
+            )
+
+            // 6b. Dev->dev address switch warning explicitly mentions passing saved login info to new address code
+            val switchCopy = PluginPermissionSummary.replacementWarningText(
+                existingSourceOrigin = "dev:http://192.168.1.50:8787",
+                newSourceOrigin = "dev:http://192.168.1.60:8787",
+                reposByUrl = emptyMap(),
+                strings = strings,
+            )
+            assertTrue(
+                "Dev->dev switch warning must state saved login info is given to new address code, got: $switchCopy",
+                switchCopy.contains("已保存的登录信息将交给新地址提供的代码") &&
+                    switchCopy.contains("192.168.1.50:8787") &&
+                    switchCopy.contains("192.168.1.60:8787"),
+            )
+
+            // 6d. Concurrent double installFromBytes for the SAME pluginId -> consistent final state, zero leftover staging dirs
+            val zipA = buildZip(makeManifest(id = pluginId, version = "1.0.0", name = "Race A"), simpleMainJs("Pkg-A"))
+            val zipB = buildZip(makeManifest(id = pluginId, version = "1.0.0", name = "Race B"), simpleMainJs("Pkg-B"))
+            val shaA = PluginRepositoryClient.sha256Hex(zipA)
+            val shaB = PluginRepositoryClient.sha256Hex(zipB)
+
+            val results = listOf(
+                async(Dispatchers.IO) {
+                    pm.installFromBytes(zipA, sourceUrl = "$devUrl/plugin.d3plugin", devServerUrl = devUrl)
+                },
+                async(Dispatchers.IO) {
+                    pm.installFromBytes(zipB, sourceUrl = "$devUrl/plugin.d3plugin", devServerUrl = devUrl)
+                },
+            ).awaitAll()
+            assertEquals(2, results.size)
+
+            val finalPkg = store.getPackage(pluginId)
+            assertNotNull(finalPkg)
+            assertTrue(
+                "Final SHA must match either zipA or zipB",
+                finalPkg!!.sha256 == shaA || finalPkg.sha256 == shaB,
+            )
+            val expectedTitle = if (finalPkg.sha256 == shaA) "Pkg-A" else "Pkg-B"
+            val onDiskMainJs = File(finalPkg.packagePath, "main.js").readText(Charsets.UTF_8)
+            assertTrue(
+                "On-disk main.js must match DB winner ($expectedTitle)",
+                onDiskMainJs.contains(expectedTitle),
+            )
+            val pluginDirChildren = File(rootDir, "packages/$pluginId").listFiles().orEmpty()
+            assertTrue(
+                "Zero .staging-* dirs may remain after concurrent double install, found: ${pluginDirChildren.map { it.name }}",
+                pluginDirChildren.none { it.name.startsWith(".staging-") },
+            )
+            assertEquals(
+                "Only the single active version dir should remain, found: ${pluginDirChildren.map { it.name }}",
+                1,
+                pluginDirChildren.size,
+            )
+
+            // 6c. createInstance serialized under pluginLockFor with concurrent reloads
+            val instAndReload = listOf(
+                async(Dispatchers.IO) { pm.createInstance(pluginId, "Concurrent Inst", emptyMap()) },
+                async(Dispatchers.IO) { pm.installFromBytes(zipA, sourceUrl = "$devUrl/plugin.d3plugin", devServerUrl = devUrl) },
+            )
+            val createdInst = instAndReload[0].await() as com.limelight.local.plugin.PluginInstanceEntity
+            instAndReload[1].await()
+            assertEquals("Pkg-A", pm.openSource(createdInst.instanceId).home().first().category.title)
         } finally {
             pm.shutdownAll()
         }

@@ -16,6 +16,7 @@ export const UDP_RATE_LIMIT_WINDOW_MS = 1000;
 export const UDP_RATE_LIMIT_PER_IP = 4;
 export const UDP_RATE_LIMIT_GLOBAL = 30;
 export const UDP_RATE_LIMIT_MAX_TRACKED_IPS = 256;
+export const DISCOVERY_MTIME_CHECK_INTERVAL_MS = 500;
 
 /**
  * Returns true strictly for RFC1918 IPv4 (10/8, 172.16/12, 192.168/16) and
@@ -143,7 +144,8 @@ export function buildDiscoveryReplyFromManifest(manifest, httpPort, locale = nul
   const translated = rawName.startsWith('$t:') && locale
     ? locale.translate(rawName.slice(3))
     : rawName;
-  let name = truncateChars(translated || manifest.id, MAX_DISCOVERY_NAME_CHARS);
+  const baseName = translated || String(manifest.id);
+  let name = truncateChars(baseName, MAX_DISCOVERY_NAME_CHARS);
   const reply = {
     name,
     id: String(manifest.id),
@@ -157,9 +159,15 @@ export function buildDiscoveryReplyFromManifest(manifest, httpPort, locale = nul
     const chars = Array.from(name);
     const nextLen = Math.max(0, Math.floor(chars.length * 0.75) - 1);
     name = nextLen > 0 ? truncateChars(chars.slice(0, nextLen).join(''), nextLen) : '';
-    reply.name = name || reply.id;
+    reply.name = name;
     encoded = Buffer.from(JSON.stringify(reply), 'utf8');
     if (name.length === 0) break;
+  }
+
+  // Strict cap invariant: if even with empty `name` the payload exceeds MAX_DISCOVERY_REPLY_BYTES
+  // (e.g. an excessively long `id` or `version`), return null so the server never sends an oversized reply.
+  if (encoded.length > MAX_DISCOVERY_REPLY_BYTES) {
+    return null;
   }
   return reply;
 }
@@ -175,7 +183,41 @@ export function buildDiscoveryReply(pluginDir, httpPort) {
   return buildDiscoveryReplyFromManifest(manifest, httpPort, locale);
 }
 
-function startUdpDiscoveryResponder(getCachedPayload, opts) {
+function encodeDiscoveryReply(reply) {
+  if (!reply) return null;
+  const buf = Buffer.from(JSON.stringify(reply), 'utf8');
+  return buf.length <= MAX_DISCOVERY_REPLY_BYTES ? buf : null;
+}
+
+async function readDiscoveryReplyAsync(pluginDir, httpPort) {
+  const manifestPath = path.join(pluginDir, 'manifest.json');
+  const raw = await fs.promises.readFile(manifestPath, 'utf8');
+  const manifest = JSON.parse(raw);
+  const check = validateManifest(manifest);
+  if (!check.valid) {
+    throw new Error(`Invalid manifest.json: ${check.errors.join('; ')}`);
+  }
+  let locale = null;
+  if (String(manifest.name || '').startsWith('$t:')) {
+    const localesDir = path.join(pluginDir, 'locales');
+    const strings = {};
+    for (const fileName of ['en.json', 'zh-CN.json']) {
+      try {
+        const text = await fs.promises.readFile(path.join(localesDir, fileName), 'utf8');
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          Object.assign(strings, parsed);
+        }
+      } catch {
+        // Optional locale file missing or mid-edit
+      }
+    }
+    locale = new PluginLocale(strings);
+  }
+  return buildDiscoveryReplyFromManifest(manifest, httpPort, locale);
+}
+
+function startUdpDiscoveryResponder(getCachedPayload, onProbeAccepted, opts) {
   const requestedPort = opts.discoverPort ?? DEV_DISCOVERY_PORT;
   const allowLoopback = Boolean(opts.allowLoopbackDiscoveryForTesting);
   const bindHost = opts.discoverHost || '0.0.0.0';
@@ -197,15 +239,17 @@ function startUdpDiscoveryResponder(getCachedPayload, opts) {
       }
     });
 
-    // Zero synchronous disk I/O per packet: strictly serves pre-cached Buffer under rate limits.
+    // Zero synchronous disk I/O per packet: strictly serves pre-cached Buffer under rate limits
+    // and triggers throttled async mtime cache validation in the background.
     udp.on('message', (msg, rinfo) => {
       if (msg.length > 128) return;
       const text = msg.toString('utf8').trim();
       if (text !== DEV_DISCOVERY_PROBE) return;
       if (!isPrivateDiscoveryAddress(rinfo.address, allowLoopback)) return;
       if (!rateLimiter.allow(rinfo.address)) return;
+      if (onProbeAccepted) onProbeAccepted();
       const payload = getCachedPayload();
-      if (!payload || payload.length === 0) return;
+      if (!payload || payload.length === 0 || payload.length > MAX_DISCOVERY_REPLY_BYTES) return;
       udp.send(payload, rinfo.port, rinfo.address, () => {});
     });
 
@@ -224,14 +268,54 @@ export async function startDevServer(pluginDir, opts = {}) {
   const host = opts.host || '0.0.0.0';
   const port = opts.port ?? 8787;
   const discoverEnabled = opts.discover !== false;
+  const discoverRefreshIntervalMs = opts.discoverRefreshIntervalMs ?? DISCOVERY_MTIME_CHECK_INTERVAL_MS;
+  const discoverWatch = opts.discoverWatch !== false;
+
+  const manifestPath = path.join(absDir, 'manifest.json');
+  const localesDir = path.join(absDir, 'locales');
 
   let cachedDiscoveryPayload = null;
+  let lastDiskSignature = '';
+  let lastMtimeCheckMs = 0;
+  let refreshInFlight = false;
+  let closed = false;
+
+  const computeDiskSignatureSync = () => {
+    try {
+      const mStat = fs.statSync(manifestPath);
+      let locSig = '';
+      try {
+        const lStat = fs.statSync(localesDir);
+        locSig = `${lStat.mtimeMs}`;
+      } catch {
+        // locales dir is optional
+      }
+      return `${mStat.mtimeMs}:${mStat.size}:${locSig}`;
+    } catch {
+      return '';
+    }
+  };
+
+  const computeDiskSignatureAsync = async () => {
+    const mStat = await fs.promises.stat(manifestPath);
+    let locSig = '';
+    try {
+      const lStat = await fs.promises.stat(localesDir);
+      locSig = `${lStat.mtimeMs}`;
+    } catch {
+      // locales dir is optional
+    }
+    return `${mStat.mtimeMs}:${mStat.size}:${locSig}`;
+  };
+
   const updateCachedDiscoveryFromDisk = (httpPort) => {
     try {
+      const sig = computeDiskSignatureSync();
       const reply = buildDiscoveryReply(absDir, httpPort);
-      cachedDiscoveryPayload = Buffer.from(JSON.stringify(reply), 'utf8');
+      cachedDiscoveryPayload = encodeDiscoveryReply(reply);
+      if (sig) lastDiskSignature = sig;
     } catch {
-      // Leave previous valid cache intact if manifest is mid-edit
+      // Leave previous valid cache intact if manifest is missing or mid-edit
     }
   };
   const updateCachedDiscoveryFromManifest = (manifest, httpPort) => {
@@ -240,10 +324,35 @@ export async function startDevServer(pluginDir, opts = {}) {
         ? PluginLocale.fromDir(absDir, 'zh-CN')
         : null;
       const reply = buildDiscoveryReplyFromManifest(manifest, httpPort, locale);
-      cachedDiscoveryPayload = Buffer.from(JSON.stringify(reply), 'utf8');
+      cachedDiscoveryPayload = encodeDiscoveryReply(reply);
+      const sig = computeDiskSignatureSync();
+      if (sig) lastDiskSignature = sig;
     } catch {
       // Ignore cache refresh errors
     }
+  };
+
+  const maybeRefreshDiscoveryCacheAsync = (force = false) => {
+    if (closed || refreshInFlight) return;
+    const now = Date.now();
+    if (!force && now - lastMtimeCheckMs < discoverRefreshIntervalMs) return;
+    lastMtimeCheckMs = now;
+    refreshInFlight = true;
+    (async () => {
+      try {
+        const sig = await computeDiskSignatureAsync();
+        if (!sig || (!force && sig === lastDiskSignature)) return;
+        const reply = await readDiscoveryReplyAsync(absDir, boundHttpPort);
+        if (!closed) {
+          cachedDiscoveryPayload = encodeDiscoveryReply(reply);
+          lastDiskSignature = sig;
+        }
+      } catch {
+        // Preserve previous valid cache if manifest was temporarily missing or mid-edit
+      } finally {
+        refreshInFlight = false;
+      }
+    })();
   };
 
   let boundHttpPort = port;
@@ -331,13 +440,43 @@ export async function startDevServer(pluginDir, opts = {}) {
   let udpSocket = null;
   let actualDiscoverPort = null;
   let discoverError = null;
+  let dirWatcher = null;
+  let watchDebounceTimer = null;
   if (discoverEnabled) {
     // Precompute discovery reply ONCE at startup so UDP probes never perform sync disk reads.
     updateCachedDiscoveryFromDisk(httpInfo.port);
-    const udpRes = await startUdpDiscoveryResponder(() => cachedDiscoveryPayload, opts);
+    const udpRes = await startUdpDiscoveryResponder(
+      () => cachedDiscoveryPayload,
+      () => maybeRefreshDiscoveryCacheAsync(false),
+      opts,
+    );
     udpSocket = udpRes.socket;
     actualDiscoverPort = udpRes.port;
     discoverError = udpRes.error;
+    if (udpSocket && discoverWatch) {
+      try {
+        dirWatcher = fs.watch(absDir, (_eventType, filename) => {
+          if (closed) return;
+          if (filename && filename !== 'manifest.json' && !String(filename).startsWith('locales')) {
+            return;
+          }
+          if (watchDebounceTimer) clearTimeout(watchDebounceTimer);
+          watchDebounceTimer = setTimeout(() => {
+            watchDebounceTimer = null;
+            maybeRefreshDiscoveryCacheAsync(true);
+          }, 50);
+          if (typeof watchDebounceTimer.unref === 'function') {
+            watchDebounceTimer.unref();
+          }
+        });
+        if (typeof dirWatcher.unref === 'function') {
+          dirWatcher.unref();
+        }
+        dirWatcher.on('error', () => {});
+      } catch {
+        dirWatcher = null;
+      }
+    }
   }
 
   return {
@@ -348,6 +487,15 @@ export async function startDevServer(pluginDir, opts = {}) {
     discoverPort: actualDiscoverPort,
     discoverError,
     close: async () => {
+      closed = true;
+      if (watchDebounceTimer) {
+        clearTimeout(watchDebounceTimer);
+        watchDebounceTimer = null;
+      }
+      if (dirWatcher) {
+        try { dirWatcher.close(); } catch {}
+        dirWatcher = null;
+      }
       if (udpSocket) {
         await new Promise((r) => {
           try {

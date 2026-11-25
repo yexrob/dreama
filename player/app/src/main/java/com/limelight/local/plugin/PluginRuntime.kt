@@ -197,6 +197,17 @@ class PluginRuntime(
 
     internal fun currentActiveTimerCount(): Int = activeTimerCount.get()
 
+    /**
+     * Collects live in-memory secret values from this runtime's cookie jar and `ctx.storage`
+     * (covering values written in-flight before disk flush) for log & diagnostic redaction.
+     */
+    internal fun collectLiveSecretValues(): List<String> {
+        val out = LinkedHashSet<String>()
+        out += cookieJar.allCookieValues()
+        out += storage.allSecretLikeValues()
+        return out.toList()
+    }
+
     internal fun tryReserveTimerSlot(): Boolean {
         while (true) {
             val cur = activeTimerCount.get()

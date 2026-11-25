@@ -1,10 +1,13 @@
 package com.limelight.local.plugin
 
 import android.content.Context
+import androidx.room.withTransaction
 import com.limelight.local.media.SourceNeedsSetupException
 import com.limelight.local.media.WallDatabase
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -440,6 +443,13 @@ interface PluginStore {
     suspend fun confirmPackagePermissions(pluginId: String, approvedPermissionsJson: String, updatedAt: Long)
     suspend fun deletePackage(pluginId: String)
 
+    /**
+     * Atomically deletes the existing package row (cascading all its instances) and inserts the
+     * replacement [entity] within a single database transaction so cross-source replacement never
+     * leaves a missing-plugin state on crash or cancellation.
+     */
+    suspend fun replacePackageAtomic(pluginId: String, entity: InstalledPluginEntity)
+
     suspend fun listInstances(): List<PluginInstanceEntity>
     suspend fun listInstancesForPlugin(pluginId: String): List<PluginInstanceEntity>
     suspend fun getInstance(instanceId: String): PluginInstanceEntity?
@@ -463,6 +473,12 @@ class RoomPluginStore(
     override suspend fun confirmPackagePermissions(pluginId: String, approvedPermissionsJson: String, updatedAt: Long) =
         db.pluginPackages().confirmPermissions(pluginId, approvedPermissionsJson, updatedAt)
     override suspend fun deletePackage(pluginId: String) = db.pluginPackages().delete(pluginId)
+    override suspend fun replacePackageAtomic(pluginId: String, entity: InstalledPluginEntity) {
+        db.withTransaction {
+            db.pluginPackages().delete(pluginId)
+            db.pluginPackages().upsert(entity)
+        }
+    }
 
     override suspend fun listInstances() = db.pluginInstances().listAll()
     override suspend fun listInstancesForPlugin(pluginId: String) = db.pluginInstances().listForPlugin(pluginId)
@@ -507,6 +523,12 @@ class InMemoryPluginStore : PluginStore {
     override suspend fun deletePackage(pluginId: String) = synchronized(this) {
         packages.remove(pluginId)
         instances.entries.removeAll { it.value.pluginId == pluginId }
+        Unit
+    }
+    override suspend fun replacePackageAtomic(pluginId: String, entity: InstalledPluginEntity) = synchronized(this) {
+        packages.remove(pluginId)
+        instances.entries.removeAll { it.value.pluginId == pluginId }
+        packages[entity.pluginId] = entity
         Unit
     }
 
@@ -570,6 +592,12 @@ class PluginPackageManager(
     private val instanceLocks = ConcurrentHashMap<String, Mutex>()
     private val activeStagingDirs = ConcurrentHashMap.newKeySet<String>()
     private val activeProbeDirs = ConcurrentHashMap.newKeySet<String>()
+
+    /** Deterministic cancellation-injection hooks used strictly by unit tests. */
+    @Volatile
+    internal var afterUpsertBeforeShutdownHookForTesting: (suspend () -> Unit)? = null
+    @Volatile
+    internal var afterWipeBeforeReplaceHookForTesting: (suspend () -> Unit)? = null
 
     /**
      * Lock ordering invariant (deadlock-free): ALWAYS acquire [pluginLockFor] BEFORE [lockFor].
@@ -665,7 +693,7 @@ class PluginPackageManager(
                 add(WILDCARD_LAN_WARNING)
             }
             if (devAddressSwitch) {
-                add("开发服务器地址已变化，确认后将切换来源地址并保留现有播放源、配置和本地数据。")
+                add("开发服务器地址已变化，确认后将切换来源地址并保留现有播放源、配置和本地数据；已保存的登录信息将交给新地址提供的代码，请确认该地址可信。")
             } else if (differentSource) {
                 add("已安装同 ID 插件但来源不同，继续安装将替换原插件并清除其所有配置、登录信息和本地数据。")
             }
@@ -688,6 +716,10 @@ class PluginPackageManager(
      * Installs, upgrades (same source), reloads (same dev server, allowing same version with
      * new SHA-256), or replaces (different source with explicit [confirmReplaceFromDifferentSource] = true)
      * a `.d3plugin` archive.
+     *
+     * When [confirmExpandedPermissions] is true (user already reviewed & confirmed expanded
+     * permissions on the install card), permissions are approved atomically inside the same
+     * per-plugin lock and DB commit so no TOCTOU gap exists between install and permission approval.
      */
     suspend fun installFromBytes(
         zipBytes: ByteArray,
@@ -698,6 +730,7 @@ class PluginPackageManager(
         expectedSha256: String? = null,
         confirmReplaceFromDifferentSource: Boolean = false,
         devServerUrl: String? = null,
+        confirmExpandedPermissions: Boolean = false,
     ): InstallResult {
         if (zipBytes.size > PluginPackageArchive.MAX_PACKAGE_BYTES) {
             throw PackageInstallException("插件包超过大小限制（上限 8 MB）")
@@ -765,124 +798,169 @@ class PluginPackageManager(
                 }
                 val prevApproved = PluginPermissions.fromJsonString(prev.approvedPermissionsJson)
                 if (manifest.permissions.isExpandedFrom(prevApproved)) {
-                    needsReconfirm = true
-                    approvedPermsJson = prev.approvedPermissionsJson
+                    if (confirmExpandedPermissions) {
+                        needsReconfirm = false
+                        approvedPermsJson = manifest.permissions.toJsonString()
+                    } else {
+                        needsReconfirm = true
+                        approvedPermsJson = prev.approvedPermissionsJson
+                    }
                 } else {
-                    needsReconfirm = prev.needsPermissionReconfirm
+                    needsReconfirm = if (confirmExpandedPermissions) false else prev.needsPermissionReconfirm
                     if (!needsReconfirm) {
                         approvedPermsJson = manifest.permissions.toJsonString()
                     }
                 }
             }
 
-            // Crash-safe staging write: NEVER delete existing.packagePath before DB commit.
-            // For same-version dev reloads, write into a fresh `<version>-<sha8>` sibling directory
-            // so the previous working files stay intact if writing fails or the process is killed.
-            val pluginRootDir = File(packagesDir, manifest.id)
-            pluginRootDir.mkdirs()
+            // Critical section from staging write through DB commit, runtime invalidation, and
+            // post-commit cleanup runs under NonCancellable so cancelling a busy dialog or screen
+            // scope can NEVER split DB state, cached runtimes, or on-disk package directories.
+            withContext(NonCancellable) {
+                val pluginRootDir = File(packagesDir, manifest.id)
+                pluginRootDir.mkdirs()
 
-            val existingPath = existing?.packagePath?.let { File(it).absolutePath }
-            val baseDir = File(pluginRootDir, manifest.version)
-            val targetDir = if (existingPath != null && baseDir.absolutePath == existingPath) {
-                val sha8 = actualSha.take(8).lowercase(java.util.Locale.ROOT)
-                val shaDir = File(pluginRootDir, "${manifest.version}-$sha8")
-                if (shaDir.absolutePath == existingPath) {
-                    File(pluginRootDir, "${manifest.version}-$sha8-${UUID.randomUUID().toString().take(6)}")
+                val existingPath = existing?.packagePath?.let { File(it).absolutePath }
+                val baseDir = File(pluginRootDir, manifest.version)
+                val targetDir = if (existingPath != null && baseDir.absolutePath == existingPath) {
+                    val sha8 = actualSha.take(8).lowercase(java.util.Locale.ROOT)
+                    val shaDir = File(pluginRootDir, "${manifest.version}-$sha8")
+                    if (shaDir.absolutePath == existingPath) {
+                        File(pluginRootDir, "${manifest.version}-$sha8-${UUID.randomUUID().toString().take(6)}")
+                    } else {
+                        shaDir
+                    }
                 } else {
-                    shaDir
+                    baseDir
                 }
-            } else {
-                baseDir
-            }
 
-            val stagingName = ".staging-${UUID.randomUUID()}"
-            val stagingDir = File(pluginRootDir, stagingName)
-            activeStagingDirs.add(stagingName)
-            try {
-                writeArchiveToDir(archive, stagingDir)
-                if (targetDir.exists() && targetDir.absolutePath != existingPath) {
-                    targetDir.deleteRecursively()
+                val stagingName = ".staging-${UUID.randomUUID()}"
+                val stagingDir = File(pluginRootDir, stagingName)
+                activeStagingDirs.add(stagingName)
+                try {
+                    writeArchiveToDir(archive, stagingDir)
+                    if (targetDir.exists() && targetDir.absolutePath != existingPath) {
+                        targetDir.deleteRecursively()
+                    }
+                    if (!stagingDir.renameTo(targetDir)) {
+                        stagingDir.copyRecursively(targetDir, overwrite = true)
+                        stagingDir.deleteRecursively()
+                    }
+                } catch (e: Exception) {
+                    runCatching { stagingDir.deleteRecursively() }
+                    throw PackageInstallException("写入插件文件失败：${e.message}", e)
+                } finally {
+                    activeStagingDirs.remove(stagingName)
                 }
-                if (!stagingDir.renameTo(targetDir)) {
-                    stagingDir.copyRecursively(targetDir, overwrite = true)
-                    stagingDir.deleteRecursively()
+
+                val effectiveSourceUrl = devServerUrl ?: sourceUrl
+                val entity = InstalledPluginEntity(
+                    pluginId = manifest.id,
+                    name = manifest.name,
+                    version = manifest.version,
+                    author = manifest.author,
+                    description = manifest.description,
+                    manifestJson = archive.manifestJson,
+                    packagePath = targetDir.absolutePath,
+                    sourceUrl = if (differentSource) effectiveSourceUrl else (effectiveSourceUrl ?: existing?.sourceUrl),
+                    repoUrl = if (differentSource) repoUrl else (repoUrl ?: existing?.repoUrl),
+                    sourceOrigin = newSourceOrigin,
+                    sha256 = actualSha,
+                    enabled = if (shouldWipeInstances) true else (existing?.enabled ?: true),
+                    needsPermissionReconfirm = needsReconfirm,
+                    approvedPermissionsJson = approvedPermsJson,
+                    installedAt = if (shouldWipeInstances) now else (existing?.installedAt ?: now),
+                    updatedAt = now,
+                )
+
+                if (shouldWipeInstances) {
+                    // §11.4 (S1): Replacing a plugin from a different source (non dev<->dev) MUST wipe
+                    // all existing instances' runtimes, configs/passwords, storage, and cookies.
+                    // Shutdown active runtimes first, then execute delete (CASCADE instances) + upsert
+                    // atomically inside ONE Room transaction, then delete old instance directories.
+                    val oldInstances = store.listInstancesForPlugin(manifest.id)
+                    for (inst in oldInstances) {
+                        lockFor(inst.instanceId).withLock {
+                            activeSources.remove(inst.instanceId)?.shutdown()
+                        }
+                    }
+                    afterWipeBeforeReplaceHookForTesting?.invoke()
+                    store.replacePackageAtomic(manifest.id, entity)
+                    for (inst in oldInstances) {
+                        lockFor(inst.instanceId).withLock {
+                            runCatching { File(instancesDir, inst.instanceId).deleteRecursively() }
+                        }
+                        instanceLocks.remove(inst.instanceId)
+                    }
+                } else {
+                    // Commit new package metadata FIRST, THEN destroy cached runtimes — all serialized
+                    // under pluginLockFor(manifest.id) + NonCancellable so concurrent openSource() or
+                    // caller cancellation can NEVER leave an obsolete runtime pointing at old code.
+                    store.upsertPackage(entity)
+                    afterUpsertBeforeShutdownHookForTesting?.invoke()
+                    shutdownRuntimesForPlugin(manifest.id)
                 }
-            } catch (e: Exception) {
-                runCatching { stagingDir.deleteRecursively() }
-                throw PackageInstallException("写入插件文件失败：${e.message}", e)
-            } finally {
-                activeStagingDirs.remove(stagingName)
-            }
 
-            val effectiveSourceUrl = devServerUrl ?: sourceUrl
-            val entity = InstalledPluginEntity(
-                pluginId = manifest.id,
-                name = manifest.name,
-                version = manifest.version,
-                author = manifest.author,
-                description = manifest.description,
-                manifestJson = archive.manifestJson,
-                packagePath = targetDir.absolutePath,
-                sourceUrl = if (differentSource) effectiveSourceUrl else (effectiveSourceUrl ?: existing?.sourceUrl),
-                repoUrl = if (differentSource) repoUrl else (repoUrl ?: existing?.repoUrl),
-                sourceOrigin = newSourceOrigin,
-                sha256 = actualSha,
-                enabled = if (shouldWipeInstances) true else (existing?.enabled ?: true),
-                needsPermissionReconfirm = needsReconfirm,
-                approvedPermissionsJson = approvedPermsJson,
-                installedAt = if (shouldWipeInstances) now else (existing?.installedAt ?: now),
-                updatedAt = now,
-            )
-
-            if (shouldWipeInstances) {
-                // §11.4 (S1): Replacing a plugin from a different source (non dev<->dev) MUST wipe all
-                // existing instances' configs/passwords, storage, and cookies.
-                wipeAllInstancesForPlugin(manifest.id)
-                store.deletePackage(manifest.id)
-                store.upsertPackage(entity)
-            } else {
-                // Commit new package metadata FIRST, THEN destroy cached runtimes — all serialized
-                // under pluginLockFor(manifest.id) so concurrent openSource() can NEVER re-cache
-                // an obsolete runtime pointing at the old package directory.
-                store.upsertPackage(entity)
-                shutdownRuntimesForPlugin(manifest.id)
-            }
-
-            // Clean up superseded version dirs and any orphaned staging/version dirs AFTER commit
-            val keepCanonical = runCatching { targetDir.canonicalPath }.getOrDefault(targetDir.absolutePath)
-            pluginRootDir.listFiles()?.forEach { child ->
-                if (child.name in activeStagingDirs) return@forEach
-                val childCanonical = runCatching { child.canonicalPath }.getOrDefault(child.absolutePath)
-                if (childCanonical != keepCanonical) {
-                    runCatching { child.deleteRecursively() }
+                // Clean up superseded version dirs and any orphaned staging/version dirs AFTER commit
+                val keepCanonical = runCatching { targetDir.canonicalPath }.getOrDefault(targetDir.absolutePath)
+                pluginRootDir.listFiles()?.forEach { child ->
+                    if (child.name in activeStagingDirs) return@forEach
+                    val childCanonical = runCatching { child.canonicalPath }.getOrDefault(child.absolutePath)
+                    if (childCanonical != keepCanonical) {
+                        runCatching { child.deleteRecursively() }
+                    }
                 }
-            }
 
-            InstallResult(
-                entity = entity,
-                manifest = manifest,
-                isUpdate = isUpdate,
-                needsPermissionReconfirm = needsReconfirm,
-                replacedDifferentSource = differentSource,
-            )
+                InstallResult(
+                    entity = entity,
+                    manifest = manifest,
+                    isUpdate = isUpdate,
+                    needsPermissionReconfirm = needsReconfirm,
+                    replacedDifferentSource = differentSource,
+                )
+            }
         }
     }
 
     /**
-     * Collects secret values (configured `password` fields) from all instances of [pluginId]
-     * so developer-screen diagnostic errors can be redacted via [PluginLogger.redact].
+     * Collects known secret values for [pluginId] across all its instances:
+     * 1. Configured `password` fields declared in `manifest.json`
+     * 2. All values stored in each instance's cookie jar (live in-memory + persisted `cookies.enc`)
+     * 3. Token/credential-like values stored in each instance's `ctx.storage` (live + `storage.enc`)
      */
     internal suspend fun collectKnownSecretsForPlugin(pluginId: String): List<String> {
         val pkg = store.getPackage(pluginId) ?: return emptyList()
-        val manifest = runCatching { ManifestParser.parseAndValidate(pkg.manifestJson) }.getOrNull() ?: return emptyList()
-        val passwordKeys = manifest.passwordConfigKeys()
-        if (passwordKeys.isEmpty()) return emptyList()
+        return collectKnownSecretsForPluginWithPackage(pluginId, pkg)
+    }
+
+    private suspend fun collectKnownSecretsForPluginWithPackage(
+        pluginId: String,
+        pkg: InstalledPluginEntity,
+    ): List<String> {
+        val manifest = runCatching { ManifestParser.parseAndValidate(pkg.manifestJson) }.getOrNull()
+        val passwordKeys = manifest?.passwordConfigKeys().orEmpty()
         val out = LinkedHashSet<String>()
         for (inst in store.listInstancesForPlugin(pluginId)) {
-            val cfg = runCatching { getInstanceConfig(inst.instanceId) }.getOrNull() ?: continue
-            for (k in passwordKeys) {
-                val v = (cfg[k] as? JsonPrimitive)?.takeIf { it.isString }?.content
-                if (!v.isNullOrEmpty()) out += v
+            if (passwordKeys.isNotEmpty()) {
+                val cfg = runCatching { getInstanceConfig(inst.instanceId) }.getOrNull()
+                if (cfg != null) {
+                    for (k in passwordKeys) {
+                        val v = (cfg[k] as? JsonPrimitive)?.takeIf { it.isString }?.content
+                        if (!v.isNullOrEmpty()) out += v
+                    }
+                }
+            }
+            activeSources[inst.instanceId]?.let { live ->
+                runCatching { out += live.collectLiveSecretValues() }
+            }
+            val instDir = File(instancesDir, inst.instanceId)
+            val cookieFile = File(instDir, "cookies.enc")
+            if (cookieFile.isFile) {
+                runCatching { out += PluginCookieJar(cookieFile, secretBox).allCookieValues() }
+            }
+            val storageFile = File(instDir, "storage.enc")
+            if (storageFile.isFile) {
+                runCatching { out += InstanceStorage(storageFile, secretBox).allSecretLikeValues() }
             }
         }
         return out.toList()
@@ -890,10 +968,19 @@ class PluginPackageManager(
 
     /**
      * Redacts a raw technical error string for Developer Mode using the shared [PluginLogger.redact]
-     * rules plus all known password-field secrets for [pluginId].
+     * rules plus all known secrets (password fields, cookies, and token-like `ctx.storage` values)
+     * for [pluginId] (or across all installed plugins when [pluginId] is null).
      */
     suspend fun redactDeveloperError(pluginId: String?, rawError: String): String {
-        val secrets = if (!pluginId.isNullOrBlank()) collectKnownSecretsForPlugin(pluginId) else emptyList()
+        val secrets = if (!pluginId.isNullOrBlank()) {
+            collectKnownSecretsForPlugin(pluginId)
+        } else {
+            val all = LinkedHashSet<String>()
+            for (pkg in store.listPackages()) {
+                all += collectKnownSecretsForPluginWithPackage(pkg.pluginId, pkg)
+            }
+            all.toList()
+        }
         return PluginLogger.redact(rawError, secrets)
     }
 
@@ -930,36 +1017,83 @@ class PluginPackageManager(
 
     /**
      * Verifies an installed plugin loads and initializes cleanly (`main.js` + optional `init(ctx)`).
+     * Reads package metadata & archive files under [pluginLockFor] so concurrent reloads cannot
+     * delete `pkgDir` mid-read and trigger spurious `FileNotFoundException`s.
      * When instances exist, verifies the first enabled instance with its real config/storage;
      * otherwise probes in a temporary runtime (ignoring `NeedsSetup` / `NeedsAuth` since no config
      * is filled yet). Returns `null` on success or the redacted raw technical error string for
-     * Developer Mode (using [PluginLogger.redact] + instance password secrets).
+     * Developer Mode (using [PluginLogger.redact] + instance password/cookie/storage secrets).
      */
     suspend fun verifyInstalledPluginLoad(
         pluginId: String,
         dnsResolver: ((String) -> List<java.net.InetAddress>)? = null,
     ): String? {
-        val pkg = store.getPackage(pluginId) ?: return null
-        if (!pkg.enabled || pkg.needsPermissionReconfirm) return null
-        val secrets = collectKnownSecretsForPlugin(pluginId)
-        val instances = store.listInstancesForPlugin(pluginId).filter { it.enabled }
-        if (instances.isNotEmpty()) {
-            return try {
-                val src = openSource(instances.first().instanceId, dnsResolver = dnsResolver)
-                src.verifyInitialized()
-                null
-            } catch (e: SourceNeedsSetupException) {
-                null
-            } catch (e: com.limelight.local.media.SourceNeedsAuthException) {
-                null
-            } catch (t: Throwable) {
-                PluginLogger.redact(extractRawTechnicalError(t), secrets)
+        data class ProbeSnapshot(
+            val manifest: PluginManifest,
+            val mainJs: String,
+            val locale: PluginLocale,
+            val secrets: List<String>,
+        )
+
+        var firstInstanceId: String? = null
+        var probeSnapshot: ProbeSnapshot? = null
+
+        pluginLockFor(pluginId).withLock {
+            val pkg = store.getPackage(pluginId) ?: return null
+            if (!pkg.enabled || pkg.needsPermissionReconfirm) return null
+            val secrets = collectKnownSecretsForPluginWithPackage(pluginId, pkg)
+            val instances = store.listInstancesForPlugin(pluginId).filter { it.enabled }
+            if (instances.isNotEmpty()) {
+                firstInstanceId = instances.first().instanceId
+            } else {
+                val manifest = ManifestParser.parseAndValidate(pkg.manifestJson)
+                val pkgDir = File(pkg.packagePath)
+                val mainJs = File(pkgDir, "main.js").readText(Charsets.UTF_8)
+                val locale = PluginLocale.fromPackageDir(pkgDir, deviceInfo.locale)
+                probeSnapshot = ProbeSnapshot(manifest, mainJs, locale, secrets)
             }
         }
-        val manifest = ManifestParser.parseAndValidate(pkg.manifestJson)
-        val pkgDir = File(pkg.packagePath)
-        val mainJs = File(pkgDir, "main.js").readText(Charsets.UTF_8)
-        val locale = PluginLocale.fromPackageDir(pkgDir, deviceInfo.locale)
+
+        if (firstInstanceId != null) {
+            var lastNotFound: java.io.FileNotFoundException? = null
+            for (attempt in 0..1) {
+                val targetId = if (attempt == 0) {
+                    firstInstanceId
+                } else {
+                    pluginLockFor(pluginId).withLock {
+                        val pkg = store.getPackage(pluginId) ?: return null
+                        if (!pkg.enabled || pkg.needsPermissionReconfirm) return null
+                        store.listInstancesForPlugin(pluginId).firstOrNull { it.enabled }?.instanceId
+                    } ?: return null
+                }
+                try {
+                    val src = openSource(targetId, dnsResolver = dnsResolver)
+                    src.verifyInitialized()
+                    return null
+                } catch (e: SourceNeedsSetupException) {
+                    return null
+                } catch (e: com.limelight.local.media.SourceNeedsAuthException) {
+                    return null
+                } catch (e: java.io.FileNotFoundException) {
+                    lastNotFound = e
+                } catch (t: Throwable) {
+                    // Re-collect secrets after init() in case it wrote cookies/storage before throwing
+                    val freshSecrets = collectKnownSecretsForPlugin(pluginId)
+                    return PluginLogger.redact(extractRawTechnicalError(t), freshSecrets)
+                }
+            }
+            val freshSecrets = collectKnownSecretsForPlugin(pluginId)
+            return PluginLogger.redact(
+                extractRawTechnicalError(lastNotFound ?: IOException("Plugin load failed")),
+                freshSecrets,
+            )
+        }
+
+        val snap = probeSnapshot ?: return null
+        val manifest = snap.manifest
+        val mainJs = snap.mainJs
+        val locale = snap.locale
+        val secrets = snap.secrets
         val logger = PluginLogger(
             pluginId = manifest.id,
             instanceId = "dev-probe",
@@ -996,7 +1130,8 @@ class PluginPackageManager(
         } catch (e: com.limelight.local.media.SourceNeedsAuthException) {
             null
         } catch (t: Throwable) {
-            val redacted = PluginLogger.redact(extractRawTechnicalError(t), secrets)
+            val allSecrets = (secrets + cookieJar.allCookieValues() + storage.allSecretLikeValues()).distinct()
+            val redacted = PluginLogger.redact(extractRawTechnicalError(t), allSecrets)
             logger.error("init error: $redacted")
             redacted
         } finally {
@@ -1065,9 +1200,15 @@ class PluginPackageManager(
         )
     }
 
-    suspend fun confirmPermissions(pluginId: String) = pluginLockFor(pluginId).withLock {
+    suspend fun confirmPermissions(
+        pluginId: String,
+        expectedSha256: String? = null,
+    ) = pluginLockFor(pluginId).withLock {
         val pkg = store.getPackage(pluginId)
             ?: throw PackageInstallException("找不到已安装的插件：$pluginId")
+        if (expectedSha256 != null && !pkg.sha256.equals(expectedSha256.trim(), ignoreCase = true)) {
+            throw PackageInstallException("插件版本或内容已变更，请重新核对权限后再确认。")
+        }
         val manifest = ManifestParser.parseAndValidate(pkg.manifestJson)
         store.confirmPackagePermissions(pluginId, manifest.permissions.toJsonString(), clockMs())
     }
@@ -1080,9 +1221,11 @@ class PluginPackageManager(
     }
 
     suspend fun uninstall(pluginId: String) = pluginLockFor(pluginId).withLock {
-        wipeAllInstancesForPlugin(pluginId)
-        store.deletePackage(pluginId)
-        File(packagesDir, pluginId).deleteRecursively()
+        withContext(NonCancellable) {
+            wipeAllInstancesForPlugin(pluginId)
+            store.deletePackage(pluginId)
+            File(packagesDir, pluginId).deleteRecursively()
+        }
     }
 
     suspend fun createInstance(
@@ -1090,7 +1233,7 @@ class PluginPackageManager(
         displayName: String,
         config: Map<String, JsonElement> = emptyMap(),
         instanceId: String = UUID.randomUUID().toString(),
-    ): PluginInstanceEntity {
+    ): PluginInstanceEntity = pluginLockFor(pluginId).withLock {
         val pkg = store.getPackage(pluginId)
             ?: throw PackageInstallException("插件尚未安装：$pluginId")
         val manifest = ManifestParser.parseAndValidate(pkg.manifestJson)
@@ -1112,7 +1255,7 @@ class PluginPackageManager(
             updatedAt = now,
         )
         store.upsertInstance(entity)
-        return entity
+        entity
     }
 
     suspend fun updateInstanceConfig(
@@ -1180,20 +1323,27 @@ class PluginPackageManager(
                 val config = getInstanceConfig(instanceId)
 
                 val passwordKeys = manifest.passwordConfigKeys()
+                val passwordValues = passwordKeys.mapNotNull { k -> (config[k] as? JsonPrimitive)?.content }
+                val instDir = File(instancesDir, instanceId)
+                val storage = InstanceStorage(File(instDir, "storage.enc"), secretBox)
+                var cookieJarRef: PluginCookieJar? = null
                 val logger = PluginLogger(
                     pluginId = manifest.id,
                     instanceId = instanceId,
                     knownSecretsProvider = {
-                        passwordKeys.mapNotNull { k -> (config[k] as? JsonPrimitive)?.content }
+                        val out = LinkedHashSet<String>()
+                        out += passwordValues
+                        cookieJarRef?.allCookieValues()?.let { out += it }
+                        out += storage.allSecretLikeValues()
+                        out
                     },
                 )
-                val instDir = File(instancesDir, instanceId)
-                val storage = InstanceStorage(File(instDir, "storage.enc"), secretBox)
                 val cookieJar = PluginCookieJar(
                     file = File(instDir, "cookies.enc"),
                     secretBox = secretBox,
                     onWarning = { msg -> logger.warn(msg) },
                 )
+                cookieJarRef = cookieJar
                 val userHosts = NetworkPolicy.extractUserHosts(manifest, config)
                 val policy = if (dnsResolver != null) {
                     NetworkPolicy(manifest.permissions, userHosts, dnsResolver)

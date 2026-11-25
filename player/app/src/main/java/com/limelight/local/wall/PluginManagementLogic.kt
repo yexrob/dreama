@@ -29,6 +29,7 @@ import com.limelight.local.stream.PhoneFormField
 import com.limelight.local.stream.PhoneFormFieldKind
 import com.limelight.local.stream.PhoneFormOption
 import com.limelight.local.stream.StringLookup
+import com.limelight.local.stream.UserFacingError
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -631,6 +632,19 @@ class DevPluginSyntaxException(
     val technicalError: String,
 ) : PackageInstallException(technicalError)
 
+/**
+ * Unified developer-screen & phone-input error result:
+ * - [devSummary] & [devTechnicalError] are shown ONLY on the headset Developer screen
+ *   (with [devTechnicalError] redacted via [PluginPackageManager.redactDeveloperError]).
+ * - [phoneError] is returned to the phone web page and NEVER contains raw technical
+ *   diagnostics, stack traces, or instance secrets.
+ */
+data class DevScreenErrorResult(
+    val devSummary: String,
+    val devTechnicalError: String?,
+    val phoneError: UserFacingError,
+)
+
 /** Outcome of a developer-mode reload attempt. */
 sealed interface DevReloadOutcome {
     data class Reloaded(
@@ -935,7 +949,7 @@ object PluginInstallGuard {
                 throw DevPluginSyntaxException(syntaxErr)
             }
         }
-        val result = packageManager.installFromBytes(
+        return packageManager.installFromBytes(
             zipBytes = pending.bytes,
             sourceUrl = pending.sourceUrl,
             repoUrl = pending.repoUrl,
@@ -944,11 +958,8 @@ object PluginInstallGuard {
             expectedSha256 = pending.expectedSha256 ?: pending.preview.sha256,
             confirmReplaceFromDifferentSource = userConfirmedReplacement,
             devServerUrl = pending.devServerUrl,
+            confirmExpandedPermissions = pending.confirmExpandedPermissionsOnInstall,
         )
-        if (pending.confirmExpandedPermissionsOnInstall && result.needsPermissionReconfirm) {
-            packageManager.confirmPermissions(result.entity.pluginId)
-        }
-        return result
     }
 
     /**
@@ -1044,7 +1055,8 @@ object PluginInstallGuard {
             when {
                 raw.contains("超过大小限制") -> strings.get(R.string.plugins_err_file_too_large)
                 raw.contains("HTTP ") -> strings.get(R.string.plugins_err_http_status)
-                raw.contains("超时") || raw.contains("Failed to connect", ignoreCase = true) ||
+                raw.contains("超时") || raw.contains("总耗时") ||
+                    raw.contains("Failed to connect", ignoreCase = true) ||
                     raw.contains("Unable to resolve", ignoreCase = true) ||
                     raw.contains("timed out", ignoreCase = true) ||
                     raw.contains("Connection refused", ignoreCase = true) ->
@@ -1094,6 +1106,7 @@ object PluginInstallGuard {
                 return false
             }
             return msg.contains("超时") ||
+                msg.contains("总耗时") ||
                 msg.contains("Failed to connect", ignoreCase = true) ||
                 msg.contains("Unable to resolve", ignoreCase = true) ||
                 msg.contains("timed out", ignoreCase = true) ||
@@ -1140,5 +1153,41 @@ object PluginInstallGuard {
             summary
         }
         return finalSummary to tech
+    }
+
+    /**
+     * Single entry point used by [PluginDeveloperScreen] (both headset actions and phone-input
+     * submission) to produce:
+     * 1. Redacted headset-only Developer diagnostics ([DevScreenErrorResult.devSummary] +
+     *    [DevScreenErrorResult.devTechnicalError]) scrubbed with password configs, cookie jar
+     *    values, and token-like `ctx.storage` values via [PluginPackageManager.redactDeveloperError].
+     * 2. Safe Simplified Chinese [DevScreenErrorResult.phoneError] for the phone web page that
+     *    NEVER contains raw technical errors, stack traces, or instance secrets.
+     */
+    suspend fun formatDeveloperScreenError(
+        error: Throwable,
+        packageManager: PluginPackageManager,
+        pluginId: String?,
+        isReload: Boolean,
+        strings: StringLookup,
+    ): DevScreenErrorResult {
+        val (summary, tech) = if (isReload) {
+            formatDevReloadError(error, strings)
+        } else {
+            formatDeveloperError(error, strings)
+        }
+        val redactedTech = if (tech != null) {
+            packageManager.redactDeveloperError(pluginId, tech)
+        } else {
+            null
+        }
+        return DevScreenErrorResult(
+            devSummary = summary,
+            devTechnicalError = redactedTech,
+            phoneError = UserFacingError(
+                title = strings.get(R.string.phone_action_dev_server),
+                detail = summary,
+            ),
+        )
     }
 }

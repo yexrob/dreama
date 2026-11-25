@@ -164,17 +164,18 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
         .firstOrNull()
     LaunchedEffect(shelfFailureForSelected, selectedLogPluginId) {
         if (shelfFailureForSelected != null) {
-            val (summary, tech) = PluginInstallGuard.formatDeveloperError(shelfFailureForSelected, strings)
-            val redactedTech = if (tech != null) {
-                withContext(Dispatchers.IO) {
-                    model.pluginHost.packageManager().redactDeveloperError(selectedLogPluginId, tech)
-                }
-            } else {
-                null
+            val formatted = withContext(Dispatchers.IO) {
+                PluginInstallGuard.formatDeveloperScreenError(
+                    error = shelfFailureForSelected,
+                    packageManager = model.pluginHost.packageManager(),
+                    pluginId = selectedLogPluginId,
+                    isReload = false,
+                    strings = strings,
+                )
             }
             if (devTechError == null) {
-                devErrorSummary = summary
-                devTechError = redactedTech
+                devErrorSummary = formatted.devSummary
+                devTechError = formatted.devTechnicalError
             }
             logVersion++
             logScrollToken++
@@ -192,20 +193,17 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
     }
 
     suspend fun recordDeveloperFailure(error: Throwable, pluginId: String?, isReload: Boolean) {
-        val (summary, tech) = if (isReload) {
-            PluginInstallGuard.formatDevReloadError(error, strings)
-        } else {
-            PluginInstallGuard.formatDeveloperError(error, strings)
+        val formatted = withContext(Dispatchers.IO) {
+            PluginInstallGuard.formatDeveloperScreenError(
+                error = error,
+                packageManager = model.pluginHost.packageManager(),
+                pluginId = pluginId,
+                isReload = isReload,
+                strings = strings,
+            )
         }
-        val redactedTech = if (tech != null) {
-            withContext(Dispatchers.IO) {
-                model.pluginHost.packageManager().redactDeveloperError(pluginId, tech)
-            }
-        } else {
-            null
-        }
-        devErrorSummary = summary
-        devTechError = redactedTech
+        devErrorSummary = formatted.devSummary
+        devTechError = formatted.devTechnicalError
         logVersion++
         logScrollToken++
     }
@@ -636,22 +634,21 @@ fun PluginDeveloperScreen(model: WallModel, nav: WallNav) {
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
-                        val (summary, tech) = PluginInstallGuard.formatDeveloperError(e, strings)
-                        val redactedTech = if (tech != null) {
-                            withContext(Dispatchers.IO) {
-                                model.pluginHost.packageManager().redactDeveloperError(selectedLogPluginId, tech)
-                            }
-                        } else {
-                            null
+                        val formatted = withContext(Dispatchers.IO) {
+                            PluginInstallGuard.formatDeveloperScreenError(
+                                error = e,
+                                packageManager = model.pluginHost.packageManager(),
+                                pluginId = selectedLogPluginId,
+                                isReload = false,
+                                strings = strings,
+                            )
                         }
-                        devErrorSummary = summary
-                        devTechError = redactedTech
-                        // Security invariant (#6): NEVER send raw technical errors back to the phone web page;
-                        // return only the Simplified Chinese summary while showing redacted details on headset.
-                        UserFacingError(
-                            context.getString(R.string.phone_action_dev_server),
-                            summary,
-                        )
+                        devErrorSummary = formatted.devSummary
+                        devTechError = formatted.devTechnicalError
+                        // Security invariant (#5/#6): NEVER send raw technical errors back to the
+                        // phone web page; return only the Simplified Chinese summary while showing
+                        // redacted details on the headset Developer screen.
+                        formatted.phoneError
                     }
                 },
                 onDismiss = { showManualInput = false },

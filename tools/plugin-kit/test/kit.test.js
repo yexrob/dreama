@@ -2079,17 +2079,47 @@ test('d3plugin serve UDP discovery caches reply at startup, enforces payload cap
   assert.equal(limiter.allow('192.168.1.12', 1040), false, '4th probe hits global cap');
   assert.equal(limiter.allow('192.168.1.10', 2100), true, 'Window reset allows probing again');
 
-  // 2. Oversized plugin name is truncated and total reply JSON stays <= MAX_DISCOVERY_REPLY_BYTES
+  // 2. Oversized plugin name is truncated and total reply JSON stays <= MAX_DISCOVERY_REPLY_BYTES;
+  //    oversized id or version that still exceeds 512 bytes MUST return null (never reply > 512 bytes).
   const hugeName = '超长插件名称测试'.repeat(60);
   const capped = buildDiscoveryReplyFromManifest(
     { id: 'com.example.longname', name: hugeName, version: '1.0.0' },
     8787,
   );
+  assert.ok(capped !== null);
   assert.ok(Array.from(capped.name).length <= MAX_DISCOVERY_NAME_CHARS);
   assert.ok(capped.name.endsWith('…'));
   assert.ok(
     Buffer.byteLength(JSON.stringify(capped), 'utf8') <= MAX_DISCOVERY_REPLY_BYTES,
     'Encoded discovery reply must not exceed MAX_DISCOVERY_REPLY_BYTES',
+  );
+
+  // Oversized `id` (> 512 bytes even when `name` is trimmed empty) -> MUST return null
+  const hugeId = `com.example.${'a'.repeat(520)}`;
+  assert.equal(
+    buildDiscoveryReplyFromManifest({ id: hugeId, name: 'Long ID', version: '1.0.0' }, 8787),
+    null,
+    'Manifest with oversized id exceeding 512 bytes must return null instead of replying > 512 bytes',
+  );
+
+  // Oversized `version` (> 512 bytes even when `name` is trimmed empty) -> MUST return null
+  const hugeVersion = `1.0.0-${'v'.repeat(520)}`;
+  assert.equal(
+    buildDiscoveryReplyFromManifest({ id: 'com.example.longver', name: 'Long Ver', version: hugeVersion }, 8787),
+    null,
+    'Manifest with oversized version exceeding 512 bytes must return null instead of replying > 512 bytes',
+  );
+
+  // Borderline `id` (e.g. 460 bytes): `name` shrinks to fit strictly <= 512 bytes without falling back to huge id
+  const borderlineId = `com.example.${'b'.repeat(440)}`;
+  const borderlineReply = buildDiscoveryReplyFromManifest(
+    { id: borderlineId, name: 'Borderline Plugin Name That Must Shrink', version: '1.0.0' },
+    8787,
+  );
+  assert.ok(borderlineReply !== null);
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(borderlineReply), 'utf8') <= MAX_DISCOVERY_REPLY_BYTES,
+    'Borderline id reply must remain strictly <= 512 bytes',
   );
 
   // 3. Cached startup reply (zero per-packet disk reads) + live UDP per-IP rate limiting
@@ -2149,6 +2179,132 @@ test('d3plugin serve UDP discovery caches reply at startup, enforces payload cap
     }
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('d3plugin serve refreshes UDP discovery cache on manifest edit without HTTP and suppresses >512B live replies', async () => {
+  function sendSingleProbe(port, timeoutMs = 400) {
+    return new Promise((resolve) => {
+      const sock = dgram.createSocket('udp4');
+      let done = false;
+      const finish = (val) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        try { sock.close(); } catch {}
+        resolve(val);
+      };
+      const timer = setTimeout(() => finish(null), timeoutMs);
+      sock.on('message', (msg) => finish(msg));
+      sock.send(Buffer.from(DEV_DISCOVERY_PROBE, 'utf8'), port, '127.0.0.1');
+    });
+  }
+
+  // 1. Live UDP responder suppresses replies when manifest id exceeds 512 bytes
+  const hugeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'd3-serve-huge-'));
+  try {
+    fs.writeFileSync(
+      path.join(hugeDir, 'manifest.json'),
+      JSON.stringify({
+        api: 1,
+        id: `com.example.${'x'.repeat(520)}`,
+        name: 'Huge ID',
+        version: '1.0.0',
+        permissions: { hosts: [], userHosts: false, lan: false },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(hugeDir, 'main.js'),
+      'export default { home(){return []}, browse(){return {items:[]}}, detail(){return {id:"1",kind:"movie",title:"1"}}, playback(){return {url:"https://example.com/1.mp4"}} };',
+    );
+    const hugeSrv = await startDevServer(hugeDir, {
+      host: '127.0.0.1',
+      port: 0,
+      discover: true,
+      discoverPort: 0,
+      allowLoopbackDiscoveryForTesting: true,
+    });
+    try {
+      const reply = await sendSingleProbe(hugeSrv.discoverPort, 250);
+      assert.equal(reply, null, 'Server MUST NOT send a UDP discovery reply exceeding 512 bytes');
+    } finally {
+      await hugeSrv.close();
+    }
+  } finally {
+    fs.rmSync(hugeDir, { recursive: true, force: true });
+  }
+
+  // 2. Editing manifest.json on disk (WITHOUT hitting HTTP) lazily refreshes cached UDP reply
+  //    Test BOTH with fs.watch disabled (pure throttled async mtime path) AND with fs.watch enabled.
+  for (const useWatch of [false, true]) {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `d3-serve-refresh-${useWatch ? 'w' : 'm'}-`));
+    try {
+      const manifestFile = path.join(tmpDir, 'manifest.json');
+      const writeManifest = (version, name) => {
+        fs.writeFileSync(
+          manifestFile,
+          JSON.stringify({
+            api: 1,
+            id: 'com.example.refresh',
+            name,
+            version,
+            permissions: { hosts: [], userHosts: false, lan: false },
+          }),
+        );
+      };
+      writeManifest('1.0.0', 'Before Edit');
+      fs.writeFileSync(
+        path.join(tmpDir, 'main.js'),
+        'export default { home(){return []}, browse(){return {items:[]}}, detail(){return {id:"1",kind:"movie",title:"1"}}, playback(){return {url:"https://example.com/1.mp4"}} };',
+      );
+
+      const srv = await startDevServer(tmpDir, {
+        host: '127.0.0.1',
+        port: 0,
+        discover: true,
+        discoverPort: 0,
+        allowLoopbackDiscoveryForTesting: true,
+        discoverWatch: useWatch,
+        discoverRefreshIntervalMs: 30,
+        discoverMaxPerIp: 20,
+        discoverMaxGlobal: 50,
+      });
+      try {
+        const firstRaw = await sendSingleProbe(srv.discoverPort, 500);
+        assert.ok(firstRaw);
+        const first = JSON.parse(firstRaw.toString('utf8'));
+        assert.equal(first.version, '1.0.0');
+        assert.equal(first.name, 'Before Edit');
+
+        // Wait slightly so filesystem mtime advances distinctly, then overwrite manifest.json
+        await new Promise((r) => setTimeout(r, 60));
+        writeManifest('2.1.0', 'After Edit');
+        const futureSec = (Date.now() + 2000) / 1000;
+        fs.utimesSync(manifestFile, futureSec, futureSec);
+
+        // Probe until the async refresh swaps the cached reply (NO HTTP requests made!)
+        let updated = null;
+        for (let attempt = 0; attempt < 15; attempt++) {
+          await new Promise((r) => setTimeout(r, 60));
+          const raw = await sendSingleProbe(srv.discoverPort, 400);
+          if (raw) {
+            const parsed = JSON.parse(raw.toString('utf8'));
+            if (parsed.version === '2.1.0' && parsed.name === 'After Edit') {
+              updated = parsed;
+              break;
+            }
+          }
+        }
+        assert.ok(
+          updated,
+          `Expected UDP discovery cache to refresh to 2.1.0 after manifest.json edit (discoverWatch=${useWatch})`,
+        );
+      } finally {
+        await srv.close();
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   }
 });
 

@@ -247,7 +247,7 @@
     <string name="plugins_install_replace_dev_to_release">将会把来自「%1$s」的开发版换成来自「%2$s」的正式版，并彻底清除原插件的所有播放源、配置、密码和本地数据。</string>
     <string name="plugins_install_replace_between_sources">已安装相同 ID 的插件（来自「%1$s」），替换为来自「%2$s」的版本会彻底清除原插件的所有播放源、配置、密码和本地数据。</string>
     <string name="plugins_install_dev_switch_title">切换开发服务器地址？</string>
-    <string name="plugins_install_dev_switch_warning">来源将从「%1$s」变为「%2$s」，已配置的播放源、配置和本地数据会保留。</string>
+    <string name="plugins_install_dev_switch_warning">来源将从「%1$s」变为「%2$s」，已配置的播放源、配置和本地数据会保留；已保存的登录信息将交给新地址提供的代码，请确认该地址可信。</string>
     <string name="plugins_install_dev_switch_btn">确认切换地址并更新</string>
     <string name="plugins_install_permission_expanded_title">重新加载申请了更多权限</string>
     <string name="plugins_install_permission_expanded_btn">确认权限并重新加载</string>

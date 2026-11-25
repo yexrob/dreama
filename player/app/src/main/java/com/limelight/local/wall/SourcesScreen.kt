@@ -1006,8 +1006,15 @@ fun PluginDetailScreen(model: WallModel, nav: WallNav, page: Page.PluginDetail) 
                                     busy = true
                                     scope.launch {
                                         try {
-                                            model.confirmPluginPermissions(entity.pluginId)
+                                            model.confirmPluginPermissions(
+                                                entity.pluginId,
+                                                expectedSha256 = entity.sha256,
+                                            )
                                             nav.toast(context.getString(R.string.plugins_detail_reconfirmed_toast))
+                                        } catch (e: CancellationException) {
+                                            throw e
+                                        } catch (e: Exception) {
+                                            nav.toast(PluginInstallGuard.formatInstallError(e, strings))
                                         } finally {
                                             busy = false
                                         }
@@ -1413,10 +1420,10 @@ fun PluginInstallConfirmSheet(
                     Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(Wall.Radius))
-                        .background(if (isDevAddressSwitch) Wall.Accent.copy(alpha = 0.14f) else Wall.Danger.copy(alpha = 0.14f))
+                        .background(Wall.Danger.copy(alpha = 0.14f))
                         .padding(18.dp),
                 ) {
-                    Notice(replaceWarningText, danger = !isDevAddressSwitch)
+                    Notice(replaceWarningText, danger = true)
                 }
             }
 
@@ -1465,7 +1472,13 @@ fun PluginInstallConfirmSheet(
                                 )
                             } catch (e: DevPluginSyntaxException) {
                                 if (onDevTechnicalError != null) {
-                                    onDevTechnicalError(e.technicalError)
+                                    val redacted = withContext(Dispatchers.IO) {
+                                        model.pluginHost.packageManager().redactDeveloperError(
+                                            manifest.id,
+                                            e.technicalError,
+                                        )
+                                    }
+                                    onDevTechnicalError(redacted)
                                     onDismiss()
                                 } else {
                                     error = PluginInstallGuard.formatInstallError(e, strings)

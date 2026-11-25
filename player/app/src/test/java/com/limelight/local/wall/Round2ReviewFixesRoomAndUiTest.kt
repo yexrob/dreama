@@ -1036,4 +1036,47 @@ class Round2ReviewFixesRoomAndUiTest {
         job.join()
         assertFalse("busy must reset in NonCancellable finally on cancellation", busy)
     }
+
+    @Test
+    fun round3_roomReplacePackageAtomicCascadesInstancesAndSurvivesCancellation() = runBlocking {
+        val pm = newPackageManager()
+        val pluginId = "dev.depth3d.roomreplace"
+        val repoZip = buildFormPluginZip(pluginId = pluginId, version = "1.0.0", extraMarker = "repo-orig")
+        val devZip = buildFormPluginZip(pluginId = pluginId, version = "1.0.0", extraMarker = "dev-new")
+
+        pm.installFromBytes(
+            zipBytes = repoZip,
+            sourceUrl = "https://repo.example.com/pkg-1.0.0.d3plugin",
+            repoUrl = "https://repo.example.com/index.json",
+        )
+        pm.createInstance(pluginId, "Room Inst", emptyMap())
+        assertEquals(1, db.pluginInstances().listForPlugin(pluginId).size)
+
+        val jobRef = AtomicReference<kotlinx.coroutines.Job?>()
+        pm.afterWipeBeforeReplaceHookForTesting = {
+            jobRef.get()?.cancel()
+            kotlinx.coroutines.yield()
+        }
+        val job = launch(Dispatchers.IO) {
+            pm.installFromBytes(
+                zipBytes = devZip,
+                sourceUrl = "http://192.168.1.50:8787/plugin.d3plugin",
+                devServerUrl = "http://192.168.1.50:8787",
+                confirmReplaceFromDifferentSource = true,
+            )
+        }
+        jobRef.set(job)
+        job.join()
+        pm.afterWipeBeforeReplaceHookForTesting = null
+
+        val replaced = db.pluginPackages().get(pluginId)
+        assertNotNull("Room atomic replacement must commit new package even under cancellation", replaced)
+        assertTrue(PluginPackageManager.isDevOrigin(replaced!!.sourceOrigin))
+        assertTrue(
+            "Room ON DELETE CASCADE inside replacePackageAtomic must wipe old instances",
+            db.pluginInstances().listForPlugin(pluginId).isEmpty(),
+        )
+        assertTrue(File(replaced.packagePath, "main.js").isFile)
+        pm.shutdownAll()
+    }
 }
