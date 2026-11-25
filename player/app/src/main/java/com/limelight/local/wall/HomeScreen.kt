@@ -23,6 +23,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -42,6 +43,7 @@ import com.limelight.local.media.Item
 import com.limelight.local.media.LocalVideoSource
 import com.limelight.local.media.MediaSource
 import com.limelight.local.media.Shelf
+import com.limelight.local.media.SourceKind
 import com.limelight.local.media.SourceNeedsSetupException
 import com.limelight.local.stream.ComputerListMerger
 import com.limelight.local.stream.StreamingComputer
@@ -68,7 +70,9 @@ fun HomeScreen(model: WallModel, nav: WallNav) {
 
     val hasContent = shelves.any { (_, s) -> s is Load.Ready && s.value.any { it.items.isNotEmpty() } }
     val settled = shelves.none { (_, s) -> s == null || s is Load.Loading } && resumes != null
-    val down = shelves.any { (_, s) -> s is Load.Failed && s.error !is SourceNeedsSetupException }
+    val down = shelves.any { (src, s) ->
+        s is Load.Failed && (s.error !is SourceNeedsSetupException || src.source.kind != SourceKind.LOCAL)
+    }
     val hero = resumes?.firstOrNull()?.let { Hero(it.source, it.item, it) } ?: shelves.firstNotNullOfOrNull { (src, s) ->
         (s as? Load.Ready)?.value?.firstNotNullOfOrNull { sh -> sh.items.firstOrNull { !it.isFolder } }?.let { Hero(src, it, null) }
     }
@@ -134,14 +138,16 @@ private fun HomeComputersRow(computers: List<StreamingComputer>, nav: WallNav) {
 private fun HeroBlock(hero: Hero, resumes: List<Resume>, nav: WallNav) {
     val r = hero.resume
     Box(Modifier.fillMaxWidth().height(if (resumes.isEmpty()) 560.dp else 700.dp)) {
-        ArtBox(hero.item.backdrop ?: hero.item.poster, hero.item.title, Artworks.Size.BACKDROP,
-            Modifier.fillMaxWidth().height(560.dp)) {
-            Box(Modifier.fillMaxSize().background(Brush.horizontalGradient(
-                0f to Wall.Bg.copy(alpha = 0.88f), 0.34f to Wall.Bg.copy(alpha = 0.62f), 0.66f to Color.Transparent)))
-            Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().fillMaxHeight(0.46f)
-                .background(Brush.verticalGradient(listOf(Color.Transparent, Wall.Bg))))
-            Box(Modifier.fillMaxWidth().height(170.dp)
-                .background(Brush.verticalGradient(listOf(Wall.Bg.copy(alpha = 0.62f), Color.Transparent))))
+        CompositionLocalProvider(LocalMediaSource provides hero.source) {
+            ArtBox(hero.item.backdrop ?: hero.item.poster, hero.item.title, Artworks.Size.BACKDROP,
+                Modifier.fillMaxWidth().height(560.dp)) {
+                Box(Modifier.fillMaxSize().background(Brush.horizontalGradient(
+                    0f to Wall.Bg.copy(alpha = 0.88f), 0.34f to Wall.Bg.copy(alpha = 0.62f), 0.66f to Color.Transparent)))
+                Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().fillMaxHeight(0.46f)
+                    .background(Brush.verticalGradient(listOf(Color.Transparent, Wall.Bg))))
+                Box(Modifier.fillMaxWidth().height(170.dp)
+                    .background(Brush.verticalGradient(listOf(Wall.Bg.copy(alpha = 0.62f), Color.Transparent))))
+            }
         }
         Column(Modifier.offset(64.dp, 128.dp).width(640.dp)) {
             Text(
@@ -179,13 +185,15 @@ private fun HeroBlock(hero: Hero, resumes: List<Resume>, nav: WallNav) {
                 contentPadding = PaddingValues(horizontal = Wall.Margin),
                 horizontalArrangement = Arrangement.spacedBy(24.dp)) {
                 items(resumes, key = { "${it.source.source.id}/${it.item.id}" }) { c ->
-                    ContinueCard(
-                        c.item.title,
-                        stringResource(R.string.home_continue_left_min, minutesLeft(c.progress.remainingMs)),
-                        c.item.backdrop ?: c.item.poster,
-                        c.progress.positionMs.toFloat() / c.progress.durationMs,
-                        { nav.play(c.source, c.item, c.progress.positionMs) },
-                    )
+                    CompositionLocalProvider(LocalMediaSource provides c.source) {
+                        ContinueCard(
+                            c.item.title,
+                            stringResource(R.string.home_continue_left_min, minutesLeft(c.progress.remainingMs)),
+                            c.item.backdrop ?: c.item.thumb ?: c.item.poster,
+                            c.progress.positionMs.toFloat() / c.progress.durationMs,
+                            { nav.play(c.source, c.item, c.progress.positionMs) },
+                        )
+                    }
                 }
             }
         }
@@ -198,23 +206,26 @@ private fun shelfTitle(src: MediaSource, shelf: Shelf) =
 @Composable
 private fun ShelfRow(src: MediaSource, shelf: Shelf, nav: WallNav) {
     val title = shelfTitle(src, shelf)
-    Column(Modifier.padding(top = 44.dp)) {
-        SectionTitle(title, Modifier.padding(start = Wall.Margin)) {
-            nav.category(src, shelf.category.id, title, shelf.category.count)
-        }
-        Spacer(Modifier.height(12.dp))
-        val row = rememberLazyListState()
-        LazyRow(state = row, flingBehavior = rememberSnapFlingBehavior(row),
-            contentPadding = PaddingValues(horizontal = Wall.Margin),
-            horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-            items(shelf.items, key = { it.id }) { item ->
-                if (item.isFolder) {
-                    val caption = item.childCount?.let { stringResource(R.string.home_folder_count, it) }
-                        ?: stringResource(R.string.home_folder_label)
-                    FolderTile(item.title, caption, item.previews,
-                        { nav.item(src, item) }, Modifier.size(168.dp, 252.dp))
-                } else {
-                    Poster(item.title, item.poster, { nav.item(src, item) })
+    val categoryId = shelf.moreCategoryId ?: shelf.category.id
+    CompositionLocalProvider(LocalMediaSource provides src) {
+        Column(Modifier.padding(top = 44.dp)) {
+            SectionTitle(title, Modifier.padding(start = Wall.Margin)) {
+                nav.category(src, categoryId, title, shelf.category.count)
+            }
+            Spacer(Modifier.height(12.dp))
+            val row = rememberLazyListState()
+            LazyRow(state = row, flingBehavior = rememberSnapFlingBehavior(row),
+                contentPadding = PaddingValues(horizontal = Wall.Margin),
+                horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                items(shelf.items, key = { it.id }) { item ->
+                    if (item.isFolder) {
+                        val caption = item.childCount?.let { stringResource(R.string.home_folder_count, it) }
+                            ?: stringResource(R.string.home_folder_label)
+                        FolderTile(item.title, caption, item.previews.ifEmpty { listOfNotNull(item.poster, item.thumb) },
+                            { nav.item(src, item) }, Modifier.size(168.dp, 252.dp))
+                    } else {
+                        Poster(item.title, item.poster ?: item.thumb ?: item.backdrop, { nav.item(src, item) })
+                    }
                 }
             }
         }
@@ -223,21 +234,22 @@ private fun ShelfRow(src: MediaSource, shelf: Shelf, nav: WallNav) {
 
 @Composable
 private fun FailedRow(src: MediaSource, error: Throwable, model: WallModel, nav: WallNav) {
-    val setup = error is SourceNeedsSetupException
-    Row(Modifier.padding(start = Wall.Margin, top = 44.dp), verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+    val presentation = rememberErrorPresentation(error, src)
+    Row(
+        Modifier.padding(start = Wall.Margin, end = Wall.Margin, top = 44.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(20.dp),
+    ) {
         SectionTitle(src.source.name)
-        if (setup) {
-            Notice(error.message ?: stringResource(R.string.home_source_needs_setup), danger = false)
-            WallButton(
-                stringResource(R.string.home_source_allow_access),
-                { if (src.source.id == LocalVideoSource.ID) nav.storage() else nav.editWebDav() },
-                small = true,
-            )
-        } else {
-            Notice(stringResource(R.string.home_source_unreachable, src.source.name))
-            WallButton(stringResource(R.string.action_retry), { model.refresh(src.source.id) }, icon = WallIcons.Refresh, small = true)
-        }
+        Notice(presentation.message, danger = presentation.danger)
+        SourceErrorActionButtons(
+            presentation = presentation,
+            source = src,
+            nav = nav,
+            onRetry = { model.refresh(src.source.id) },
+            small = true,
+            primaryAsWhite = false,
+        )
     }
 }
 

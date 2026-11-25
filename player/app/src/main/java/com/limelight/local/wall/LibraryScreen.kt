@@ -20,6 +20,7 @@ import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
@@ -41,6 +42,7 @@ import com.limelight.local.media.Item
 import com.limelight.local.media.LocalVideoSource
 import com.limelight.local.media.MediaSource
 import com.limelight.local.media.SourceKind
+import com.limelight.local.media.SourceNeedsAuthException
 import com.limelight.local.media.SourceNeedsSetupException
 import kotlinx.coroutines.flow.filter
 
@@ -80,7 +82,7 @@ private class Listing {
 @Composable
 private fun rememberListing(nav: WallNav, page: Page, src: MediaSource?, categoryId: String): Listing {
     val listing = nav.keep(page, "listing:${src?.source?.id}:$categoryId") { Listing() }
-    LaunchedEffect(listing, listing.attempt) {
+    LaunchedEffect(listing, listing.attempt, nav.refreshSignal) {
         // A kept listing already has its pages; only a new or retried one loads
         if (src != null && listing.items.isEmpty()) {
             listing.more(src, categoryId)
@@ -112,11 +114,23 @@ fun LibraryScreen(model: WallModel, nav: WallNav) {
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.offset(40.dp, 120.dp).width(392.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             for (s in sources) {
-                val count = (model.shelves[s.source.id] as? Load.Ready)?.value?.firstOrNull()?.category?.count
-                val sub = count?.let { stringResource(R.string.library_label_with_count, s.source.description, it) }
-                    ?: s.source.description
-                ListRow(s.source.name, sub = sub,
-                    lead = s.icon(), selected = s == selected) { selectedId = s.source.id }
+                val shelfState = model.shelves[s.source.id]
+                val failedErr = (shelfState as? Load.Failed)?.error
+                val count = (shelfState as? Load.Ready)?.value?.firstOrNull()?.category?.count
+                val sub = when {
+                    failedErr is SourceNeedsAuthException -> stringResource(R.string.plugin_status_needs_auth)
+                    failedErr is SourceNeedsSetupException -> stringResource(R.string.plugin_status_needs_setup)
+                    failedErr != null -> stringResource(R.string.plugin_status_unreachable)
+                    count != null -> stringResource(R.string.library_label_with_count, s.source.description, count)
+                    else -> s.source.description
+                }
+                ListRow(
+                    label = s.source.name,
+                    sub = sub,
+                    subDanger = failedErr != null,
+                    lead = s.icon(),
+                    selected = s == selected,
+                ) { selectedId = s.source.id }
             }
             if (sources.none { it.source.kind == SourceKind.WEBDAV }) {
                 val webDavSub = found?.let { stringResource(R.string.library_found_webdav, it.substringAfter("://")) }
@@ -135,7 +149,9 @@ fun LibraryScreen(model: WallModel, nav: WallNav) {
                     modifier = Modifier.padding(top = 4.dp))
             }
             Box(Modifier.offset(488.dp, 240.dp).width(728.dp)) {
-                FolderPane(selected, listing, nav)
+                CompositionLocalProvider(LocalMediaSource provides selected) {
+                    FolderPane(selected, listing, nav)
+                }
             }
         }
         NavBar(Tab.Library, nav::tab, nav.settings, solid = true)
@@ -160,39 +176,41 @@ private fun FolderPane(src: MediaSource, listing: Listing, nav: WallNav) {
                 val countLabel = item.childCount?.let { stringResource(R.string.home_folder_count, it) }
                     ?: item.subtitle?.takeIf { it.isNotEmpty() }
                 FolderTile(item.title, countLabel,
-                    item.previews.ifEmpty { listOfNotNull(item.poster) }, { nav.item(src, item) },
+                    item.previews.ifEmpty { listOfNotNull(item.poster, item.backdrop, item.thumb) }, { nav.item(src, item) },
                     Modifier.height(148.dp))
             }
         }
     }
 }
 
-/** Says what happened and gives one thing to do about it; no error codes (library.html, offline). */
+/** Says what happened and gives one thing to do about it; no error codes (library.html, offline, §3.2). */
 @Composable
 private fun SourceProblem(src: MediaSource, error: Throwable, nav: WallNav, retry: () -> Unit) {
-    val setup = error is SourceNeedsSetupException
+    val presentation = rememberErrorPresentation(error, src)
     Column(Modifier.width(660.dp)) {
-        Icon(WallIcons.Alert, null, Modifier.size(48.dp), tint = if (setup) Wall.Text2 else Wall.Danger)
+        Icon(WallIcons.Alert, null, Modifier.size(48.dp), tint = if (presentation.danger) Wall.Danger else Wall.Text2)
         Text(
-            if (setup) error.message ?: stringResource(R.string.home_source_needs_setup)
-            else stringResource(R.string.library_source_unreachable, src.source.name),
+            presentation.message,
             style = WallType.Head,
             modifier = Modifier.padding(top = 20.dp),
         )
-        Text(
-            stringResource(if (setup) R.string.library_storage_hint else R.string.library_source_offline_hint),
-            style = WallType.Body, color = Wall.Text2, modifier = Modifier.padding(top = 8.dp),
-        )
-        Row(Modifier.padding(top = 36.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            if (setup) {
-                WallButton(stringResource(R.string.home_source_allow_access), nav.storage, kind = ButtonKind.Primary)
-            } else {
-                WallButton(stringResource(R.string.action_retry), retry, icon = WallIcons.Refresh, kind = ButtonKind.Primary)
-                if (src.source.kind == SourceKind.WEBDAV) {
-                    WallButton(stringResource(R.string.library_check_settings), { nav.editWebDav() })
-                }
-            }
+        presentation.hint?.let { hintText ->
+            Text(
+                hintText,
+                style = WallType.Body,
+                color = Wall.Text2,
+                modifier = Modifier.padding(top = 8.dp),
+            )
         }
+        SourceErrorActionButtons(
+            presentation = presentation,
+            source = src,
+            nav = nav,
+            onRetry = retry,
+            onDismiss = { nav.back() },
+            primaryAsWhite = true,
+            modifier = Modifier.padding(top = 36.dp),
+        )
     }
 }
 
@@ -222,45 +240,47 @@ fun GridScreen(model: WallModel, nav: WallNav, page: Page.Grid) {
     }
     val cellW: Dp = 172.dp
     val cellH: Dp = 258.dp
-    Box(Modifier.fillMaxSize()) {
-        val error = listing.error
-        when {
-            src == null -> Box(Modifier.offset(64.dp, 160.dp)) { Notice(stringResource(R.string.library_source_missing)) }
-            error != null && listing.items.isEmpty() -> Box(Modifier.offset(64.dp, 160.dp)) {
-                SourceProblem(src, error, nav) { retry(listing) }
-            }
-            listing.items.isEmpty() && listing.next != null -> Row(Modifier.offset(64.dp, 128.dp),
-                horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-                repeat(6) { Skeleton(Modifier.size(cellW, cellH), 14.dp) }
-            }
-            listing.items.isEmpty() -> Text(stringResource(R.string.library_empty_videos), style = WallType.Body, color = Wall.Text2,
-                modifier = Modifier.offset(64.dp, 160.dp))
-            else -> LazyVerticalGrid(GridCells.Fixed(6), Modifier.fillMaxSize(), state = grid,
-                contentPadding = PaddingValues(start = Wall.Margin, end = Wall.Margin, top = 128.dp, bottom = 64.dp),
-                horizontalArrangement = Arrangement.spacedBy(24.dp), verticalArrangement = Arrangement.spacedBy(26.dp)) {
-                items(listing.items, key = { it.id }) { item ->
-                    if (item.isFolder) {
-                        val countLabel = item.childCount?.let { stringResource(R.string.home_folder_count, it) }
-                        FolderTile(item.title, countLabel, item.previews,
-                            { nav.item(src, item) }, Modifier.size(cellW, cellH))
-                    } else {
-                        Poster(item.title, item.poster, { nav.item(src, item) }, width = cellW, height = cellH)
+    CompositionLocalProvider(LocalMediaSource provides src) {
+        Box(Modifier.fillMaxSize()) {
+            val error = listing.error
+            when {
+                src == null -> Box(Modifier.offset(64.dp, 160.dp)) { Notice(stringResource(R.string.library_source_missing)) }
+                error != null && listing.items.isEmpty() -> Box(Modifier.offset(64.dp, 160.dp)) {
+                    SourceProblem(src, error, nav) { retry(listing) }
+                }
+                listing.items.isEmpty() && listing.next != null -> Row(Modifier.offset(64.dp, 128.dp),
+                    horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                    repeat(6) { Skeleton(Modifier.size(cellW, cellH), 14.dp) }
+                }
+                listing.items.isEmpty() -> Text(stringResource(R.string.library_empty_videos), style = WallType.Body, color = Wall.Text2,
+                    modifier = Modifier.offset(64.dp, 160.dp))
+                else -> LazyVerticalGrid(GridCells.Fixed(6), Modifier.fillMaxSize(), state = grid,
+                    contentPadding = PaddingValues(start = Wall.Margin, end = Wall.Margin, top = 128.dp, bottom = 64.dp),
+                    horizontalArrangement = Arrangement.spacedBy(24.dp), verticalArrangement = Arrangement.spacedBy(26.dp)) {
+                    items(listing.items, key = { it.id }) { item ->
+                        if (item.isFolder) {
+                            val countLabel = item.childCount?.let { stringResource(R.string.home_folder_count, it) }
+                            FolderTile(item.title, countLabel, item.previews.ifEmpty { listOfNotNull(item.poster, item.thumb) },
+                                { nav.item(src, item) }, Modifier.size(cellW, cellH))
+                        } else {
+                            Poster(item.title, item.poster ?: item.thumb ?: item.backdrop, { nav.item(src, item) }, width = cellW, height = cellH)
+                        }
                     }
                 }
             }
-        }
-        // The header sits over the grid's top padding so scrolled rows pass under it
-        Box(Modifier.fillMaxWidth().height(112.dp).background(Wall.Bg))
-        Box(Modifier.offset(64.dp, 32.dp)) { RoundButton(WallIcons.ChevL, { nav.back() }, filled = true) }
-        Row(Modifier.offset(152.dp, 32.dp).height(64.dp), verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(20.dp)) {
-            Text(page.title, style = WallType.Title, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f, fill = false))
-            val n = page.count ?: listing.items.size.takeIf { listing.next == null && it > 0 }
-            src?.let {
-                val label = n?.let { c -> stringResource(R.string.library_label_with_count, it.source.name, c) }
-                    ?: it.source.name
-                Text(label, style = WallType.Caption, color = Wall.Text2)
+            // The header sits over the grid's top padding so scrolled rows pass under it
+            Box(Modifier.fillMaxWidth().height(112.dp).background(Wall.Bg))
+            Box(Modifier.offset(64.dp, 32.dp)) { RoundButton(WallIcons.ChevL, { nav.back() }, filled = true) }
+            Row(Modifier.offset(152.dp, 32.dp).height(64.dp), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+                Text(page.title, style = WallType.Title, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false))
+                val n = page.count ?: listing.items.size.takeIf { listing.next == null && it > 0 }
+                src?.let {
+                    val label = n?.let { c -> stringResource(R.string.library_label_with_count, it.source.name, c) }
+                        ?: it.source.name
+                    Text(label, style = WallType.Caption, color = Wall.Text2)
+                }
             }
         }
     }

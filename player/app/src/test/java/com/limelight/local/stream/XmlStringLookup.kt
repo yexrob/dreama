@@ -13,21 +13,27 @@ object XmlStringLookup : StringLookup {
     private val byId: Map<Int, String> by lazy { loadStrings() }
 
     private fun loadStrings(): Map<Int, String> {
-        val candidates = listOf(
-            File("src/main/res/values/strings_depth3d.xml"),
-            File("app/src/main/res/values/strings_depth3d.xml"),
-            File("player/app/src/main/res/values/strings_depth3d.xml"),
+        val baseDirs = listOf(
+            File("src/main/res/values"),
+            File("app/src/main/res/values"),
+            File("player/app/src/main/res/values"),
         )
-        val xmlFile = candidates.firstOrNull { it.isFile }
-            ?: error("Could not locate strings_depth3d.xml from ${File(".").absolutePath}")
+        val valuesDir = baseDirs.firstOrNull { File(it, "strings_depth3d.xml").isFile }
+            ?: error("Could not locate res/values/strings_depth3d.xml from ${File(".").absolutePath}")
 
-        val doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(xmlFile)
-        val nodes = doc.getElementsByTagName("string")
-        val byName = HashMap<String, String>(nodes.length)
-        for (i in 0 until nodes.length) {
-            val node = nodes.item(i)
-            val name = node.attributes?.getNamedItem("name")?.nodeValue ?: continue
-            byName[name] = unescapeAndroidString(node.textContent ?: "")
+        val byName = HashMap<String, String>()
+        val xmlFiles = listOf("strings.xml", "strings_depth3d.xml", "strings_plugin.xml")
+            .map { File(valuesDir, it) }
+            .filter { it.isFile }
+        val builder = DocumentBuilderFactory.newInstance().newDocumentBuilder()
+        for (xmlFile in xmlFiles) {
+            val doc = builder.parse(xmlFile)
+            val nodes = doc.getElementsByTagName("string")
+            for (i in 0 until nodes.length) {
+                val node = nodes.item(i)
+                val name = node.attributes?.getNamedItem("name")?.nodeValue ?: continue
+                byName[name] = unescapeAndroidString(node.textContent ?: "")
+            }
         }
 
         val result = HashMap<Int, String>()

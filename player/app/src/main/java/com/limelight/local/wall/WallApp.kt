@@ -13,6 +13,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -28,6 +29,7 @@ import com.limelight.local.stream.RetryAction
 import com.limelight.local.stream.StreamFlowState
 import com.limelight.local.stream.StreamingComputer
 import com.limelight.nvstream.http.NvApp
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
@@ -52,10 +54,15 @@ sealed interface Page {
 class WallNav(
     private val model: WallModel,
     private val actions: WallActions,
+    private val scope: CoroutineScope,
     private val starter: (MediaSource, Item, Long) -> Unit,
 ) {
     val stack = mutableStateListOf<Page>(Page.Tabs(Tab.Home))
     var webDavSheet by mutableStateOf<String?>(null)
+        private set
+    var pluginLogsSheet by mutableStateOf<Pair<String, String>?>(null)
+        private set
+    var refreshSignal by mutableIntStateOf(0)
         private set
 
     val top: Page get() = stack.last()
@@ -77,6 +84,10 @@ class WallNav(
     }
 
     fun back(): Boolean {
+        if (pluginLogsSheet != null) {
+            pluginLogsSheet = null
+            return true
+        }
         if (webDavSheet != null) {
             webDavSheet = null
             return true
@@ -99,6 +110,13 @@ class WallNav(
         return false
     }
 
+    fun backAndRefresh(sourceId: String) {
+        back()
+        kept.keys.removeAll { (_, key) -> key.startsWith("listing:$sourceId:") }
+        refreshSignal++
+        model.refresh(sourceId)
+    }
+
     fun detail(source: MediaSource, item: Item) = open(Page.Detail(source.source.id, item))
 
     fun category(source: MediaSource, categoryId: String, title: String, count: Int? = null) =
@@ -112,6 +130,32 @@ class WallNav(
     fun openSettings() = open(Page.Settings)
 
     fun openPcApps(computer: StreamingComputer) = open(Page.PcApps(computer))
+
+    fun pluginLogin(source: MediaSource) {
+        openSettings()
+    }
+
+    fun pluginSettings(source: MediaSource) {
+        openSettings()
+    }
+
+    fun pluginLogs(source: MediaSource) {
+        val pluginId = model.pluginIdForSource(source) ?: return
+        pluginLogsSheet = pluginId to model.pluginDisplayName(pluginId)
+    }
+
+    fun closePluginLogs() {
+        pluginLogsSheet = null
+    }
+
+    fun disablePlugin(source: MediaSource) {
+        scope.launch {
+            val name = model.disablePluginForSource(source)
+            if (name != null) {
+                actions.toast(actions.hostActivity.getString(R.string.plugin_disabled_toast, name))
+            }
+        }
+    }
 
     fun connectComputer(computer: StreamingComputer, app: NvApp? = null) {
         model.streaming.connect(
@@ -146,7 +190,7 @@ class WallNav(
 fun WallApp(model: WallModel, actions: WallActions, pendingTab: StateFlow<Tab?>) {
     val scope = rememberCoroutineScope()
     val nav = remember {
-        WallNav(model, actions) { source, item, startMs ->
+        WallNav(model, actions, scope) { source, item, startMs ->
             scope.launch {
                 try {
                     val info = source.playback(item.id).copy(startPositionMs = startMs)
@@ -167,7 +211,8 @@ fun WallApp(model: WallModel, actions: WallActions, pendingTab: StateFlow<Tab?>)
 
     val flowState by model.streaming.flow.collectAsState()
     BackHandler(
-        enabled = nav.stack.size > 1 || nav.top != Page.Tabs(Tab.Home) || nav.webDavSheet != null || flowState !is StreamFlowState.Idle,
+        enabled = nav.stack.size > 1 || nav.top != Page.Tabs(Tab.Home) ||
+            nav.webDavSheet != null || nav.pluginLogsSheet != null || flowState !is StreamFlowState.Idle,
     ) {
         nav.back()
     }
@@ -191,6 +236,15 @@ fun WallApp(model: WallModel, actions: WallActions, pendingTab: StateFlow<Tab?>)
                 }
             }
             nav.webDavSheet?.let { WebDavSheet(model, nav, it) }
+            nav.pluginLogsSheet?.let { (pluginId, pluginName) ->
+                PluginLogsSheet(
+                    pluginId = pluginId,
+                    pluginName = pluginName,
+                    model = model,
+                    onDismiss = { nav.closePluginLogs() },
+                    onCleared = { actions.toast(actions.hostActivity.getString(R.string.plugin_logs_cleared)) },
+                )
+            }
         }
     }
 }

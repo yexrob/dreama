@@ -7,12 +7,18 @@ import androidx.lifecycle.viewModelScope
 import com.limelight.LimeLog
 import com.limelight.local.WebDav
 import com.limelight.local.media.Item
+import com.limelight.local.media.ItemNotFoundException
 import com.limelight.local.media.LocalVideoSource
 import com.limelight.local.media.MediaSource
 import com.limelight.local.media.Shelf
 import com.limelight.local.media.WallDatabase
 import com.limelight.local.media.WatchProgress
 import com.limelight.local.media.WebDavSource
+import com.limelight.local.plugin.InstalledPluginEntity
+import com.limelight.local.plugin.PluginInstanceEntity
+import com.limelight.local.plugin.PluginLogEntry
+import com.limelight.local.plugin.PluginMediaSource
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
@@ -20,7 +26,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -36,18 +41,38 @@ sealed interface Load<out T> {
 data class Resume(val source: MediaSource, val item: Item, val progress: WatchProgress)
 
 /**
- * The wall's state across pages: the sources, each one's home shelves, and
- * 继续观看 from Room. Sources are asked once and kept until the user asks
- * again (重试) or comes back from the player, since a WebDAV listing is a
- * network round trip.
+ * The wall's state across pages: the sources (local, WebDAV, and enabled plugin
+ * instances), each one's home shelves, and 继续观看 from Room. Sources are asked
+ * once and kept until the user asks again (重试) or comes back from the player,
+ * since remote listings are network round trips.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class WallModel(app: Application) : AndroidViewModel(app) {
     private val local = LocalVideoSource(app)
     private val webdav = MutableStateFlow(WebDav.load(app)?.let(::WebDavSource))
+    val pluginHost: PluginHost = PluginHost.get(app)
+    private val pluginSources = MutableStateFlow<List<MediaSource>>(emptyList())
 
-    val sources: StateFlow<List<MediaSource>> = webdav.map { listOfNotNull(local, it) }
-        .stateIn(viewModelScope, SharingStarted.Eagerly, listOfNotNull(local, webdav.value))
+    private val pluginManager = WallPluginSourceManager(
+        scope = viewModelScope,
+        openSource = { instanceId -> pluginHost.openSource(instanceId) },
+    )
+
+    val sources: StateFlow<List<MediaSource>> = combine(webdav, pluginSources) { wd, plugins ->
+        buildList {
+            add(local)
+            if (wd != null) add(wd)
+            addAll(plugins)
+        }
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, listOfNotNull(local, webdav.value))
+
+    val installedPlugins: StateFlow<List<InstalledPluginEntity>> =
+        pluginHost.database.pluginPackages().observeAll()
+            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val pluginInstances: StateFlow<List<PluginInstanceEntity>> =
+        pluginHost.database.pluginInstances().observeAll()
+            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     val shelves = mutableStateMapOf<String, Load<List<Shelf>>>()
 
@@ -55,7 +80,8 @@ class WallModel(app: Application) : AndroidViewModel(app) {
     val discovered = MutableStateFlow<String?>(null)
 
     val continueWatching: StateFlow<Load<List<Resume>>> = combine(
-        WallDatabase.get(app).progress().recent(40), sources) { rows, srcs -> rows to srcs }
+        WallDatabase.get(app).progress().recent(40), sources,
+    ) { rows, srcs -> rows to srcs }
         .mapLatest { (rows, srcs) -> Load.Ready(resolve(rows, srcs)) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), Load.Loading)
 
@@ -65,6 +91,24 @@ class WallModel(app: Application) : AndroidViewModel(app) {
 
     init {
         refreshAll()
+        viewModelScope.launch {
+            pluginHost.awaitBuiltInReady()
+            combine(
+                pluginHost.database.pluginPackages().observeAll(),
+                pluginHost.database.pluginInstances().observeAll(),
+                pluginHost.changes,
+            ) { pkgs, insts, _ -> pkgs to insts }
+                .collect { (pkgs, insts) ->
+                    val reconciled = pluginManager.reconcile(pkgs, insts)
+                    reconciled.removedSourceIds.forEach { shelves.remove(it) }
+                    pluginSources.value = reconciled.sources
+                    reconciled.sources.forEach { src ->
+                        if (src.source.id in reconciled.changedSourceIds || shelves[src.source.id] == null) {
+                            pluginManager.refreshSource(src, shelves)
+                        }
+                    }
+                }
+        }
         if (webdav.value == null) {
             viewModelScope.launch(Dispatchers.IO) {
                 discovered.value = WebDav.discover(app, 4000)
@@ -74,15 +118,21 @@ class WallModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
+        pluginManager.cancelAll()
         streaming.onDestroy()
         super.onCleared()
     }
 
     fun reloadSavedWebDav() {
-        val loaded = WebDav.load(getApplication()) ?: return
-        webdav.value = WebDavSource(loaded)
-        discovered.value = null
-        refresh(WebDavSource.ID)
+        val loaded = WebDav.load(getApplication())
+        webdav.value = loaded?.let(::WebDavSource)
+        if (loaded != null) {
+            discovered.value = null
+            refresh(WebDavSource.ID)
+        } else {
+            pluginManager.cancelSource(WebDavSource.ID)
+            shelves.remove(WebDavSource.ID)
+        }
     }
 
     fun source(id: String): MediaSource? = sources.value.firstOrNull { it.source.id == id }
@@ -93,18 +143,29 @@ class WallModel(app: Application) : AndroidViewModel(app) {
 
     fun refresh(sourceId: String) {
         val src = source(sourceId) ?: return
-        if (shelves[sourceId] !is Load.Ready) {
-            shelves[sourceId] = Load.Loading
-        }
-        viewModelScope.launch {
-            shelves[sourceId] = try {
-                Load.Ready(src.home())
-            } catch (e: Exception) {
-                LimeLog.warning("depth3d: ${src.source.name} home failed: $e")
-                Load.Failed(e)
-            }
-        }
+        pluginManager.refreshSource(src, shelves)
     }
+
+    fun pluginIdForSource(source: MediaSource): String? = pluginManager.pluginIdForSource(source)
+
+    fun pluginDisplayName(pluginId: String): String {
+        val entity = installedPlugins.value.firstOrNull { it.pluginId == pluginId } ?: return pluginId
+        return runCatching { pluginHost.localizeManifest(entity).name }.getOrDefault(entity.name)
+    }
+
+    suspend fun disablePluginForSource(source: MediaSource): String? {
+        val pluginId = pluginIdForSource(source) ?: return null
+        val name = pluginDisplayName(pluginId)
+        withContext(Dispatchers.IO) {
+            pluginHost.packageManager.setPluginEnabled(pluginId, false)
+        }
+        pluginHost.notifyChanged()
+        return name
+    }
+
+    fun recentLogsForPlugin(pluginId: String): List<PluginLogEntry> = pluginHost.recentLogs(pluginId)
+
+    fun clearLogsForPlugin(pluginId: String) = pluginHost.clearLogs(pluginId)
 
     fun progress(sourceId: String, itemId: String): Flow<WatchProgress?> =
         WallDatabase.get(getApplication()).progress().observe(sourceId, itemId)
@@ -127,14 +188,27 @@ class WallModel(app: Application) : AndroidViewModel(app) {
     fun savedWebDav(): WebDav.Server? = WebDav.load(getApplication())
 
     // Newest first; an item whose source is gone or whose file was deleted is
-    // dropped rather than shown as a card that cannot play
-    private suspend fun resolve(rows: List<WatchProgress>, srcs: List<MediaSource>): List<Resume> =
-        rows.filter { it.resumable }.mapNotNull { p ->
+    // dropped rather than shown as a card that cannot play. ItemNotFound cleans
+    // up the stale WatchProgress row per plugin-host-integration.md §3.2.
+    private suspend fun resolve(rows: List<WatchProgress>, srcs: List<MediaSource>): List<Resume> {
+        val progressDao = WallDatabase.get(getApplication()).progress()
+        return rows.filter { it.resumable }.mapNotNull { p ->
             val src = srcs.firstOrNull { it.source.id == p.sourceId } ?: return@mapNotNull null
             try {
-                Resume(src, src.detail(p.itemId), p)
-            } catch (e: Exception) {
+                val item = pluginManager.runWithConcurrencyLimit(src.source.kind) {
+                    src.detail(p.itemId)
+                }
+                Resume(src, item, p)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: ItemNotFoundException) {
+                runCatching {
+                    withContext(Dispatchers.IO) { progressDao.delete(p.sourceId, p.itemId) }
+                }
+                null
+            } catch (_: Exception) {
                 null
             }
         }.take(12)
+    }
 }

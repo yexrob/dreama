@@ -165,6 +165,76 @@ abstract class CopyPluginSchemas extends DefaultTask {
     }
 }
 
+// Deterministic .d3plugin archive builder matching tools/plugin-kit/src/pack.js
+// (manifest.json, main.js, optional icon.png, sorted locales/*.json, fixed timestamp).
+abstract class PackBuiltinPlugins extends DefaultTask {
+    @InputDirectory
+    abstract DirectoryProperty getJellyfinDir()
+
+    @OutputDirectory
+    abstract DirectoryProperty getOutputDir()
+
+    @TaskAction
+    void pack() {
+        def srcDir = jellyfinDir.get().asFile
+        def manifestFile = new File(srcDir, 'manifest.json')
+        def mainJsFile = new File(srcDir, 'main.js')
+        if (!manifestFile.isFile()) {
+            throw new GradleException("Missing built-in plugin manifest.json in ${srcDir}")
+        }
+        if (!mainJsFile.isFile()) {
+            throw new GradleException("Missing built-in plugin main.js in ${srcDir}")
+        }
+        def parsed = new groovy.json.JsonSlurper().parse(manifestFile)
+        def pluginId = parsed?.id?.toString()?.trim()
+        if (!pluginId) {
+            throw new GradleException("Built-in plugin manifest.json missing id in ${srcDir}")
+        }
+
+        def outBase = new File(outputDir.get().asFile, 'builtin-plugins')
+        if (outBase.exists()) {
+            outBase.deleteDir()
+        }
+        outBase.mkdirs()
+        def outZip = new File(outBase, "${pluginId}.d3plugin")
+
+        // Fixed UTC timestamp 2026-01-01T00:00:00Z for reproducible output
+        final long fixedTimeMs = 1767225600000L
+        def entries = new LinkedHashMap<String, byte[]>()
+        entries.put('manifest.json', manifestFile.bytes)
+        entries.put('main.js', mainJsFile.bytes)
+        def iconFile = new File(srcDir, 'icon.png')
+        if (iconFile.isFile()) {
+            entries.put('icon.png', iconFile.bytes)
+        }
+        def localesDir = new File(srcDir, 'locales')
+        if (localesDir.isDirectory()) {
+            def localeFiles = localesDir.listFiles({ f -> f.isFile() && f.name.endsWith('.json') } as FileFilter)
+            if (localeFiles != null) {
+                Arrays.sort(localeFiles, { a, b -> a.name <=> b.name } as Comparator<File>)
+                for (File lf : localeFiles) {
+                    entries.put("locales/${lf.name}".toString(), lf.bytes)
+                }
+            }
+        }
+
+        // Write standard DEFLATE zip with known CRC/size on each Local File Header (no data descriptor)
+        // so both PluginPackageArchive.inspect and tools/plugin-kit inspectArchiveBuffer verify cleanly.
+        outZip.withOutputStream { fos ->
+            def zos = new java.util.zip.ZipOutputStream(fos)
+            zos.setLevel(java.util.zip.Deflater.BEST_COMPRESSION)
+            entries.each { name, data ->
+                def entry = new java.util.zip.ZipEntry(name)
+                entry.setTime(fixedTimeMs)
+                zos.putNextEntry(entry)
+                zos.write(data)
+                zos.closeEntry()
+            }
+            zos.finish()
+        }
+    }
+}
+
 def generateXrShared = tasks.register('generateXrShared', GenerateXrShared) {
     header = layout.projectDirectory.file('src/main/jni/xr-renderer/xr_shared.h')
     outputDir = layout.buildDirectory.dir('generated/source/xrshared')
@@ -177,10 +247,16 @@ def copyPluginSchemas = tasks.register('copyPluginSchemas', CopyPluginSchemas) {
     outputDir = layout.buildDirectory.dir('generated/resources/plugin-schema')
 }
 
+def packBuiltinPlugins = tasks.register('packBuiltinPlugins', PackBuiltinPlugins) {
+    jellyfinDir = rootProject.layout.projectDirectory.dir('../plugins/jellyfin')
+    outputDir = layout.buildDirectory.dir('generated/assets/builtin-plugins')
+}
+
 androidComponents {
     onVariants(selector().all()) { variant ->
         variant.sources.java.addGeneratedSourceDirectory(generateXrShared, { it.outputDir })
         variant.sources.resources.addGeneratedSourceDirectory(copyPluginSchemas, { it.outputDir })
+        variant.sources.assets.addGeneratedSourceDirectory(packBuiltinPlugins, { it.outputDir })
     }
 }
 

@@ -62,6 +62,9 @@ interface WatchProgressDao {
 
     @Upsert
     suspend fun upsert(progress: WatchProgress)
+
+    @Query("DELETE FROM watch_progress WHERE sourceId = :sourceId AND itemId = :itemId")
+    suspend fun delete(sourceId: String, itemId: String)
 }
 
 @Database(

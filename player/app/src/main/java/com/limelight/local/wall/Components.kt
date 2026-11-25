@@ -40,6 +40,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -64,7 +65,17 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import com.limelight.local.media.Artwork
 import com.limelight.local.media.Artworks
+import com.limelight.local.media.MediaSource
+import com.limelight.local.plugin.PluginHostGuards
+import com.limelight.local.plugin.PluginImages
+import com.limelight.local.plugin.PluginMediaSource
 import kotlinx.coroutines.delay
+
+/**
+ * Current [MediaSource] in scope for artwork loading so plugin items always route
+ * through [PluginImages.loadBitmap] with the source's [com.limelight.local.plugin.NetworkPolicy].
+ */
+val LocalMediaSource = compositionLocalOf<MediaSource?> { null }
 
 /**
  * Hover from the controller ray, held 80 ms after it leaves. The ray shakes
@@ -303,15 +314,51 @@ fun Notice(text: String, icon: ImageVector = WallIcons.Alert, danger: Boolean = 
 /**
  * Loads [art] for drawing. Null until the frame is ready, and stays null if
  * there is none, in which case the caller draws its placeholder.
+ *
+ * Plugin artwork is ALWAYS loaded via [PluginImages.loadBitmap] under the
+ * active [PluginMediaSource]'s NetworkPolicy and cached in [Artworks]'s single
+ * shared LRU cache — never passed to [Artworks.load].
  */
 @Composable
-fun rememberArt(art: Artwork?, size: Artworks.Size): State<Bitmap?> {
+fun rememberArt(
+    art: Artwork?,
+    size: Artworks.Size,
+    source: MediaSource? = LocalMediaSource.current,
+): State<Bitmap?> {
     val context = LocalContext.current
-    return produceState(art?.let { Artworks.cached(it, size) }, art, size) {
+    val pluginSource = source as? PluginMediaSource
+    val isPluginArt = art != null && (PluginHostGuards.isPluginArtwork(art) || pluginSource != null)
+    val pluginCacheKey = if (art != null && isPluginArt && pluginSource != null) {
+        "plugin:${pluginSource.instanceId}:${art.cacheKey}@${size.px}"
+    } else {
+        null
+    }
+    val cachedNow = when {
+        art == null -> null
+        isPluginArt -> pluginCacheKey?.let { Artworks.cachedByKey(it) }
+        else -> Artworks.cached(art, size)
+    }
+    return produceState(cachedNow, art, size, pluginCacheKey, isPluginArt) {
         // The state outlives a change of art (the hero moving on), so start clean
-        value = art?.let { Artworks.cached(it, size) }
+        value = when {
+            art == null -> null
+            isPluginArt -> pluginCacheKey?.let { Artworks.cachedByKey(it) }
+            else -> Artworks.cached(art, size)
+        }
         if (art != null && value == null) {
-            value = Artworks.load(context, art, size)
+            value = if (isPluginArt) {
+                if (pluginSource != null && pluginCacheKey != null) {
+                    runCatching {
+                        PluginImages.loadBitmap(pluginSource, art, maxEdgePx = size.px)
+                    }.getOrNull()?.also { bmp ->
+                        Artworks.putCachedByKey(pluginCacheKey, bmp)
+                    }
+                } else {
+                    null
+                }
+            } else {
+                Artworks.load(context, art, size)
+            }
         }
     }
 }
@@ -322,9 +369,15 @@ fun rememberArt(art: Artwork?, size: Artworks.Size): State<Bitmap?> {
  * is not one grey block, and the image fades in over it (240 ms, ux-spec §5).
  */
 @Composable
-fun ArtBox(art: Artwork?, seed: String, size: Artworks.Size, modifier: Modifier = Modifier,
-           content: @Composable BoxScope.() -> Unit = {}) {
-    val bmp by rememberArt(art, size)
+fun ArtBox(
+    art: Artwork?,
+    seed: String,
+    size: Artworks.Size,
+    modifier: Modifier = Modifier,
+    source: MediaSource? = LocalMediaSource.current,
+    content: @Composable BoxScope.() -> Unit = {},
+) {
+    val bmp by rememberArt(art, size, source)
     Box(modifier.background(placeholder(seed))) {
         AnimatedVisibility(bmp != null, enter = fadeIn(tween(240)), exit = fadeOut(tween(0))) {
             bmp?.let {
