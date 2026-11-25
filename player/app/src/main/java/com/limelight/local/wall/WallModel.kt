@@ -17,15 +17,19 @@ import com.limelight.local.media.WallDatabase
 import com.limelight.local.media.WatchProgress
 import com.limelight.local.media.WebDavSource
 import com.limelight.local.plugin.InstalledPluginEntity
+import com.limelight.local.plugin.PluginCapability
 import com.limelight.local.plugin.PluginInstanceEntity
 import com.limelight.local.plugin.PluginLogEntry
 import com.limelight.local.plugin.PluginManifest
 import com.limelight.local.plugin.PluginMediaSource
 import com.limelight.local.plugin.PluginRepoEntity
 import com.limelight.local.plugin.PluginRepoIndex
+import com.limelight.local.search.PluginSearchableSource
 import com.limelight.local.search.SearchAggregator
 import com.limelight.local.search.SearchConfig
 import com.limelight.local.search.SearchHistoryStore
+import com.limelight.local.search.SearchSourceClassifier
+import com.limelight.local.search.SearchableSource
 import com.limelight.local.stream.AndroidPrefsStore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -154,6 +158,33 @@ class WallModel(app: Application) : AndroidViewModel(app) {
 
     fun setRememberSearchHistory(enabled: Boolean) {
         searchHistory.setRememberEnabled(enabled)
+    }
+
+    /**
+     * Resolves the currently live [PluginMediaSource] directly from [pluginHost] (bypassing any
+     * stale [sources] snapshot while async post-login reconciliation is still running) so Search
+     * retry and post-login refresh never execute against a shut-down runtime.
+     */
+    suspend fun resolveFreshSearchableSource(
+        sourceId: String,
+        genericPluginLabel: String,
+    ): SearchableSource? {
+        val plugin = try {
+            pluginHost.openSourceBySourceId(sourceId)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            null
+        } ?: return null
+        if (plugin.isClosed || !plugin.capabilities.contains(PluginCapability.SEARCH)) return null
+        val inst = runCatching {
+            withContext(Dispatchers.IO) { pluginHost.store.getInstance(plugin.instanceId) }
+        }.getOrNull()
+        return PluginSearchableSource(
+            plugin = plugin,
+            typeLabel = SearchSourceClassifier.typeLabelFor(plugin, genericPluginLabel),
+            knownNeedsAuth = inst?.authState == "NEEDS_AUTH",
+        )
     }
 
     init {

@@ -222,12 +222,15 @@ class DetailStage3Test {
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
     fun resolveDetailTargetOnlyTraversesEpisodeParentWhenExplicitlyRequestedAndHonorsBudget() = runTest {
-        val ep3 = Item("ep-3", ItemKind.EPISODE, "退潮之后", parentId = "season-2", index = 3)
+        val bareEp3 = Item("ep-3", ItemKind.EPISODE, "退潮之后", parentId = "season-2", index = 3)
+        val fullEp3 = bareEp3.copy(overview = "完整单集简介", durationMs = 2_700_000L)
         val season2 = Item("season-2", ItemKind.SEASON, "第 2 季", parentId = "series-1", index = 2)
         val series = Item("series-1", ItemKind.SERIES, "潮汐表", seasons = listOf(season2))
 
         val detailCalls = ArrayList<String>()
-        var parentDelayMs = 0L
+        var epDelayMs = 0L
+        var seasonDelayMs = 0L
+        var seriesDelayMs = 0L
         var failParent = false
         val src = object : MediaSource {
             override val source = Source("plugin:nas", "NAS", SourceKind.PLUGIN, "NAS")
@@ -235,12 +238,16 @@ class DetailStage3Test {
             override suspend fun browse(categoryId: String, page: Int): MediaPage<Item> = MediaPage(emptyList(), null)
             override suspend fun detail(itemId: String): Item {
                 detailCalls += itemId
-                if (itemId == "season-2") {
-                    if (parentDelayMs > 0L) delay(parentDelayMs)
-                    if (failParent) throw SourceUnavailableException("parent failed")
+                when (itemId) {
+                    "ep-3" -> if (epDelayMs > 0L) delay(epDelayMs)
+                    "season-2" -> {
+                        if (seasonDelayMs > 0L) delay(seasonDelayMs)
+                        if (failParent) throw SourceUnavailableException("parent failed")
+                    }
+                    "series-1" -> if (seriesDelayMs > 0L) delay(seriesDelayMs)
                 }
                 return when (itemId) {
-                    "ep-3" -> ep3
+                    "ep-3" -> fullEp3
                     "season-2" -> season2
                     "series-1" -> series
                     else -> throw SourceUnavailableException("missing $itemId")
@@ -251,42 +258,93 @@ class DetailStage3Test {
 
         // 1. Default entry (Home Continue Watching / Library / Next Episode): resolveEpisodeParent = false
         //    MUST make ONLY 1 detail() call and return the episode directly (exact pre-Task-H behavior)
-        val defaultRes = DetailStateLogic.resolveDetailTarget(src, ep3)
+        val defaultRes = DetailStateLogic.resolveDetailTarget(src, bareEp3)
         assertEquals(listOf("ep-3"), detailCalls)
         assertEquals("ep-3", defaultRes.displayItem.id)
+        assertEquals("完整单集简介", defaultRes.displayItem.overview)
         assertNull(defaultRes.focusSeasonId)
         assertNull(defaultRes.focusEpisodeId)
+        assertNull(defaultRes.fallbackParentId)
 
         // 2. Explicit Search episode entry (resolveEpisodeParent = true): resolves Episode -> Season -> Series
+        //    Slow ep-3 fetch (2 500 ms) does NOT eat into the upward parentResolveTimeoutMs (1 000 ms)!
         detailCalls.clear()
-        val searchRes = DetailStateLogic.resolveDetailTarget(src, ep3, resolveEpisodeParent = true)
+        epDelayMs = 2_500L
+        seasonDelayMs = 200L
+        seriesDelayMs = 200L
+        val searchRes = DetailStateLogic.resolveDetailTarget(
+            source = src,
+            initialItem = bareEp3,
+            resolveEpisodeParent = true,
+            parentResolveTimeoutMs = 1_000L,
+        )
         assertEquals(listOf("ep-3", "season-2", "series-1"), detailCalls)
         assertEquals("series-1", searchRes.displayItem.id)
         assertEquals("season-2", searchRes.focusSeasonId)
         assertEquals("ep-3", searchRes.focusEpisodeId)
+        assertNull(searchRes.fallbackParentId)
 
-        // 3. Explicit entry with parent failure falls back cleanly to original episode detail
+        // 3. Explicit entry with parent failure falls back to FULL episode detail + fallbackParentId entry
         detailCalls.clear()
+        epDelayMs = 0L
+        seasonDelayMs = 0L
+        seriesDelayMs = 0L
         failParent = true
-        val errFallback = DetailStateLogic.resolveDetailTarget(src, ep3, resolveEpisodeParent = true)
+        val errFallback = DetailStateLogic.resolveDetailTarget(src, bareEp3, resolveEpisodeParent = true)
         assertEquals("ep-3", errFallback.displayItem.id)
+        assertEquals("完整单集简介", errFallback.displayItem.overview)
+        assertEquals("season-2", errFallback.fallbackParentId)
         assertNull(errFallback.focusSeasonId)
         assertNull(errFallback.focusEpisodeId)
 
-        // 4. Explicit entry exceeding overall budget stops at parentResolveTimeoutMs and falls back cleanly
+        // 4. Upward season lookup exceeding parentResolveTimeoutMs stops after budget, keeps FULL epDetail + fallbackParentId
         detailCalls.clear()
         failParent = false
-        parentDelayMs = 15_000L
+        epDelayMs = 500L
+        seasonDelayMs = 15_000L
         val t0 = testScheduler.currentTime
         val timeoutFallback = DetailStateLogic.resolveDetailTarget(
             source = src,
-            initialItem = ep3,
+            initialItem = bareEp3,
             resolveEpisodeParent = true,
             parentResolveTimeoutMs = 2_000L,
         )
-        assertEquals(2_000L, testScheduler.currentTime - t0)
+        // Elapsed = 500 ms (epDetail outside budget) + 2 000 ms (parent budget)
+        assertEquals(2_500L, testScheduler.currentTime - t0)
         assertEquals("ep-3", timeoutFallback.displayItem.id)
+        assertEquals("完整单集简介", timeoutFallback.displayItem.overview)
+        assertEquals("season-2", timeoutFallback.fallbackParentId)
         assertNull(timeoutFallback.focusEpisodeId)
+
+        // 5. Fast season + slow series timeout preserves series-1 as fallbackParentId and season-2 as fallbackSeasonId
+        detailCalls.clear()
+        epDelayMs = 0L
+        seasonDelayMs = 100L
+        seriesDelayMs = 15_000L
+        val seriesTimeoutFallback = DetailStateLogic.resolveDetailTarget(
+            source = src,
+            initialItem = bareEp3,
+            resolveEpisodeParent = true,
+            parentResolveTimeoutMs = 1_000L,
+        )
+        assertEquals("ep-3", seriesTimeoutFallback.displayItem.id)
+        assertEquals("完整单集简介", seriesTimeoutFallback.displayItem.overview)
+        assertEquals("series-1", seriesTimeoutFallback.fallbackParentId)
+        assertEquals("season-2", seriesTimeoutFallback.fallbackSeasonId)
+
+        // 6. Tapping 「查看所属剧集」 with fallbackParentId ("season-2") resolves up to Series focused on ep-3
+        detailCalls.clear()
+        seasonDelayMs = 0L
+        seriesDelayMs = 0L
+        val openSeriesRes = DetailStateLogic.resolveDetailTarget(
+            source = src,
+            initialItem = Item("season-2", ItemKind.SEASON, bareEp3.title),
+            requestedFocusEpisodeId = "ep-3",
+            resolveEpisodeParent = true,
+        )
+        assertEquals("series-1", openSeriesRes.displayItem.id)
+        assertEquals("season-2", openSeriesRes.focusSeasonId)
+        assertEquals("ep-3", openSeriesRes.focusEpisodeId)
     }
 
     @Test
@@ -356,6 +414,62 @@ class DetailStage3Test {
                 episodes = episodes,
                 targetEpisodeId = "e7",
                 explicitFocusEpisodeId = "e6",
+                readyForInitialScroll = true,
+            ),
+        )
+    }
+
+    @Test
+    fun seasonlessSeriesAutoScrollWaitsForLocalWatchProgressBeforeScrollingOnce() {
+        val episodes = (1..8).map { n -> Item("p$n", ItemKind.EPISODE, "第 $n 集", index = n, durationMs = 2_400_000L) }
+        val ctrl = SeriesAutoScrollController()
+
+        // Before Room local progress emits (`localProgressLoaded = false`), seasonless series MUST NOT scroll yet
+        val readyBeforeProgress = DetailStateLogic.isReadyForInitialSeriesScroll(
+            loadingDetail = false,
+            hasSeasons = false,
+            hasInitialResolution = false,
+            localProgressLoaded = false,
+        )
+        assertFalse(readyBeforeProgress)
+        assertNull(
+            ctrl.consumeScrollTargetIndex(
+                seasonKey = "__direct_episodes__",
+                episodes = episodes,
+                targetEpisodeId = "p1",
+                readyForInitialScroll = readyBeforeProgress,
+            ),
+        )
+
+        // Once local progress arrives (resumed on p6), readiness flips true and scrolls ONCE to index 4 (p5 on left)
+        val readyAfterProgress = DetailStateLogic.isReadyForInitialSeriesScroll(
+            loadingDetail = false,
+            hasSeasons = false,
+            hasInitialResolution = false,
+            localProgressLoaded = true,
+        )
+        assertTrue(readyAfterProgress)
+        val localProgress = mapOf(
+            "p6" to WatchProgress("plugin:1", "p6", "第 6 集", 900_000L, 2_400_000L, updatedAt = 500L),
+        )
+        val target = DetailStateLogic.pickPlayTarget(null, episodes, localProgress)!!
+        assertEquals("p6", target.episode.id)
+        assertEquals(
+            4,
+            ctrl.consumeScrollTargetIndex(
+                seasonKey = "__direct_episodes__",
+                episodes = episodes,
+                targetEpisodeId = target.episode.id,
+                readyForInitialScroll = readyAfterProgress,
+            ),
+        )
+
+        // Subsequent progress update does NOT re-scroll
+        assertNull(
+            ctrl.consumeScrollTargetIndex(
+                seasonKey = "__direct_episodes__",
+                episodes = episodes,
+                targetEpisodeId = "p7",
                 readyForInitialScroll = true,
             ),
         )

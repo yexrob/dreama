@@ -1,14 +1,29 @@
 package com.limelight.local.plugin
 
+import com.limelight.local.media.Item
+import com.limelight.local.media.ItemKind
 import com.limelight.local.media.PluginInternalException
+import com.limelight.local.search.PluginSearchableSource
+import com.limelight.local.search.SearchAggregator
+import com.limelight.local.search.SearchKindFilter
 import com.limelight.local.search.SearchLogSanitizer
+import com.limelight.local.search.SearchRowStatus
+import com.limelight.local.search.SearchWarmUpCoordinator
+import com.limelight.local.wall.DetailStateLogic
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import java.io.ByteArrayOutputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -50,6 +65,7 @@ class PluginRuntimeSearchCancellationAndLoggingTest {
         mainJs: String,
         hostPort: Int? = null,
         sinkLines: MutableList<String>? = null,
+        clockMs: () -> Long = System::currentTimeMillis,
     ): Pair<PluginRuntime, PluginMediaSource> {
         val manifest = PluginManifest(
             api = 1,
@@ -102,6 +118,7 @@ class PluginRuntimeSearchCancellationAndLoggingTest {
             storage = storage,
             cookieJar = cookies,
             logger = logger,
+            clockMs = clockMs,
         )
         val mapper = PluginProtocolMapper(policy)
         val source = PluginMediaSource(
@@ -471,6 +488,516 @@ class PluginRuntimeSearchCancellationAndLoggingTest {
         } finally {
             runCatching { source.close() }
             tmpDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun timerPromiseCancellationUnwindsCleanlyRunsFinallyWithoutRebuildingVm() = runBlocking {
+        val tmpDir = Files.createTempDirectory("d3-rt-cancel-timer").toFile()
+        val mainJs = """
+            let initCount = 0;
+            let finallyCount = 0;
+            let clearedTimerFired = 0;
+            let staleFetchRejected = 0;
+            export default {
+              async init() { initCount += 1; },
+              home() {
+                return [{
+                  id: 's1',
+                  title: 'init=' + initCount + ',fin=' + finallyCount + ',cleared=' + clearedTimerFired + ',rej=' + staleFetchRejected,
+                  style: 'poster',
+                  items: []
+                }];
+              },
+              browse() { return { items: [], next: null }; },
+              detail(ctx, { itemId }) { return { id: itemId, kind: 'movie', title: '详情-' + itemId }; },
+              playback() { return { url: 'https://cdn.example.com/v.mp4' }; },
+              async search(ctx, { query }) {
+                if (query === 'sleep') {
+                  try {
+                    await new Promise((r) => setTimeout(r, 5000));
+                    try {
+                      await ctx.fetch('https://cdn.example.com/should-not-run');
+                    } catch (_) {
+                      staleFetchRejected += 1;
+                    }
+                    return { items: [{ id: 'late', kind: 'movie', title: '不应到达' }], next: null };
+                  } finally {
+                    finallyCount += 1;
+                  }
+                }
+                if (query === 'cleared') {
+                  const id = setTimeout(() => { clearedTimerFired += 1; }, 5000);
+                  clearTimeout(id);
+                  await new Promise((r) => setTimeout(r, 20));
+                  return { items: [{ id: 'ok-cleared', kind: 'movie', title: '正常清除' }], next: null };
+                }
+                return { items: [{ id: 'hit-' + query, kind: 'movie', title: '命中 ' + query }], next: null };
+              },
+              suggest(ctx, { query }) { return [query + ' 推荐']; }
+            };
+        """.trimIndent()
+
+        val (runtime, source) = buildRuntimeAndSource(tmpDir, mainJs)
+        try {
+            // Warm up VM -> creationCount == 1
+            assertEquals("init=1,fin=0,cleared=0,rej=0", source.home().single().category.title)
+            assertEquals(1, runtime.creationCount)
+
+            // 1. User clearTimeout() must NOT trigger callback or abort the active call
+            assertEquals(listOf("ok-cleared"), source.search("cleared").items.map { it.id })
+            assertEquals(1, runtime.creationCount)
+
+            // 2. Host cancellation during `await new Promise(r => setTimeout(r, 5000))` settles the
+            //    timer, rejects subsequent host calls, executes plugin `finally`, and keeps VM alive!
+            var caughtCancel = false
+            val startedMs = System.currentTimeMillis()
+            val job = launch(Dispatchers.IO) {
+                try {
+                    source.search("sleep")
+                } catch (ce: CancellationException) {
+                    caughtCancel = true
+                    throw ce
+                }
+            }
+            val waitDeadline = System.currentTimeMillis() + 3_000L
+            while (runtime.currentActiveTimerCount() == 0 && System.currentTimeMillis() < waitDeadline) {
+                delay(10)
+            }
+            assertTrue("Expected active timer before cancelling", runtime.currentActiveTimerCount() >= 1)
+
+            val cancelAtMs = System.currentTimeMillis()
+            job.cancel()
+            job.join()
+            val cancelElapsedMs = System.currentTimeMillis() - cancelAtMs
+
+            assertTrue("Expected CancellationException", caughtCancel)
+            assertEquals("VM must NOT be rebuilt after timer cancellation", 1, runtime.creationCount)
+            assertTrue("VM must remain warm and initialized", runtime.isInitialized)
+            assertEquals(0, runtime.currentActiveTimerCount())
+            assertTrue("Cooperative timer cancel should settle fast (was ${cancelElapsedMs}ms)", cancelElapsedMs < 240L)
+
+            // 3. Plugin `finally` ran, post-cancel fetch was rejected by expired generation,
+            //    clearTimeout callback never fired, and subsequent calls reuse the exact same VM.
+            assertEquals("init=1,fin=1,cleared=0,rej=1", source.home().single().category.title)
+            assertEquals(listOf("hit-潮"), source.search("潮").items.map { it.id })
+            assertEquals(listOf("潮 推荐"), source.suggest("潮"))
+            assertEquals(1, runtime.creationCount)
+            assertTrue(
+                "Zero ERROR logs expected after cooperative timer cancellation, got: ${runtime.logger.recentEntries()}",
+                runtime.logger.recentEntries().none { it.level == PluginLogLevel.ERROR },
+            )
+            assertTrue(System.currentTimeMillis() - startedMs < 5_000L)
+        } finally {
+            runCatching { source.close() }
+            tmpDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun singleFlightTokenRefreshCancelledDuringBackoffSleepCleansUpAndNextCallSucceeds() = runBlocking {
+        val tmpDir = Files.createTempDirectory("d3-rt-singleflight-backoff").toFile()
+        val server = MockWebServer()
+        val refreshAttempts = AtomicInteger(0)
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                return when (request.path) {
+                    "/refresh" -> {
+                        val n = refreshAttempts.incrementAndGet()
+                        if (n == 1) {
+                            MockResponse().setResponseCode(500).setBody("temporary error")
+                        } else {
+                            MockResponse().setResponseCode(200).setBody("""{"token":"tok-$n"}""")
+                        }
+                    }
+                    else -> MockResponse().setResponseCode(200).setBody("""{"ok":true}""")
+                }
+            }
+        }
+        server.start()
+        val baseUrl = "http://192.168.1.50:${server.port}"
+        val mainJs = """
+            let refreshInFlight = null;
+            let cachedToken = null;
+            let finallyRan = 0;
+
+            async function ensureToken(ctx) {
+              if (cachedToken) return cachedToken;
+              if (!refreshInFlight) {
+                refreshInFlight = (async () => {
+                  try {
+                    for (let attempt = 0; attempt < 3; attempt++) {
+                      const resp = await ctx.fetch('$baseUrl/refresh');
+                      if (resp.ok) {
+                        cachedToken = resp.json().token;
+                        return cachedToken;
+                      }
+                      await new Promise((r) => setTimeout(r, 5000));
+                    }
+                    throw new Error('refresh failed');
+                  } finally {
+                    refreshInFlight = null;
+                    finallyRan += 1;
+                  }
+                })();
+              }
+              return refreshInFlight;
+            }
+
+            export default {
+              home() { return []; },
+              browse() { return { items: [], next: null }; },
+              detail(ctx, { itemId }) { return { id: itemId, kind: 'movie', title: itemId }; },
+              playback() { return { url: '$baseUrl/v.mp4' }; },
+              async search(ctx, { query }) {
+                const tok = await ensureToken(ctx);
+                return {
+                  items: [{ id: tok + ':' + finallyRan, kind: 'movie', title: query + ' ' + tok }],
+                  next: null
+                };
+              }
+            };
+        """.trimIndent()
+
+        val (runtime, source) = buildRuntimeAndSource(tmpDir, mainJs, hostPort = server.port)
+        try {
+            // Warm up VM so creationCount == 1
+            source.home()
+            assertEquals(1, runtime.creationCount)
+
+            // 1. First search triggers refreshInFlight: attempt 0 gets HTTP 500 and enters 5 s backoff sleep.
+            var caughtCancel = false
+            val job = launch(Dispatchers.IO) {
+                try {
+                    source.search("潮")
+                } catch (ce: CancellationException) {
+                    caughtCancel = true
+                    throw ce
+                }
+            }
+            val deadline = System.currentTimeMillis() + 3_000L
+            while (runtime.currentActiveTimerCount() == 0 && System.currentTimeMillis() < deadline) {
+                delay(10)
+            }
+            assertEquals("Attempt 1 should have hit /refresh before backoff sleep", 1, refreshAttempts.get())
+            assertTrue("Backoff timer must be active", runtime.currentActiveTimerCount() >= 1)
+
+            // 2. Cancel during backoff sleep -> must unwind cleanly, run `finally { refreshInFlight = null }`,
+            //    and NOT rebuild the VM!
+            job.cancel()
+            job.join()
+            assertTrue(caughtCancel)
+            assertEquals("VM must NOT be rebuilt", 1, runtime.creationCount)
+            assertTrue(runtime.isInitialized)
+            assertEquals("Cancelled call must NOT send a 2nd /refresh request", 1, refreshAttempts.get())
+
+            // 3. Next call immediately succeeds on the SAME VM (proving refreshInFlight was cleared
+            //    instead of staying permanently stuck on an unsettled promise!)
+            val res = source.search("雾")
+            assertEquals(1, runtime.creationCount)
+            assertEquals(2, refreshAttempts.get())
+            assertEquals(listOf("tok-2:2"), res.items.map { it.id })
+            assertTrue(
+                "Zero ERROR logs expected, got: ${runtime.logger.recentEntries()}",
+                runtime.logger.recentEntries().none { it.level == PluginLogLevel.ERROR },
+            )
+        } finally {
+            runCatching { source.close() }
+            runCatching { server.shutdown() }
+            tmpDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun backgroundWarmUpEnablesSuggestCapsTimeoutBacksOffAndLogsAtMostOneNonErrorWarning() = runBlocking {
+        val tmpDir = Files.createTempDirectory("d3-rt-warmup").toFile()
+        assertEquals(5_000L, PluginRuntime.DEFAULT_WARM_UP_TIMEOUT_MS)
+        assertTrue(PluginRuntime.DEFAULT_WARM_UP_FAILURE_BACKOFF_MS >= 10_000L)
+
+        val okJs = """
+            export default {
+              async init() {},
+              home() { return []; },
+              browse() { return { items: [], next: null }; },
+              detail(ctx, { itemId }) { return { id: itemId, kind: 'movie', title: 'T' }; },
+              playback() { return { url: 'https://cdn.example.com/a.mp4' }; },
+              search() { return { items: [], next: null }; },
+              suggest(ctx, { query }) { return [query + ' 1', query + ' 2']; }
+            };
+        """.trimIndent()
+        val brokenInitJs = """
+            export default {
+              async init() { throw new Error('init boom'); },
+              home() { return []; },
+              browse() { return { items: [], next: null }; },
+              detail(ctx, { itemId }) { return { id: itemId, kind: 'movie', title: 'T' }; },
+              playback() { return { url: 'https://cdn.example.com/a.mp4' }; },
+              search() { return { items: [], next: null }; },
+              suggest(ctx, { query }) { return [query]; }
+            };
+        """.trimIndent()
+        val hangingInitJs = """
+            export default {
+              async init() { await new Promise((r) => setTimeout(r, 20000)); },
+              home() { return []; },
+              browse() { return { items: [], next: null }; },
+              detail(ctx, { itemId }) { return { id: itemId, kind: 'movie', title: 'T' }; },
+              playback() { return { url: 'https://cdn.example.com/a.mp4' }; },
+              search() { return { items: [], next: null }; },
+              suggest(ctx, { query }) { return [query]; }
+            };
+        """.trimIndent()
+
+        var fakeNowMs = 1_000_000L
+        val (okRuntime, okSource) = buildRuntimeAndSource(File(tmpDir, "ok").apply { mkdirs() }, okJs)
+        val (badRuntime, badSource) = buildRuntimeAndSource(
+            File(tmpDir, "bad").apply { mkdirs() },
+            brokenInitJs,
+            clockMs = { fakeNowMs },
+        )
+        val (hangRuntime, hangSource) = buildRuntimeAndSource(
+            File(tmpDir, "hang").apply { mkdirs() },
+            hangingInitJs,
+            clockMs = { fakeNowMs },
+        )
+        val searchScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        try {
+            // 1. Before warm-up: cold VM skips suggest(); warm-up enables suggest() on 1 VM
+            assertFalse(okRuntime.isInitialized)
+            assertTrue(okSource.suggest("潮").isEmpty())
+            assertEquals(0, okRuntime.creationCount)
+
+            assertTrue(okSource.warmUpIfNeeded())
+            assertTrue(okRuntime.isInitialized)
+            assertEquals(1, okRuntime.creationCount)
+            assertEquals(listOf("潮 1", "潮 2"), okSource.suggest("潮"))
+
+            // 2. Failing init during background warm-up via SearchWarmUpCoordinator:
+            //    - emits ZERO ERROR logs
+            //    - emits AT MOST 1 non-ERROR (WARN) log for this source on entering Search
+            //    - activates backoff so immediate retry skips without creating another VM or logging again
+            val coordinator = SearchWarmUpCoordinator(ioDispatcher = Dispatchers.IO)
+            val badSearchable = PluginSearchableSource(badSource, "SearchRT", knownNeedsAuth = false)
+            assertEquals(listOf(badSource.source.id), coordinator.warmUpUninitialized(listOf(badSearchable), searchScope))
+            val waitBad = System.currentTimeMillis() + 3_000L
+            while (badRuntime.logger.recentEntries().isEmpty() && System.currentTimeMillis() < waitBad) {
+                delay(15)
+            }
+            assertFalse(badRuntime.isInitialized)
+            assertEquals(1, badRuntime.creationCount)
+            val badLogs1 = badRuntime.logger.recentEntries()
+            assertTrue("Warm-up failure must NOT log ERROR, got: $badLogs1", badLogs1.none { it.level == PluginLogLevel.ERROR })
+            assertEquals("Expected at most 1 non-ERROR log for warm-up failure, got: $badLogs1", 1, badLogs1.size)
+            assertEquals(PluginLogLevel.WARN, badLogs1.single().level)
+
+            // Re-calling coordinator in same Search session does nothing, AND direct warmUpIfNeeded
+            // within the 30 s backoff window also returns false with ZERO extra VM creations or logs!
+            assertTrue(coordinator.warmUpUninitialized(listOf(badSearchable), searchScope).isEmpty())
+            assertFalse(badSource.warmUpIfNeeded())
+            assertEquals(1, badRuntime.creationCount)
+            assertEquals(1, badRuntime.logger.recentEntries().size)
+
+            // Advancing clock past backoff allows a subsequent warm-up attempt
+            fakeNowMs += PluginRuntime.DEFAULT_WARM_UP_FAILURE_BACKOFF_MS + 1L
+            assertFalse(badSource.warmUpIfNeeded())
+            assertEquals(2, badRuntime.creationCount)
+            assertTrue(badRuntime.logger.recentEntries().none { it.level == PluginLogLevel.ERROR })
+            assertEquals(2, badRuntime.logger.recentEntries().size)
+
+            // 3. Hanging init(ctx) aborts promptly at the short warm-up timeout (NOT 15 s / 30 s),
+            //    logs 1 WARN (0 ERROR), and enters backoff
+            val hangStart = System.currentTimeMillis()
+            assertFalse(hangSource.warmUpIfNeeded(timeoutMsOverride = 350L))
+            val hangElapsed = System.currentTimeMillis() - hangStart
+            assertTrue("Hanging warm-up should abort near short budget (was ${hangElapsed}ms)", hangElapsed < 2_000L)
+            assertFalse(hangRuntime.isInitialized)
+            val hangLogs = hangRuntime.logger.recentEntries()
+            assertTrue("Hanging warm-up must NOT log ERROR, got: $hangLogs", hangLogs.none { it.level == PluginLogLevel.ERROR })
+            assertEquals(1, hangLogs.size)
+            assertEquals(PluginLogLevel.WARN, hangLogs.single().level)
+
+            // Still backed off right after timeout
+            assertFalse(hangSource.warmUpIfNeeded(timeoutMsOverride = 350L))
+            assertEquals(1, hangRuntime.creationCount)
+        } finally {
+            searchScope.cancel()
+            runCatching { okSource.close() }
+            runCatching { badSource.close() }
+            runCatching { hangSource.close() }
+            tmpDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun episodeParentLookupTimeoutKeepsEpisodeDetailAndDoesNotRebuildVm() = runBlocking {
+        val tmpDir = Files.createTempDirectory("d3-rt-ep-timeout").toFile()
+        val mainJs = """
+            export default {
+              home() { return []; },
+              browse() { return { items: [], next: null }; },
+              async detail(ctx, { itemId }) {
+                if (itemId === 'ep-3') {
+                  return {
+                    id: 'ep-3',
+                    kind: 'episode',
+                    title: '第 3 集 · 退潮之后',
+                    overview: '完整单集简介内容',
+                    durationMs: 2700000,
+                    parentId: 'season-2'
+                  };
+                }
+                if (itemId === 'season-2') {
+                  await new Promise((r) => setTimeout(r, 5000));
+                  return { id: 'season-2', kind: 'season', title: '第 2 季', parentId: 'series-1' };
+                }
+                return { id: itemId, kind: 'series', title: '潮汐表', seasons: [] };
+              },
+              playback() { return { url: 'https://cdn.example.com/ep3.mp4' }; },
+              search() { return { items: [], next: null }; }
+            };
+        """.trimIndent()
+
+        val (runtime, source) = buildRuntimeAndSource(tmpDir, mainJs)
+        try {
+            val bareSearchEp = Item(id = "ep-3", kind = ItemKind.EPISODE, title = "退潮之后", parentId = "season-2")
+            val res = DetailStateLogic.resolveDetailTarget(
+                source = source,
+                initialItem = bareSearchEp,
+                resolveEpisodeParent = true,
+                parentResolveTimeoutMs = 250L,
+            )
+
+            // Full episode detail is preserved along with fallbackParentId to open owning series later
+            assertEquals("ep-3", res.displayItem.id)
+            assertEquals("完整单集简介内容", res.displayItem.overview)
+            assertEquals(2_700_000L, res.displayItem.durationMs)
+            assertEquals("season-2", res.fallbackParentId)
+            // CRITICAL: Timeout cancellation of parent detail() did NOT rebuild the QuickJS VM!
+            assertEquals("Parent timeout must not rebuild VM", 1, runtime.creationCount)
+            assertTrue(runtime.isInitialized)
+            // Subsequent calls on the same VM continue working cleanly
+            assertEquals("潮汐表", source.detail("series-1").title)
+            assertEquals(1, runtime.creationCount)
+        } finally {
+            runCatching { source.close() }
+            tmpDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun reloginReplacingRuntimeDoesNotBreakSearchRetryWithStaleSourceReference() = runBlocking {
+        val rootDir = Files.createTempDirectory("d3-relogin-retry").toFile()
+        val store = InMemoryPluginStore()
+        val secretBox = SoftwareAesSecretBox()
+        val mgr = PluginPackageManager(rootDir = rootDir, store = store, secretBox = secretBox)
+        val aggScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        try {
+            val manifestJson = """
+                {
+                  "api": 1,
+                  "id": "com.example.reloginsearch",
+                  "name": "ReloginSearch",
+                  "version": "1.0.0",
+                  "auth": "form",
+                  "capabilities": ["search"],
+                  "permissions": {"hosts": ["api.example.com"]},
+                  "config": [{"key": "token", "type": "password", "label": "Token"}]
+                }
+            """.trimIndent()
+            val mainJs = """
+                export default {
+                  home() { return []; },
+                  browse() { return { items: [], next: null }; },
+                  detail(ctx, { itemId }) { return { id: itemId, kind: 'movie', title: itemId }; },
+                  playback() { return { url: 'https://api.example.com/v.mp4' }; },
+                  search(ctx, { query }) {
+                    if (ctx.config.token !== 'valid-token') {
+                      throw new ctx.Error('NeedsAuth', '请重新登录');
+                    }
+                    return {
+                      items: [{ id: 'live-1', kind: 'movie', title: '已登录命中 ' + query }],
+                      next: null
+                    };
+                  }
+                };
+            """.trimIndent()
+
+            val zip = ByteArrayOutputStream().use { baos ->
+                ZipOutputStream(baos).use { zos ->
+                    zos.putNextEntry(ZipEntry("manifest.json"))
+                    zos.write(manifestJson.toByteArray(Charsets.UTF_8))
+                    zos.closeEntry()
+                    zos.putNextEntry(ZipEntry("main.js"))
+                    zos.write(mainJs.toByteArray(Charsets.UTF_8))
+                    zos.closeEntry()
+                }
+                baos.toByteArray()
+            }
+            mgr.installFromBytes(zip, sourceUrl = "file:///reloginsearch.d3plugin")
+            val inst = mgr.createInstance(
+                pluginId = "com.example.reloginsearch",
+                displayName = "测试源",
+                config = mapOf("token" to JsonPrimitive("expired-token")),
+            )
+            val sourceId = PluginMediaSource.sourceIdFor(inst.instanceId)
+
+            // 1. Initial search on oldSrc hits NeedsAuth
+            val oldSrc = mgr.openSource(inst.instanceId)
+            val staleWrapper = PluginSearchableSource(oldSrc, "ReloginSearch", knownNeedsAuth = false)
+            val agg = SearchAggregator(
+                scope = aggScope,
+                ioDispatcher = Dispatchers.IO,
+                initialBatchWindowMs = 50L,
+            )
+            agg.search("潮", SearchKindFilter.ALL, listOf(staleWrapper))
+            val wait1 = System.currentTimeMillis() + 5_000L
+            while (!agg.state.value.allSettled && System.currentTimeMillis() < wait1) {
+                delay(20)
+            }
+            assertTrue(agg.state.value.visibleRows.single().status is SearchRowStatus.NeedsAuth)
+
+            // 2. Simulate PluginFormScreen re-login: updateInstanceConfig shuts down oldSrc,
+            //    then openSource(instId) creates live newSrc — BEFORE WallModel.sources updates!
+            mgr.updateInstanceConfig(
+                instanceId = inst.instanceId,
+                displayName = "测试源",
+                config = mapOf("token" to JsonPrimitive("valid-token")),
+            )
+            assertTrue("updateInstanceConfig must close old runtime", oldSrc.isClosed)
+            val liveNewSrc = mgr.openSource(inst.instanceId)
+            assertFalse(liveNewSrc.isClosed)
+            assertTrue(liveNewSrc !== oldSrc)
+
+            // 3. SearchScreen's post-login retry passes staleWrapper (closed!) + resolveFreshSource
+            agg.retrySource(
+                sourceId = sourceId,
+                updatedSource = staleWrapper,
+                resolveFreshSource = { id ->
+                    if (id == sourceId) {
+                        val live = mgr.openSource(inst.instanceId)
+                        PluginSearchableSource(live, "ReloginSearch", knownNeedsAuth = false)
+                    } else {
+                        null
+                    }
+                },
+                forceResolveFresh = true,
+            )
+            val wait2 = System.currentTimeMillis() + 5_000L
+            while (
+                (agg.state.value.visibleRows.single().refreshingInPlace ||
+                    agg.state.value.visibleRows.single().status is SearchRowStatus.NeedsAuth) &&
+                System.currentTimeMillis() < wait2
+            ) {
+                delay(20)
+            }
+            val row = agg.state.value.visibleRows.single()
+            assertTrue("Expected live Results after re-login retry, got: ${row.status}", row.status is SearchRowStatus.Results)
+            assertEquals(listOf("live-1"), (row.status as SearchRowStatus.Results).items.map { it.id })
+            assertTrue("Row mediaSource must be updated to liveNewSrc", row.mediaSource === liveNewSrc)
+        } finally {
+            aggScope.cancel()
+            runCatching { mgr.shutdownAll() }
+            rootDir.deleteRecursively()
         }
     }
 }

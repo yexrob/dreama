@@ -533,6 +533,7 @@
     <string name="library_source_missing">这个播放源已经不在了</string>
 
     <string name="detail_restart">从头播放</string>
+    <string name="detail_open_series">查看所属剧集</string>
 
     <string name="source_local_name">本机</string>
     <string name="source_local_desc">头显存储</string>

@@ -243,6 +243,31 @@ class PluginMediaSource(
     val isRuntimeInitialized: Boolean
         get() = runtime.isInitialized
 
+    /** True once this plugin source's underlying runtime has been closed/shut down. */
+    val isClosed: Boolean
+        get() = runtime.isClosed
+
+    /**
+     * Best-effort background warm-up (e.g. on entering Search) so optional `suggest()` can
+     * respond on a warm VM without cold-starting during typing. Uses a bounded ~5 s timeout,
+     * backs off briefly after initialization failure, never queues behind active calls, and
+     * silently ignores any initialization/auth/network errors.
+     */
+    suspend fun warmUpIfNeeded(
+        timeoutMsOverride: Long? = null,
+        backoffMs: Long = PluginRuntime.DEFAULT_WARM_UP_FAILURE_BACKOFF_MS,
+    ): Boolean {
+        if (runtime.isInitialized || runtime.isClosed) return runtime.isInitialized
+        return try {
+            stateGuard()
+            runtime.warmUpIfIdle(timeoutMsOverride = timeoutMsOverride, backoffMs = backoffMs)
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     override suspend fun reportProgress(
         itemId: String,
         positionMs: Long,

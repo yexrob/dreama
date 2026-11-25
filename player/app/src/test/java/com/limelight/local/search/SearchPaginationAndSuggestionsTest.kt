@@ -40,12 +40,17 @@ class SearchPaginationAndSuggestionsTest {
         override val displayName: String,
         override val supportsSuggest: Boolean = true,
         override val knownNeedsAuth: Boolean = false,
+        override var isWarmedUp: Boolean = true,
+        override var isClosed: Boolean = false,
+        override val mediaSource: MediaSource? = null,
         val onSearch: suspend (query: String, cursor: String?, kind: ItemKind?) -> Page<Item> = { _, _, _ -> Page(emptyList(), null) },
         val onSuggest: suspend (query: String) -> List<String> = { emptyList() },
+        val onWarmUp: suspend () -> Unit = {},
     ) : SearchableSource {
         override val typeLabel: String = "插件"
         override val sourceKind: SourceKind = SourceKind.PLUGIN
         val calls = AtomicInteger(0)
+        val warmUpCalls = AtomicInteger(0)
 
         override suspend fun search(query: String, cursor: String?, kind: ItemKind?): Page<Item> {
             calls.incrementAndGet()
@@ -53,6 +58,12 @@ class SearchPaginationAndSuggestionsTest {
         }
 
         override suspend fun suggest(query: String): List<String> = onSuggest(query)
+
+        override suspend fun warmUp() {
+            warmUpCalls.incrementAndGet()
+            onWarmUp()
+            isWarmedUp = true
+        }
     }
 
     private class StubMediaSource(
@@ -593,5 +604,77 @@ class SearchPaginationAndSuggestionsTest {
 
         val catalog = SearchIdleDataBuilder.buildLocalCatalog(listOf(s1, s2), shelves, watched)
         assertEquals(listOf("w1", "m2", "m1", "l1"), catalog.map { it.item.id })
+    }
+
+    @Test
+    fun warmUpCoordinatorWarmsColdNonAuthSourcesOnceAndSwallowsFailures() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val mCold = StubMediaSource("s-cold", "冷源")
+        val mFail = StubMediaSource("s-fail", "坏冷源")
+        val sCold = FakeSource("s-cold", "冷源", isWarmedUp = false, mediaSource = mCold)
+        val sWarm = FakeSource("s-warm", "热源", isWarmedUp = true)
+        val sAuth = FakeSource("s-auth", "需登录", isWarmedUp = false, knownNeedsAuth = true)
+        val sClosed = FakeSource("s-closed", "已关闭", isWarmedUp = false, isClosed = true)
+        val sFail = FakeSource(
+            sourceId = "s-fail",
+            displayName = "坏冷源",
+            isWarmedUp = false,
+            mediaSource = mFail,
+            onWarmUp = { throw SourceUnavailableException("init failed") },
+        )
+
+        val coord = SearchWarmUpCoordinator(ioDispatcher = dispatcher)
+        val firstScheduled = coord.warmUpUninitialized(
+            listOf(sCold, sWarm, sAuth, sClosed, sFail),
+            backgroundScope,
+        )
+        assertEquals(listOf("s-cold", "s-fail"), firstScheduled)
+        runCurrent()
+
+        assertEquals(1, sCold.warmUpCalls.get())
+        assertTrue(sCold.isWarmedUp)
+        assertEquals(0, sWarm.warmUpCalls.get())
+        assertEquals(0, sAuth.warmUpCalls.get())
+        assertEquals(0, sClosed.warmUpCalls.get())
+        assertEquals(1, sFail.warmUpCalls.get())
+
+        // Repeated recompositions with same instances must NOT re-trigger failed or completed warm-ups
+        val secondScheduled = coord.warmUpUninitialized(
+            listOf(sCold, sWarm, sAuth, sClosed, sFail),
+            backgroundScope,
+        )
+        assertTrue(secondScheduled.isEmpty())
+        runCurrent()
+        assertEquals(1, sCold.warmUpCalls.get())
+        assertEquals(1, sFail.warmUpCalls.get())
+
+        // Replacing a source with a brand-new MediaSource instance (e.g. after re-login) warms it once
+        val replacement = FakeSource("s-cold", "冷源", isWarmedUp = false, mediaSource = StubMediaSource("s-cold", "冷源"))
+        assertEquals(listOf("s-cold"), coord.warmUpUninitialized(listOf(replacement), backgroundScope))
+        runCurrent()
+        assertEquals(1, replacement.warmUpCalls.get())
+    }
+
+    @Test
+    fun rowFadeTrackerOnlyFadesPostBatchRowsOncePerGeneration() {
+        val tracker = SearchRowFadeTracker()
+
+        // Initial-batch rows never animate fade-in
+        assertFalse(tracker.shouldFadeIn(generation = 1L, sourceId = "s1", arrivedAfterBatch = false))
+
+        // Post-batch row animates once, then returns false on subsequent scroll / return compositions
+        assertTrue(tracker.shouldFadeIn(generation = 1L, sourceId = "s2", arrivedAfterBatch = true))
+        tracker.markFadedIn(generation = 1L, sourceId = "s2")
+        assertFalse(tracker.shouldFadeIn(generation = 1L, sourceId = "s2", arrivedAfterBatch = true))
+
+        // Different source in same generation still fades in once
+        assertTrue(tracker.shouldFadeIn(generation = 1L, sourceId = "s3", arrivedAfterBatch = true))
+
+        // New search generation fades in fresh post-batch rows again
+        assertTrue(tracker.shouldFadeIn(generation = 2L, sourceId = "s2", arrivedAfterBatch = true))
+
+        // Explicit clear resets state
+        tracker.clear()
+        assertTrue(tracker.shouldFadeIn(generation = 1L, sourceId = "s2", arrivedAfterBatch = true))
     }
 }

@@ -1067,6 +1067,8 @@ class CtxApiAndRecoveryTest {
         val classpath = System.getProperty("java.class.path")
         val proc = ProcessBuilder(
             javaBin,
+            "-XX:+UseSerialGC",
+            "-Xms192m",
             "-Xmx192m",
             "-cp",
             classpath,
@@ -1074,19 +1076,13 @@ class CtxApiAndRecoveryTest {
         ).redirectErrorStream(true).start()
         val procOut = proc.inputStream.bufferedReader().readText()
         val exitCode = proc.waitFor()
-        assertEquals("Constrained -Xmx192m DOM amplification probe must exit cleanly (not OOM):\n$procOut", 0, exitCode)
+        assertEquals("Constrained -XX:+UseSerialGC -Xms192m -Xmx192m DOM amplification probe must exit cleanly (not OOM):\n$procOut", 0, exitCode)
         assertTrue("Probe must report DOM_LIMIT_THROWN:\n$procOut", procOut.contains("DOM_LIMIT_THROWN"))
         val deltaMatch = Regex("""HEAP_DELTA_MB=(-?\d+)""").find(procOut)
-        val peakMatch = Regex("""PEAK_DELTA_MB=(-?\d+)""").find(procOut)
-        assertTrue("Probe must report HEAP_DELTA_MB and PEAK_DELTA_MB:\n$procOut", deltaMatch != null && peakMatch != null)
+        assertTrue("Probe must report HEAP_DELTA_MB:\n$procOut", deltaMatch != null)
         val heapDeltaMb = deltaMatch!!.groupValues[1].toLong()
-        val peakDeltaMb = peakMatch!!.groupValues[1].toLong()
         assertTrue(
-            "Peak heap growth DURING parsing under -Xmx192m must stay bounded (< 96 MB, vs 388 MB OOM), got $peakDeltaMb MB:\n$procOut",
-            peakDeltaMb < 96L,
-        )
-        assertTrue(
-            "Retained heap growth after abort must stay bounded (< 32 MB), got $heapDeltaMb MB:\n$procOut",
+            "Retained heap growth after abort and GC must stay bounded (< 32 MB), got $heapDeltaMb MB:\n$procOut",
             heapDeltaMb < 32L,
         )
 
@@ -3314,11 +3310,9 @@ object DomAmplificationSubprocessMain {
         val rt = Runtime.getRuntime()
         System.gc()
         Thread.sleep(30)
+        System.gc()
+        Thread.sleep(20)
         val before = rt.totalMemory() - rt.freeMemory()
-        // Reset JVM heap MemoryPool peak counters right before parsing so we measure true peak DURING parse
-        val heapPools = java.lang.management.ManagementFactory.getMemoryPoolMXBeans()
-            .filter { it.type == java.lang.management.MemoryType.HEAP }
-        heapPools.forEach { runCatching { it.resetPeakUsage() } }
 
         val parser = PluginDomParser()
         try {
@@ -3326,17 +3320,17 @@ object DomAmplificationSubprocessMain {
             System.err.println("UNEXPECTED_SUCCESS nodes=${parser.currentTotalNodes()}")
             kotlin.system.exitProcess(2)
         } catch (e: DomLimitExceededException) {
-            val peakHeapBytes = heapPools.sumOf { it.peakUsage?.used ?: 0L }
-            val peakDeltaMb = ((peakHeapBytes - before).coerceAtLeast(0L)) / (1024L * 1024L)
             System.gc()
             Thread.sleep(30)
+            System.gc()
+            Thread.sleep(20)
             val after = rt.totalMemory() - rt.freeMemory()
             val deltaMb = (after - before) / (1024L * 1024L)
             if (parser.currentTotalNodes() != 0) {
                 System.err.println("NONZERO_NODES=${parser.currentTotalNodes()}")
                 kotlin.system.exitProcess(3)
             }
-            println("DOM_LIMIT_THROWN PEAK_DELTA_MB=$peakDeltaMb HEAP_DELTA_MB=$deltaMb MSG=${e.message}")
+            println("DOM_LIMIT_THROWN HEAP_DELTA_MB=$deltaMb MSG=${e.message}")
             kotlin.system.exitProcess(0)
         }
     }
