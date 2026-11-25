@@ -320,6 +320,74 @@ class PluginRuntime(
         }
     }
 
+    /**
+     * Ensures `main.js` is compiled, registered, and optional `init(ctx)` has run.
+     * Used by developer-mode reload verification to surface syntax or `init` failures immediately.
+     */
+    suspend fun verifyInitialized(timeoutMsOverride: Long? = null) = callMutex.withLock {
+        if (closed) {
+            throw PluginErrorMapper.toException(
+                PluginErrorPayload(PluginErrorCode.INTERNAL),
+                context = androidContext,
+            )
+        }
+        ensureInitializedLocked(timeoutMsOverride ?: defaultTimeoutMs)
+    }
+
+    /**
+     * Compiles and registers `main.js` without invoking `init(ctx)` so developer mode can
+     * detect syntax/export errors before committing a reload over an existing working plugin.
+     */
+    internal suspend fun verifyModuleCompiles(timeoutMsOverride: Long? = null) = callMutex.withLock {
+        val timeoutMs = timeoutMsOverride ?: defaultTimeoutMs
+        val loader = moduleLoader {
+            load { name ->
+                when (name) {
+                    "plugin/main.js", "./main.js", "main.js" -> ModuleContent.Source(mainJsSource)
+                    else -> null
+                }
+            }
+        }
+        val qjs = QuickJs.create(jobDispatcher = dispatcher, moduleLoader = loader)
+        qjs.memoryLimit = memoryLimitBytes
+        qjs.maxStackSize = MAX_STACK_BYTES
+        qjs.evaluationTimeoutMillis = timeoutMs
+        val dl = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        callDeadlineNanos = dl
+        domParser.setCallDeadlineNanos(dl)
+        val token = PluginCrypto.hexEncode(PluginCrypto.randomBytes(16))
+        try {
+            bindHostBridge(qjs, token)
+            withContext(dispatcher) {
+                withTimeout(timeoutMs) {
+                    qjs.evaluate<Unit>(SHARED_BOOTSTRAP_JS, filename = "__d3_bootstrap.js")
+                    qjs.evaluate<Unit>(
+                        "__d3_seal_bootstrap(${JsonPrimitive(token)});",
+                        filename = "__d3_seal.js",
+                    )
+                    qjs.evaluate<Unit>(
+                        """
+                        import __plugin from 'plugin/main.js';
+                        globalThis.__d3_register(__plugin);
+                        """.trimIndent(),
+                        filename = "__d3_entry.js",
+                        asModule = true,
+                    )
+                }
+            }
+        } catch (t: Throwable) {
+            handleInvocationFailureLocked(qjs, "load", t, null)
+        } finally {
+            try { qjs.interruptEvaluation() } catch (_: Throwable) {}
+            try {
+                withContext(dispatcher) { qjs.close() }
+            } catch (_: Throwable) {
+                runCatching { qjs.close() }
+            }
+            callDeadlineNanos = Long.MAX_VALUE
+        }
+    }
+
     suspend fun reset() = callMutex.withLock {
         destroyRuntimeLocked(runDispose = true)
     }

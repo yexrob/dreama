@@ -417,7 +417,11 @@ data class PluginInstallPreview(
     val needsPermissionReconfirm: Boolean,
     val allowsWildcardLanAccess: Boolean,
     val permissionWarnings: List<String>,
-)
+    val existingSourceOrigin: String? = null,
+) {
+    val isDevSource: Boolean get() = PluginPackageManager.isDevOrigin(sourceOrigin)
+    val isFileSource: Boolean get() = PluginPackageManager.isFileOrigin(sourceOrigin)
+}
 
 /**
  * Persistence abstraction backed by Room ([RoomPluginStore]) in production and
@@ -572,6 +576,7 @@ class PluginPackageManager(
         zipBytes: ByteArray,
         sourceUrl: String? = null,
         repoUrl: String? = null,
+        devServerUrl: String? = null,
     ): PluginInstallPreview {
         if (zipBytes.size > PluginPackageArchive.MAX_PACKAGE_BYTES) {
             throw PackageInstallException("插件包超过大小限制（上限 8 MB）")
@@ -579,7 +584,18 @@ class PluginPackageManager(
         val actualSha = PluginRepositoryClient.sha256Hex(zipBytes)
         val archive = PluginPackageArchive.inspect(zipBytes)
         val manifest = ManifestParser.parseAndValidate(archive.manifestJson)
-        val newSourceOrigin = canonicalSourceOrigin(repoUrl = repoUrl, sourceUrl = sourceUrl)
+        if (manifest.minApp != null) {
+            val reqApp = SemVer.parse(manifest.minApp)
+            val curApp = SemVer.parse(appVersion)
+            if (reqApp != null && curApp != null && curApp < reqApp) {
+                throw PackageInstallException("此插件需要 depth3d ${manifest.minApp} 及以上版本（当前版本 $appVersion）")
+            }
+        }
+        val newSourceOrigin = canonicalSourceOrigin(
+            repoUrl = repoUrl,
+            sourceUrl = sourceUrl,
+            devServerUrl = devServerUrl,
+        )
         val existing = store.getPackage(manifest.id)
         val differentSource = existing != null && isDifferentSource(existing.sourceOrigin, newSourceOrigin)
         val isUpdate = existing != null && !differentSource
@@ -607,12 +623,14 @@ class PluginPackageManager(
             needsPermissionReconfirm = needsReconfirm,
             allowsWildcardLanAccess = manifest.permissions.allowsWildcardLanAccess,
             permissionWarnings = warnings,
+            existingSourceOrigin = existing?.sourceOrigin,
         )
     }
 
     /**
-     * Installs, upgrades (same source), or replaces (different source with
-     * explicit [confirmReplaceFromDifferentSource] = true) a `.d3plugin` archive.
+     * Installs, upgrades (same source), reloads (same dev server, allowing same version with
+     * new SHA-256), or replaces (different source with explicit [confirmReplaceFromDifferentSource] = true)
+     * a `.d3plugin` archive.
      */
     suspend fun installFromBytes(
         zipBytes: ByteArray,
@@ -622,6 +640,7 @@ class PluginPackageManager(
         expectedVersion: String? = null,
         expectedSha256: String? = null,
         confirmReplaceFromDifferentSource: Boolean = false,
+        devServerUrl: String? = null,
     ): InstallResult {
         if (zipBytes.size > PluginPackageArchive.MAX_PACKAGE_BYTES) {
             throw PackageInstallException("插件包超过大小限制（上限 8 MB）")
@@ -643,11 +662,16 @@ class PluginPackageManager(
             val reqApp = SemVer.parse(manifest.minApp)
             val curApp = SemVer.parse(appVersion)
             if (reqApp != null && curApp != null && curApp < reqApp) {
-                throw PackageInstallException("此插件需要 depth3d ${manifest.minApp} 及以上版本")
+                throw PackageInstallException("此插件需要 depth3d ${manifest.minApp} 及以上版本（当前版本 $appVersion）")
             }
         }
 
-        val newSourceOrigin = canonicalSourceOrigin(repoUrl = repoUrl, sourceUrl = sourceUrl)
+        val newSourceOrigin = canonicalSourceOrigin(
+            repoUrl = repoUrl,
+            sourceUrl = sourceUrl,
+            devServerUrl = devServerUrl,
+        )
+        val isDevSource = isDevOrigin(newSourceOrigin)
         val existing = store.getPackage(manifest.id)
         val now = clockMs()
 
@@ -666,12 +690,14 @@ class PluginPackageManager(
 
         if (isUpdate) {
             val prev = existing
-            val oldVer = SemVer.parse(prev.version)
-            val newVer = SemVer.parse(manifest.version)
-            if (oldVer != null && newVer != null && newVer <= oldVer) {
-                throw PackageInstallException(
-                    "更新版本号（${manifest.version}）必须大于已安装版本（${prev.version}）",
-                )
+            if (!isDevSource) {
+                val oldVer = SemVer.parse(prev.version)
+                val newVer = SemVer.parse(manifest.version)
+                if (oldVer != null && newVer != null && newVer <= oldVer) {
+                    throw PackageInstallException(
+                        "更新版本号（${manifest.version}）必须大于已安装版本（${prev.version}）",
+                    )
+                }
             }
             val prevApproved = PluginPermissions.fromJsonString(prev.approvedPermissionsJson)
             if (manifest.permissions.isExpandedFrom(prevApproved)) {
@@ -685,13 +711,34 @@ class PluginPackageManager(
             }
         }
 
-        // Write package files into a versioned directory before mutating DB state
-        val targetDir = File(File(packagesDir, manifest.id), manifest.version)
-        val stagingDir = File(File(packagesDir, manifest.id), ".staging-${UUID.randomUUID()}")
+        // Crash-safe staging write: NEVER delete existing.packagePath before DB commit.
+        // For same-version dev reloads, write into a fresh `<version>-<sha8>` sibling directory
+        // so the previous working files stay intact if writing fails or the process is killed.
+        val pluginRootDir = File(packagesDir, manifest.id)
+        pluginRootDir.mkdirs()
+        pluginRootDir.listFiles { f -> f.isDirectory && f.name.startsWith(".staging-") }
+            ?.forEach { runCatching { it.deleteRecursively() } }
+
+        val existingPath = existing?.packagePath?.let { File(it).absolutePath }
+        val baseDir = File(pluginRootDir, manifest.version)
+        val targetDir = if (existingPath != null && baseDir.absolutePath == existingPath) {
+            val sha8 = actualSha.take(8).lowercase(java.util.Locale.ROOT)
+            val shaDir = File(pluginRootDir, "${manifest.version}-$sha8")
+            if (shaDir.absolutePath == existingPath) {
+                File(pluginRootDir, "${manifest.version}-$sha8-${UUID.randomUUID().toString().take(6)}")
+            } else {
+                shaDir
+            }
+        } else {
+            baseDir
+        }
+
+        val stagingDir = File(pluginRootDir, ".staging-${UUID.randomUUID()}")
         try {
             writeArchiveToDir(archive, stagingDir)
-            if (targetDir.exists()) targetDir.deleteRecursively()
-            targetDir.parentFile?.mkdirs()
+            if (targetDir.exists() && targetDir.absolutePath != existingPath) {
+                targetDir.deleteRecursively()
+            }
             if (!stagingDir.renameTo(targetDir)) {
                 stagingDir.copyRecursively(targetDir, overwrite = true)
                 stagingDir.deleteRecursively()
@@ -708,9 +755,11 @@ class PluginPackageManager(
             store.deletePackage(manifest.id)
         } else {
             // Dispose any running runtimes for this plugin so they reload the updated code
+            // while preserving all existing instances (config, ctx.storage, cookies).
             shutdownRuntimesForPlugin(manifest.id)
         }
 
+        val effectiveSourceUrl = devServerUrl ?: sourceUrl
         val entity = InstalledPluginEntity(
             pluginId = manifest.id,
             name = manifest.name,
@@ -719,7 +768,7 @@ class PluginPackageManager(
             description = manifest.description,
             manifestJson = archive.manifestJson,
             packagePath = targetDir.absolutePath,
-            sourceUrl = if (differentSource) sourceUrl else (sourceUrl ?: existing?.sourceUrl),
+            sourceUrl = if (differentSource) effectiveSourceUrl else (effectiveSourceUrl ?: existing?.sourceUrl),
             repoUrl = if (differentSource) repoUrl else (repoUrl ?: existing?.repoUrl),
             sourceOrigin = newSourceOrigin,
             sha256 = actualSha,
@@ -731,9 +780,9 @@ class PluginPackageManager(
         )
         store.upsertPackage(entity)
 
-        // Remove superseded version directories on disk
-        if (existing != null && existing.packagePath != targetDir.absolutePath) {
-            runCatching { File(existing.packagePath).deleteRecursively() }
+        // Remove superseded version directories on disk AFTER Room commit succeeds
+        if (existingPath != null && existingPath != targetDir.absolutePath) {
+            runCatching { File(existingPath).deleteRecursively() }
         }
 
         return InstallResult(
@@ -743,6 +792,116 @@ class PluginPackageManager(
             needsPermissionReconfirm = needsReconfirm,
             replacedDifferentSource = differentSource,
         )
+    }
+
+    /**
+     * Verifies `main.js` inside [zipBytes] compiles and registers a default export in QuickJS
+     * without running `init(ctx)`. Logs any syntax/load failure to [PluginLogger] and returns
+     * the raw technical error string (with line number when available) for Developer Mode, or
+     * `null` on success.
+     */
+    suspend fun verifyArchiveMainJsSyntax(zipBytes: ByteArray): String? {
+        val archive = PluginPackageArchive.inspect(zipBytes)
+        val manifest = ManifestParser.parseAndValidate(archive.manifestJson)
+        val locale = PluginLocale.fromMap(archive.locales, deviceInfo.locale)
+        val logger = PluginLogger(pluginId = manifest.id, instanceId = "dev-check")
+        val tmpDir = File(rootDir, ".probe-${UUID.randomUUID()}")
+        val policy = NetworkPolicy(manifest.permissions, emptySet())
+        val storage = InstanceStorage(File(tmpDir, "storage.enc"), secretBox)
+        val cookieJar = PluginCookieJar(File(tmpDir, "cookies.enc"), secretBox)
+        val runtime = PluginRuntime(
+            manifest = locale.localizeManifest(manifest),
+            instanceId = "dev-check",
+            mainJsSource = archive.mainJs,
+            config = emptyMap(),
+            fetchGateway = PluginFetchGateway(policy, cookieJar, okHttpClient),
+            storage = storage,
+            cookieJar = cookieJar,
+            logger = logger,
+            locale = locale,
+            deviceInfo = deviceInfo,
+            androidContext = androidContext,
+        )
+        return try {
+            runtime.verifyModuleCompiles()
+            null
+        } catch (t: Throwable) {
+            val raw = extractRawTechnicalError(t)
+            logger.error("main.js load error: $raw")
+            raw
+        } finally {
+            runCatching { runtime.close() }
+            runCatching { tmpDir.deleteRecursively() }
+        }
+    }
+
+    /**
+     * Verifies an installed plugin loads and initializes cleanly (`main.js` + optional `init(ctx)`).
+     * When instances exist, verifies the first enabled instance with its real config/storage;
+     * otherwise probes in a temporary runtime (ignoring `NeedsSetup` / `NeedsAuth` since no config
+     * is filled yet). Returns `null` on success or the raw technical error string for Developer Mode.
+     */
+    suspend fun verifyInstalledPluginLoad(
+        pluginId: String,
+        dnsResolver: ((String) -> List<java.net.InetAddress>)? = null,
+    ): String? {
+        val pkg = store.getPackage(pluginId) ?: return null
+        if (!pkg.enabled || pkg.needsPermissionReconfirm) return null
+        val instances = store.listInstancesForPlugin(pluginId).filter { it.enabled }
+        if (instances.isNotEmpty()) {
+            return try {
+                val src = openSource(instances.first().instanceId, dnsResolver = dnsResolver)
+                src.verifyInitialized()
+                null
+            } catch (e: SourceNeedsSetupException) {
+                null
+            } catch (e: com.limelight.local.media.SourceNeedsAuthException) {
+                null
+            } catch (t: Throwable) {
+                extractRawTechnicalError(t)
+            }
+        }
+        val manifest = ManifestParser.parseAndValidate(pkg.manifestJson)
+        val pkgDir = File(pkg.packagePath)
+        val mainJs = File(pkgDir, "main.js").readText(Charsets.UTF_8)
+        val locale = PluginLocale.fromPackageDir(pkgDir, deviceInfo.locale)
+        val logger = PluginLogger(pluginId = manifest.id, instanceId = "dev-probe")
+        val tmpDir = File(rootDir, ".probe-${UUID.randomUUID()}")
+        val policy = if (dnsResolver != null) {
+            NetworkPolicy(manifest.permissions, emptySet(), dnsResolver)
+        } else {
+            NetworkPolicy(manifest.permissions, emptySet())
+        }
+        val storage = InstanceStorage(File(tmpDir, "storage.enc"), secretBox)
+        val cookieJar = PluginCookieJar(File(tmpDir, "cookies.enc"), secretBox)
+        val runtime = PluginRuntime(
+            manifest = locale.localizeManifest(manifest),
+            instanceId = "dev-probe",
+            mainJsSource = mainJs,
+            config = emptyMap(),
+            fetchGateway = PluginFetchGateway(policy, cookieJar, okHttpClient),
+            storage = storage,
+            cookieJar = cookieJar,
+            logger = logger,
+            locale = locale,
+            deviceInfo = deviceInfo,
+            androidContext = androidContext,
+        )
+        return try {
+            runtime.verifyInitialized()
+            null
+        } catch (e: SourceNeedsSetupException) {
+            null
+        } catch (e: com.limelight.local.media.SourceNeedsAuthException) {
+            null
+        } catch (t: Throwable) {
+            val raw = extractRawTechnicalError(t)
+            logger.error("init error: $raw")
+            raw
+        } finally {
+            runCatching { runtime.close() }
+            runCatching { tmpDir.deleteRecursively() }
+        }
     }
 
     suspend fun installFromFile(
@@ -1041,7 +1200,45 @@ class PluginPackageManager(
 
     companion object {
         const val LOCAL_FILE_ORIGIN = "local-file"
+        const val DEV_ORIGIN_PREFIX = "dev:"
         const val WILDCARD_LAN_WARNING = "可访问你局域网里的任意设备"
+
+        fun isDevOrigin(sourceOrigin: String): Boolean =
+            sourceOrigin.startsWith(DEV_ORIGIN_PREFIX)
+
+        fun isFileOrigin(sourceOrigin: String): Boolean =
+            sourceOrigin == LOCAL_FILE_ORIGIN
+
+        fun devServerBaseUrlFromOrigin(sourceOrigin: String): String? =
+            if (isDevOrigin(sourceOrigin)) sourceOrigin.removePrefix(DEV_ORIGIN_PREFIX).takeIf { it.isNotBlank() } else null
+
+        fun devDisplayAddressFromOrigin(sourceOrigin: String): String? {
+            val base = devServerBaseUrlFromOrigin(sourceOrigin) ?: return null
+            val parsed = base.toHttpUrlOrNull() ?: return base
+            val hostFmt = if (parsed.host.contains(':')) "[${parsed.host}]" else parsed.host
+            return "$hostFmt:${parsed.port}"
+        }
+
+        fun extractRawTechnicalError(error: Throwable): String {
+            var cur: Throwable? = error
+            var deepest: Throwable = error
+            while (cur != null) {
+                if (cur is RepositoryVerificationException && !cur.technicalDetail.isNullOrBlank()) {
+                    return cur.technicalDetail
+                }
+                if (cur is ManifestValidationException) {
+                    return cur.message ?: cur.errors.joinToString("\n")
+                }
+                if (cur is com.dokar.quickjs.QuickJsException) {
+                    return cur.message ?: cur.toString()
+                }
+                deepest = cur
+                cur = cur.cause
+            }
+            return deepest.message?.takeIf { it.isNotBlank() }
+                ?: error.message?.takeIf { it.isNotBlank() }
+                ?: error.javaClass.simpleName
+        }
 
         /**
          * Returns true when installing from [newSourceOrigin] over an already
@@ -1063,11 +1260,27 @@ class PluginPackageManager(
 
         /**
          * Computes canonical source identity for `(pluginId, sourceOrigin)` (§11.4):
+         * - Dev server installs identify as `dev:<scheme>://<host>:<port>` (distinct from repo/builtin/file)
          * - Repository installs identify by normalized repository index URL (query/fragment stripped)
          * - Direct HTTP(S) URL installs identify by full normalized URL stripped of query & fragment
          * - Local file installs identify as [LOCAL_FILE_ORIGIN] (never treated as same-source update)
          */
-        fun canonicalSourceOrigin(repoUrl: String?, sourceUrl: String?): String {
+        fun canonicalSourceOrigin(
+            repoUrl: String?,
+            sourceUrl: String?,
+            devServerUrl: String? = null,
+        ): String {
+            if (!devServerUrl.isNullOrBlank()) {
+                val parsed = devServerUrl.trim().toHttpUrlOrNull()
+                return if (parsed != null) {
+                    val portPart = if (parsed.port == HttpUrl.defaultPort(parsed.scheme)) "" else ":${parsed.port}"
+                    val host = NetworkPolicy.canonicalizeHost(parsed.host)
+                    val hostFormatted = if (host.contains(':')) "[$host]" else host
+                    "$DEV_ORIGIN_PREFIX${parsed.scheme.lowercase()}://$hostFormatted$portPart"
+                } else {
+                    "$DEV_ORIGIN_PREFIX${devServerUrl.trim()}"
+                }
+            }
             if (!repoUrl.isNullOrBlank()) {
                 val parsed = repoUrl.trim().toHttpUrlOrNull()
                 return if (parsed != null) {

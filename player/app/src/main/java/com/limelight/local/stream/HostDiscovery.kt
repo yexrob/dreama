@@ -20,6 +20,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.Inet4Address
@@ -589,16 +590,19 @@ enum class UdpDiscoveryProtocol(
     val wireValue: String,
     val probeMessage: String,
     val port: Int = 7359,
+    val manifestAllowed: Boolean = true,
 ) {
-    JELLYFIN("udp:jellyfin", "who is JellyfinServer?", 7359),
-    EMBY("udp:emby", "who is EmbyServer?", 7359),
+    JELLYFIN("udp:jellyfin", "who is JellyfinServer?", 7359, manifestAllowed = true),
+    EMBY("udp:emby", "who is EmbyServer?", 7359, manifestAllowed = true),
+    PLUGIN_DEV("udp:d3plugin-dev", "depth3d-plugin-dev-discover-v1", 18787, manifestAllowed = false),
     ;
 
     companion object {
         const val DEFAULT_PORT = 7359
+        const val PLUGIN_DEV_PORT = 18787
 
         fun fromWire(raw: String?): UdpDiscoveryProtocol? =
-            entries.firstOrNull { it.wireValue.equals(raw?.trim(), ignoreCase = true) }
+            entries.firstOrNull { it.manifestAllowed && it.wireValue.equals(raw?.trim(), ignoreCase = true) }
     }
 }
 
@@ -683,6 +687,7 @@ object UdpLanServerDiscovery {
                             protocol = protocol,
                             payload = payload,
                             allowLoopbackForTesting = allowLoopbackForTesting,
+                            senderAddress = packet.address?.hostAddress,
                         ) ?: continue
                         val idKey = parsed.txt["id"]?.lowercase(Locale.ROOT) ?: parsed.endpointKey
                         if (idKey !in foundById) {
@@ -714,8 +719,34 @@ object UdpLanServerDiscovery {
         protocol: UdpDiscoveryProtocol,
         payload: String,
         allowLoopbackForTesting: Boolean = false,
+        senderAddress: String? = null,
     ): DiscoveredLanService? {
         val obj = runCatching { json.parseToJsonElement(payload.trim()) as? JsonObject }.getOrNull() ?: return null
+        if (protocol == UdpDiscoveryProtocol.PLUGIN_DEV) {
+            val id = (obj["id"] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+            val version = (obj["version"] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+            val port = (obj["port"] as? JsonPrimitive)?.intOrNull?.takeIf { it in 1..65535 } ?: return null
+            val name = (obj["name"] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() } ?: id
+            val rawSender = senderAddress?.trim()?.removePrefix("[")?.removeSuffix("]")?.substringBefore('%')
+                ?.takeIf { it.isNotEmpty() } ?: return null
+            if (!isPrivateLanIpLiteral(rawSender, allowLoopbackForTesting)) return null
+            val hostFmt = HttpHostProtocolClient.formatAuthorityHost(rawSender)
+            val normalizedUrl = "http://$hostFmt:$port"
+            val dedupeId = "${id.lowercase(Locale.ROOT)}@${RawComputer.normalizeAddress(rawSender)}:$port"
+            return DiscoveredLanService(
+                serviceType = protocol.wireValue,
+                serviceName = name,
+                address = rawSender,
+                port = port,
+                txt = mapOf(
+                    "id" to dedupeId,
+                    "pluginId" to id,
+                    "version" to version,
+                    "scheme" to "http",
+                    "address" to normalizedUrl,
+                ),
+            )
+        }
         val id = (obj["Id"] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() } ?: return null
         val rawAddr = (obj["Address"] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() } ?: return null
         val parsedAddr = parsePrivateServerAddress(rawAddr, allowLoopbackForTesting) ?: return null

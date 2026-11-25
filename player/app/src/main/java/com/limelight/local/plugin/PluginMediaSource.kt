@@ -363,6 +363,10 @@ class PluginMediaSource(
         onLoggedOut?.invoke() ?: Unit
     }
 
+    suspend fun verifyInitialized() = guarded {
+        runtime.verifyInitialized()
+    }
+
     suspend fun shutdown() {
         runtime.shutdown()
     }
