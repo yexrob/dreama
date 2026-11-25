@@ -919,8 +919,8 @@ test('Round 3: shared zip-vectors.json (incl. dual.zip PoC) and shared dom-vecto
   }
   assert.ok(knownDiffCount >= 6, 'Expected at least 6 knownDifference vectors (select, ws, template)');
 
-  // Round 9 Items #2 & #3: Run ALL shared estimatedBytesVectors from dom-vectors.json (±5% parity with Android)
-  assert.ok(Array.isArray(domVectors.estimatedBytesVectors) && domVectors.estimatedBytesVectors.length >= 14);
+  // Round 9 & 10: Run ALL shared estimatedBytesVectors from dom-vectors.json (±5% parity with Android)
+  assert.ok(Array.isArray(domVectors.estimatedBytesVectors) && domVectors.estimatedBytesVectors.length >= 24);
   for (const ev of domVectors.estimatedBytesVectors) {
     const inp = ev.input ?? ((ev.prefix || '') + (ev.unit || '').repeat(ev.repeat || 1) + (ev.suffix || ''));
     const tol = ev.tolerancePct ?? 5;
@@ -1500,6 +1500,27 @@ test('Round 8 & 9: host-model parity (2 MB XML/HTML real pages + 150k simple ele
     } finally {
       tightV8.clear();
     }
+    assert.equal(currentV8SafetyMemoryBytes(), 0);
+  }
+
+  // 6. Round 10 Item #3: accept/reject parity on 2 MB `entity` (host rejects -> kit rejects)
+  //    and 2 MB `xtextent` (host accepts -> kit accepts)
+  {
+    const p = new PluginDomParser();
+    try {
+      const entityFull = '<p>' + '&lt;<!>'.repeat(Math.floor((2 * 1024 * 1024 - 16) / 7)) + '</p>';
+      assert.throws(() => p.parseHtml(entityFull), DomLimitExceededError);
+      assert.equal(p.docCount, 0);
+      assert.equal(p.currentVmMemoryBytes, 0);
+
+      const xtextentFull = '<r>' + 'x&amp;'.repeat(Math.floor((2 * 1024 * 1024 - 128) / 6)) + '</r>';
+      const rx = p.parseXml(xtextentFull);
+      assert.ok(rx > 0, '2 MB xtextent XML must be accepted by kit just like Android host');
+      assert.ok(p.currentEstimatedDomBytes <= 2 * 1024 * 1024, `xtextent should coalesce to ~1 MB, got ${p.currentEstimatedDomBytes}`);
+    } finally {
+      p.clear();
+    }
+    assert.equal(currentProcessDomMemoryBytes(), 0);
     assert.equal(currentV8SafetyMemoryBytes(), 0);
   }
 });

@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.AtomicLong
 
 class DomLimitExceededException(message: String) : IllegalStateException(message)
 class DomTimeoutException(message: String) : IllegalStateException(message)
+class DomHostIncompatibleException(message: String) : IllegalStateException(message)
 
 /**
  * Process-wide DOM memory ledger bounding total live DOM bytes across ALL active
@@ -186,6 +187,7 @@ class PluginDomParser(
 
     fun parseHtml(html: String): Long {
         checkDeadline(callDeadlineNanos)
+        requireJsoupReflectionReady()
         val budgetBytes = enforcePreParseLimits(html)
         val parser = Parser.htmlParser()
             .settings(ParseSettings.htmlDefault)
@@ -202,6 +204,7 @@ class PluginDomParser(
 
     fun parseXml(xml: String): Long {
         checkDeadline(callDeadlineNanos)
+        requireJsoupReflectionReady()
         val budgetBytes = enforcePreParseLimits(xml)
         val sanitized = escapeUndefinedXmlEntities(xml, callDeadlineNanos)
         val parser = Parser.xmlParser()
@@ -777,7 +780,7 @@ class PluginDomParser(
         var abortError: RuntimeException? = null
         val inspectedChildIndex = IdentityHashMap<Element, Int>()
         val lastElemChild = IdentityHashMap<Element, Element>()
-        val seenStr = arrayOfNulls<String>(STR_DEDUP_SLOTS)
+        val seenStr = IdentityStringSet()
         val seenCustomTags = IdentityHashMap<Tag, Boolean>()
 
         fun checkOverBudget(budgetBytes: Long) {
@@ -964,6 +967,11 @@ class PluginDomParser(
             }
             // Detach the parse-time Parser (TreeBuilder + TagSet + Tokens) so they are GC-eligible immediately.
             doc.parser(if (isXml) DETACHED_XML_PARSER else DETACHED_HTML_PARSER)
+            // Drop streaming dedup tables before exact recount so the two sets never coexist in heap.
+            liveState.seenStr.clear()
+            liveState.seenCustomTags.clear()
+            liveState.inspectedChildIndex.clear()
+            liveState.lastElemChild.clear()
             return estimateDocumentExact(doc, budgetBytes, deadline)
         } finally {
             // Release in-flight streaming reservation; registerDocument atomically reserves the exact final charge.
@@ -990,8 +998,70 @@ class PluginDomParser(
         const val MAX_NTH_ABS = 1_000_000
         const val MAX_SAFE_JS_HANDLE_ID = 9_007_199_254_740_991L
         private const val MAX_NESTING_DEPTH = 512
-        private const val STR_DEDUP_SLOTS = 4096
         private const val PROCESS_RESERVE_CHUNK_BYTES = 256L * 1024L
+
+        /**
+         * Open-addressed exact identity set for `String` references (1 ref slot per entry,
+         * never evicts). Membership is 100% invariant to `System.identityHashCode` history,
+         * while avoiding O(N^2) content-hash collisions when hundreds of thousands of fresh
+         * `String` instances share identical text (e.g. comments or entity-decoded nodes).
+         */
+        internal class IdentityStringSet(initialCapacity: Int = 1024) {
+            private var table: Array<String?> = arrayOfNulls(initialCapacity)
+            private var mask: Int = initialCapacity - 1
+            private var size: Int = 0
+            private var threshold: Int = (initialCapacity * 2) / 3
+
+            /** Returns true if [s] was NOT previously present (and inserts it). */
+            fun add(s: String): Boolean {
+                val tbl = table
+                var idx = mix(System.identityHashCode(s)) and mask
+                while (true) {
+                    val cur = tbl[idx]
+                    if (cur == null) {
+                        tbl[idx] = s
+                        if (++size >= threshold) rehash()
+                        return true
+                    }
+                    if (cur === s) return false
+                    idx = (idx + 1) and mask
+                }
+            }
+
+            fun clear() {
+                table = EMPTY_STRING_TABLE
+                mask = 0
+                size = 0
+                threshold = 0
+            }
+
+            private fun rehash() {
+                val old = table
+                val newCap = old.size shl 1
+                val next = arrayOfNulls<String>(newCap)
+                val newMask = newCap - 1
+                for (s in old) {
+                    if (s != null) {
+                        var idx = mix(System.identityHashCode(s)) and newMask
+                        while (next[idx] != null) idx = (idx + 1) and newMask
+                        next[idx] = s
+                    }
+                }
+                table = next
+                mask = newMask
+                threshold = (newCap * 2) / 3
+            }
+
+            companion object {
+                private val EMPTY_STRING_TABLE = emptyArray<String?>()
+
+                private fun mix(h: Int): Int {
+                    var x = h * -0x61c88647
+                    x = x xor (x ushr 16)
+                    return x
+                }
+            }
+        }
 
         internal val GLOBAL_PROCESS_LEDGER = ProcessDomMemoryLedger()
 
@@ -1018,28 +1088,57 @@ class PluginDomParser(
         private val DETACHED_XML_PARSER: Parser = Parser.xmlParser()
 
         // Cached reflection accessors into app-owned Jsoup container fields (protected by
-        // proguard-rules.pro; pure-public-API fallbacks are used if any field is unavailable).
-        private val JSOUP_ATTRS_SIZE_FIELD: Field? = runCatching {
+        // proguard-rules.pro). Checked ONCE at class init; ANY missing field fails closed
+        // (rejects parse with DomHostIncompatibleException rather than silently underestimating).
+        internal val JSOUP_ATTRS_SIZE_FIELD: Field? = runCatching {
             Attributes::class.java.getDeclaredField("size").apply { isAccessible = true }
         }.getOrNull()
-        private val JSOUP_ATTRS_KEYS_FIELD: Field? = runCatching {
+        internal val JSOUP_ATTRS_KEYS_FIELD: Field? = runCatching {
             Attributes::class.java.getDeclaredField("keys").apply { isAccessible = true }
         }.getOrNull()
-        private val JSOUP_EL_ATTRS_FIELD: Field? = runCatching {
+        internal val JSOUP_EL_ATTRS_FIELD: Field? = runCatching {
             Element::class.java.getDeclaredField("attributes").apply { isAccessible = true }
         }.getOrNull()
-        private val JSOUP_EL_CHILDS_FIELD: Field? = runCatching {
+        internal val JSOUP_EL_CHILDS_FIELD: Field? = runCatching {
             Element::class.java.getDeclaredField("childNodes").apply { isAccessible = true }
         }.getOrNull()
-        private val JSOUP_EMPTY_NODE_LIST: Any? = runCatching {
+        internal val JSOUP_EMPTY_NODE_LIST: Any? = runCatching {
             Element::class.java.getDeclaredField("EmptyNodeList").apply { isAccessible = true }.get(null)
         }.getOrNull()
-        private val JSOUP_LEAF_VALUE_FIELD: Field? = runCatching {
+        internal val JSOUP_LEAF_VALUE_FIELD: Field? = runCatching {
             LeafNode::class.java.getDeclaredField("value").apply { isAccessible = true }
         }.getOrNull()
-        private val JSOUP_FORM_LINKED_FIELD: Field? = runCatching {
+        internal val JSOUP_FORM_LINKED_FIELD: Field? = runCatching {
             FormElement::class.java.getDeclaredField("linkedEls").apply { isAccessible = true }
         }.getOrNull()
+
+        internal val JSOUP_MISSING_FIELDS: List<String> = buildList {
+            if (JSOUP_ATTRS_SIZE_FIELD == null) add("Attributes.size")
+            if (JSOUP_ATTRS_KEYS_FIELD == null) add("Attributes.keys")
+            if (JSOUP_EL_ATTRS_FIELD == null) add("Element.attributes")
+            if (JSOUP_EL_CHILDS_FIELD == null) add("Element.childNodes")
+            if (JSOUP_EMPTY_NODE_LIST == null) add("Element.EmptyNodeList")
+            if (JSOUP_LEAF_VALUE_FIELD == null) add("LeafNode.value")
+            if (JSOUP_FORM_LINKED_FIELD == null) add("FormElement.linkedEls")
+        }
+        internal val JSOUP_REFLECTION_READY: Boolean = JSOUP_MISSING_FIELDS.isEmpty()
+
+        @Volatile
+        internal var simulatedMissingJsoupFieldForTesting: String? = null
+
+        internal fun requireJsoupReflectionReady() {
+            val simulated = simulatedMissingJsoupFieldForTesting
+            if (simulated != null) {
+                throw DomHostIncompatibleException(
+                    "DOM 解析器内部字段不可用（模拟缺失：$simulated）；已拒绝解析以避免内存记账低估",
+                )
+            }
+            if (!JSOUP_REFLECTION_READY) {
+                throw DomHostIncompatibleException(
+                    "DOM 解析器不兼容当前 Jsoup 版本，缺少内部字段：${JSOUP_MISSING_FIELDS.joinToString(", ")}；已拒绝解析以避免内存记账低估",
+                )
+            }
+        }
 
         private val XML_BUILTIN_ENTITIES = setOf("amp", "lt", "gt", "quot", "apos")
         private val HTML_SKIP_TEXT_TAGS = setOf("script", "style")
@@ -1069,36 +1168,34 @@ class PluginDomParser(
          * array capacity (0 when no [Attributes] object is retained).
          */
         internal fun compactElementAttributes(el: Element): Int {
+            requireJsoupReflectionReady()
+            val elAttrsField = JSOUP_EL_ATTRS_FIELD!!
+            val attrsSizeField = JSOUP_ATTRS_SIZE_FIELD!!
+            val attrsKeysField = JSOUP_ATTRS_KEYS_FIELD!!
             val attrCount = el.attributesSize()
             if (attrCount == 0) {
                 el.clearAttributes()
-                val remaining = JSOUP_EL_ATTRS_FIELD?.get(el) as? Attributes ?: return 0
-                val rawSize = JSOUP_ATTRS_SIZE_FIELD?.getInt(remaining) ?: 0
+                val remaining = elAttrsField.get(el) as? Attributes ?: return 0
+                val rawSize = attrsSizeField.getInt(remaining)
                 if (rawSize <= 0) return 0
-                val keysArr = JSOUP_ATTRS_KEYS_FIELD?.get(remaining) as? Array<*>
-                val cap = keysArr?.size ?: rawSize
-                if (cap > rawSize) {
-                    JSOUP_EL_ATTRS_FIELD.set(el, remaining.clone())
+                val keysArr = attrsKeysField.get(remaining) as? Array<*>
+                    ?: throw DomHostIncompatibleException("Jsoup Attributes.keys 字段类型不符合预期")
+                if (keysArr.size > rawSize) {
+                    elAttrsField.set(el, remaining.clone())
                     return rawSize
                 }
-                return cap
+                return keysArr.size
             }
-            val attrsObj = JSOUP_EL_ATTRS_FIELD?.get(el) as? Attributes
-            if (attrsObj != null && JSOUP_ATTRS_KEYS_FIELD != null && JSOUP_ATTRS_SIZE_FIELD != null) {
-                val rawSize = JSOUP_ATTRS_SIZE_FIELD.getInt(attrsObj)
-                val keysArr = JSOUP_ATTRS_KEYS_FIELD.get(attrsObj) as? Array<*>
-                val cap = keysArr?.size ?: rawSize
-                if (cap > rawSize) {
-                    JSOUP_EL_ATTRS_FIELD.set(el, attrsObj.clone())
-                    return rawSize
-                }
-                return cap
+            val attrsObj = elAttrsField.get(el) as? Attributes
+                ?: throw DomHostIncompatibleException("Jsoup Element.attributes 字段在存在属性时为空")
+            val rawSize = attrsSizeField.getInt(attrsObj)
+            val keysArr = attrsKeysField.get(attrsObj) as? Array<*>
+                ?: throw DomHostIncompatibleException("Jsoup Attributes.keys 字段类型不符合预期")
+            if (keysArr.size > rawSize) {
+                elAttrsField.set(el, attrsObj.clone())
+                return rawSize
             }
-            // Pure-public-API fallback if Jsoup field reflection is unavailable
-            val cloned = el.attributes().clone()
-            el.clearAttributes()
-            el.attributes().addAll(cloned)
-            return maxOf(3, attrCount)
+            return keysArr.size
         }
 
         /**
@@ -1106,16 +1203,20 @@ class PluginDomParser(
          * and [DocumentType]) when `keys.length > size` (e.g. duplicate attributes on `<?xml ...?>`).
          */
         internal fun compactLeafAttributes(node: LeafNode): Int {
-            val lv = JSOUP_LEAF_VALUE_FIELD?.get(node) as? Attributes ?: return 0
-            val rawSize = JSOUP_ATTRS_SIZE_FIELD?.getInt(lv) ?: lv.size()
+            requireJsoupReflectionReady()
+            val leafValField = JSOUP_LEAF_VALUE_FIELD!!
+            val attrsSizeField = JSOUP_ATTRS_SIZE_FIELD!!
+            val attrsKeysField = JSOUP_ATTRS_KEYS_FIELD!!
+            val lv = leafValField.get(node) as? Attributes ?: return 0
+            val rawSize = attrsSizeField.getInt(lv)
             if (rawSize <= 0) return 0
-            val keysArr = JSOUP_ATTRS_KEYS_FIELD?.get(lv) as? Array<*>
-            val cap = keysArr?.size ?: rawSize
-            if (cap > rawSize) {
-                JSOUP_LEAF_VALUE_FIELD.set(node, lv.clone())
+            val keysArr = attrsKeysField.get(lv) as? Array<*>
+                ?: throw DomHostIncompatibleException("Jsoup Attributes.keys 字段类型不符合预期")
+            if (keysArr.size > rawSize) {
+                leafValField.set(node, lv.clone())
                 return rawSize
             }
-            return cap
+            return keysArr.size
         }
 
         /**
@@ -1125,15 +1226,20 @@ class PluginDomParser(
          * call `ArrayList.trimToSize()` so backing array capacity equals exact `childNodeSize()`.
          */
         internal fun compactChildNodes(el: Element): Int {
+            requireJsoupReflectionReady()
+            val childsField = JSOUP_EL_CHILDS_FIELD!!
+            val emptyList = JSOUP_EMPTY_NODE_LIST!!
             val cc = el.childNodeSize()
-            val nl = JSOUP_EL_CHILDS_FIELD?.get(el) as? ArrayList<*>
+            val raw = childsField.get(el)
             if (cc == 0) {
-                if (nl != null && JSOUP_EMPTY_NODE_LIST != null && nl !== JSOUP_EMPTY_NODE_LIST) {
-                    JSOUP_EL_CHILDS_FIELD.set(el, JSOUP_EMPTY_NODE_LIST)
+                if (raw !== emptyList) {
+                    childsField.set(el, emptyList)
                 }
                 return 0
             }
-            nl?.trimToSize()
+            val nl = raw as? ArrayList<*>
+                ?: throw DomHostIncompatibleException("Jsoup Element.childNodes 字段类型不是预期的 ArrayList")
+            nl.trimToSize()
             return cc
         }
 
@@ -1143,7 +1249,9 @@ class PluginDomParser(
          */
         internal fun compactFormElement(el: Element) {
             if (el !is FormElement) return
-            val linked = JSOUP_FORM_LINKED_FIELD?.get(el) as? ArrayList<*> ?: return
+            requireJsoupReflectionReady()
+            val linked = JSOUP_FORM_LINKED_FIELD!!.get(el) as? ArrayList<*>
+                ?: throw DomHostIncompatibleException("Jsoup FormElement.linkedEls 字段类型不是预期的 ArrayList")
             if (linked.isNotEmpty()) linked.clear()
             linked.trimToSize()
         }
@@ -1160,11 +1268,9 @@ class PluginDomParser(
             return 32L + 16L + align8(childCount.toLong() * 4L)
         }
 
-        internal fun exactStrBytes(s: String?, seen: Array<String?>): Long {
+        internal fun exactStrBytes(s: String?, seen: IdentityStringSet): Long {
             if (s == null || s.isEmpty()) return 0L
-            val slot = (System.identityHashCode(s) * -0x61c88647) ushr 20
-            if (seen[slot] === s) return 0L
-            seen[slot] = s
+            if (!seen.add(s)) return 0L
             val len = s.length
             var wide = false
             var i = 0
@@ -1198,7 +1304,7 @@ class PluginDomParser(
             return s
         }
 
-        internal fun estimateNonElementNodeBytes(node: Node, seenStr: Array<String?>): Long = when (node) {
+        internal fun estimateNonElementNodeBytes(node: Node, seenStr: IdentityStringSet): Long = when (node) {
             is CDataNode -> LEAF_NODE_BASE_BYTES + exactStrBytes(node.text(), seenStr)
             is TextNode -> LEAF_NODE_BASE_BYTES + exactStrBytes(node.wholeText, seenStr)
             is DataNode -> LEAF_NODE_BASE_BYTES + exactStrBytes(node.wholeData, seenStr)
@@ -1257,9 +1363,10 @@ class PluginDomParser(
             estimateDocumentExact(doc, Long.MAX_VALUE, Long.MAX_VALUE).estimatedBytes
 
         private fun estimateDocumentExact(doc: Document, budgetBytes: Long, deadlineNanos: Long): ParsedDocStats {
+            requireJsoupReflectionReady()
             var bytes = DOC_BASE_BYTES
             var elemCount = 0
-            val seenStr = arrayOfNulls<String>(STR_DEDUP_SLOTS)
+            val seenStr = IdentityStringSet()
             val seenCustomTags = IdentityHashMap<Tag, Boolean>()
             val stack = ArrayDeque<Node>()
             val rootAttrCap = compactElementAttributes(doc)

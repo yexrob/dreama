@@ -30,6 +30,7 @@ import okio.Buffer
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -1314,10 +1315,10 @@ class CtxApiAndRecoveryTest {
         }
         assertTrue("Expected at least 6 knownDifference vectors (select, ws, template)", knownDiffCount >= 6)
 
-        // 1b. Round 9 Item #2 & #3: Run ALL shared estimatedBytesVectors from dom-vectors.json
+        // 1b. Round 9 & 10: Run ALL shared estimatedBytesVectors from dom-vectors.json
         //     asserting Android & plugin-kit agree on estimated DOM bytes within ±5%.
         val estVectors = vecRoot["estimatedBytesVectors"]!!.jsonArray
-        assertTrue("Expected at least 14 shared estimatedBytesVectors", estVectors.size >= 14)
+        assertTrue("Expected at least 24 shared estimatedBytesVectors", estVectors.size >= 24)
         for (evEl in estVectors) {
             val ev = evEl.jsonObject
             val name = ev["name"]!!.jsonPrimitive.content
@@ -1714,6 +1715,205 @@ class CtxApiAndRecoveryTest {
         val r8Exit = r8Proc.waitFor()
         assertEquals("Round 8 -Xmx256m process-budget & fixes suite MUST pass:\n$r8Out", 0, r8Exit)
         assertTrue("Round 8 fixes must report ROUND8_FIXES_PASSED:\n$r8Out", r8Out.contains("ROUND8_FIXES_PASSED"))
+    }
+
+    @Test
+    fun round10VerifiesDeterministicEstimationAndFailClosedJsoupReflection(): Unit = runBlocking {
+        // 1. Round 10 Item #1: Estimation must be 100% deterministic across ANY JVM identityHashCode history.
+        //    Consume k identity hash codes (k in 0, 287, 539, 616, 896, 1337, 2048) before parsing & estimating
+        //    EVERY shared estimatedBytesVector in dom-vectors.json plus a 2 MB DASH mpd_list.xml document, and
+        //    assert byte-for-byte identical estimates across every k.
+        val repoRoot = ManifestAndPermissionTest.locateRepoRoot()
+        val vectorsFile = File(repoRoot, "docs/specs/plugin-schema/dom-vectors.json")
+        val vecRoot = kotlinx.serialization.json.Json.parseToJsonElement(vectorsFile.readText()).jsonObject
+        val estVectors = vecRoot["estimatedBytesVectors"]!!.jsonArray
+        assertTrue("Expected at least 24 shared estimatedBytesVectors", estVectors.size >= 24)
+
+        data class VecInput(val name: String, val isXml: Boolean, val input: String, val expectedBytes: Long?)
+        val inputs = ArrayList<VecInput>(estVectors.size + 1)
+        for (evEl in estVectors) {
+            val ev = evEl.jsonObject
+            val name = ev["name"]!!.jsonPrimitive.content
+            val isXml = ev["mode"]!!.jsonPrimitive.content == "xml"
+            val input = ev["input"]?.jsonPrimitive?.content ?: buildString {
+                append(ev["prefix"]?.jsonPrimitive?.content ?: "")
+                val unit = ev["unit"]?.jsonPrimitive?.content ?: ""
+                val rep = ev["repeat"]?.jsonPrimitive?.int ?: 1
+                repeat(rep) { append(unit) }
+                append(ev["suffix"]?.jsonPrimitive?.content ?: "")
+            }
+            inputs.add(VecInput(name, isXml, input, ev["expectedBytes"]!!.jsonPrimitive.long))
+        }
+        // Add 2 MB mpd_list.xml (which previously fluctuated up to +42.7% under System.identityHashCode collisions)
+        val mpdList = buildString(2 * 1024 * 1024) {
+            val head = "<?xml version=\"1.0\"?>\n<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\">\n<Period><AdaptationSet><Representation id=\"1\" bandwidth=\"1000\"><SegmentList duration=\"2\">\n"
+            val tail = "</SegmentList></Representation></AdaptationSet></Period></MPD>\n"
+            val lim = 2 * 1024 * 1024 - 256
+            append(head)
+            var bytes = head.length + tail.length
+            var idx = 0
+            while (true) {
+                val row = "<SegmentURL media=\"seg-${idx++}.m4s\"/>\n"
+                if (bytes + row.length > lim) break
+                append(row)
+                bytes += row.length
+            }
+            append(tail)
+        }
+        inputs.add(VecInput("mpd_list_2mb_xml", true, mpdList, null))
+
+        val hashOffsets = listOf(0, 287, 539, 616, 896, 1337, 2048)
+        val baseline = LinkedHashMap<String, Long>()
+        for (k in hashOffsets) {
+            var sink = 0
+            repeat(k) { sink = sink xor Any().hashCode() }
+            assertTrue(sink != Int.MIN_VALUE || k >= 0) // keep hash calls live
+            for (v in inputs) {
+                val p = PluginDomParser()
+                try {
+                    if (v.isXml) p.parseXml(v.input) else p.parseHtml(v.input)
+                    val est = p.currentEstimatedDomBytes()
+                    if (k == 0) {
+                        baseline[v.name] = est
+                        if (v.expectedBytes != null) {
+                            assertEquals(
+                                "Baseline deterministic estimate mismatch for '${v.name}'",
+                                v.expectedBytes,
+                                est,
+                            )
+                        }
+                    } else {
+                        assertEquals(
+                            "Estimate for '${v.name}' drifted after consuming k=$k identity hashes",
+                            baseline[v.name],
+                            est,
+                        )
+                    }
+                } finally {
+                    p.clear()
+                }
+            }
+        }
+        assertEquals(0L, PluginDomParser.currentProcessDomMemoryBytes())
+
+        // 2. Round 10 Item #2: Verify ALL 7 required Jsoup internal reflection fields are non-null under
+        //    the current Jsoup version (upgrading Jsoup MUST pass this test first!).
+        assertNotNull("Jsoup Attributes.size field must be accessible", PluginDomParser.JSOUP_ATTRS_SIZE_FIELD)
+        assertNotNull("Jsoup Attributes.keys field must be accessible", PluginDomParser.JSOUP_ATTRS_KEYS_FIELD)
+        assertNotNull("Jsoup Element.attributes field must be accessible", PluginDomParser.JSOUP_EL_ATTRS_FIELD)
+        assertNotNull("Jsoup Element.childNodes field must be accessible", PluginDomParser.JSOUP_EL_CHILDS_FIELD)
+        assertNotNull("Jsoup Element.EmptyNodeList field must be accessible", PluginDomParser.JSOUP_EMPTY_NODE_LIST)
+        assertNotNull("Jsoup LeafNode.value field must be accessible", PluginDomParser.JSOUP_LEAF_VALUE_FIELD)
+        assertNotNull("Jsoup FormElement.linkedEls field must be accessible", PluginDomParser.JSOUP_FORM_LINKED_FIELD)
+        assertTrue(
+            "Expected zero missing Jsoup fields, found: ${PluginDomParser.JSOUP_MISSING_FIELDS}",
+            PluginDomParser.JSOUP_MISSING_FIELDS.isEmpty(),
+        )
+        assertTrue("JSOUP_REFLECTION_READY must be true", PluginDomParser.JSOUP_REFLECTION_READY)
+
+        // 3. Round 10 Item #2: Inject simulated missing field for EACH of the 7 fields and assert parseHtml,
+        //    parseXml, and estimateDocumentBytes fail closed with DomHostIncompatibleException (never silently
+        //    returning an underestimated document or leaking ledger bytes).
+        val requiredFields = listOf(
+            "Attributes.size",
+            "Attributes.keys",
+            "Element.attributes",
+            "Element.childNodes",
+            "Element.EmptyNodeList",
+            "LeafNode.value",
+            "FormElement.linkedEls",
+        )
+        val probeDoc = org.jsoup.Jsoup.parse("<p a a>x</p>")
+        for (fieldName in requiredFields) {
+            val p = PluginDomParser()
+            PluginDomParser.simulatedMissingJsoupFieldForTesting = fieldName
+            try {
+                try {
+                    p.parseHtml("<p a a a>x</p>")
+                    fail("parseHtml must fail closed when $fieldName is missing")
+                } catch (e: DomHostIncompatibleException) {
+                    assertTrue(
+                        "Error message must name missing field '$fieldName': ${e.message}",
+                        e.message?.contains(fieldName) == true,
+                    )
+                }
+                try {
+                    p.parseXml("<r><p a='1' a='1'/></r>")
+                    fail("parseXml must fail closed when $fieldName is missing")
+                } catch (e: DomHostIncompatibleException) {
+                    assertTrue(
+                        "Error message must name missing field '$fieldName': ${e.message}",
+                        e.message?.contains(fieldName) == true,
+                    )
+                }
+                try {
+                    PluginDomParser.estimateDocumentBytes(probeDoc)
+                    fail("estimateDocumentBytes must fail closed when $fieldName is missing")
+                } catch (e: DomHostIncompatibleException) {
+                    assertTrue(
+                        "Error message must name missing field '$fieldName': ${e.message}",
+                        e.message?.contains(fieldName) == true,
+                    )
+                }
+                assertEquals(0, p.currentLiveDocCount())
+                assertEquals(0L, p.currentVmMemoryBytes())
+                assertEquals(0L, PluginDomParser.currentProcessDomMemoryBytes())
+            } finally {
+                PluginDomParser.simulatedMissingJsoupFieldForTesting = null
+                p.clear()
+            }
+        }
+
+        // End-to-end through QuickJS PluginRuntime: simulated missing Jsoup field surfaces as PluginInternalException
+        val tmpDir = Files.createTempDirectory("plugin-r10-reflect-").toFile()
+        val secretBox = SoftwareAesSecretBox()
+        val logger = PluginLogger("dev.depth3d.r10reflect", "inst-r10-reflect", sink = { _, _ -> })
+        val storage = InstanceStorage(File(tmpDir, "storage.enc"), secretBox)
+        val cookieJar = PluginCookieJar(File(tmpDir, "cookies.enc"), secretBox)
+        val manifest = PluginManifest(
+            api = 1,
+            id = "dev.depth3d.r10reflect",
+            name = "R10Reflect",
+            version = "1.0.0",
+            permissions = PluginPermissions(hosts = listOf("api.example.com")),
+        )
+        val runtime = PluginRuntime(
+            manifest = manifest,
+            instanceId = "inst-r10-reflect",
+            mainJsSource = """
+                export default {
+                  home() { return []; },
+                  browse(ctx) {
+                    const d = ctx.parse.html('<p a a>hello</p>');
+                    return { text: d.querySelector('p').text };
+                  },
+                  detail() { return { id: '1', kind: 'video', title: '1' }; },
+                  playback() { return { url: 'https://cdn.example.com/a.mp4' }; },
+                };
+            """.trimIndent(),
+            config = emptyMap(),
+            fetchGateway = PluginFetchGateway(NetworkPolicy(manifest.permissions), cookieJar),
+            storage = storage,
+            cookieJar = cookieJar,
+            logger = logger,
+        )
+        try {
+            PluginDomParser.simulatedMissingJsoupFieldForTesting = "Attributes.keys"
+            try {
+                runtime.invoke("browse", JsonObject(emptyMap()))
+                fail("ctx.parse.html must reject with PluginInternalException when Jsoup reflection fails")
+            } catch (_: PluginInternalException) {
+            } finally {
+                PluginDomParser.simulatedMissingJsoupFieldForTesting = null
+            }
+            // Recovers immediately once field is available
+            val ok = runtime.invoke("browse", JsonObject(emptyMap()))
+            assertEquals("hello", ok.jsonObject["text"]!!.jsonPrimitive.content)
+        } finally {
+            PluginDomParser.simulatedMissingJsoupFieldForTesting = null
+            runtime.close()
+            tmpDir.deleteRecursively()
+        }
     }
 }
 

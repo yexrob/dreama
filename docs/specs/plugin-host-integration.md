@@ -165,6 +165,8 @@ when (error) {
 | 单 VM 存活 DOM 总预算 | **48 MB** | 单实例同时存活文档 ≤ 8 份；在 19 万元素级别大页面上调用 `select('*')` 会为全部元素建句柄并触发 48 MB 句柄表上限 |
 | 单文档估算内存 | **32 MB** | 压实 `Attributes` / `Element$NodeList` / `LeafNode` / `FormElement.linkedEls` 并分离 `Document.parser` 后，按实际结构精确记账 |
 
+> **Jsoup 内部字段强校验（失败即拒绝）**：`PluginDomParser` 在类初始化时一次性校验并缓存 `Attributes.size`、`Attributes.keys`、`Element.attributes`、`Element.childNodes`、`Element.EmptyNodeList`、`LeafNode.value`、`FormElement.linkedEls` 7 个内部字段（已在 `proguard-rules.pro` 显式保留）。任一字段缺失时，所有 DOM 解析均直接抛出 `DomHostIncompatibleException` 拒绝解析，绝不静默兜底或低估内存。**升级 Jsoup 必须先过这条测试**（`CtxApiAndRecoveryTest.round10VerifiesDeterministicEstimationAndFailClosedJsoupReflection`）。
+
 ### 4.2 不计入进程账本的每 VM 独立与最坏瞬时占用
 
 以下缓冲与运行时内存**不计入**上述 64 MB 进程级 DOM 账本，每个并发活跃的插件 VM 都可能独立触达其上限：

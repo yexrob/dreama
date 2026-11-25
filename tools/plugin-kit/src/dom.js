@@ -125,16 +125,65 @@ export function childListBytes(childCount) {
 }
 
 /**
+ * Updates Jsoup's simulated 512-slot `CharacterReader.stringCache` without charging bytes
+ * (used for tag names read during lexing so known-tag cache evictions such as `"svg"` vs `"d"`
+ * match Android Jsoup accurately).
+ */
+function touchStringCache(s, stringCache) {
+  if (!s || s.length === 0 || s.length > 12) return;
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+  }
+  stringCache[h & 511] = s;
+}
+
+function countCharCode(s, code) {
+  let c = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (s.charCodeAt(i) === code) c += 1;
+  }
+  return c;
+}
+
+/**
+ * Computes the fraction of `\n` characters produced by parse5 that originated from `\r\n`
+ * (which parse5 normalizes to `\n`, whereas Jsoup 1.24.1 preserves `\r\n` verbatim).
+ * Returns 0 immediately for LF-only documents.
+ */
+function computeHtmlCrlfRatio(text) {
+  if (!text.includes('\r')) return 0;
+  let crlf = 0;
+  let totalOutNl = 0;
+  const len = text.length;
+  for (let i = 0; i < len; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 13) {
+      totalOutNl += 1;
+      if (i + 1 < len && text.charCodeAt(i + 1) === 10) {
+        crlf += 1;
+        i += 1;
+      }
+    } else if (c === 10) {
+      totalOutNl += 1;
+    }
+  }
+  return totalOutNl > 0 ? (crlf / totalOutNl) : 0;
+}
+
+/**
  * Mirrors Jsoup's `CharacterReader.cacheString` (len <= 12, 512-slot Java String.hashCode
  * table) + `PluginDomParser.exactStrBytes` (Latin-1 vs UTF-16 + >512 KB G1GC humongous
  * 1 MB region rounding). Pass `bypassCache = true` for strings produced via Jsoup's
- * `TokenData` / `Tokeniser.unescapeEntities` (which allocate fresh Strings bypassing
- * `CharacterReader.stringCache`).
+ * `TokenData` / `Tokeniser.unescapeEntities` / HTML character reference decoding (which
+ * allocate fresh Strings bypassing `CharacterReader.stringCache`). Pass `extraLen` for
+ * `\r` characters stripped by parse5 CRLF normalization that Jsoup retains verbatim.
  */
-function exactStrBytesHost(s, stringCache, bypassCache = false) {
-  if (!s || s.length === 0) return 0;
+function exactStrBytesHost(s, stringCache, bypassCache = false, extraLen = 0) {
+  if (!s || (s.length === 0 && extraLen <= 0)) return 0;
   const len = s.length;
-  if (!bypassCache && len <= 12) {
+  const totalLen = len + extraLen;
+  if (!bypassCache && extraLen === 0 && totalLen <= 12) {
     let h = 0;
     for (let i = 0; i < len; i++) {
       h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
@@ -147,7 +196,7 @@ function exactStrBytesHost(s, stringCache, bypassCache = false) {
   for (let i = 0; i < len; i++) {
     if (s.charCodeAt(i) > 0xFF) { wide = true; break; }
   }
-  const dataBytes = wide ? len * 2 : len;
+  const dataBytes = wide ? totalLen * 2 : totalLen;
   const backingBytes = 16 + dataBytes;
   if (backingBytes > 512 * 1024) {
     const mb = 1024 * 1024;
@@ -1869,6 +1918,7 @@ function createBudgetedParse5TreeAdapter(
   v8SafetyLedger,
   v8SafetyHolder,
   maxV8SafetyBytes,
+  htmlTracker,
 ) {
   const base = parse5.defaultTreeAdapter;
   let hostBytes = DOC_BASE_BYTES;
@@ -1876,9 +1926,11 @@ function createBudgetedParse5TreeAdapter(
   let ops = 0;
   let inFlightHostReserved = 0;
   let inFlightV8Reserved = 0;
+  let pendingTextHasEntity = false;
   const seenCustomTags = new Set();
   const stringCache = new Array(512);
   const nodeDepth = new WeakMap();
+  const crlfRatio = htmlTracker?.crlfRatio ?? 0;
 
   function getDepth(node) {
     return nodeDepth.get(node) ?? 0;
@@ -1927,26 +1979,43 @@ function createBudgetedParse5TreeAdapter(
   return {
     ...base,
     _releaseInFlight: releaseInFlight,
+    _markNextTextHasEntity() {
+      pendingTextHasEntity = true;
+    },
     createElement(tagName, namespaceURI, attrs) {
+      pendingTextHasEntity = false;
       const tn = String(tagName ?? '');
       if (tn.length > MAX_NAME_LENGTH) {
         throw new DomLimitExceededError(`DOM 标签名超过长度上限（最多 ${MAX_NAME_LENGTH} 字符）`);
       }
+      const isExcessDepthClone = Boolean(
+        htmlTracker && attrs &&
+        htmlTracker.getOpenStackDepth() >= MAX_JSOUP_NESTING_DEPTH &&
+        htmlTracker.seenTokenAttrArrays.has(attrs),
+      );
+      if (htmlTracker && attrs) htmlTracker.seenTokenAttrArrays.add(attrs);
+
       const norm = asciiLowerFast(tn);
-      let hostAdd = ELEMENT_BASE_BYTES;
-      if (norm === 'form') hostAdd += FORM_ELEMENT_EXTRA_BYTES;
+      let hostAdd = isExcessDepthClone ? 0 : ELEMENT_BASE_BYTES;
+      if (!isExcessDepthClone && norm === 'form') hostAdd += FORM_ELEMENT_EXTRA_BYTES;
       let v8Add = V8_HTML_ELEM_BYTES;
-      if (!isKnownJsoupHtmlTag(norm, namespaceURI)) {
-        const tagKey = `${namespaceURI || ''}\u0000${tn}`;
-        if (!seenCustomTags.has(tagKey)) {
-          seenCustomTags.add(tagKey);
-          hostAdd += CUSTOM_TAG_BASE_BYTES + exactStrBytesHost(tn, stringCache);
-          if (norm !== tn) hostAdd += exactStrBytesHost(norm, stringCache);
-          v8Add += 24 + strBytesV8(tn);
+      if (!isExcessDepthClone) {
+        if (!isKnownJsoupHtmlTag(norm, namespaceURI)) {
+          const tagKey = `${namespaceURI || ''}\u0000${tn}`;
+          if (!seenCustomTags.has(tagKey)) {
+            seenCustomTags.add(tagKey);
+            hostAdd += CUSTOM_TAG_BASE_BYTES + exactStrBytesHost(tn, stringCache);
+            if (norm !== tn) hostAdd += exactStrBytesHost(norm, stringCache);
+            v8Add += 24 + strBytesV8(tn);
+          } else {
+            touchStringCache(tn, stringCache);
+          }
+        } else {
+          touchStringCache(tn, stringCache);
         }
       }
       if (attrs && attrs.length > 0) {
-        hostAdd += attrsContainerBytes(attrs.length);
+        if (!isExcessDepthClone) hostAdd += attrsContainerBytes(attrs.length);
         v8Add += V8_HTML_ATTRS_CONTAINER_BYTES;
         for (let i = 0; i < attrs.length; i++) {
           const a = attrs[i];
@@ -1955,38 +2024,54 @@ function createBudgetedParse5TreeAdapter(
             throw new DomLimitExceededError(`DOM 属性名超过长度上限（最多 ${MAX_NAME_LENGTH} 字符）`);
           }
           const v = String(a.value ?? '');
-          hostAdd += exactStrBytesHost(k, stringCache) + exactStrBytesHost(v, stringCache);
+          if (!isExcessDepthClone) {
+            const hadEnt = Boolean(htmlTracker?.entityAttrs.has(a));
+            const extraCr = (crlfRatio > 0 && v.includes('\n')) ? Math.round(countCharCode(v, 10) * crlfRatio) : 0;
+            hostAdd += exactStrBytesHost(k, stringCache) + exactStrBytesHost(v, stringCache, hadEnt, extraCr);
+          }
           v8Add += V8_HTML_ATTR_ENTRY_BYTES + strBytesV8(v) + (k.length > 2 ? Math.min(24, k.length * 2) : 0);
         }
       }
       charge(hostAdd, v8Add);
-      return base.createElement(tagName, namespaceURI, attrs);
+      const el = base.createElement(tagName, namespaceURI, attrs);
+      if (isExcessDepthClone && htmlTracker) htmlTracker.excessDepthClones.add(el);
+      return el;
     },
     createCommentNode(data) {
+      pendingTextHasEntity = false;
       const d = String(data ?? '');
+      const extraCr = (crlfRatio > 0 && d.includes('\n')) ? Math.round(countCharCode(d, 10) * crlfRatio) : 0;
       // Jsoup Token$Comment builds comment data via TokenData (fresh String, bypassing CharacterReader.stringCache)
       charge(
-        LEAF_NODE_BASE_BYTES + exactStrBytesHost(d, stringCache, true),
+        LEAF_NODE_BASE_BYTES + exactStrBytesHost(d, stringCache, true, extraCr),
         V8_HTML_COMMENT_BYTES + strBytesV8(d),
       );
       return base.createCommentNode(data);
     },
     createTextNode(value) {
+      const hadEnt = pendingTextHasEntity;
+      pendingTextHasEntity = false;
       const v = String(value ?? '');
+      const extraCr = (crlfRatio > 0 && v.includes('\n')) ? Math.round(countCharCode(v, 10) * crlfRatio) : 0;
       charge(
-        LEAF_NODE_BASE_BYTES + exactStrBytesHost(v, stringCache),
+        LEAF_NODE_BASE_BYTES + exactStrBytesHost(v, stringCache, hadEnt, extraCr),
         V8_HTML_TEXT_BYTES + strBytesV8(v),
       );
-      return base.createTextNode(value);
+      const node = base.createTextNode(value);
+      if (hadEnt && htmlTracker) htmlTracker.entityTextNodes.add(node);
+      return node;
     },
     setDocumentType(document, name, publicId, systemId) {
+      pendingTextHasEntity = false;
       const n = String(name ?? '');
       const pub = String(publicId ?? '');
       const sys = String(systemId ?? '');
-      const ac = (n ? 1 : 0) + (pub ? 1 : 0) + (sys ? 1 : 0) + ((pub || sys) ? 1 : 0);
+      const hasPubSys = Boolean(pub || sys);
+      const ac = hasPubSys ? 5 : 4;
       charge(
         DOCTYPE_BASE_BYTES + attrsContainerBytes(ac) + exactStrBytesHost(n, stringCache) +
-          exactStrBytesHost(pub, stringCache) + exactStrBytesHost(sys, stringCache),
+          exactStrBytesHost(pub, stringCache) + exactStrBytesHost(sys, stringCache) +
+          (hasPubSys ? exactStrBytesHost('pubsyskey', stringCache, true) : 0),
         V8_HTML_OTHER_BYTES,
       );
       return base.setDocumentType(document, name, publicId, systemId);
@@ -1996,7 +2081,8 @@ function createBudgetedParse5TreeAdapter(
       const isFirst = !ch || ch.length === 0;
       const pDepth = getDepth(parentNode);
       nodeDepth.set(newNode, pDepth + 1);
-      const hostAdd = (isFirst && pDepth < MAX_JSOUP_NESTING_DEPTH) ? 52 : 4;
+      const isClone = Boolean(htmlTracker?.excessDepthClones.has(newNode));
+      const hostAdd = isClone ? 0 : ((isFirst && pDepth < MAX_JSOUP_NESTING_DEPTH) ? 52 : 4);
       charge(
         hostAdd,
         isFirst ? V8_HTML_CHILD_LIST_BYTES + V8_HTML_CHILD_SLOT_BYTES : V8_HTML_CHILD_SLOT_BYTES,
@@ -2008,7 +2094,8 @@ function createBudgetedParse5TreeAdapter(
       const isFirst = !ch || ch.length === 0;
       const pDepth = getDepth(parentNode);
       nodeDepth.set(newNode, pDepth + 1);
-      const hostAdd = (isFirst && pDepth < MAX_JSOUP_NESTING_DEPTH) ? 52 : 4;
+      const isClone = Boolean(htmlTracker?.excessDepthClones.has(newNode));
+      const hostAdd = isClone ? 0 : ((isFirst && pDepth < MAX_JSOUP_NESTING_DEPTH) ? 52 : 4);
       charge(
         hostAdd,
         isFirst ? V8_HTML_CHILD_LIST_BYTES + V8_HTML_CHILD_SLOT_BYTES : V8_HTML_CHILD_SLOT_BYTES,
@@ -2017,7 +2104,7 @@ function createBudgetedParse5TreeAdapter(
     },
     detachNode(node) {
       const parent = base.getParentNode(node);
-      if (parent) {
+      if (parent && !htmlTracker?.excessDepthClones.has(node)) {
         const ch = base.getChildNodes(parent);
         const pDepth = getDepth(parent);
         const refund = (ch && ch.length === 1 && pDepth < MAX_JSOUP_NESTING_DEPTH) ? 52 : 4;
@@ -2026,23 +2113,50 @@ function createBudgetedParse5TreeAdapter(
       return base.detachNode(node);
     },
     insertText(parentNode, text) {
+      const hadEnt = pendingTextHasEntity;
+      pendingTextHasEntity = false;
       const ch = base.getChildNodes(parentNode);
       const prev = ch && ch.length > 0 ? ch[ch.length - 1] : null;
       const isNewTextNode = !prev || !base.isTextNode(prev);
       const t = String(text ?? '');
       const isFirst = !ch || ch.length === 0;
+      const extraCr = (crlfRatio > 0 && t.includes('\n')) ? Math.round(countCharCode(t, 10) * crlfRatio) : 0;
       const hostSlotAdd = isNewTextNode ? ((isFirst ? 48 : 0) + 4 + LEAF_NODE_BASE_BYTES) : 0;
       const v8SlotAdd = isNewTextNode
         ? ((isFirst ? V8_HTML_CHILD_LIST_BYTES : 0) + V8_HTML_CHILD_SLOT_BYTES + V8_HTML_TEXT_BYTES)
         : 0;
-      // Only add incremental text length during streaming (exactStrBytesHost runs in post-parse recount)
-      charge(hostSlotAdd + t.length, v8SlotAdd + t.length);
-      return base.insertText(parentNode, text);
+      let hostTextAdd = t.length + extraCr;
+      if (hadEnt) {
+        if (isNewTextNode) {
+          hostTextAdd = exactStrBytesHost(t, stringCache, true, extraCr);
+        } else if (htmlTracker && prev && !htmlTracker.entityTextNodes.has(prev)) {
+          hostTextAdd += 48;
+        }
+      }
+      charge(hostSlotAdd + hostTextAdd, v8SlotAdd + t.length);
+      base.insertText(parentNode, text);
+      if (hadEnt && htmlTracker) {
+        const afterCh = base.getChildNodes(parentNode);
+        const target = afterCh && afterCh.length > 0 ? afterCh[afterCh.length - 1] : null;
+        if (target && base.isTextNode(target)) htmlTracker.entityTextNodes.add(target);
+      }
     },
     insertTextBefore(parentNode, text, referenceNode) {
+      const hadEnt = pendingTextHasEntity;
+      pendingTextHasEntity = false;
       const t = String(text ?? '');
-      charge(LEAF_NODE_BASE_BYTES + 4 + t.length, V8_HTML_TEXT_BYTES + V8_HTML_CHILD_SLOT_BYTES + t.length);
-      return base.insertTextBefore(parentNode, text, referenceNode);
+      const extraCr = (crlfRatio > 0 && t.includes('\n')) ? Math.round(countCharCode(t, 10) * crlfRatio) : 0;
+      const hostTextAdd = hadEnt ? exactStrBytesHost(t, stringCache, true, extraCr) : (t.length + extraCr);
+      charge(LEAF_NODE_BASE_BYTES + 4 + hostTextAdd, V8_HTML_TEXT_BYTES + V8_HTML_CHILD_SLOT_BYTES + t.length);
+      base.insertTextBefore(parentNode, text, referenceNode);
+      if (hadEnt && htmlTracker) {
+        const ch = base.getChildNodes(parentNode);
+        if (ch) {
+          const refIdx = ch.indexOf(referenceNode);
+          const target = refIdx > 0 ? ch[refIdx - 1] : null;
+          if (target && base.isTextNode(target)) htmlTracker.entityTextNodes.add(target);
+        }
+      }
     },
     adoptAttributes(recipient, attrs) {
       if (attrs && attrs.length > 0) {
@@ -2055,7 +2169,9 @@ function createBudgetedParse5TreeAdapter(
             throw new DomLimitExceededError(`DOM 属性名超过长度上限（最多 ${MAX_NAME_LENGTH} 字符）`);
           }
           const v = String(a.value ?? '');
-          hostAdd += 8 + exactStrBytesHost(k, stringCache) + exactStrBytesHost(v, stringCache);
+          const hadEnt = Boolean(htmlTracker?.entityAttrs.has(a));
+          const extraCr = (crlfRatio > 0 && v.includes('\n')) ? Math.round(countCharCode(v, 10) * crlfRatio) : 0;
+          hostAdd += 8 + exactStrBytesHost(k, stringCache) + exactStrBytesHost(v, stringCache, hadEnt, extraCr);
           v8Add += V8_HTML_ATTR_ENTRY_BYTES + strBytesV8(v) + (k.length > 2 ? Math.min(24, k.length * 2) : 0);
         }
         charge(hostAdd, v8Add);
@@ -2066,19 +2182,20 @@ function createBudgetedParse5TreeAdapter(
 }
 
 /**
- * Counts unique attribute keys/values in an `<?xml ...?>` declaration body
- * so `linkedom` (which drops XML PIs/declarations) matches Jsoup's `XmlDeclaration`
- * byte accounting identically.
+ * Counts unique attribute keys/values in an `<?xml ...?>` or `<!ELEMENT ...>` declaration
+ * body so `linkedom` (which drops XML PIs and `<!NAME>` declarations) matches Jsoup's
+ * `XmlDeclaration` byte accounting identically.
  */
-function estimateXmlDeclBodyHostBytes(target, body, stringCache) {
+function estimateXmlDeclBodyHostBytes(target, body, stringCache, cacheTarget = false) {
   let hostBytes = XML_DECL_BASE_BYTES;
   const seen = new Set();
   seen.add(target);
   let i = 0;
   const len = body.length;
   let uniqueAttrs = 0;
-  // Jsoup XmlDeclaration stores `#declaration` -> target plus each parsed attribute (fresh Strings)
-  let attrStrBytes = exactStrBytesHost('#declaration', stringCache) + exactStrBytesHost(target, stringCache, true);
+  // Jsoup XmlDeclaration stores `#declaration` -> target plus each parsed attribute
+  let attrStrBytes = exactStrBytesHost('#declaration', stringCache) +
+    exactStrBytesHost(target, stringCache, !cacheTarget);
   while (i < len) {
     while (i < len && isAsciiWsCode(body.charCodeAt(i))) i += 1;
     if (i >= len) break;
@@ -2121,22 +2238,146 @@ function estimateXmlDeclBodyHostBytes(target, body, stringCache) {
   if (uniqueAttrs > 0) {
     hostBytes += attrsContainerBytes(1 + uniqueAttrs) + attrStrBytes;
   } else {
-    hostBytes += exactStrBytesHost(target, stringCache, true);
+    hostBytes += exactStrBytesHost(target, stringCache, !cacheTarget);
   }
   return hostBytes;
 }
 
 /**
+ * Parses an XML `<!DOCTYPE ...>` declaration starting at `start` (pointing at `<`)
+ * directly from source (bypassing linkedom's regex truncation on names containing digits)
+ * and computes its exact Jsoup `DocumentType` host-model byte cost.
+ */
+function scanXmlDoctypeHostBytes(xml, start, len, stringCache) {
+  let j = start + 9; // past "<!DOCTYPE"
+  let bracketDepth = 0;
+  let quote = 0;
+  while (j < len) {
+    const c = xml.charCodeAt(j);
+    if (quote !== 0) {
+      if (c === quote) quote = 0;
+    } else if (c === 34 || c === 39) {
+      quote = c;
+    } else if (c === 91) { // '['
+      bracketDepth += 1;
+    } else if (c === 93 && bracketDepth > 0) { // ']'
+      bracketDepth -= 1;
+    } else if (c === 62 && bracketDepth === 0) { // '>'
+      break;
+    }
+    j += 1;
+  }
+  const contentEnd = j;
+  const nextIndex = j < len ? j + 1 : len;
+
+  // Parse: <!DOCTYPE name [PUBLIC "pub" "sys" | SYSTEM "sys"] [internalSubset]>
+  let p = start + 9;
+  while (p < contentEnd && isAsciiWsCode(xml.charCodeAt(p))) p += 1;
+  const nameStart = p;
+  while (p < contentEnd) {
+    const c = xml.charCodeAt(p);
+    if (isAsciiWsCode(c) || c === 91 || c === 62) break;
+    p += 1;
+  }
+  const name = xml.slice(nameStart, p);
+  while (p < contentEnd && isAsciiWsCode(xml.charCodeAt(p))) p += 1;
+
+  let pubSysKey = '';
+  let pub = '';
+  let sys = '';
+  const kwStart = p;
+  while (p < contentEnd && !isAsciiWsCode(xml.charCodeAt(p)) && xml.charCodeAt(p) !== 91) p += 1;
+  const kw = xml.slice(kwStart, p).toUpperCase();
+  function readQuoted() {
+    while (p < contentEnd && isAsciiWsCode(xml.charCodeAt(p))) p += 1;
+    if (p >= contentEnd) return '';
+    const q = xml.charCodeAt(p);
+    if (q !== 34 && q !== 39) return '';
+    p += 1;
+    const s = p;
+    while (p < contentEnd && xml.charCodeAt(p) !== q) p += 1;
+    const out = xml.slice(s, p);
+    if (p < contentEnd) p += 1;
+    return out;
+  }
+  if (kw === 'PUBLIC') {
+    pubSysKey = 'PUBLIC';
+    pub = readQuoted();
+    sys = readQuoted();
+  } else if (kw === 'SYSTEM') {
+    pubSysKey = 'SYSTEM';
+    sys = readQuoted();
+  }
+
+  // Jsoup DocumentType always stores `#doctype`, `name`, `publicId`, `systemId` (4 attrs),
+  // plus a fresh `pubsyskey` (via Normalizer.lowerCase("pubSysKey")) when PUBLIC/SYSTEM is present (5 attrs).
+  const hasPubSys = pubSysKey.length > 0;
+  const ac = hasPubSys ? 5 : 4;
+  let bytes = DOCTYPE_BASE_BYTES + attrsContainerBytes(ac) +
+    exactStrBytesHost('#doctype', stringCache) +
+    exactStrBytesHost('name', stringCache) +
+    exactStrBytesHost('publicId', stringCache) +
+    exactStrBytesHost('systemId', stringCache) +
+    exactStrBytesHost(name, stringCache) +
+    exactStrBytesHost(pub, stringCache) +
+    exactStrBytesHost(sys, stringCache);
+  if (hasPubSys) {
+    bytes += exactStrBytesHost('pubsyskey', stringCache, true) + exactStrBytesHost(pubSysKey, stringCache);
+  }
+  return { nextIndex, bytes };
+}
+
+/**
+ * Coalesces consecutive XML `#text` sibling nodes produced by `linkedom` (which splits
+ * every XML character/entity reference such as `x&amp;x&amp;` into separate `#text` nodes,
+ * whereas Jsoup merges adjacent text into a single `TextNode`).
+ */
+function coalesceXmlTextNodes(doc, deadlineMs) {
+  const stack = [doc];
+  let ops = 0;
+  while (stack.length > 0) {
+    if ((++ops & 1023) === 0) checkDeadline(deadlineMs);
+    const parent = stack.pop();
+    let child = parent.firstChild;
+    while (child) {
+      if ((++ops & 1023) === 0) checkDeadline(deadlineMs);
+      if (child.nodeType === 3) {
+        let next = child.nextSibling;
+        if (next && next.nodeType === 3) {
+          const parts = [String(child.nodeValue ?? '')];
+          while (next && next.nodeType === 3) {
+            if ((++ops & 1023) === 0) checkDeadline(deadlineMs);
+            parts.push(String(next.nodeValue ?? ''));
+            const toRemove = next;
+            next = next.nextSibling;
+            toRemove.remove();
+          }
+          child.nodeValue = parts.join('');
+        }
+        child = next;
+      } else {
+        if (child.nodeType === 1 && child.firstChild) stack.push(child);
+        child = child.nextSibling;
+      }
+    }
+  }
+}
+
+/**
  * Fast XML pre-scan enforcing `MAX_NAME_LENGTH`, aborting over-budget XML inputs
  * BEFORE `linkedom` allocates an oversized tree (checking both host-model `budgetBytes`
- * and the loose V8 safety net `v8SafetyBudgetBytes`), and computing host-model bytes
- * for XML declarations / processing instructions that `linkedom` drops.
+ * and the loose V8 safety net `v8SafetyBudgetBytes`), and computing exact Jsoup host-model
+ * bytes for XML declarations, processing instructions, `<!DOCTYPE>` (bypassing linkedom's
+ * digit-truncation bug), and `<!ELEMENT / !ATTLIST / !ENTITY / !NOTATION>` declarations
+ * that `linkedom` drops.
  */
 function preScanXml(xml, budgetBytes, v8SafetyBudgetBytes, deadlineMs) {
   let hostEst = DOC_BASE_BYTES;
   let v8Est = DOC_BASE_BYTES;
-  let droppedPiHostBytes = 0;
-  let droppedPiCount = 0;
+  let droppedDeclHostBytes = 0;
+  let droppedAtRootCount = 0;
+  let droppedInsideElemCount = 0;
+  let openElemDepth = 0;
   const stringCache = new Array(512);
   const len = xml.length;
   let i = 0;
@@ -2174,24 +2415,66 @@ function preScanXml(xml, budgetBytes, v8SafetyBudgetBytes, deadlineMs) {
         const body = xml.slice(bodyStart, contentEnd);
         let piHost;
         if (target.toLowerCase() === 'xml') {
-          piHost = estimateXmlDeclBodyHostBytes(target, body, stringCache);
+          piHost = estimateXmlDeclBodyHostBytes(target, body, stringCache, false);
         } else {
           // Jsoup ProcessingInstruction creates fresh target & data Strings via TokenData
           piHost = PI_NODE_BASE_BYTES + exactStrBytesHost(target, stringCache, true) + exactStrBytesHost(body, stringCache, true);
         }
-        droppedPiHostBytes += piHost + 4;
-        droppedPiCount += 1;
+        droppedDeclHostBytes += piHost + 4;
+        if (openElemDepth > 0) droppedInsideElemCount += 1;
+        else droppedAtRootCount += 1;
         hostEst += piHost + 4;
         v8Est += 16;
         i = stop;
       } else if (i + 1 < len && xml.charCodeAt(i + 1) === 47) { // '</'
         const end = xml.indexOf('>', i + 2);
+        if (openElemDepth > 0) openElemDepth -= 1;
         i = end >= 0 ? end + 1 : len;
       } else if (i + 1 < len && xml.charCodeAt(i + 1) === 33) { // '<!'
-        const end = xml.indexOf('>', i + 2);
-        hostEst += DOCTYPE_BASE_BYTES + 4;
-        v8Est += V8_XML_OTHER_BYTES;
-        i = end >= 0 ? end + 1 : len;
+        const prefix9 = xml.slice(i, i + 9).toUpperCase();
+        const after9 = i + 9 < len ? xml.charCodeAt(i + 9) : 62;
+        if (prefix9 === '<!DOCTYPE' && (isAsciiWsCode(after9) || after9 === 62 || after9 === 91)) {
+          const dt = scanXmlDoctypeHostBytes(xml, i, len, stringCache);
+          droppedDeclHostBytes += dt.bytes + 4;
+          if (openElemDepth > 0) droppedInsideElemCount += 1;
+          else droppedAtRootCount += 1;
+          hostEst += dt.bytes + 4;
+          v8Est += V8_XML_OTHER_BYTES;
+          i = dt.nextIndex;
+        } else {
+          // Jsoup XmlTreeBuilder parses `<!ELEMENT ...>` / `<!ATTLIST ...>` / `<!ENTITY ...>` /
+          // `<!NOTATION ...>` as XmlDeclaration via Comment.asXmlDeclaration(); linkedom drops them.
+          const end = xml.indexOf('>', i + 2);
+          const contentEnd = end >= 0 ? end : len;
+          const stop = end >= 0 ? end + 1 : len;
+          const c2 = i + 2 < contentEnd ? xml.charCodeAt(i + 2) : 0;
+          const isDeclNameStart = (c2 >= 65 && c2 <= 90) || (c2 >= 97 && c2 <= 122) || c2 === 95 || c2 === 58;
+          if (isDeclNameStart) {
+            let tEnd = i + 2;
+            while (tEnd < contentEnd && !isAsciiWsCode(xml.charCodeAt(tEnd))) tEnd += 1;
+            const target = xml.slice(i + 2, tEnd);
+            if (target.length > MAX_NAME_LENGTH) {
+              throw new DomLimitExceededError(`XML 声明名超过长度上限（最多 ${MAX_NAME_LENGTH} 字符）`);
+            }
+            let bodyStart = tEnd;
+            while (bodyStart < contentEnd && isAsciiWsCode(xml.charCodeAt(bodyStart))) bodyStart += 1;
+            const body = xml.slice(bodyStart, contentEnd);
+            const declHost = estimateXmlDeclBodyHostBytes(target, body, stringCache, true);
+            droppedDeclHostBytes += declHost + 4;
+            if (openElemDepth > 0) droppedInsideElemCount += 1;
+            else droppedAtRootCount += 1;
+            hostEst += declHost + 4;
+          } else {
+            const bogusData = xml.slice(i + 2, contentEnd);
+            const bogusHost = LEAF_NODE_BASE_BYTES + exactStrBytesHost(bogusData, stringCache, true);
+            droppedDeclHostBytes += bogusHost + 4;
+            if (openElemDepth > 0) droppedInsideElemCount += 1;
+            else droppedAtRootCount += 1;
+            hostEst += bogusHost + 4;
+          }
+          v8Est += 16;
+          i = stop;
+        }
       } else {
         hostEst += ELEMENT_BASE_BYTES + 4;
         v8Est += V8_XML_ELEM_BYTES;
@@ -2212,6 +2495,7 @@ function preScanXml(xml, budgetBytes, v8SafetyBudgetBytes, deadlineMs) {
         let inAttrName = false;
         let attrNameLen = 0;
         let afterEq = false;
+        let selfClosing = false;
         while (i < len) {
           const c = xml.charCodeAt(i);
           if (quote !== 0) {
@@ -2223,21 +2507,28 @@ function preScanXml(xml, budgetBytes, v8SafetyBudgetBytes, deadlineMs) {
             quote = c;
             inAttrName = false;
             attrNameLen = 0;
+            selfClosing = false;
           } else if (c === 61) {
             if (inAttrName) { attrCount += 1; inAttrName = false; attrNameLen = 0; }
             afterEq = true;
+            selfClosing = false;
           } else if (isAsciiWsCode(c) || c === 47) {
             if (inAttrName) { attrCount += 1; inAttrName = false; attrNameLen = 0; }
             if (afterEq && c === 47) afterEq = false;
+            selfClosing = c === 47;
           } else if (!afterEq) {
             inAttrName = true;
             attrNameLen += 1;
+            selfClosing = false;
             if (attrNameLen > MAX_NAME_LENGTH) {
               throw new DomLimitExceededError(`DOM 属性名超过长度上限（最多 ${MAX_NAME_LENGTH} 字符）`);
             }
+          } else {
+            selfClosing = false;
           }
           i += 1;
         }
+        if (!selfClosing) openElemDepth += 1;
         if (attrCount > 0) {
           // Conservative lower bound (attrs may contain duplicates; exact deduped count is charged post-parse)
           hostEst += 56;
@@ -2274,7 +2565,7 @@ function preScanXml(xml, budgetBytes, v8SafetyBudgetBytes, deadlineMs) {
       i = stop;
     }
   }
-  return { droppedPiHostBytes, droppedPiCount };
+  return { droppedDeclHostBytes, droppedAtRootCount, droppedInsideElemCount };
 }
 
 export class PluginDomParser {
@@ -2349,6 +2640,20 @@ export class PluginDomParser {
     checkDeadline(this.deadlineMs);
     const text = String(html ?? '');
     const { budgetBytes, v8SafetyBudgetBytes } = this._checkPreParseLimits(text);
+    const entityAttrs = new WeakSet();
+    const entityTextNodes = new WeakSet();
+    const seenTokenAttrArrays = new WeakSet();
+    const excessDepthClones = new WeakSet();
+    const crlfRatio = computeHtmlCrlfRatio(text);
+    let parserRef = null;
+    const htmlTracker = {
+      entityAttrs,
+      entityTextNodes,
+      seenTokenAttrArrays,
+      excessDepthClones,
+      crlfRatio,
+      getOpenStackDepth: () => (parserRef?.openElements?.stackTop ?? 0) + 1,
+    };
     const adapter = createBudgetedParse5TreeAdapter(
       budgetBytes,
       this.deadlineMs,
@@ -2358,12 +2663,29 @@ export class PluginDomParser {
       this._v8SafetyLedger,
       this._v8SafetyHolder,
       this.maxV8SafetyMemoryBytes,
+      htmlTracker,
     );
     let document;
     let stats;
     try {
-      document = parse5.parse(text, { treeAdapter: adapter });
-      stats = this._normalizeAndEstimateDoc(document, true, budgetBytes, v8SafetyBudgetBytes, 0);
+      const parser = new parse5.Parser({ treeAdapter: adapter });
+      parserRef = parser;
+      if (text.includes('&') && typeof parser.tokenizer?.entityDecoder?.emitCodePoint === 'function') {
+        const tok = parser.tokenizer;
+        const dec = tok.entityDecoder;
+        const origEmit = dec.emitCodePoint;
+        dec.emitCodePoint = function patchedEmitCodePoint(cp, consumed) {
+          if (tok._isCharacterReferenceInAttribute()) {
+            if (tok.currentAttr) entityAttrs.add(tok.currentAttr);
+          } else {
+            adapter._markNextTextHasEntity();
+          }
+          return origEmit.call(this, cp, consumed);
+        };
+      }
+      parser.tokenizer.write(text, true);
+      document = parser.document;
+      stats = this._normalizeAndEstimateDoc(document, true, budgetBytes, v8SafetyBudgetBytes, null, htmlTracker);
     } finally {
       adapter._releaseInFlight();
     }
@@ -2376,7 +2698,8 @@ export class PluginDomParser {
     const { budgetBytes, v8SafetyBudgetBytes } = this._checkPreParseLimits(text);
     const pre = preScanXml(text, budgetBytes, v8SafetyBudgetBytes, this.deadlineMs);
     const document = this._xmlParser.parseFromString(text, 'text/xml');
-    const stats = this._normalizeAndEstimateDoc(document, false, budgetBytes, v8SafetyBudgetBytes, pre.droppedPiHostBytes);
+    coalesceXmlTextNodes(document, this.deadlineMs);
+    const stats = this._normalizeAndEstimateDoc(document, false, budgetBytes, v8SafetyBudgetBytes, pre, null);
     return this._registerDocument(document, true, stats.elementCount, stats.estimatedBytes, stats.v8EstimatedBytes);
   }
 
@@ -2658,9 +2981,11 @@ export class PluginDomParser {
    * estimates across ALL node kinds (plus a rough V8 byte estimate for the 512 MB
    * Node safety net).
    */
-  _normalizeAndEstimateDoc(doc, isParse5Html, budgetBytes, v8SafetyBudgetBytes, droppedPiHostBytes = 0) {
+  _normalizeAndEstimateDoc(doc, isParse5Html, budgetBytes, v8SafetyBudgetBytes, xmlPre = null, htmlTracker = null) {
     const isXmlDoc = !isParse5Html;
-    let hostBytes = DOC_BASE_BYTES + droppedPiHostBytes;
+    const crlfRatio = htmlTracker?.crlfRatio ?? 0;
+    const droppedDeclHostBytes = xmlPre?.droppedDeclHostBytes ?? 0;
+    let hostBytes = DOC_BASE_BYTES + droppedDeclHostBytes;
     let v8Bytes = DOC_BASE_BYTES;
     let elementCount = 0;
     const seenCustomTags = new Set();
@@ -2668,20 +2993,40 @@ export class PluginDomParser {
     const stack = [];
     const depthStack = [];
     const rootChildren = getChildNodes(doc);
+    let xmlRootNonDtCount = 0;
     if (rootChildren.length > 0) {
-      hostBytes += childListBytes(rootChildren.length);
-      if (!isXmlDoc) v8Bytes += V8_HTML_CHILD_LIST_BYTES + V8_HTML_CHILD_SLOT_BYTES * rootChildren.length;
+      if (isXmlDoc) {
+        for (let i = 0; i < rootChildren.length; i++) {
+          if (rootChildren[i].nodeType !== 10) xmlRootNonDtCount += 1;
+        }
+        if (xmlRootNonDtCount > 0) {
+          hostBytes += childListBytes(xmlRootNonDtCount);
+        } else if ((xmlPre?.droppedAtRootCount ?? 0) > 0) {
+          hostBytes += 48; // Element$NodeList header (slots already counted in preScanXml)
+        }
+      } else {
+        hostBytes += childListBytes(rootChildren.length);
+        v8Bytes += V8_HTML_CHILD_LIST_BYTES + V8_HTML_CHILD_SLOT_BYTES * rootChildren.length;
+      }
       for (let i = rootChildren.length - 1; i >= 0; i--) {
         stack.push(rootChildren[i]);
         depthStack.push(1);
       }
+    } else if (isXmlDoc && (xmlPre?.droppedAtRootCount ?? 0) > 0) {
+      hostBytes += 48;
     }
+    let pendingElemDeclHeader = isXmlDoc && (xmlPre?.droppedInsideElemCount ?? 0) > 0;
     let ops = 0;
     while (stack.length > 0) {
       if ((++ops & 1023) === 0) checkDeadline(this.deadlineMs);
       const cur = stack.pop();
       const depth = depthStack.pop();
       if (!cur) continue;
+      if (typeof cur === 'string') {
+        // Closing tag sentinel: mirror Jsoup's `</tag>` CharacterReader.cacheString update
+        touchStringCache(cur, stringCache);
+        continue;
+      }
       if (isElementNode(cur)) {
         elementCount += 1;
         const tn = getRawTagName(cur);
@@ -2694,17 +3039,41 @@ export class PluginDomParser {
           cur.childNodes = tmplChildren;
           cur.content = null;
         }
+        const isClone = Boolean(htmlTracker?.excessDepthClones.has(cur));
+        const ch = getChildNodes(cur);
+        if (isClone) {
+          // Adoption-agency formatting clone at depth >= 512 that Jsoup never creates due to setMaxDepth(512).
+          // Keep V8 safety accounting intact, skip host element/list overhead, and flatten children into slots.
+          v8Bytes += V8_HTML_ELEM_BYTES;
+          if (ch.length > 0) {
+            v8Bytes += V8_HTML_CHILD_LIST_BYTES + V8_HTML_CHILD_SLOT_BYTES * ch.length;
+            hostBytes += (ch.length - 1) * 4;
+            const nextDepth = depth + 1;
+            for (let i = ch.length - 1; i >= 0; i--) {
+              stack.push(ch[i]);
+              depthStack.push(nextDepth);
+            }
+          } else {
+            hostBytes = Math.max(DOC_BASE_BYTES, hostBytes - 4);
+          }
+          continue;
+        }
+
         const norm = asciiLowerFast(tn);
         hostBytes += ELEMENT_BASE_BYTES;
         if (!isXmlDoc && norm === 'form') hostBytes += FORM_ELEMENT_EXTRA_BYTES;
 
         // Custom tag accounting: XML has empty TagSet (every distinct tag is custom);
         // HTML uses Jsoup's exact TagSet.HtmlTagSet known tags.
+        // Only touch stringCache when NOT charging a brand-new custom tag name, so first-seen
+        // custom tags are not pre-cached into returning 0 bytes.
         if (isXmlDoc) {
           if (!seenCustomTags.has(tn)) {
             seenCustomTags.add(tn);
             hostBytes += CUSTOM_TAG_BASE_BYTES + exactStrBytesHost(tn, stringCache);
             if (norm !== tn) hostBytes += exactStrBytesHost(norm, stringCache);
+          } else {
+            touchStringCache(tn, stringCache);
           }
           v8Bytes += V8_XML_ELEM_BYTES;
         } else {
@@ -2714,7 +3083,11 @@ export class PluginDomParser {
               seenCustomTags.add(tagKey);
               hostBytes += CUSTOM_TAG_BASE_BYTES + exactStrBytesHost(tn, stringCache);
               if (norm !== tn) hostBytes += exactStrBytesHost(norm, stringCache);
+            } else {
+              touchStringCache(tn, stringCache);
             }
+          } else {
+            touchStringCache(tn, stringCache);
           }
           v8Bytes += V8_HTML_ELEM_BYTES;
         }
@@ -2734,7 +3107,9 @@ export class PluginDomParser {
               a.value = flattenStrV8(a.value);
             }
             const v = String(a.value ?? '');
-            hostBytes += exactStrBytesHost(k, stringCache) + exactStrBytesHost(v, stringCache);
+            const hadEnt = Boolean(htmlTracker?.entityAttrs.has(a));
+            const extraCr = (!isXmlDoc && crlfRatio > 0 && v.includes('\n')) ? Math.round(countCharCode(v, 10) * crlfRatio) : 0;
+            hostBytes += exactStrBytesHost(k, stringCache) + exactStrBytesHost(v, stringCache, hadEnt, extraCr);
             if (isXmlDoc) {
               v8Bytes += V8_XML_ATTR_ENTRY_BYTES + strBytesV8(k) + strBytesV8(v);
             } else {
@@ -2742,7 +3117,6 @@ export class PluginDomParser {
             }
           }
         }
-        const ch = getChildNodes(cur);
         if (ch.length > 0) {
           // Jsoup caps parser nesting at MAX_JSOUP_NESTING_DEPTH (512): pure nested element chains
           // flatten into siblings (4B/slot, no NodeList), while elements holding text/other children
@@ -2759,11 +3133,19 @@ export class PluginDomParser {
             hostBytes += childListBytes(ch.length);
           }
           if (!isXmlDoc) v8Bytes += V8_HTML_CHILD_LIST_BYTES + V8_HTML_CHILD_SLOT_BYTES * ch.length;
+          // Push closing-tag cache sentinel BEFORE children so it runs right after children finish
+          if (tn.length <= 12 && (isXmlDoc || !HTML_VOID_TAGS.has(norm))) {
+            stack.push(tn);
+            depthStack.push(depth);
+          }
           const nextDepth = depth + 1;
           for (let i = ch.length - 1; i >= 0; i--) {
             stack.push(ch[i]);
             depthStack.push(nextDepth);
           }
+        } else if (pendingElemDeclHeader && depth === 1) {
+          hostBytes += 48; // Root XML element held only dropped PIs/DOCTYPEs/<!ELEMENT>s
+          pendingElemDeclHeader = false;
         }
       } else if (isCDataNode(cur)) {
         const v = getNodeTextValue(cur);
@@ -2774,32 +3156,43 @@ export class PluginDomParser {
           cur.value = flattenStrV8(cur.value);
         }
         const v = getNodeTextValue(cur);
-        // Jsoup unescapeEntities() allocates a fresh String whenever '&' was unescaped in XML
-        const bypass = isXmlDoc && v.includes('&');
-        hostBytes += LEAF_NODE_BASE_BYTES + exactStrBytesHost(v, stringCache, bypass);
+        // Jsoup unescapeEntities() / HTML character reference decoding allocates a fresh String
+        const bypass = isXmlDoc
+          ? (v.includes('&') || v.includes('<'))
+          : Boolean(htmlTracker?.entityTextNodes.has(cur));
+        const extraCr = (!isXmlDoc && crlfRatio > 0 && v.includes('\n')) ? Math.round(countCharCode(v, 10) * crlfRatio) : 0;
+        hostBytes += LEAF_NODE_BASE_BYTES + exactStrBytesHost(v, stringCache, bypass, extraCr);
         v8Bytes += (isXmlDoc ? V8_XML_TEXT_BYTES : V8_HTML_TEXT_BYTES) + strBytesV8(v);
       } else if (isCommentNode(cur)) {
         if (!isXmlDoc && typeof cur.data === 'string' && cur.data.length >= 16) {
           cur.data = flattenStrV8(cur.data);
         }
         const d = getNodeCommentData(cur);
+        const extraCr = (!isXmlDoc && crlfRatio > 0 && d.includes('\n')) ? Math.round(countCharCode(d, 10) * crlfRatio) : 0;
         // Jsoup Token$Comment builds comment data via TokenData (fresh String, bypassing stringCache)
-        hostBytes += LEAF_NODE_BASE_BYTES + exactStrBytesHost(d, stringCache, true);
+        hostBytes += LEAF_NODE_BASE_BYTES + exactStrBytesHost(d, stringCache, true, extraCr);
         v8Bytes += (isXmlDoc ? V8_XML_COMMENT_BYTES : V8_HTML_COMMENT_BYTES) + strBytesV8(d);
       } else if (cur.nodeType === 10 || cur.nodeName === '#documentType') {
-        const name = String(cur.name ?? '');
-        const pub = String(cur.publicId ?? '');
-        const sys = String(cur.systemId ?? '');
-        // Jsoup DocumentType always stores name, publicId, systemId (3 entries) plus pubSysKey when present
-        const ac = 3 + ((pub || sys) ? 1 : 0);
-        hostBytes += DOCTYPE_BASE_BYTES + attrsContainerBytes(ac) +
-          exactStrBytesHost(name, stringCache) +
-          exactStrBytesHost(pub, stringCache) +
-          exactStrBytesHost(sys, stringCache) +
-          exactStrBytesHost('name', stringCache) +
-          exactStrBytesHost('publicId', stringCache) +
-          exactStrBytesHost('systemId', stringCache);
-        if (pub || sys) hostBytes += exactStrBytesHost('pubSysKey', stringCache);
+        if (!isXmlDoc) {
+          const name = String(cur.name ?? '');
+          const pub = String(cur.publicId ?? '');
+          const sys = String(cur.systemId ?? '');
+          // Jsoup DocumentType always stores `#doctype`, `name`, `publicId`, `systemId` (4 attrs),
+          // plus fresh `pubsyskey` when PUBLIC/SYSTEM is present (5 attrs).
+          const hasPubSys = Boolean(pub || sys);
+          const ac = hasPubSys ? 5 : 4;
+          hostBytes += DOCTYPE_BASE_BYTES + attrsContainerBytes(ac) +
+            exactStrBytesHost('#doctype', stringCache) +
+            exactStrBytesHost('name', stringCache) +
+            exactStrBytesHost('publicId', stringCache) +
+            exactStrBytesHost('systemId', stringCache) +
+            exactStrBytesHost(name, stringCache) +
+            exactStrBytesHost(pub, stringCache) +
+            exactStrBytesHost(sys, stringCache);
+          if (hasPubSys) {
+            hostBytes += exactStrBytesHost('pubsyskey', stringCache, true) + exactStrBytesHost(pub ? 'PUBLIC' : 'SYSTEM', stringCache);
+          }
+        }
         v8Bytes += isXmlDoc ? V8_XML_OTHER_BYTES : V8_HTML_OTHER_BYTES;
       } else {
         hostBytes += OTHER_NODE_BASE_BYTES;
