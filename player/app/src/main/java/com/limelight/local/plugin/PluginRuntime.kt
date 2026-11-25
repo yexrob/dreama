@@ -158,6 +158,7 @@ class PluginRuntime(
     private val memoryLimitBytes: Long = DEFAULT_MEMORY_LIMIT_BYTES,
     private val defaultTimeoutMs: Long = DEFAULT_CALL_TIMEOUT_MS,
     private val playbackTimeoutMs: Long = PLAYBACK_CALL_TIMEOUT_MS,
+    private val clockMs: () -> Long = System::currentTimeMillis,
 ) : Closeable {
 
     private val json = Json { ignoreUnknownKeys = true }
@@ -249,17 +250,39 @@ class PluginRuntime(
     val isClosed: Boolean
         get() = closed
 
+    @Volatile
+    private var warmUpBackoffUntilMs: Long = 0L
+
     /**
      * Best-effort background warm-up (e.g. when entering Search so optional `suggest()` can run
-     * on a warm VM): returns immediately if already initialized, closed, or busy with another call.
+     * on a warm VM):
+     * - Returns immediately if already initialized, closed, in failure backoff, or busy with
+     *   another call (never queues behind or interrupts active calls).
+     * - Uses a short total budget ([DEFAULT_WARM_UP_TIMEOUT_MS], ~5 s across bootstrap + `init`)
+     *   so a hanging `init(ctx)` cannot stall Home/Detail for ~30 s.
+     * - On failure or timeout, logs a single non-ERROR warning and backs off for [backoffMs]
+     *   before another background warm-up attempt.
      */
-    suspend fun warmUpIfIdle(timeoutMsOverride: Long? = null) {
-        if (closed || (initialized && quickJs != null)) return
-        if (!callMutex.tryLock()) return
-        try {
-            if (!closed && (!initialized || quickJs == null)) {
-                ensureInitializedLocked(timeoutMsOverride ?: defaultTimeoutMs)
+    suspend fun warmUpIfIdle(
+        timeoutMsOverride: Long? = null,
+        backoffMs: Long = DEFAULT_WARM_UP_FAILURE_BACKOFF_MS,
+    ): Boolean {
+        if (closed) return false
+        if (initialized && quickJs != null) return true
+        if (clockMs() < warmUpBackoffUntilMs) return false
+        if (!callMutex.tryLock()) return false
+        return try {
+            if (closed) return false
+            if (initialized && quickJs != null) return true
+            if (clockMs() < warmUpBackoffUntilMs) return false
+            val budgetMs = (timeoutMsOverride ?: DEFAULT_WARM_UP_TIMEOUT_MS).coerceAtLeast(1L)
+            val ok = ensureInitializedLocked(timeoutMs = budgetMs, isBackgroundWarmUp = true)
+            if (ok) {
+                warmUpBackoffUntilMs = 0L
+            } else {
+                warmUpBackoffUntilMs = clockMs() + backoffMs.coerceAtLeast(0L)
             }
+            ok
         } finally {
             callMutex.unlock()
         }
@@ -570,10 +593,14 @@ class PluginRuntime(
         runCatching { cookieJar.flush() }
     }
 
-    private suspend fun ensureInitializedLocked(timeoutMs: Long) {
-        if (quickJs != null && initialized) return
+    private suspend fun ensureInitializedLocked(
+        timeoutMs: Long,
+        isBackgroundWarmUp: Boolean = false,
+    ): Boolean {
+        if (quickJs != null && initialized) return true
         destroyRuntimeLocked(runDispose = false)
 
+        val initStartNanos = System.nanoTime()
         val loader = moduleLoader {
             load { name ->
                 when (name) {
@@ -586,7 +613,7 @@ class PluginRuntime(
         qjs.memoryLimit = memoryLimitBytes
         qjs.maxStackSize = MAX_STACK_BYTES
         qjs.evaluationTimeoutMillis = timeoutMs
-        val dl = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        val dl = initStartNanos + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
         callDeadlineNanos = dl
         domParser.setCallDeadlineNanos(dl)
         bridgeToken = PluginCrypto.hexEncode(PluginCrypto.randomBytes(16))
@@ -632,7 +659,11 @@ class PluginRuntime(
             }
             pendingEval = null
             quickJs = qjs
-            // Run optional init(ctx) inside its own scoped invocation (§11.1: failure == call failure)
+            // Run optional init(ctx) within the SAME total timeout budget so bootstrap + init
+            // never double the wall wait (e.g. 2x timeout holding callMutex).
+            val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - initStartNanos)
+            val remainingMs = (timeoutMs - elapsedMs).coerceAtLeast(1L)
+            qjs.evaluationTimeoutMillis = remainingMs
             val gen = callGeneration.incrementAndGet()
             val initScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
             activeCallScope = initScope
@@ -648,7 +679,7 @@ class PluginRuntime(
                 }
                 pendingEval = initDeferred
                 try {
-                    withTimeout(timeoutMs) { initDeferred.await() }
+                    withTimeout(remainingMs) { initDeferred.await() }
                 } catch (e: TimeoutCancellationException) {
                     if (currentCoroutineContext().isActive) {
                         throw InternalCallTimeoutException(e)
@@ -662,6 +693,7 @@ class PluginRuntime(
                 runCatching { cookieJar.flush() }
             }
             initialized = true
+            return true
         } catch (ce: CancellationException) {
             // Caller cancelled during init: silently release the half-initialized VM without
             // logging an error and rethrow cooperative CancellationException directly.
@@ -700,6 +732,15 @@ class PluginRuntime(
                 }
                 quickJs = null
                 initialized = false
+            }
+            if (isBackgroundWarmUp) {
+                val reason = if (t is InternalCallTimeoutException || t is TimeoutCancellationException) {
+                    "timed out after ${timeoutMs}ms"
+                } else {
+                    t.message ?: t.javaClass.simpleName
+                }
+                logger.warn("Background warm-up failed for '$instanceId': $reason")
+                return false
             }
             handleInvocationFailureLocked(null, "init", t, null)
         } finally {
@@ -1359,6 +1400,8 @@ class PluginRuntime(
         const val MAX_ACTIVE_TIMERS = 256
         const val DEFAULT_CALL_TIMEOUT_MS = 15_000L
         const val PLAYBACK_CALL_TIMEOUT_MS = 30_000L
+        const val DEFAULT_WARM_UP_TIMEOUT_MS = 5_000L
+        const val DEFAULT_WARM_UP_FAILURE_BACKOFF_MS = 30_000L
         private const val DISPOSE_TIMEOUT_MS = 2_000L
         private const val SHUTDOWN_WAIT_MS = 2_000L
         private const val GRACEFUL_CANCEL_WAIT_MS = 250L

@@ -249,18 +249,22 @@ class PluginMediaSource(
 
     /**
      * Best-effort background warm-up (e.g. on entering Search) so optional `suggest()` can
-     * respond on a warm VM without cold-starting during typing. Never queues behind active
-     * calls and silently ignores any initialization/auth/network errors.
+     * respond on a warm VM without cold-starting during typing. Uses a bounded ~5 s timeout,
+     * backs off briefly after initialization failure, never queues behind active calls, and
+     * silently ignores any initialization/auth/network errors.
      */
-    suspend fun warmUpIfNeeded() {
-        if (runtime.isInitialized || runtime.isClosed) return
-        try {
+    suspend fun warmUpIfNeeded(
+        timeoutMsOverride: Long? = null,
+        backoffMs: Long = PluginRuntime.DEFAULT_WARM_UP_FAILURE_BACKOFF_MS,
+    ): Boolean {
+        if (runtime.isInitialized || runtime.isClosed) return runtime.isInitialized
+        return try {
             stateGuard()
-            runtime.warmUpIfIdle()
+            runtime.warmUpIfIdle(timeoutMsOverride = timeoutMsOverride, backoffMs = backoffMs)
         } catch (ce: kotlinx.coroutines.CancellationException) {
             throw ce
         } catch (_: Throwable) {
-            // Silent best-effort warm-up
+            false
         }
     }
 
