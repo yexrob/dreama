@@ -54,7 +54,7 @@ class PhoneInputAndBarTest {
 
     @Test(expected = IllegalArgumentException::class)
     fun qrCodeMatrixRejectsOversizedPayload() {
-        QrCodeMatrix.encode("a".repeat(200))
+        QrCodeMatrix.encode("a".repeat(300))
     }
 
     @Test
@@ -443,5 +443,29 @@ class PhoneInputAndBarTest {
         val stream = if (code >= 400) conn.errorStream else conn.inputStream
         val text = stream?.bufferedReader(StandardCharsets.UTF_8)?.readText().orEmpty()
         return code to text
+    }
+
+    @Test
+    fun qrEncodesLongLoginPayloadsUpToVersionNine() {
+        // 145 bytes is the real-world QR login URL length that used to crash the login card.
+        val sizes = mapOf(145 to 45, 190 to 49, 230 to 53)
+        val dir = java.io.File("build/qr-samples").apply { mkdirs() }
+        for ((len, expectedSize) in sizes) {
+            val text = "https://example.com/qr?" + "k".repeat(len - 23)
+            val qr = QrCodeMatrix.encode(text)
+            org.junit.Assert.assertEquals(expectedSize, qr.size)
+            val sb = StringBuilder("P1\n${qr.size + 8} ${qr.size + 8}\n")
+            for (y in -4 until qr.size + 4) {
+                for (x in -4 until qr.size + 4) {
+                    val dark = x in 0 until qr.size && y in 0 until qr.size && qr[x, y]
+                    sb.append(if (dark) "1 " else "0 ")
+                }
+                sb.append('\n')
+            }
+            java.io.File(dir, "qr-$len.pbm").writeText(sb.toString())
+            java.io.File(dir, "qr-$len.txt").writeText(text)
+        }
+        org.junit.Assert.assertNull(QrCodeMatrix.encodeOrNull("a".repeat(QrCodeMatrix.MAX_PAYLOAD_BYTES + 1)))
+        org.junit.Assert.assertNotNull(QrCodeMatrix.encodeOrNull("a".repeat(QrCodeMatrix.MAX_PAYLOAD_BYTES)))
     }
 }

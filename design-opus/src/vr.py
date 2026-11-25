@@ -75,18 +75,27 @@ def ray(x, y, x0=1306, y0=1000):
             f'<div class="vcur" style="left:{x}px;top:{y}px"></div><div class="ctrl"></div>')
 
 
-def bar(play_icon='pause', hover_track=False, adjust_on=False, play_hover=False):
-    track = ('<div class="vtrack' + (' hov' if hover_track else '') + '"><div class="buf"></div><div class="played"></div>'
+def bar(play_icon='pause', hover_track=False, adjust_on=False, play_hover=False, dm=None, src='NAS', dm_hover=False):
+    """dm: None = the source has no danmaku, so the button is not drawn (and the track keeps its full
+    27.2 deg); 'on' / 'off' = danmaku button state. With the button the track shortens to 23.2 deg."""
+    tstyle = ' style="width:464px"' if dm else ''
+    track = ('<div class="vtrack' + (' hov' if hover_track else '') + f'"{tstyle}><div class="buf"></div><div class="played"></div>'
              + ('<div class="tick" style="left:58.2%"></div>' if hover_track else '') + '</div>')
     bubble = '<div class="vbubble" style="left:825px;top:806px;transform:translateX(-50%)">1:05:10</div>' if hover_track else ''
     title = ('<div class="vt" style="left:508px;top:818px"><b style="font-weight:600">雾港</b>'
-             '<span class="c2"> · 2025 · 来自 NAS</span></div>') if not hover_track else ''
+             f'<span class="c2"> · 2025 · 来自 {src}</span></div>') if not hover_track else ''
+    rtime = 872 if dm else 952
+    dmb = ''
+    if dm:
+        dmb = (f'<div class="vround dmb {dm}{" hov" if dm_hover else ""}" style="left:996px;top:834px"><span>弹</span>'
+               + ('<i></i>' if dm == 'off' else '') + '</div>')
     return ('<div class="vround ex" style="left:330px;top:834px">' + ic('chev-l') + '</div>'
             '<div class="vp" style="left:400px;top:806px;width:800px;height:112px"></div>'
             f'<div class="vround pl{" hov" if play_hover else ""}" style="left:420px;top:830px">{ic(play_icon)}</div>'
             + title + track + bubble +
             '<div class="vt c2" style="left:508px;top:874px">0:42:18</div>'
-            '<div class="vt c2" style="left:952px;top:874px;width:100px;text-align:right">-1:09:42</div>'
+            f'<div class="vt c2" style="left:{rtime}px;top:874px;width:100px;text-align:right">-1:09:42</div>'
+            + dmb +
             f'<div class="vpill{" on" if adjust_on else ""}" style="left:1076px;top:834px">{ic("sliders")}调整</div>')
 
 
@@ -140,10 +149,9 @@ def cast_card():
 
 
 def toast():
-    steps = ''.join(f'<i class="{"on" if i < 4 else ""}"></i>' for i in range(4))
-    return ('<div class="vp" style="left:610px;top:834px;width:380px;height:52px;border-radius:26px;display:flex;align-items:center;'
-            f'justify-content:center;gap:16px;font-size:24px;font-weight:500"><span class="c2">3D 强度</span>'
-            f'<span class="steps">{steps}</span><b style="font-weight:600">强烈</b></div>')
+    return ('<div class="vp" style="left:680px;top:834px;width:240px;height:52px;border-radius:26px;display:flex;align-items:center;'
+            'justify-content:center;gap:14px;font-size:24px;font-weight:500"><span class="c2">弹幕</span>'
+            '<b style="font-weight:600">已关</b></div>')
 
 
 def buffering():
@@ -181,22 +189,22 @@ def vr_page():
     S['clean'] = screen() + subt()
     S['measure'] = screen() + subt(474) + bar(adjust_on=True) + menu() + measure()
     layers = {
-        'menu': '9 / 16：调暗 1 · 画面 2 · 字幕 1 · 控制条 1 · 弹出卡片 1 · 射线 2 · 手柄 1',
-        'bar': '8 / 16：调暗 1 · 画面 2 · 字幕 1 · 控制条 1 · 射线 2 · 手柄 1',
-        'paused': '7 / 16：调暗 1 · 画面 2 · 控制条 1 · 射线 2 · 手柄 1',
-        'toast': '5 / 16：调暗 1 · 画面 2 · 字幕 1 · 提示 1',
-        'next': '7 / 16：调暗 1 · 画面 2 · 弹出卡片 1 · 射线 2 · 手柄 1',
-        'cast': '8 / 16：调暗 1 · 画面 2 · 字幕 1 · 弹出卡片 1 · 射线 2 · 手柄 1',
-        'buffer': '4 / 16：调暗 1 · 画面 2 · 弹出卡片 1',
-        'clean': '4 / 16：调暗 1 · 画面 2 · 字幕 1',
-        'measure': '9 / 16 · 上限设计值 11（含 toast 与发光层）',
+        'menu': '9 / 16：调暗 1 · 画面 2 · 字幕 1 · 控制条 1 · 弹出卡片 1 · 射线 2 · 手柄 1（片源没有弹幕；有弹幕 +2）',
+        'bar': '8 / 16：调暗 1 · 画面 2 · 字幕 1 · 控制条 1 · 射线 2 · 手柄 1（片源没有弹幕；有弹幕 +2）',
+        'paused': '7 / 16：调暗 1 · 画面 2 · 控制条 1 · 射线 2 · 手柄 1（片源没有弹幕；有弹幕 +2）',
+        'toast': '5 / 16：调暗 1 · 画面 2 · 字幕 1 · 提示 1（片源没有弹幕；有弹幕 +2）',
+        'next': '7 / 16：调暗 1 · 画面 2 · 弹出卡片 1 · 射线 2 · 手柄 1（片源没有弹幕；有弹幕 +2）',
+        'cast': '8 / 16：调暗 1 · 画面 2 · 字幕 1 · 弹出卡片 1 · 射线 2 · 手柄 1（片源没有弹幕；有弹幕 +2）',
+        'buffer': '4 / 16：调暗 1 · 画面 2 · 弹出卡片 1（片源没有弹幕；有弹幕 +2）',
+        'clean': '4 / 16：调暗 1 · 画面 2 · 字幕 1（片源没有弹幕；有弹幕 +2）',
+        'measure': '9 / 16 · 上限设计值 13（含弹幕、调色板和发光层，见 §6.5）',
     }
     states = [
-        ('menu', '快捷菜单', '点「调整」打开。菜单是控制条的一部分，从它右端向上长出来；字幕临时抬到菜单上方。选项改了立即生效。'),
+        ('menu', '快捷菜单（已被取代）', '<b>这一版已被手上的调色板取代，见 vr-palette.html 和 ux-spec §6.3。</b>旧方案：点「调整」打开，菜单从控制条右端向上长出来，字幕临时抬到菜单上方。'),
         ('bar', '控制条', '射线进入画面或控制条时出现，离开 3 秒后淡出。悬停进度条：线变粗、出现时间气泡，扳机跳转。'),
         ('paused', '暂停', '暂停时房间亮回来（「开灯」），控制条常驻不隐藏。'),
-        ('toast', '提示', '摇杆上下改 3D 强度：不弹界面，只在视线下方 18° 出一条提示，2.5 秒后消失。'),
-        ('next', '下一集', '片尾字幕开始时，在菜单的位置出现下一集卡片，倒数 8 秒。不遮画面中央。'),
+        ('toast', '提示', '按 Y 开关弹幕、摇杆快进快退：不弹界面，只在视线下方 18° 出一条提示，2.5 秒后消失。（原来的「摇杆上下改 3D 强度」已去掉）'),
+        ('next', '下一集', '片尾字幕开始时，在控制条上方（原来菜单的位置）出现下一集卡片，倒数 8 秒。不遮画面中央。'),
         ('cast', '投屏请求', '看片时有人投屏：同一个位置出卡片，字幕抬到上方，不自动打断。'),
         ('buffer', '缓冲', '超过 500 ms 才出现，放在画面中央，只有一行字。'),
         ('clean', '沉浸', '什么都不碰时：只剩画面和字幕，手柄和射线也隐藏。'),
@@ -204,6 +212,7 @@ def vr_page():
     ]
     body = room
     for sid, html in S.items():
+        html = html.replace('id="rg"', f'id="rg-{sid}"').replace('url(#rg)', f'url(#rg-{sid})')
         body += f'<div data-st="{sid}">{html}</div>'
     body += '</div>'
     links = ''.join(f'<a href="#{sid}">{label}</a>' for sid, label, _ in states)

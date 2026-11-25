@@ -213,6 +213,7 @@
     <string name="plugins_installed_toast">已安装插件「%1$s」</string>
     <string name="plugins_install_failed_generic">插件安装未能完成，请检查仓库地址或网络连接后重试。</string>
     <string name="plugins_builtin_uninstall_blocked">内置插件不能卸载，如需隐藏可先停用。</string>
+    <string name="plugin_form_qr_too_long">这个登录二维码内容太长，无法显示。请换一种登录方式，或联系插件作者。</string>
 
     <!-- Phone input: dev server address & direct HTTPS package URL -->
     <string name="phone_html_dev_page_title">depth3d · 连接开发服务器</string>

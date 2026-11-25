@@ -91,8 +91,9 @@ fun HomeScreen(model: WallModel, nav: WallNav) {
                 }
                 for ((src, state) in shelves) {
                     when (state) {
-                        is Load.Ready -> state.value.filter { it.items.isNotEmpty() }.forEach { shelf ->
-                            item("${src.source.id}/${shelf.category.id}") { ShelfRow(src, shelf, nav) }
+                        is Load.Ready -> state.value.filter { it.items.isNotEmpty() }.forEachIndexed { i, shelf ->
+                            // Sources may repeat a category id; the index keeps keys unique without dropping rows.
+                            item("${src.source.id}/$i/${shelf.category.id}") { ShelfRow(src, shelf, nav) }
                         }
                         is Load.Failed -> item("${src.source.id}/failed") { FailedRow(src, state.error, model, nav) }
                         else -> item("${src.source.id}/loading") { SkeletonRow() }
@@ -121,7 +122,7 @@ private fun HomeComputersRow(computers: List<StreamingComputer>, nav: WallNav) {
             contentPadding = PaddingValues(horizontal = Wall.Margin),
             horizontalArrangement = Arrangement.spacedBy(24.dp),
         ) {
-            items(computers, key = { it.id }) { pc ->
+            items(computers.distinctBy { it.id }, key = { it.id }) { pc ->
                 PcCard(
                     computer = pc,
                     onPrimaryClick = {
@@ -184,7 +185,7 @@ private fun HeroBlock(hero: Hero, resumes: List<Resume>, nav: WallNav) {
                 flingBehavior = rememberSnapFlingBehavior(row),
                 contentPadding = PaddingValues(horizontal = Wall.Margin),
                 horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-                items(resumes, key = { "${it.source.source.id}/${it.item.id}" }) { c ->
+                items(resumes.distinctBy { "${it.source.source.id}/${it.item.id}" }, key = { "${it.source.source.id}/${it.item.id}" }) { c ->
                     CompositionLocalProvider(LocalMediaSource provides c.source) {
                         ContinueCard(
                             c.item.title,
@@ -217,7 +218,7 @@ private fun ShelfRow(src: MediaSource, shelf: Shelf, nav: WallNav) {
             LazyRow(state = row, flingBehavior = rememberSnapFlingBehavior(row),
                 contentPadding = PaddingValues(horizontal = Wall.Margin),
                 horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-                items(shelf.items, key = { it.id }) { item ->
+                items(shelf.items.distinctBy { it.id }, key = { it.id }) { item ->
                     if (item.isFolder) {
                         val caption = item.childCount?.let { stringResource(R.string.home_folder_count, it) }
                             ?: stringResource(R.string.home_folder_label)

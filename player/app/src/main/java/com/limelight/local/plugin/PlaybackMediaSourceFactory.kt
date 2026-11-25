@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.annotation.OptIn
 import androidx.media3.common.C
+import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.util.UnstableApi
@@ -20,9 +21,12 @@ import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.MediaSource as ExoMediaSource
 import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
-import androidx.media3.exoplayer.source.SingleSampleMediaSource
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
+import androidx.media3.extractor.Extractor
+import androidx.media3.extractor.ExtractorsFactory
+import androidx.media3.extractor.text.DefaultSubtitleParserFactory
+import androidx.media3.extractor.text.SubtitleExtractor
 import com.limelight.local.media.Artwork
 import com.limelight.local.media.DashStream
 import com.limelight.local.media.Item
@@ -1130,19 +1134,35 @@ internal class PlaybackMediaSourceFactory(
             } else {
                 baseSubFactory
             }
-            val subConfig = MediaItem.SubtitleConfiguration.Builder(Uri.parse(sub.track.url))
-                .setId(sub.track.id)
-                .setLabel(sub.track.label)
-                .setMimeType(sub.media3MimeType)
-                .apply {
-                    sub.track.lang?.let(::setLanguage)
-                    if (sub.track.isDefault) setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
-                }
-                .build()
-            sources += SingleSampleMediaSource.Factory(subDataSourceFactory)
-                .createMediaSource(subConfig, C.TIME_UNSET)
+            // Media3 parses subtitles during extraction (TextRenderer only accepts
+            // application/x-media3-cues), so sidecar files go through SubtitleExtractor
+            // the same way DefaultMediaSourceFactory does. SingleSampleMediaSource would
+            // hand raw text/vtt samples to the renderer and fail the whole playback.
+            sources += buildSidecarSubtitleSource(sub, subDataSourceFactory)
         }
         return MergingMediaSource(*sources.toTypedArray())
+    }
+
+    internal fun sidecarSubtitleFormat(sub: ResolvedSubtitlePlan): Format =
+        Format.Builder()
+            .setId(sub.track.id)
+            .setLabel(sub.track.label)
+            .setSampleMimeType(sub.media3MimeType)
+            .setLanguage(sub.track.lang)
+            .setSelectionFlags(if (sub.track.isDefault) C.SELECTION_FLAG_DEFAULT else 0)
+            .build()
+
+    private fun buildSidecarSubtitleSource(
+        sub: ResolvedSubtitlePlan,
+        dataSourceFactory: DataSource.Factory,
+    ): ExoMediaSource {
+        val format = sidecarSubtitleFormat(sub)
+        val parserFactory = DefaultSubtitleParserFactory()
+        val extractorsFactory = ExtractorsFactory {
+            arrayOf<Extractor>(SubtitleExtractor(parserFactory.create(format), format))
+        }
+        return ProgressiveMediaSource.Factory(dataSourceFactory, extractorsFactory)
+            .createMediaSource(MediaItem.fromUri(Uri.parse(sub.track.url)))
     }
 
     /** Exposed for unit tests to verify real `SafePluginHttpDataSource` behavior. */
