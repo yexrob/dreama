@@ -213,4 +213,99 @@
     <string name="plugins_installed_toast">已安装插件「%1$s」</string>
     <string name="plugins_install_failed_generic">插件安装未能完成，请检查仓库地址或网络连接后重试。</string>
     <string name="plugins_builtin_uninstall_blocked">内置插件不能卸载，如需隐藏可先停用。</string>
+
+    <!-- Phone input: dev server address & direct HTTPS package URL -->
+    <string name="phone_html_dev_page_title">depth3d · 连接开发服务器</string>
+    <string name="phone_html_dev_heading">填写电脑开发服务器地址</string>
+    <string name="phone_html_dev_hint">填写运行 d3plugin serve 的电脑局域网地址（例如 192.168.1.20:8787）</string>
+    <string name="phone_html_dev_placeholder">例如 192.168.1.20:8787</string>
+    <string name="phone_html_dev_submit">连接到头显</string>
+    <string name="phone_action_dev_server">连接开发服务器</string>
+    <string name="phone_input_dev_title">在手机上填写电脑地址</string>
+    <string name="phone_input_dev_sub">扫码填写局域网里运行 d3plugin serve 的电脑地址，支持 192.168.1.20:8787 或 http://192.168.1.20:8787。</string>
+    <string name="phone_input_dev_label">开发服务器地址</string>
+    <string name="phone_input_dev_placeholder">192.168.1.20:8787</string>
+
+    <string name="phone_html_direct_page_title">depth3d · 直链安装插件</string>
+    <string name="phone_html_direct_heading">粘贴 .d3plugin 地址</string>
+    <string name="phone_html_direct_hint">粘贴以 https:// 开头的单个 .d3plugin 安装包地址</string>
+    <string name="phone_html_direct_placeholder">例如 https://example.com/my-plugin-1.0.0.d3plugin</string>
+    <string name="phone_html_direct_submit">下载并预览</string>
+    <string name="phone_action_direct_url">下载插件包</string>
+    <string name="phone_input_direct_title">在手机上粘贴 .d3plugin 地址</string>
+    <string name="phone_input_direct_sub">扫码在手机浏览器粘贴单个 .d3plugin 插件包的 HTTPS 地址，提交后头显会下载并校验。</string>
+    <string name="phone_input_direct_label">插件包 HTTPS 地址</string>
+    <string name="phone_input_direct_placeholder">https://example.com/plugin.d3plugin</string>
+
+    <!-- Dev mode & local file install: origins, warnings & actions -->
+    <string name="plugins_origin_dev">开发版</string>
+    <string name="plugins_origin_dev_with_addr">开发版 · %1$s</string>
+    <string name="plugins_origin_file">本地文件</string>
+    <string name="plugins_install_dev_banner">开发版 · 来自 %1$s，未经仓库校验</string>
+    <string name="plugins_install_replace_to_dev">将会把来自「%1$s」的正式版换成开发版，并彻底清除原插件的所有播放源、配置、密码和本地数据。</string>
+    <string name="plugins_install_replace_file_to_dev">将会把来自「%1$s」的插件换成开发版，并彻底清除原插件的所有播放源、配置、密码和本地数据。</string>
+    <string name="plugins_install_replace_dev_to_release">将会把来自「%1$s」的开发版换成来自「%2$s」的正式版，并彻底清除原插件的所有播放源、配置、密码和本地数据。</string>
+    <string name="plugins_install_replace_between_sources">已安装相同 ID 的插件（来自「%1$s」），替换为来自「%2$s」的版本会彻底清除原插件的所有播放源、配置、密码和本地数据。</string>
+    <string name="plugins_install_permission_expanded_title">重新加载申请了更多权限</string>
+    <string name="plugins_install_permission_expanded_btn">确认权限并重新加载</string>
+    <string name="plugins_repo_replace">替换安装</string>
+    <string name="plugins_action_load">加载</string>
+    <string name="plugins_action_download">下载</string>
+
+    <!-- Add Plugin menu & Plugins tab developer entry -->
+    <string name="plugins_add_btn">添加插件</string>
+    <string name="plugins_add_sheet_title">添加插件</string>
+    <string name="plugins_add_repo_sub">订阅 HTTPS 插件仓库，浏览、安装并接收更新</string>
+    <string name="plugins_add_file_title">从文件安装</string>
+    <string name="plugins_add_file_sub">安装头显存储里的 .d3plugin 插件包，或粘贴 HTTPS 地址</string>
+    <string name="plugins_dev_row_title">开发者</string>
+    <string name="plugins_dev_row_sub">从电脑加载开发中的插件、重新加载并查看日志</string>
+
+    <!-- Developer Mode screen -->
+    <string name="dev_screen_title">开发者</string>
+    <string name="dev_screen_guide">在电脑上运行 d3plugin serve &lt;目录&gt;，头显和电脑在同一个 Wi‑Fi。</string>
+    <string name="dev_manual_addr_btn">输入电脑地址</string>
+    <string name="dev_rescan_btn">重新搜索</string>
+    <string name="dev_discovered_section">在局域网里找到的开发服务器</string>
+    <string name="dev_searching">正在搜索局域网内的开发服务器…</string>
+    <string name="dev_no_wifi">还没连上 Wi‑Fi，无法发现局域网开发服务器，请先连接网络。</string>
+    <string name="dev_discovered_empty">暂未发现运行中的开发服务器，可点击「重新搜索」或手动「输入电脑地址」。</string>
+    <string name="dev_installed_section">已安装的开发版插件</string>
+    <string name="dev_installed_empty">还没有安装开发版插件。</string>
+    <string name="dev_reload_btn">重新加载</string>
+    <string name="dev_detail_btn">详情</string>
+    <string name="dev_loading_pkg">正在从电脑拉取并校验插件包…</string>
+    <string name="dev_reloading_pkg">正在重新加载插件…</string>
+    <string name="dev_reloaded_toast">已重新加载「%1$s」</string>
+    <string name="dev_reload_offline_hint">电脑暂时连不上，已保留当前安装的版本。</string>
+    <string name="dev_logs_section">最近日志 · %1$s</string>
+    <string name="dev_logs_refresh">刷新</string>
+    <string name="dev_logs_empty">暂无日志，重新加载或访问该插件后会在这里显示最新输出。</string>
+    <string name="dev_tech_error_title">插件加载失败（开发诊断信息）</string>
+    <string name="dev_server_entry_sub">v%1$s · %2$s · %3$s</string>
+    <string name="dev_installed_entry_sub">开发版 · v%1$s · 来自 %2$s</string>
+
+    <!-- Local File & Direct HTTPS URL install screen -->
+    <string name="file_install_title">从文件安装</string>
+    <string name="file_install_pick_btn">选择文件</string>
+    <string name="file_install_direct_url_btn">粘贴 HTTPS 地址</string>
+    <string name="file_install_refresh_btn">刷新</string>
+    <string name="file_install_paths_title">插件包目录</string>
+    <string name="file_install_path_download">下载目录：%1$s</string>
+    <string name="file_install_path_app">应用目录（无需权限，推荐 adb push）：%1$s</string>
+    <string name="file_install_scoped_hint">受系统存储限制，下载目录里的文件若未列出，请点「选择文件」或通过 adb push 放到应用目录。</string>
+    <string name="file_install_dir_download">下载目录</string>
+    <string name="file_install_dir_app">应用目录</string>
+    <string name="file_install_scanning">正在扫描插件包…</string>
+    <string name="file_install_empty">这两个目录里暂无 .d3plugin 文件。可点「选择文件」、用 adb push 放到应用目录，或「粘贴 HTTPS 地址」。</string>
+    <string name="file_install_picker_unavailable">当前系统没有内置文件选择器，请用 adb push 将 .d3plugin 放入上方应用目录后点「刷新」。</string>
+    <string name="file_install_reading">正在读取并校验插件包…</string>
+    <string name="file_install_downloading_url">正在下载并校验插件包…</string>
+    <string name="plugins_err_invalid_manifest">插件配置清单（manifest.json）不合法，无法安装。</string>
+    <string name="plugins_err_direct_https_only">直链安装仅支持以 https:// 开头的地址。</string>
+    <string name="plugins_err_file_too_large">插件包超过大小限制（上限 8 MB）。</string>
+    <string name="plugins_err_file_unreadable">无法读取所选插件文件，请确认文件存在且未损坏。</string>
+    <string name="plugins_err_invalid_package">所选文件不是合法的 .d3plugin 插件包。</string>
+    <string name="plugins_err_http_status">下载插件失败，服务器返回了错误状态，请检查地址后重试。</string>
+    <string name="plugins_err_connect_failed">暂时连不上服务器，请检查网络连接和地址后重试。</string>
 </resources>

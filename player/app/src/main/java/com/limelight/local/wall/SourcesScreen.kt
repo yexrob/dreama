@@ -60,6 +60,7 @@ import com.limelight.local.plugin.InstalledPluginEntity
 import com.limelight.local.plugin.PluginInstanceEntity
 import com.limelight.local.plugin.PluginManifest
 import com.limelight.local.plugin.PluginMediaSource
+import com.limelight.local.plugin.PluginPackageManager
 import com.limelight.local.plugin.PluginRepoEntity
 import com.limelight.local.plugin.PluginSourceMismatchException
 import com.limelight.local.plugin.RepoPluginEntry
@@ -103,6 +104,7 @@ fun SourcesScreen(model: WallModel, nav: WallNav, initialTab: SourcesTab = Sourc
         PluginInstallGuard.findAvailableUpdates(installedPlugins, pluginRepos, model.pluginHost.repoClient)
     }
 
+    var showAddPluginMenu by remember { mutableStateOf(false) }
     var showAddRepoSheet by remember { mutableStateOf(false) }
     var busyJob by remember { mutableStateOf<Job?>(null) }
     var busyMessage by remember { mutableStateOf<String?>(null) }
@@ -159,8 +161,8 @@ fun SourcesScreen(model: WallModel, nav: WallNav, initialTab: SourcesTab = Sourc
                 )
             } else {
                 WallButton(
-                    text = stringResource(R.string.sources_add_repo_btn),
-                    onClick = { showAddRepoSheet = true },
+                    text = stringResource(R.string.plugins_add_btn),
+                    onClick = { showAddPluginMenu = true },
                     icon = WallIcons.Plus,
                     kind = ButtonKind.Primary,
                 )
@@ -276,10 +278,12 @@ fun SourcesScreen(model: WallModel, nav: WallNav, initialTab: SourcesTab = Sourc
                         else -> null
                     }
                     val update = availableUpdates[pkg.pluginId]
+                    val isDev = PluginPackageManager.isDevOrigin(pkg.sourceOrigin)
                     ManagementRow(
                         icon = WallIcons.Cube,
                         title = manifest.name,
                         sub = sub,
+                        badgeText = if (isDev) stringResource(R.string.plugins_origin_dev) else null,
                         dangerStatus = if (pkg.needsPermissionReconfirm) problem else null,
                         mutedStatus = if (!pkg.enabled && !pkg.needsPermissionReconfirm) problem else null,
                         trailingAction = update?.let { upd ->
@@ -333,7 +337,32 @@ fun SourcesScreen(model: WallModel, nav: WallNav, initialTab: SourcesTab = Sourc
                         )
                     }
                 }
+
+                // Bottom Developer entry row (§1: 「播放源与插件 › 插件」页签底部一行「开发者」)
+                item("developer-entry") {
+                    Spacer(Modifier.height(16.dp))
+                    ManagementRow(
+                        icon = WallIcons.Computer,
+                        title = stringResource(R.string.plugins_dev_row_title),
+                        sub = stringResource(R.string.plugins_dev_row_sub),
+                        onClick = { nav.openPluginDeveloper() },
+                    )
+                }
             }
+        }
+
+        if (showAddPluginMenu) {
+            AddPluginChoiceSheet(
+                onAddRepo = {
+                    showAddPluginMenu = false
+                    showAddRepoSheet = true
+                },
+                onInstallFromFile = {
+                    showAddPluginMenu = false
+                    nav.openPluginFileInstall()
+                },
+                onDismiss = { showAddPluginMenu = false },
+            )
         }
 
         if (showAddRepoSheet) {
@@ -830,9 +859,58 @@ fun PluginDetailScreen(model: WallModel, nav: WallNav, page: Page.PluginDetail) 
     val entity = installedPlugins.firstOrNull { it.pluginId == page.pluginId }
     val manifest = entity?.let { model.localizedManifestFor(it) }
     val isBuiltIn = entity?.let { BuiltInPluginInstaller.isBuiltIn(it) } == true
+    val isDev = entity?.let { PluginPackageManager.isDevOrigin(it.sourceOrigin) } == true
+    val devServerUrl = entity?.let { PluginPackageManager.devServerBaseUrlFromOrigin(it.sourceOrigin) }
 
     var showUninstallConfirm by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
+    var reloadJob by remember { mutableStateOf<Job?>(null) }
+    var reloadBusyMsg by remember { mutableStateOf<String?>(null) }
+    var reloadError by remember { mutableStateOf<String?>(null) }
+    var pendingReloadConfirm by remember { mutableStateOf<PendingPluginInstall?>(null) }
+
+    DisposableEffect(Unit) {
+        onDispose { reloadJob?.cancel() }
+    }
+
+    fun startDevReload() {
+        val url = devServerUrl ?: return
+        if (reloadJob?.isActive == true) return
+        reloadError = null
+        reloadBusyMsg = context.getString(R.string.dev_reloading_pkg)
+        reloadJob = scope.launch {
+            try {
+                val outcome = withContext(Dispatchers.IO) {
+                    PluginInstallGuard.reloadDevPlugin(
+                        packageManager = model.pluginHost.packageManager(),
+                        repoClient = model.pluginHost.repoClient,
+                        rawServerAddress = url,
+                        localize = { b, p -> model.pluginHost.localizePreview(b, p) },
+                    )
+                }
+                when (outcome) {
+                    is DevReloadOutcome.Reloaded -> {
+                        model.pluginHost.notifyChanged()
+                        if (outcome.loadTechnicalError != null) {
+                            reloadError = context.getString(R.string.plugin_error_internal)
+                        } else {
+                            nav.toast(context.getString(R.string.dev_reloaded_toast, outcome.displayName))
+                        }
+                    }
+                    is DevReloadOutcome.NeedsConfirmation -> {
+                        pendingReloadConfirm = outcome.pending
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                val baseErr = PluginInstallGuard.formatInstallError(e, strings)
+                reloadError = "$baseErr ${context.getString(R.string.dev_reload_offline_hint)}"
+            } finally {
+                reloadBusyMsg = null
+            }
+        }
+    }
 
     Box(Modifier.fillMaxSize()) {
         Box(Modifier.offset(64.dp, 32.dp)) {
@@ -962,8 +1040,23 @@ fun PluginDetailScreen(model: WallModel, nav: WallNav, page: Page.PluginDetail) 
                     }
                 }
 
+                reloadError?.let { err ->
+                    item("reload-err") {
+                        Notice(err, danger = true)
+                    }
+                }
+
                 item("actions") {
                     Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                        if (isDev && devServerUrl != null) {
+                            WallButton(
+                                text = stringResource(R.string.dev_reload_btn),
+                                onClick = { startDevReload() },
+                                icon = WallIcons.Refresh,
+                                kind = if (entity.needsPermissionReconfirm) ButtonKind.Plain else ButtonKind.Primary,
+                                enabled = !busy && reloadBusyMsg == null,
+                            )
+                        }
                         WallButton(
                             text = stringResource(R.string.plugin_action_view_logs),
                             onClick = { nav.openPluginLogs(entity.pluginId) },
@@ -980,6 +1073,30 @@ fun PluginDetailScreen(model: WallModel, nav: WallNav, page: Page.PluginDetail) 
                     }
                 }
             }
+        }
+
+        reloadBusyMsg?.let { msg ->
+            BusyModal(
+                message = msg,
+                onCancel = {
+                    reloadJob?.cancel()
+                    reloadJob = null
+                    reloadBusyMsg = null
+                },
+            )
+        }
+
+        pendingReloadConfirm?.let { pending ->
+            PluginInstallConfirmSheet(
+                pending = pending,
+                model = model,
+                strings = strings,
+                onInstalled = { name ->
+                    pendingReloadConfirm = null
+                    nav.toast(context.getString(R.string.dev_reloaded_toast, name))
+                },
+                onDismiss = { pendingReloadConfirm = null },
+            )
         }
 
         if (showUninstallConfirm && entity != null && manifest != null && !isBuiltIn) {
@@ -1094,9 +1211,11 @@ fun RepoBrowseScreen(model: WallModel, nav: WallNav, page: Page.RepoBrowse) {
                     )
                 }
             } else {
+                val repoOrigin = PluginPackageManager.canonicalSourceOrigin(repoUrl = page.repoUrl, sourceUrl = null)
                 items(entries, key = { it.id }) { entry ->
                     val existing = installedById[entry.id]
-                    val alreadyLatest = existing != null && existing.version == entry.version
+                    val sameOrigin = existing != null && existing.sourceOrigin == repoOrigin
+                    val alreadyLatest = sameOrigin && existing.version == entry.version
                     val sub = buildString {
                         append(entry.version)
                         if (entry.description.isNotBlank()) append(" · ").append(entry.description)
@@ -1116,10 +1235,10 @@ fun RepoBrowseScreen(model: WallModel, nav: WallNav, page: Page.RepoBrowse) {
                                 }
                             } else {
                                 WallButton(
-                                    text = if (existing != null) {
-                                        stringResource(R.string.plugins_update_to, entry.version)
-                                    } else {
-                                        stringResource(R.string.plugins_repo_install)
+                                    text = when {
+                                        existing != null && !sameOrigin -> stringResource(R.string.plugins_repo_replace)
+                                        existing != null -> stringResource(R.string.plugins_update_to, entry.version)
+                                        else -> stringResource(R.string.plugins_repo_install)
                                     },
                                     onClick = { startDownload(entry) },
                                     kind = ButtonKind.Primary,
@@ -1173,17 +1292,33 @@ fun PluginInstallConfirmSheet(
     strings: AndroidStringLookup,
     onInstalled: (String) -> Unit,
     onDismiss: () -> Unit,
+    onDevTechnicalError: ((String) -> Unit)? = null,
 ) {
     val scope = rememberCoroutineScope()
+    val pluginRepos by model.pluginRepos.collectAsState()
+    val reposByUrl = remember(pluginRepos) { pluginRepos.associateBy { it.url } }
     val preview = pending.preview
     val manifest = preview.manifest
     val permLines = remember(manifest) { PluginPermissionSummary.detailLines(manifest.permissions, strings) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var requireExplicitReplace by remember(pending) { mutableStateOf(preview.requiresReplacementConfirmation) }
+    var mismatchExistingOrigin by remember(pending) { mutableStateOf(preview.existingSourceOrigin) }
+
+    val devAddr = pending.devDisplayAddress ?: PluginPackageManager.devDisplayAddressFromOrigin(preview.sourceOrigin)
+    val isDev = preview.isDevSource || devAddr != null
+    val replaceWarningText = remember(mismatchExistingOrigin, preview.sourceOrigin, reposByUrl) {
+        PluginPermissionSummary.replacementWarningText(
+            existingSourceOrigin = mismatchExistingOrigin,
+            newSourceOrigin = preview.sourceOrigin,
+            reposByUrl = reposByUrl,
+            strings = strings,
+        )
+    }
 
     val titleRes = when {
         requireExplicitReplace -> R.string.plugins_install_replace_title
+        pending.confirmExpandedPermissionsOnInstall -> R.string.plugins_install_permission_expanded_title
         preview.isUpdate -> R.string.plugins_install_update_title
         else -> R.string.plugins_install_confirm_title
     }
@@ -1213,6 +1348,22 @@ fun PluginInstallConfirmSheet(
                 color = Wall.Text2,
             )
 
+            if (isDev && !devAddr.isNullOrBlank()) {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(Wall.Radius))
+                        .background(Wall.Accent.copy(alpha = 0.14f))
+                        .padding(horizontal = 18.dp, vertical = 14.dp),
+                ) {
+                    Text(
+                        stringResource(R.string.plugins_install_dev_banner, devAddr),
+                        style = WallType.Caption,
+                        color = Wall.Accent,
+                    )
+                }
+            }
+
             Column(
                 Modifier
                     .fillMaxWidth()
@@ -1229,7 +1380,9 @@ fun PluginInstallConfirmSheet(
                     Notice(stringResource(R.string.plugins_perm_wildcard_lan), danger = true)
                 }
                 for (warn in preview.permissionWarnings) {
-                    if (!warn.contains(com.limelight.local.plugin.PluginPackageManager.WILDCARD_LAN_WARNING) || !preview.allowsWildcardLanAccess) {
+                    val isWildcardDup = warn.contains(PluginPackageManager.WILDCARD_LAN_WARNING) && preview.allowsWildcardLanAccess
+                    val isReplaceDup = requireExplicitReplace && warn.contains("来源不同")
+                    if (!isWildcardDup && !isReplaceDup) {
                         Notice(warn, danger = true)
                     }
                 }
@@ -1243,7 +1396,7 @@ fun PluginInstallConfirmSheet(
                         .background(Wall.Danger.copy(alpha = 0.14f))
                         .padding(18.dp),
                 ) {
-                    Notice(stringResource(R.string.plugins_install_replace_warning), danger = true)
+                    Notice(replaceWarningText, danger = true)
                 }
             }
 
@@ -1255,8 +1408,11 @@ fun PluginInstallConfirmSheet(
             ) {
                 WallButton(
                     text = stringResource(
-                        if (requireExplicitReplace) R.string.plugins_install_replace_btn
-                        else R.string.plugins_install_confirm_btn,
+                        when {
+                            requireExplicitReplace -> R.string.plugins_install_replace_btn
+                            pending.confirmExpandedPermissionsOnInstall -> R.string.plugins_install_permission_expanded_btn
+                            else -> R.string.plugins_install_confirm_btn
+                        },
                     ),
                     onClick = {
                         if (busy) return@WallButton
@@ -1277,8 +1433,21 @@ fun PluginInstallConfirmSheet(
                                 throw e
                             } catch (e: PluginSourceMismatchException) {
                                 // Never auto-confirm: escalate UI to explicit replacement warning
+                                mismatchExistingOrigin = e.existingSourceOrigin
                                 requireExplicitReplace = true
-                                error = PluginInstallGuard.formatInstallError(e, strings)
+                                error = PluginPermissionSummary.replacementWarningText(
+                                    existingSourceOrigin = e.existingSourceOrigin,
+                                    newSourceOrigin = e.newSourceOrigin,
+                                    reposByUrl = reposByUrl,
+                                    strings = strings,
+                                )
+                            } catch (e: DevPluginSyntaxException) {
+                                if (onDevTechnicalError != null) {
+                                    onDevTechnicalError(e.technicalError)
+                                    onDismiss()
+                                } else {
+                                    error = PluginInstallGuard.formatInstallError(e, strings)
+                                }
                             } catch (e: Exception) {
                                 error = PluginInstallGuard.formatInstallError(e, strings)
                             } finally {
@@ -1294,6 +1463,55 @@ fun PluginInstallConfirmSheet(
                     onClick = { if (!busy) onDismiss() },
                     kind = ButtonKind.Plain,
                     enabled = !busy,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AddPluginChoiceSheet(
+    onAddRepo: () -> Unit,
+    onInstallFromFile: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(Wall.Scrim)
+            .clickable(remember { MutableInteractionSource() }, indication = null) { onDismiss() },
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            Modifier
+                .width(740.dp)
+                .shadow(40.dp, RoundedCornerShape(Wall.RadiusXl))
+                .clip(RoundedCornerShape(Wall.RadiusXl))
+                .background(Wall.Sheet)
+                .clickable(remember { MutableInteractionSource() }, indication = null) {}
+                .padding(horizontal = 40.dp, vertical = 36.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text(stringResource(R.string.plugins_add_sheet_title), style = WallType.Head)
+            Spacer(Modifier.height(4.dp))
+            ManagementRow(
+                icon = WallIcons.Cloud,
+                title = stringResource(R.string.sources_add_repo_btn),
+                sub = stringResource(R.string.plugins_add_repo_sub),
+                onClick = onAddRepo,
+            )
+            ManagementRow(
+                icon = WallIcons.Folder,
+                title = stringResource(R.string.plugins_add_file_title),
+                sub = stringResource(R.string.plugins_add_file_sub),
+                onClick = onInstallFromFile,
+            )
+            Row(Modifier.padding(top = 10.dp), horizontalArrangement = Arrangement.End) {
+                Spacer(Modifier.weight(1f))
+                WallButton(
+                    text = stringResource(R.string.action_cancel),
+                    onClick = onDismiss,
+                    kind = ButtonKind.Ghost,
                 )
             }
         }
@@ -1327,10 +1545,12 @@ internal fun SourcesTabPill(label: String, selected: Boolean, onClick: () -> Uni
 }
 
 @Composable
-private fun ManagementRow(
+internal fun ManagementRow(
     icon: ImageVector,
     title: String,
     sub: String,
+    badgeText: String? = null,
+    selected: Boolean = false,
     dangerStatus: String? = null,
     mutedStatus: String? = null,
     trailingAction: (@Composable () -> Unit)? = null,
@@ -1338,20 +1558,51 @@ private fun ManagementRow(
 ) {
     val interaction = remember { MutableInteractionSource() }
     val hovered by rememberRayHover(interaction)
+    val bg = when {
+        selected -> Wall.Sel
+        hovered -> Wall.SurfaceHi
+        else -> Color.Transparent
+    }
     Row(
         Modifier
             .fillMaxWidth()
             .heightIn(min = 88.dp)
             .clip(RoundedCornerShape(Wall.Radius))
-            .background(if (hovered) Wall.SurfaceHi else Color.Transparent)
+            .background(bg)
             .ray(interaction, onClick)
             .padding(horizontal = 24.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(24.dp),
     ) {
-        Icon(icon, null, Modifier.size(36.dp), tint = if (hovered) Wall.Text else Wall.Text2)
+        Icon(icon, null, Modifier.size(36.dp), tint = if (hovered || selected) Wall.Text else Wall.Text2)
         Column(Modifier.weight(1f)) {
-            Text(title, style = WallType.Label, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text(
+                    title,
+                    style = WallType.Label,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                if (!badgeText.isNullOrBlank()) {
+                    Box(
+                        Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Wall.Accent.copy(alpha = 0.20f))
+                            .padding(horizontal = 10.dp, vertical = 3.dp),
+                    ) {
+                        Text(
+                            badgeText,
+                            style = WallType.Caption.copy(fontSize = 20.sp, lineHeight = 24.sp),
+                            color = Wall.Accent,
+                            maxLines = 1,
+                        )
+                    }
+                }
+            }
             if (sub.isNotBlank()) {
                 Text(
                     sub,
