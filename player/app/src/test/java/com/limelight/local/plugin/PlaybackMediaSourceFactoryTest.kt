@@ -468,4 +468,20 @@ class PlaybackMediaSourceFactoryTest {
             }
         }
     }
+
+    @Test
+    fun sidecarSubtitleFormatsAreParsedDuringExtraction() {
+        // Regression: raw text/vtt samples reaching TextRenderer failed the whole playback with
+        // "Legacy decoding is disabled". Every sidecar mime we emit must have an extraction-time parser.
+        val parserFactory = androidx.media3.extractor.text.DefaultSubtitleParserFactory()
+        val mimes = listOf(
+            androidx.media3.common.MimeTypes.APPLICATION_SUBRIP,
+            androidx.media3.common.MimeTypes.TEXT_VTT,
+            androidx.media3.common.MimeTypes.TEXT_SSA,
+        )
+        for (mime in mimes) {
+            val format = androidx.media3.common.Format.Builder().setSampleMimeType(mime).build()
+            org.junit.Assert.assertTrue("no parser for $mime", parserFactory.supportsFormat(format))
+        }
+    }
 }

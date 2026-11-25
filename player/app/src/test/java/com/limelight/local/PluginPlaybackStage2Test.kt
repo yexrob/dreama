@@ -274,7 +274,7 @@ class PluginPlaybackStage2Test {
         assertEquals("1080p", loaded.selectedQualityId)
         assertEquals(1, loaded.subtitleCount)
         assertEquals("sess-1", loaded.sessionId)
-        // MergingMediaSource proves external subtitle SingleSampleMediaSource was merged in
+        // MergingMediaSource proves the external subtitle source was merged in
         assertTrue(
             "Expected MergingMediaSource when external subtitle is present, got ${loaded.mediaSource.javaClass.simpleName}",
             loaded.mediaSource is MergingMediaSource,

@@ -952,8 +952,17 @@ private fun InteractivePluginAuthCard(
         ) {
             when (step) {
                 is InteractiveAuthStep.Qr -> {
-                    val qrMatrix = remember(step.start.qr) { QrCodeMatrix.encode(step.start.qr) }
-                    QrCodeView(qrMatrix, size = 232.dp)
+                    val qrMatrix = remember(step.start.qr) { QrCodeMatrix.encodeOrNull(step.start.qr) }
+                    if (qrMatrix != null) {
+                        QrCodeView(qrMatrix, size = 232.dp)
+                    } else {
+                        Text(
+                            stringResource(R.string.plugin_form_qr_too_long),
+                            style = WallType.Body,
+                            color = Wall.Text2,
+                            modifier = Modifier.width(232.dp),
+                        )
+                    }
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(14.dp)) {
                         Text(stringResource(R.string.plugin_form_qr_login_title, pluginName), style = WallType.Head)
                         step.start.hint?.takeIf { it.isNotBlank() }?.let {
