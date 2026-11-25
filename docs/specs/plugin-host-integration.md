@@ -150,3 +150,34 @@ when (error) {
     else -> showOffline("连不上「${src.source.name}」", onRetry = retry)
 }
 ```
+
+---
+
+## 4. 插件运行时资源上限与单 VM 最坏瞬时内存占用
+
+为避免在头显设备上引发 OOM，宿主对插件运行时实施分层资源预算。接入方在设计并发刷新（例如首页同时并发加载多个插件源）时，必须区分**纳入进程级共享账本的常驻 DOM 配额**与**不计入进程账本的每 VM 独立/瞬时开销**。
+
+### 4.1 纳入进程级 DOM 账本的配额（全进程共享）
+
+| 维度 | 上限 | 说明 |
+| --- | --- | --- |
+| 进程级存活 DOM 总预算 | **64 MB** | 全部活跃插件 VM 共享同一原子账本，覆盖所有存活 DOM 树、元素句柄表（约 184 B/句柄）与长类名查询缓存；流式解析期按 256 KB 分块增量预占，调用结束、`doc.close()` 或 VM 销毁时同步归还 |
+| 单 VM 存活 DOM 总预算 | **48 MB** | 单实例同时存活文档 ≤ 8 份；在 19 万元素级别大页面上调用 `select('*')` 会为全部元素建句柄并触发 48 MB 句柄表上限 |
+| 单文档估算内存 | **32 MB** | 压实 `Attributes` / `Element$NodeList` / `LeafNode` / `FormElement.linkedEls` 并分离 `Document.parser` 后，按实际结构精确记账 |
+
+### 4.2 不计入进程账本的每 VM 独立与最坏瞬时占用
+
+以下缓冲与运行时内存**不计入**上述 64 MB 进程级 DOM 账本，每个并发活跃的插件 VM 都可能独立触达其上限：
+
+| 资源项 | 逻辑上限 | 最坏瞬时内存（每并发 VM） | 所在堆与生命周期 |
+| --- | --- | --- | --- |
+| QuickJS VM 堆与栈 | 64 MB 堆 + 512 KB 栈 | **~64.5 MB** | Native 堆；随 `PluginRuntime` 存活，超时或 OOM 重建时释放 |
+| DOM 解析输入字符串 | ≤ 2 MB UTF-8 | **2–8 MB** | JVM/ART 堆；非 Latin-1 UTF-16 `String` 最高 4 MB，`parseXml` 未定义实体转义副本再增至多 4 MB，解析返回即释放 |
+| DOM 序列化输出缓冲（`html` / `outerHtml` / `text` / 转义后 `attrsJson`） | ≤ 8 MB UTF-8 | **16–32 MB** | JVM/ART 堆；`BoundedOutputBuffer` 的 `StringBuilder`（UTF-16 最高 16 MB）+ `toString()` 成品副本 + 桥接传回 QuickJS 的瞬时拷贝，调用返回即释放 |
+| CSS 选择器查询记忆表与兄弟表 | ≤ 16 MB 逻辑预算 | **~16 MB** | JVM/ART 堆；单次 `select` / `selectAll` 期间存在，查询返回即释放 |
+| 插件返回值 JSON 序列化缓冲 | ≤ 8 MB UTF-8 | **8–16 MB** | QuickJS + JVM/ART 桥接层瞬时拷贝，单次 `invoke` 返回后释放 |
+| `ctx.fetch` 响应体在途缓冲 | ≤ 16 MB（单响应 ≤ 8 MB，并发 ≤ 4） | **~16 MB** | JVM/ART 堆；调用 `text()` / `json()` / `bytes()` 一次性消费后立即释放 |
+| `ctx.fetch` 请求体排队与在途缓冲 | ≤ 8 MB（单请求体 ≤ 2 MB，并发 ≤ 4、排队 ≤ 16） | **~8 MB** | JVM/ART 堆；请求完成、失败或取消后释放；另每请求 URL ≤ 8 KB、头 ≤ 32 KB |
+| 实例持久化与日志缓冲 | `storage` ≤ 1 MB、`cookies` ≤ 256 KB、`log` ≤ 256 KB | **~1.5 MB** | JVM/ART 堆；常驻实例生命周期 |
+
+**单并发活跃 VM 账本外最坏瞬时合计**：**~130–145 MB**（其中 Native QuickJS 堆最高 ~64.5 MB，JVM/ART 堆瞬时峰值最高 ~65–80 MB；若同时叠加上表全进程共享的 64 MB DOM 账本，单个活跃插件在极端并发 `fetch` + 序列化 + 查询场景下的总峰值可达 **~200 MB**）。宿主 UI 在首页刷新多个插件源时建议限制并发活跃插件调用数（例如最多 2–3 个并行），避免多 VM 瞬时缓冲叠加触发低内存设备 LMk。

@@ -821,7 +821,7 @@ class CtxApiAndRecoveryTest {
                   return 'R'.repeat(9 * 1024 * 1024);
                 }
                 if (mode === 'dom-node-flood') {
-                  ctx.parse.html('<i>x</i>'.repeat(250000));
+                  ctx.parse.html('<i>x'.repeat(300000));
                   return { ok: true };
                 }
                 if (mode === 'timer-flood') {
@@ -969,9 +969,11 @@ class CtxApiAndRecoveryTest {
             )
             val directDom = PluginDomParser()
             try {
-                directDom.parseHtml("<i>x</i>".repeat(250_000))
+                directDom.parseHtml("<i>x".repeat(300_000))
                 fail("Direct PluginDomParser must reject > 32 MB DOM mid-parse")
             } catch (_: DomLimitExceededException) {
+            } finally {
+                directDom.clear()
             }
             assertEquals("Rejected DOM parse must retain 0 nodes in host parser", 0, directDom.currentTotalNodes())
 
@@ -1311,6 +1313,37 @@ class CtxApiAndRecoveryTest {
             }
         }
         assertTrue("Expected at least 6 knownDifference vectors (select, ws, template)", knownDiffCount >= 6)
+
+        // 1b. Round 9 Item #2 & #3: Run ALL shared estimatedBytesVectors from dom-vectors.json
+        //     asserting Android & plugin-kit agree on estimated DOM bytes within ±5%.
+        val estVectors = vecRoot["estimatedBytesVectors"]!!.jsonArray
+        assertTrue("Expected at least 14 shared estimatedBytesVectors", estVectors.size >= 14)
+        for (evEl in estVectors) {
+            val ev = evEl.jsonObject
+            val name = ev["name"]!!.jsonPrimitive.content
+            val mode = ev["mode"]!!.jsonPrimitive.content
+            val input = ev["input"]?.jsonPrimitive?.content ?: buildString {
+                append(ev["prefix"]?.jsonPrimitive?.content ?: "")
+                val unit = ev["unit"]?.jsonPrimitive?.content ?: ""
+                val rep = ev["repeat"]?.jsonPrimitive?.int ?: 1
+                repeat(rep) { append(unit) }
+                append(ev["suffix"]?.jsonPrimitive?.content ?: "")
+            }
+            val expectedBytes = ev["expectedBytes"]!!.jsonPrimitive.long
+            val tolPct = ev["tolerancePct"]?.jsonPrimitive?.content?.toDouble() ?: 5.0
+            val p = PluginDomParser()
+            try {
+                if (mode == "xml") p.parseXml(input) else p.parseHtml(input)
+                val actualBytes = p.currentEstimatedDomBytes()
+                val relDiffPct = kotlin.math.abs(actualBytes - expectedBytes).toDouble() * 100.0 / expectedBytes.toDouble()
+                assertTrue(
+                    "estimatedBytesVector '$name': actual=$actualBytes expected=$expectedBytes diff=${"%.2f".format(relDiffPct)}% > $tolPct%",
+                    relDiffPct <= tolPct,
+                )
+            } finally {
+                p.clear()
+            }
+        }
 
         // 2. Round 5 Item #1 [Blocking]: Pathological selectors MUST complete in < 1s via O(N*S) memoized DP
         run {
@@ -1812,6 +1845,24 @@ object Round8CalibrationSubprocessMain {
         "xent" -> fill("<r>", "&a;<!---->", "</r>", f)
         "xattr" -> fill("<r>", "<a b='c' d='e'/>", "</r>", f)
         "xns" -> fill("<r>", "<n:a xmlns:n='u'/>", "</r>", f)
+        // Round 9 Item #1: duplicate attributes (HTML & XML & XmlDeclaration), moved children, FormElement
+        "dup7" -> fill("<div>", "<p" + " a".repeat(7) + "></p>", "</div>", f)
+        "dup13" -> fill("<div>", "<p" + " a".repeat(13) + "></p>", "</div>", f)
+        "dup49" -> fill("<div>", "<p" + " a".repeat(49) + "></p>", "</div>", f)
+        "dup97" -> fill("<div>", "<p" + " a".repeat(97) + "></p>", "</div>", f)
+        "dup385" -> fill("<div>", "<p" + " a".repeat(385) + "></p>", "</div>", f)
+        "dup97b" -> fill("", "<b" + " a".repeat(97) + ">", "", f)
+        "dup97i" -> fill("<div>", "<i" + " a".repeat(97) + ">", "</div>", f)
+        "xdup7" -> fill("<r>", "<p" + " a='1'".repeat(7) + "/>", "</r>", f)
+        "xdup13" -> fill("<r>", "<p" + " a='1'".repeat(13) + "/>", "</r>", f)
+        "xdup49" -> fill("<r>", "<p" + " a='1'".repeat(49) + "/>", "</r>", f)
+        "xdup97" -> fill("<r>", "<p" + " a='1'".repeat(97) + "/>", "</r>", f)
+        "xdup385" -> fill("<r>", "<p" + " a='1'".repeat(385) + "/>", "</r>", f)
+        "xdecl_dup385" -> fill("<r>", "<?xml" + " a='1'".repeat(385) + "?>", "</r>", f)
+        "adopt_moved_500" -> fill("", "<b><div>" + "<br>".repeat(500) + "</b></div>", "", f * 0.5)
+        "adopt" -> fill("", "<b><p>x</b>y</p>", "", f)
+        "many_forms" -> "<form><input></form>".repeat((80_000 * f).toInt().coerceAtLeast(1))
+        "form_inputs" -> "<form>" + "<input>".repeat((200_000 * f).toInt().coerceAtLeast(1)) + "</form>"
         else -> throw IllegalArgumentException("unknown shape $k")
     }
 
@@ -1905,7 +1956,8 @@ object Round8CalibrationSubprocessMain {
             clear()
         }
 
-        // 1. All 39 synthetic shapes at largest scale accepted under 32 MB default cap (matching R.java)
+        // 1. All 39 synthetic shapes + Round 9 container-compaction shapes (dup7/13/49/97/385 HTML & XML,
+        //    dup97b/dup97i, xdecl_dup385, adopt_moved_500, adopt, many_forms, form_inputs)
         val shapes = listOf(
             "pi", "bogus", "comment", "textcmt", "elem", "elemshort", "elemtext", "ws",
             "attr1", "attrnull", "manyattr", "manyattr3", "uniqattr", "longattrval", "hugeattrval",
@@ -1913,6 +1965,9 @@ object Round8CalibrationSubprocessMain {
             "fostercmt", "fostertext", "fosterpi", "script", "scripts",
             "xpi", "xpiattr", "xdoctype", "xcdata", "xcdata1", "xelem", "xtextcmt",
             "xuniqtag", "xcase", "xent", "xattr", "xns",
+            "dup7", "dup13", "dup49", "dup97", "dup385", "dup97b", "dup97i",
+            "xdup7", "xdup13", "xdup49", "xdup97", "xdup385", "xdecl_dup385",
+            "adopt_moved_500", "adopt", "many_forms", "form_inputs",
         )
         for (shape in shapes) {
             val isXml = shape.startsWith("x")
@@ -2065,6 +2120,26 @@ object Round8CalibrationSubprocessMain {
                     "<html><head></head><body><table class=\"list\">",
                     { i -> "<tr class=\"${if (i % 2 != 0) "odd" else "even"}\"><td class=\"cat\"><a href=\"/cat/5\"><img src=\"/i/tv.png\" alt=\"TV\"></a></td><td class=\"name\"><a href=\"/t/$i\" title=\"Show S01E$i 1080p\">Show S01E$i 1080p WEB-DL</a> <span class=\"tag new\">NEW</span></td><td class=\"size\">${(i % 90) / 10.0 + 1} GB</td><td class=\"seed\">${i % 300}</td><td class=\"leech\">${i % 40}</td><td class=\"date\">2024-03-${10 + i % 18}</td></tr>" },
                     "</table></body></html>",
+                ),
+            ),
+            Triple(
+                "pages3/big.mpd.xml",
+                true,
+                buildPage(
+                    lim2m,
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\" mediaPresentationDuration=\"PT2H\"><Period id=\"0\"><AdaptationSet mimeType=\"video/mp4\" segmentAlignment=\"true\"><Representation id=\"v1\" bandwidth=\"3000000\" width=\"1920\" height=\"1080\"><SegmentList duration=\"2\">\n",
+                    { i -> "<SegmentURL media=\"chunk-$i.m4s\" mediaRange=\"${i * 4096}-${(i + 1) * 4096 - 1}\"/>\n" },
+                    "</SegmentList></Representation></AdaptationSet></Period></MPD>\n",
+                ),
+            ),
+            Triple(
+                "pages3/playlist.xspf.xml",
+                true,
+                buildPage(
+                    lim2m,
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><playlist version=\"1\" xmlns=\"http://xspf.org/ns/0/\"><trackList>\n",
+                    { i -> "<track><location>http://iptv.ex.com/live/$i.m3u8</location><title>频道$i ${w(i, 1)}</title><image>http://ex.com/logo/$i.png</image><extension application=\"x\"><group>${w(i, 2)}</group></extension></track>\n" },
+                    "</trackList></playlist>\n",
                 ),
             ),
         )
@@ -2276,6 +2351,75 @@ object Round8ProcessBudgetAndFixesSubprocessMain {
             }
         }
 
+        // 5. Round 9 Item #1 [Blocking]: Fill.java scenario — 60 MB ballast + 2 concurrent VMs each
+        //    holding 8 live 2 MB dup385 docs + select('*') + outerHtml + text under -Xmx256m -> ZERO OOM!
+        run {
+            val ballast = Array(60) { ByteArray(1024 * 1024 - 64) }
+            val unit385 = "<p" + " a".repeat(385) + "></p>"
+            val count385 = (2 * 1024 * 1024 - 128) / unit385.length
+            val dup385 = "<div>" + unit385.repeat(count385) + "</div>"
+            val baseHeap = retainedBytes()
+            val vm1 = PluginDomParser()
+            val vm2 = PluginDomParser()
+            val errors = java.util.concurrent.CopyOnWriteArrayList<Throwable>()
+            val bar = java.util.concurrent.CyclicBarrier(3)
+
+            fun runFill(vm: PluginDomParser) {
+                try {
+                    val roots = ArrayList<Long>(8)
+                    repeat(8) {
+                        roots.add(vm.parseHtml(dup385))
+                    }
+                    for (r in roots) {
+                        vm.selectAllIds(r, "*")
+                        vm.outerHtml(r)
+                        vm.text(r)
+                    }
+                } catch (t: Throwable) {
+                    errors.add(t)
+                } finally {
+                    bar.await()
+                    bar.await()
+                }
+            }
+
+            val t1 = Thread { runFill(vm1) }
+            val t2 = Thread { runFill(vm2) }
+            t1.start()
+            t2.start()
+            bar.await()
+            if (errors.isNotEmpty()) {
+                bar.await()
+                throw AssertionError("Fill 2x8 dup385 under -Xmx256m + 60MB ballast failed: ${errors.first()}", errors.first())
+            }
+            val afterHeap = retainedBytes()
+            val realDelta = (afterHeap - baseHeap).coerceAtLeast(1L)
+            val estTotal = vm1.currentVmMemoryBytes() + vm2.currentVmMemoryBytes()
+            val ratio = realDelta.toDouble() / estTotal.toDouble()
+            println(
+                String.format(
+                    java.util.Locale.ROOT,
+                    "OK [R9_fill_60mb_ballast_2x8_dup385] real=%.2fMB est=%.2fMB ratio=%.3f ballast=%dMB",
+                    realDelta / 1048576.0,
+                    estTotal / 1048576.0,
+                    ratio,
+                    ballast.size,
+                ),
+            )
+            if (ratio < 0.75 || ratio > 1.15) {
+                bar.await()
+                throw AssertionError("Fill 2x8 dup385 real/est=$ratio outside [0.75, 1.15]")
+            }
+            bar.await()
+            t1.join()
+            t2.join()
+            vm1.clear()
+            vm2.clear()
+            if (PluginDomParser.currentProcessDomMemoryBytes() != 0L) {
+                throw AssertionError("Process DOM budget leaked after Fill 2x8 dup385 clear")
+            }
+        }
+
         println("ROUND8_FIXES_PASSED")
         kotlin.system.exitProcess(0)
     }
@@ -2408,8 +2552,8 @@ object Round7SoakAndFixesSubprocessMain {
         // 2. Three exact OOM payloads from Round 7 Item #1 (scaled to <= 2 MB input)
         val pi2Mb = "<?>".repeat((2 * 1024 * 1024) / 3 - 10)
         val textCmt2Mb = "x<!>".repeat((2 * 1024 * 1024) / 4 - 10)
-        val elemText260k = "<i>x".repeat(260_000) // 1.04 MB, ~34 MB > 32 MB single-doc cap
-        val elemText180k = "<i>x".repeat(180_000) // 720 KB, ~23.5 MB <= 32 MB single-doc cap
+        val elemText300k = "<i>x".repeat(300_000) // 1.20 MB, ~35.5 MB > 32 MB single-doc cap
+        val elemText200k = "<i>x".repeat(200_000) // 800 KB, ~23.7 MB <= 32 MB single-doc cap
 
         run {
             val p = PluginDomParser()
@@ -2435,16 +2579,16 @@ object Round7SoakAndFixesSubprocessMain {
 
             val tEt = System.nanoTime()
             try {
-                p.parseHtml(elemText260k)
-                throw AssertionError("<i>x * 260k must exceed 32 MB single-doc budget")
+                p.parseHtml(elemText300k)
+                throw AssertionError("<i>x * 300k must exceed 32 MB single-doc budget")
             } catch (_: DomLimitExceededException) {
             }
             val etMs = (System.nanoTime() - tEt) / 1_000_000L
-            if (etMs >= 5000L) throw AssertionError("R7_elemtext_260k_rejected exceeded 5000ms: ${etMs}ms")
-            println("OK [R7_elemtext_260k_rejected] ${etMs}ms")
-            // 2 x (<i>x * 180k) (~23.5 MB each = ~47 MB <= 48 MB) succeed, then select('*') hits 48 MB VM budget!
-            val d1 = p.parseHtml(elemText180k)
-            val d2 = p.parseHtml(elemText180k)
+            if (etMs >= 5000L) throw AssertionError("R7_elemtext_300k_rejected exceeded 5000ms: ${etMs}ms")
+            println("OK [R7_elemtext_300k_rejected] ${etMs}ms")
+            // 2 x (<i>x * 200k) (~23.7 MB each = ~47.4 MB <= 48 MB) succeed, then select('*') hits 48 MB VM budget!
+            val d1 = p.parseHtml(elemText200k)
+            val d2 = p.parseHtml(elemText200k)
             assertFastUnder1s("R7_two_docs_plus_handles_48mb_cap") {
                 try {
                     p.selectAllIds(d1, "*")
@@ -2637,7 +2781,7 @@ object Round7SoakAndFixesSubprocessMain {
             var maxRetainedMb = 0L
             while (System.currentTimeMillis() - startMs < 30_000L) {
                 // a) Hit all 3 attack payloads — every one must fail cleanly without leaking
-                for (attack in listOf(pi2Mb, textCmt2Mb, elemText260k)) {
+                for (attack in listOf(pi2Mb, textCmt2Mb, elemText300k)) {
                     try {
                         p.parseHtml(attack)
                         throw AssertionError("Attack payload unexpectedly succeeded during soak cycle #$cycles")

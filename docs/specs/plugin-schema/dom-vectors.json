@@ -1221,5 +1221,147 @@
       "expectedAndroid": "<html><head><template><table><form></form></table></template></head><body></body></html>",
       "expectedKit": "<html><head><template><table></table></template></head><body></body></html>"
     }
+  ],
+  "estimatedBytesVectors": [
+    {
+      "name": "html_table_pretty",
+      "mode": "html",
+      "prefix": "<!DOCTYPE html><html><head><title>t</title></head><body><table class=\"list\"><tbody>",
+      "unit": "  <tr><td>1</td><td><a href=\"/item/1\">alpha beta</a></td><td class=\"size\">123 MB</td><td>2024-01-11</td></tr>\n",
+      "repeat": 300,
+      "suffix": "</tbody></table></body></html>",
+      "expectedBytes": 258356,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_list_cards",
+      "mode": "html",
+      "prefix": "<!DOCTYPE html><html><body><ul class=\"items\">\n",
+      "unit": "<li class=\"item card\" data-id=\"42\"><a class=\"title\" href=\"/v/42.html\" title=\"电影\"><img src=\"/p/42.jpg\" alt=\"第一季\" loading=\"lazy\"></a><span class=\"meta\">HD · 45分钟</span></li>\n",
+      "repeat": 200,
+      "suffix": "</ul></body></html>",
+      "expectedBytes": 141952,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_article_cjk",
+      "mode": "html",
+      "prefix": "<html><body><article>",
+      "unit": "<p>视频 电影 剧集 第一季 1080p <a href=\"#n1\">[1]</a> alpha beta gamma delta</p>\n",
+      "repeat": 200,
+      "suffix": "</article></body></html>",
+      "expectedBytes": 107176,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_script_heavy",
+      "mode": "html",
+      "prefix": "<!DOCTYPE html><html><head><style>.c{color:red;margin:0 auto}\n.c{color:red;margin:0 auto}\n</style></head><body><div id=\"__next\">",
+      "unit": "<script>self.__next_f.push([1,\"payload-data-block-0123456789\"])</script><div class=\"r\"><a href=\"/a/1\">alpha</a></div>",
+      "repeat": 120,
+      "suffix": "</div></body></html>",
+      "expectedBytes": 72820,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_dup_attrs_97",
+      "mode": "html",
+      "prefix": "<div>",
+      "unit": "<p a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a></p>",
+      "repeat": 200,
+      "suffix": "</div>",
+      "expectedBytes": 23832,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_long_attr_256",
+      "mode": "html",
+      "prefix": "<div>",
+      "unit": "<p aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0=1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1=1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2=1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3=1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4=1></p>",
+      "repeat": 100,
+      "suffix": "</div>",
+      "expectedBytes": 163832,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_long_tag_256_same",
+      "mode": "html",
+      "prefix": "<div>",
+      "unit": "<tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttx/>",
+      "repeat": 800,
+      "suffix": "</div>",
+      "expectedBytes": 60128,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_adoption_moved",
+      "mode": "html",
+      "prefix": "",
+      "unit": "<b><div><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br></b></div>",
+      "repeat": 40,
+      "suffix": "",
+      "expectedBytes": 90092,
+      "tolerancePct": 5
+    },
+    {
+      "name": "html_forms_many",
+      "mode": "html",
+      "prefix": "",
+      "unit": "<form><input></form>",
+      "repeat": 1000,
+      "suffix": "",
+      "expectedBytes": 157292,
+      "tolerancePct": 5
+    },
+    {
+      "name": "xml_dash_mpd_timeline",
+      "mode": "xml",
+      "prefix": "<?xml version=\"1.0\"?><MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\"><Period id=\"0\"><AdaptationSet mimeType=\"video/mp4\"><SegmentTemplate media=\"v-$Time$.m4s\"><SegmentTimeline>\n",
+      "unit": "  <S t=\"180000\" d=\"180000\"/>\n",
+      "repeat": 800,
+      "suffix": "</SegmentTimeline></SegmentTemplate></AdaptationSet></Period></MPD>",
+      "expectedBytes": 118844,
+      "tolerancePct": 5
+    },
+    {
+      "name": "xml_rss_cdata",
+      "mode": "xml",
+      "prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><rss version=\"2.0\"><channel><title>Podcast</title>\n",
+      "unit": "  <item><title>Episode 1</title><link>https://example.com/p/1</link><enclosure url=\"https://cdn.example.com/1.mp3\" length=\"1000\" type=\"audio/mpeg\"/><description><![CDATA[<p>中文简介 alpha</p>]]></description></item>\n",
+      "repeat": 150,
+      "suffix": "</channel></rss>",
+      "expectedBytes": 128376,
+      "tolerancePct": 5
+    },
+    {
+      "name": "xml_xspf_playlist",
+      "mode": "xml",
+      "prefix": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><playlist version=\"1\" xmlns=\"http://xspf.org/ns/0/\"><trackList>\n",
+      "unit": "<track><location>http://iptv.ex.com/live/0.m3u8</location><title>频道0 测试</title><image>http://ex.com/logo/0.png</image><extension application=\"x\"><group>影视</group></extension></track>\n",
+      "repeat": 250,
+      "suffix": "</trackList></playlist>",
+      "expectedBytes": 231912,
+      "tolerancePct": 5
+    },
+    {
+      "name": "xml_dup_attrs_97",
+      "mode": "xml",
+      "prefix": "<r>",
+      "unit": "<p a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1' a='1'/>",
+      "repeat": 200,
+      "suffix": "</r>",
+      "expectedBytes": 23820,
+      "tolerancePct": 5
+    },
+    {
+      "name": "xml_undef_ent_pi_doctype",
+      "mode": "xml",
+      "prefix": "<?xml version=\"1.0\"?><r>",
+      "unit": "<!DOCTYPE a><?p data1234567890?>&eacute;<b/>",
+      "repeat": 300,
+      "suffix": "</r>",
+      "expectedBytes": 117120,
+      "tolerancePct": 5
+    }
   ]
 }

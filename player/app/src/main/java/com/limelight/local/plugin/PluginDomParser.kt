@@ -2,12 +2,15 @@ package com.limelight.local.plugin
 
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonPrimitive
+import org.jsoup.nodes.Attributes
 import org.jsoup.nodes.CDataNode
 import org.jsoup.nodes.Comment
 import org.jsoup.nodes.DataNode
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.DocumentType
 import org.jsoup.nodes.Element
+import org.jsoup.nodes.FormElement
+import org.jsoup.nodes.LeafNode
 import org.jsoup.nodes.Node
 import org.jsoup.nodes.ProcessingInstruction
 import org.jsoup.nodes.TextNode
@@ -18,6 +21,7 @@ import org.jsoup.parser.StreamParser
 import org.jsoup.parser.Tag
 import java.io.Reader
 import java.lang.ref.WeakReference
+import java.lang.reflect.Field
 import java.util.IdentityHashMap
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -186,7 +190,7 @@ class PluginDomParser(
         val parser = Parser.htmlParser()
             .settings(ParseSettings.htmlDefault)
             .setMaxDepth(MAX_NESTING_DEPTH)
-        val parsed = parseWithStreamingByteBudget(html, parser, budgetBytes)
+        val parsed = parseWithStreamingByteBudget(html, parser, isXml = false, budgetBytes = budgetBytes)
         parsed.doc.outputSettings().prettyPrint(false)
         return registerDocument(
             doc = parsed.doc,
@@ -203,7 +207,7 @@ class PluginDomParser(
         val parser = Parser.xmlParser()
             .settings(ParseSettings.preserveCase)
             .setMaxDepth(MAX_NESTING_DEPTH)
-        val parsed = parseWithStreamingByteBudget(sanitized, parser, budgetBytes)
+        val parsed = parseWithStreamingByteBudget(sanitized, parser, isXml = true, budgetBytes = budgetBytes)
         parsed.doc.outputSettings().prettyPrint(false)
         return registerDocument(
             doc = parsed.doc,
@@ -817,13 +821,17 @@ class PluginDomParser(
                         if ((++ops and 1023) == 0) checkDeadline(deadlineNanos)
                         val child = children[i]
                         if (child is Element) {
+                            // Compact oversized Attributes immediately on newly-inserted open elements
+                            // (e.g., unclosed `<b a a...x385>` duplicate-attribute floods) so mid-parse
+                            // heap never spikes before element close/emit.
+                            compactElementAttributes(child)
                             if ((inspectedChildIndex[child] ?: 0) >= 0) {
                                 lastElemChild[cur] = child
                             }
-                            openChainNonElemBytes += 5L // incremental child-slot estimate
+                            openChainNonElemBytes += 4L // incremental child-slot estimate
                             checkOverBudget(budgetBytes)
                         } else {
-                            openChainNonElemBytes += 5L + estimateNonElementNodeBytes(child, seenStr)
+                            openChainNonElemBytes += 4L + estimateNonElementNodeBytes(child, seenStr)
                             checkOverBudget(budgetBytes)
                         }
                         i += 1
@@ -854,34 +862,38 @@ class PluginDomParser(
             if (tagName.length > MAX_NAME_LENGTH) {
                 throw DomLimitExceededException("DOM 标签名超过长度上限（最多 $MAX_NAME_LENGTH 字符）")
             }
-            // Reclaim any empty Attributes container left by Jsoup's HtmlTreeBuilder formatting stack
-            val attrCount = el.attributesSize()
-            if (attrCount == 0) el.clearAttributes()
+            // Compact Attributes (reclaiming empty containers and duplicate-attribute over-allocation)
+            // and FormElement.linkedEls so actual heap matches the exact logical model mid-parse.
+            val attrCap = compactElementAttributes(el)
+            compactFormElement(el)
 
             emittedBytes += ELEMENT_BASE_BYTES
+            if (el is FormElement) emittedBytes += FORM_ELEMENT_EXTRA_BYTES
             val tag = el.tag()
             if (!tag.isKnownTag && seenCustomTags.put(tag, java.lang.Boolean.TRUE) == null) {
                 emittedBytes += CUSTOM_TAG_BASE_BYTES + exactStrBytes(tag.name, seenStr)
                 val norm = tag.normalName()
                 if (norm !== tag.name) emittedBytes += exactStrBytes(norm, seenStr)
             }
-            if (attrCount > 0) {
-                emittedBytes += attrsContainerBytes(attrCount)
-                var ops = 0
-                for (a in el.attributes()) {
-                    if ((++ops and 255) == 0) checkDeadline(deadlineNanos)
-                    val k = a.key
-                    if (k.length > MAX_NAME_LENGTH) {
-                        throw DomLimitExceededException("DOM 属性名超过长度上限（最多 $MAX_NAME_LENGTH 字符）")
+            if (attrCap > 0) {
+                emittedBytes += attrsContainerBytes(attrCap)
+                if (el.attributesSize() > 0) {
+                    var ops = 0
+                    for (a in el.attributes()) {
+                        if ((++ops and 255) == 0) checkDeadline(deadlineNanos)
+                        val k = a.key
+                        if (k.length > MAX_NAME_LENGTH) {
+                            throw DomLimitExceededException("DOM 属性名超过长度上限（最多 $MAX_NAME_LENGTH 字符）")
+                        }
+                        emittedBytes += exactStrBytes(k, seenStr) + exactStrBytes(a.value, seenStr)
+                        checkOverBudget(budgetBytes)
                     }
-                    emittedBytes += exactStrBytes(k, seenStr) + exactStrBytes(a.value, seenStr)
-                    checkOverBudget(budgetBytes)
                 }
             }
-            val childCount = el.childNodeSize()
+            val childCount = compactChildNodes(el)
             if (childCount > 0) {
                 val fullListBytes = childListBytes(childCount)
-                val alreadySlotBytes = prev.toLong() * 5L
+                val alreadySlotBytes = prev.toLong() * 4L
                 if (fullListBytes > alreadySlotBytes) {
                     emittedBytes += (fullListBytes - alreadySlotBytes)
                 }
@@ -908,13 +920,19 @@ class PluginDomParser(
 
     /**
      * Step 1: Parses [input] incrementally via Jsoup [StreamParser] + [BudgetCheckingReader],
-     * accounting ALL node types live during parsing and aborting on over-budget trees or
-     * >256-char tag/attribute names.
-     * Step 2: Performs an exact iterative full-tree byte & element recount (also covering
-     * HTML5 foster-parented and adoption-agency reparented nodes) which becomes the
-     * authoritative byte charge for both VM and process budgets.
+     * compacting grow-never-shrink containers (`Attributes`, `Element$NodeList`, `FormElement.linkedEls`)
+     * and accounting ALL node types live during parsing.
+     * Step 2: Detaches the `Parser`/`TreeBuilder`/`TagSet` from [Document] and performs an exact
+     * iterative full-tree compaction + byte & element recount (also covering HTML5 foster-parented
+     * and adoption-agency reparented nodes), which becomes the authoritative byte charge for both
+     * VM and process budgets.
      */
-    private fun parseWithStreamingByteBudget(input: String, parser: Parser, budgetBytes: Long): ParsedDocStats {
+    private fun parseWithStreamingByteBudget(
+        input: String,
+        parser: Parser,
+        isXml: Boolean,
+        budgetBytes: Long,
+    ): ParsedDocStats {
         val deadline = callDeadlineNanos
         val liveState = LiveParseBudgetState(processLedger, processHolder, maxProcessMemoryBytes)
         val reader = BudgetCheckingReader(input, budgetBytes, deadline, liveState)
@@ -944,6 +962,8 @@ class PluginDomParser(
                 liveState.abortError?.let { throw it }
                 throw t
             }
+            // Detach the parse-time Parser (TreeBuilder + TagSet + Tokens) so they are GC-eligible immediately.
+            doc.parser(if (isXml) DETACHED_XML_PARSER else DETACHED_HTML_PARSER)
             return estimateDocumentExact(doc, budgetBytes, deadline)
         } finally {
             // Release in-flight streaming reservation; registerDocument atomically reserves the exact final charge.
@@ -978,17 +998,48 @@ class PluginDomParser(
         fun currentProcessDomMemoryBytes(): Long = GLOBAL_PROCESS_LEDGER.currentTotalBytes()
 
         // Empirically calibrated JVM (Jsoup 1.24.1 / OpenJDK 17 CompressedOops & Android ART)
-        // per-type structural sizes. Verified across all 52 synthetic & real-page datasets
-        // with actual/estimated ratio in [0.87, 1.05] (target [0.75, 1.15]).
+        // per-type structural sizes after compacting Jsoup grow-never-shrink containers
+        // (Attributes, Element$NodeList, LeafNode Attributes, FormElement.linkedEls, and
+        // detaching Document.parser). Target actual/estimated ratio in [0.75, 1.15].
         internal const val DOC_BASE_BYTES = 1024L
         internal const val ELEMENT_BASE_BYTES = 36L
-        internal const val CUSTOM_TAG_BASE_BYTES = 76L
+        internal const val FORM_ELEMENT_EXTRA_BYTES = 24L
+        internal const val CUSTOM_TAG_BASE_BYTES = 32L
         internal const val LEAF_NODE_BASE_BYTES = 28L
         internal const val PI_NODE_BASE_BYTES = 36L
         internal const val XML_DECL_BASE_BYTES = 36L
         internal const val DOCTYPE_BASE_BYTES = 28L
         internal const val OTHER_NODE_BASE_BYTES = 48L
         internal const val HANDLE_ENTRY_BYTES = 184L
+
+        // Stateless parsers used to detach Document.parser after parse completes, freeing
+        // TreeBuilder (formattingElements/pendingTableCharacters/tokens) and TagSet HashMaps.
+        private val DETACHED_HTML_PARSER: Parser = Parser.htmlParser()
+        private val DETACHED_XML_PARSER: Parser = Parser.xmlParser()
+
+        // Cached reflection accessors into app-owned Jsoup container fields (protected by
+        // proguard-rules.pro; pure-public-API fallbacks are used if any field is unavailable).
+        private val JSOUP_ATTRS_SIZE_FIELD: Field? = runCatching {
+            Attributes::class.java.getDeclaredField("size").apply { isAccessible = true }
+        }.getOrNull()
+        private val JSOUP_ATTRS_KEYS_FIELD: Field? = runCatching {
+            Attributes::class.java.getDeclaredField("keys").apply { isAccessible = true }
+        }.getOrNull()
+        private val JSOUP_EL_ATTRS_FIELD: Field? = runCatching {
+            Element::class.java.getDeclaredField("attributes").apply { isAccessible = true }
+        }.getOrNull()
+        private val JSOUP_EL_CHILDS_FIELD: Field? = runCatching {
+            Element::class.java.getDeclaredField("childNodes").apply { isAccessible = true }
+        }.getOrNull()
+        private val JSOUP_EMPTY_NODE_LIST: Any? = runCatching {
+            Element::class.java.getDeclaredField("EmptyNodeList").apply { isAccessible = true }.get(null)
+        }.getOrNull()
+        private val JSOUP_LEAF_VALUE_FIELD: Field? = runCatching {
+            LeafNode::class.java.getDeclaredField("value").apply { isAccessible = true }
+        }.getOrNull()
+        private val JSOUP_FORM_LINKED_FIELD: Field? = runCatching {
+            FormElement::class.java.getDeclaredField("linkedEls").apply { isAccessible = true }
+        }.getOrNull()
 
         private val XML_BUILTIN_ENTITIES = setOf("amp", "lt", "gt", "quot", "apos")
         private val HTML_SKIP_TEXT_TAGS = setOf("script", "style")
@@ -1011,32 +1062,102 @@ class PluginDomParser(
 
         private fun align8(n: Long): Long = (n + 7L) and -8L
 
-        private fun arrayListCap(init: Int, size: Int): Long {
-            if (size <= init) return init.toLong()
-            var cap = init.toLong()
-            val target = size.toLong()
-            while (cap < target) cap += (cap ushr 1)
+        /**
+         * Compacts an [Element]'s [Attributes] container so its backing `keys`/`vals` arrays
+         * have exact length `== size` (eliminating duplicate-attribute and `removeAttr` bloat)
+         * and releases empty containers (`size == 0` -> `null`). Returns the compacted backing
+         * array capacity (0 when no [Attributes] object is retained).
+         */
+        internal fun compactElementAttributes(el: Element): Int {
+            val attrCount = el.attributesSize()
+            if (attrCount == 0) {
+                el.clearAttributes()
+                val remaining = JSOUP_EL_ATTRS_FIELD?.get(el) as? Attributes ?: return 0
+                val rawSize = JSOUP_ATTRS_SIZE_FIELD?.getInt(remaining) ?: 0
+                if (rawSize <= 0) return 0
+                val keysArr = JSOUP_ATTRS_KEYS_FIELD?.get(remaining) as? Array<*>
+                val cap = keysArr?.size ?: rawSize
+                if (cap > rawSize) {
+                    JSOUP_EL_ATTRS_FIELD.set(el, remaining.clone())
+                    return rawSize
+                }
+                return cap
+            }
+            val attrsObj = JSOUP_EL_ATTRS_FIELD?.get(el) as? Attributes
+            if (attrsObj != null && JSOUP_ATTRS_KEYS_FIELD != null && JSOUP_ATTRS_SIZE_FIELD != null) {
+                val rawSize = JSOUP_ATTRS_SIZE_FIELD.getInt(attrsObj)
+                val keysArr = JSOUP_ATTRS_KEYS_FIELD.get(attrsObj) as? Array<*>
+                val cap = keysArr?.size ?: rawSize
+                if (cap > rawSize) {
+                    JSOUP_EL_ATTRS_FIELD.set(el, attrsObj.clone())
+                    return rawSize
+                }
+                return cap
+            }
+            // Pure-public-API fallback if Jsoup field reflection is unavailable
+            val cloned = el.attributes().clone()
+            el.clearAttributes()
+            el.attributes().addAll(cloned)
+            return maxOf(3, attrCount)
+        }
+
+        /**
+         * Compacts a [LeafNode]'s internal [Attributes] container (used by [XmlDeclaration]
+         * and [DocumentType]) when `keys.length > size` (e.g. duplicate attributes on `<?xml ...?>`).
+         */
+        internal fun compactLeafAttributes(node: LeafNode): Int {
+            val lv = JSOUP_LEAF_VALUE_FIELD?.get(node) as? Attributes ?: return 0
+            val rawSize = JSOUP_ATTRS_SIZE_FIELD?.getInt(lv) ?: lv.size()
+            if (rawSize <= 0) return 0
+            val keysArr = JSOUP_ATTRS_KEYS_FIELD?.get(lv) as? Array<*>
+            val cap = keysArr?.size ?: rawSize
+            if (cap > rawSize) {
+                JSOUP_LEAF_VALUE_FIELD.set(node, lv.clone())
+                return rawSize
+            }
             return cap
         }
 
-        private fun attrsCap(size: Int): Long {
-            if (size <= 3) return 3L
-            var cap = 3L
-            val target = size.toLong()
-            while (cap < target) cap = cap shl 1
-            return cap
+        /**
+         * Compacts an [Element]'s `Element$NodeList` (`ArrayList<Node>`) after children may
+         * have been moved out (HTML5 adoption agency, foster parenting, or node removal):
+         * empty lists are reset to `Element.EmptyNodeList` (0 bytes), and non-empty lists
+         * call `ArrayList.trimToSize()` so backing array capacity equals exact `childNodeSize()`.
+         */
+        internal fun compactChildNodes(el: Element): Int {
+            val cc = el.childNodeSize()
+            val nl = JSOUP_EL_CHILDS_FIELD?.get(el) as? ArrayList<*>
+            if (cc == 0) {
+                if (nl != null && JSOUP_EMPTY_NODE_LIST != null && nl !== JSOUP_EMPTY_NODE_LIST) {
+                    JSOUP_EL_CHILDS_FIELD.set(el, JSOUP_EMPTY_NODE_LIST)
+                }
+                return 0
+            }
+            nl?.trimToSize()
+            return cc
         }
 
-        internal fun attrsContainerBytes(attrCount: Int): Long {
-            val cap = attrsCap(attrCount)
-            // Attributes object (24B) + String[cap] + Object[cap]
-            return 24L + 2L * (16L + align8(cap * 4L))
+        /**
+         * Clears and trims `FormElement.linkedEls` (never exposed by the read-only plugin
+         * DOM API) so `<form>` elements with many/reparented inputs retain zero hidden list bloat.
+         */
+        internal fun compactFormElement(el: Element) {
+            if (el !is FormElement) return
+            val linked = JSOUP_FORM_LINKED_FIELD?.get(el) as? ArrayList<*> ?: return
+            if (linked.isNotEmpty()) linked.clear()
+            linked.trimToSize()
+        }
+
+        internal fun attrsContainerBytes(cap: Int): Long {
+            if (cap <= 0) return 0L
+            // Attributes object (24B) + exact-sized String[cap] + Object[cap]
+            return 24L + 2L * (16L + align8(cap.toLong() * 4L))
         }
 
         internal fun childListBytes(childCount: Int): Long {
-            val cap = arrayListCap(4, childCount)
-            // Element$NodeList (36B incl. overhead) + Object[cap] + ~1B/child fragmentation
-            return 36L + 16L + align8(cap * 4L) + childCount.toLong()
+            if (childCount <= 0) return 0L
+            // Compacted Element$NodeList (32B) + exact-sized Object[childCount]
+            return 32L + 16L + align8(childCount.toLong() * 4L)
         }
 
         internal fun exactStrBytes(s: String?, seen: Array<String?>): Long {
@@ -1095,9 +1216,9 @@ class PluginDomParser(
                     throw DomLimitExceededException("XML 声明名超过长度上限（最多 $MAX_NAME_LENGTH 字符）")
                 }
                 var b = XML_DECL_BASE_BYTES
-                val ac = node.attributesSize()
-                if (ac > 0) {
-                    b += attrsContainerBytes(ac)
+                val cap = compactLeafAttributes(node)
+                if (cap > 0) {
+                    b += attrsContainerBytes(cap)
                     for (a in node.attributes()) {
                         if (a.key.length > MAX_NAME_LENGTH) {
                             throw DomLimitExceededException("DOM 属性名超过长度上限（最多 $MAX_NAME_LENGTH 字符）")
@@ -1110,20 +1231,27 @@ class PluginDomParser(
                 b
             }
             is DocumentType -> {
-                val ac = node.attributesSize()
-                DOCTYPE_BASE_BYTES +
-                    attrsContainerBytes(maxOf(ac, 4)) +
-                    exactStrBytes(node.name(), seenStr) +
-                    exactStrBytes(node.publicId(), seenStr) +
-                    exactStrBytes(node.systemId(), seenStr)
+                val cap = compactLeafAttributes(node)
+                var b = DOCTYPE_BASE_BYTES
+                if (cap > 0) {
+                    b += attrsContainerBytes(cap)
+                    for (a in node.attributes()) {
+                        b += exactStrBytes(a.key, seenStr) + exactStrBytes(a.value, seenStr)
+                    }
+                } else {
+                    b += exactStrBytes(node.name(), seenStr) +
+                        exactStrBytes(node.publicId(), seenStr) +
+                        exactStrBytes(node.systemId(), seenStr)
+                }
+                b
             }
             else -> OTHER_NODE_BASE_BYTES
         }
 
         /**
-         * Exact iterative full-tree byte & element recount (excluding `#document` from
-         * [ParsedDocStats.elementCount]). Also reclaims empty `Attributes` left on
-         * HTML5 formatting elements and enforces [MAX_NAME_LENGTH].
+         * Exact iterative full-tree compaction + byte & element recount (excluding `#document`
+         * from [ParsedDocStats.elementCount]). Compacts `Attributes`, `Element$NodeList`,
+         * `LeafNode` attributes, and `FormElement.linkedEls`, and enforces [MAX_NAME_LENGTH].
          */
         internal fun estimateDocumentBytes(doc: Document): Long =
             estimateDocumentExact(doc, Long.MAX_VALUE, Long.MAX_VALUE).estimatedBytes
@@ -1134,7 +1262,16 @@ class PluginDomParser(
             val seenStr = arrayOfNulls<String>(STR_DEDUP_SLOTS)
             val seenCustomTags = IdentityHashMap<Tag, Boolean>()
             val stack = ArrayDeque<Node>()
-            val rootCc = doc.childNodeSize()
+            val rootAttrCap = compactElementAttributes(doc)
+            if (rootAttrCap > 0) {
+                bytes += attrsContainerBytes(rootAttrCap)
+                if (doc.attributesSize() > 0) {
+                    for (a in doc.attributes()) {
+                        bytes += exactStrBytes(a.key, seenStr) + exactStrBytes(a.value, seenStr)
+                    }
+                }
+            }
+            val rootCc = compactChildNodes(doc)
             if (rootCc > 0) {
                 bytes += childListBytes(rootCc)
                 val rootChildren = doc.childNodes()
@@ -1152,27 +1289,30 @@ class PluginDomParser(
                     if (tagName.length > MAX_NAME_LENGTH) {
                         throw DomLimitExceededException("DOM 标签名超过长度上限（最多 $MAX_NAME_LENGTH 字符）")
                     }
-                    val attrCount = node.attributesSize()
-                    if (attrCount == 0) node.clearAttributes()
+                    val attrCap = compactElementAttributes(node)
+                    compactFormElement(node)
                     bytes += ELEMENT_BASE_BYTES
+                    if (node is FormElement) bytes += FORM_ELEMENT_EXTRA_BYTES
                     val tag = node.tag()
                     if (!tag.isKnownTag && seenCustomTags.put(tag, java.lang.Boolean.TRUE) == null) {
                         bytes += CUSTOM_TAG_BASE_BYTES + exactStrBytes(tag.name, seenStr)
                         val norm = tag.normalName()
                         if (norm !== tag.name) bytes += exactStrBytes(norm, seenStr)
                     }
-                    if (attrCount > 0) {
-                        bytes += attrsContainerBytes(attrCount)
-                        for (a in node.attributes()) {
-                            if ((++ops and 1023) == 0) checkDeadline(deadlineNanos)
-                            val k = a.key
-                            if (k.length > MAX_NAME_LENGTH) {
-                                throw DomLimitExceededException("DOM 属性名超过长度上限（最多 $MAX_NAME_LENGTH 字符）")
+                    if (attrCap > 0) {
+                        bytes += attrsContainerBytes(attrCap)
+                        if (node.attributesSize() > 0) {
+                            for (a in node.attributes()) {
+                                if ((++ops and 1023) == 0) checkDeadline(deadlineNanos)
+                                val k = a.key
+                                if (k.length > MAX_NAME_LENGTH) {
+                                    throw DomLimitExceededException("DOM 属性名超过长度上限（最多 $MAX_NAME_LENGTH 字符）")
+                                }
+                                bytes += exactStrBytes(k, seenStr) + exactStrBytes(a.value, seenStr)
                             }
-                            bytes += exactStrBytes(k, seenStr) + exactStrBytes(a.value, seenStr)
                         }
                     }
-                    val childCount = node.childNodeSize()
+                    val childCount = compactChildNodes(node)
                     if (childCount > 0) {
                         bytes += childListBytes(childCount)
                         val children = node.childNodes()

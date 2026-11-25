@@ -919,6 +919,26 @@ test('Round 3: shared zip-vectors.json (incl. dual.zip PoC) and shared dom-vecto
   }
   assert.ok(knownDiffCount >= 6, 'Expected at least 6 knownDifference vectors (select, ws, template)');
 
+  // Round 9 Items #2 & #3: Run ALL shared estimatedBytesVectors from dom-vectors.json (±5% parity with Android)
+  assert.ok(Array.isArray(domVectors.estimatedBytesVectors) && domVectors.estimatedBytesVectors.length >= 14);
+  for (const ev of domVectors.estimatedBytesVectors) {
+    const inp = ev.input ?? ((ev.prefix || '') + (ev.unit || '').repeat(ev.repeat || 1) + (ev.suffix || ''));
+    const tol = ev.tolerancePct ?? 5;
+    const p = new PluginDomParser();
+    try {
+      if (ev.mode === 'xml') p.parseXml(inp);
+      else p.parseHtml(inp);
+      const actual = p.currentEstimatedDomBytes;
+      const diffPct = Math.abs(actual - ev.expectedBytes) * 100 / ev.expectedBytes;
+      assert.ok(
+        diffPct <= tol,
+        `estimatedBytesVector '${ev.name}': actual=${actual} expected=${ev.expectedBytes} diff=${diffPct.toFixed(2)}% > ${tol}%`,
+      );
+    } finally {
+      p.clear();
+    }
+  }
+
   // Pathological selector complexity tests (< 1s each)
   {
     const p = new PluginDomParser();
@@ -969,7 +989,7 @@ test('Round 3: shared zip-vectors.json (incl. dual.zip PoC) and shared dom-vecto
 
     const amp = new PluginDomParser();
     try {
-      assert.throws(() => amp.parseHtml('<b><p>x</b>y</p>'.repeat(95_000)), DomLimitExceededError);
+      assert.throws(() => amp.parseHtml('<b><p>x</b>y</p>'.repeat(130_000)), DomLimitExceededError);
       assert.equal(amp.totalNodes, 0);
     } finally { amp.clear(); }
 
@@ -1068,41 +1088,45 @@ test('Round 6: selector hard caps, 16 MB memo budget, budgeted attr/class, dedup
     p.clear();
   }
 
-  // 4. Required #4: 110k <i> + select('*') looped 40x -> deduplicated handles; 8 live docs / 48 MB VM cap / doc.close()
+  // 4. Required #4: 110k <i>x + select('*') looped 40x -> deduplicated handles; 8 live docs / 48 MB VM cap / doc.close()
   {
     const p = new PluginDomParser();
-    const html110k = '<div>' + '<i></i>'.repeat(110_000) + '</div>'; // ~16.8 MiB V8
-    const root = p.parseHtml(html110k);
-    const first = p.selectAllIds(root, '*');
-    const expectedHandles = p.handleCount;
-    assert.equal(expectedHandles, 110_005);
-    for (let i = 0; i < 40; i++) {
-      const t = Date.now();
-      const ids = p.selectAllIds(root, '*');
-      assert.ok(Date.now() - t < 1000, `select('*') iter #${i} exceeded 1s`);
-      assert.equal(ids.length, first.length);
-      assert.equal(p.handleCount, expectedHandles, `handle count leaked on iter #${i}`);
+    try {
+      const html110k = '<div>' + '<i>x</i>'.repeat(110_000) + '</div>'; // ~13.0 MiB host model
+      const root = p.parseHtml(html110k);
+      const first = p.selectAllIds(root, '*');
+      const expectedHandles = p.handleCount;
+      assert.equal(expectedHandles, 110_005);
+      for (let i = 0; i < 40; i++) {
+        const t = Date.now();
+        const ids = p.selectAllIds(root, '*');
+        assert.ok(Date.now() - t < 1000, `select('*') iter #${i} exceeded 1s`);
+        assert.equal(ids.length, first.length);
+        assert.equal(p.handleCount, expectedHandles, `handle count leaked on iter #${i}`);
+      }
+
+      // ~13.0 MiB doc1 + ~19.3 MiB handles + ~13.0 MiB doc2 = ~45.3 MiB <= 48 MiB
+      const root2 = p.parseHtml(html110k);
+      assert.equal(p.docCount, 2);
+      assert.equal(p.totalNodes, 220_008);
+      const html50k = '<div>' + '<i>x</i>'.repeat(50_000) + '</div>'; // ~5.9 MiB -> ~51.2 MiB > 48 MiB VM cap
+      assert.throws(() => p.parseHtml(html50k), DomLimitExceededError);
+
+      assert.equal(p.closeDoc(root), true);
+      assert.equal(p.docCount, 1);
+      assert.equal(p.totalNodes, 110_004);
+      const root3 = p.parseHtml(html50k);
+      assert.equal(p.docCount, 2);
+      assert.equal(p.totalNodes, 160_008);
+      p.closeDoc(root2);
+      p.closeDoc(root3);
+      assert.equal(p.docCount, 0);
+      assert.equal(p.totalNodes, 0);
+      assert.equal(p.handleCount, 0);
+      assert.equal(p.currentVmMemoryBytes, 0);
+    } finally {
+      p.clear();
     }
-
-    // 16.8 MiB doc1 + 13.4 MiB handles + 16.8 MiB doc2 = 47.0 MiB <= 48 MiB
-    const root2 = p.parseHtml(html110k);
-    assert.equal(p.docCount, 2);
-    assert.equal(p.totalNodes, 220_008);
-    const html50k = '<div>' + '<i></i>'.repeat(50_000) + '</div>'; // ~7.6 MiB -> 54.6 MiB > 48 MiB VM cap
-    assert.throws(() => p.parseHtml(html50k), DomLimitExceededError);
-
-    assert.equal(p.closeDoc(root), true);
-    assert.equal(p.docCount, 1);
-    assert.equal(p.totalNodes, 110_004);
-    const root3 = p.parseHtml(html50k);
-    assert.equal(p.docCount, 2);
-    assert.equal(p.totalNodes, 160_008);
-    p.closeDoc(root2);
-    p.closeDoc(root3);
-    assert.equal(p.docCount, 0);
-    assert.equal(p.totalNodes, 0);
-    assert.equal(p.handleCount, 0);
-    assert.equal(p.currentVmMemoryBytes, 0);
   }
 
   // 5. Small #7 & #9: :nth-* overflow rejection + identical DomLimitExceededError class for step & memory budgets
@@ -1193,49 +1217,53 @@ test('Round 6: selector hard caps, 16 MB memo budget, budgeted attr/class, dedup
 test('Round 7: byte-budgeted DOM (2 MB/24 MB/48 MB), :empty caching & loop ticks, 8 MB serialization cap, 200k classed selectors, monotonic nextId', async () => {
   const { PluginDomParser, DomLimitExceededError, DomTimeoutError } = await import('../src/dom.js');
 
-  // 1. Input > 2 MB rejected, plus 3 OOM payloads (PI, text+comment, <i>x * 200k) aborted mid-parse
+  // 1. Input > 2 MB rejected, plus 3 OOM payloads (PI, text+comment, <i>x * 300k) aborted mid-parse
   {
     const p = new PluginDomParser();
-    assert.throws(() => p.parseHtml('<p>' + 'a'.repeat(2 * 1024 * 1024 + 16) + '</p>'), DomLimitExceededError);
+    try {
+      assert.throws(() => p.parseHtml('<p>' + 'a'.repeat(2 * 1024 * 1024 + 16) + '</p>'), DomLimitExceededError);
 
-    const pi2Mb = '<?>'.repeat(Math.floor((2 * 1024 * 1024) / 3) - 10);
-    const textCmt2Mb = 'x<!>'.repeat(Math.floor((2 * 1024 * 1024) / 4) - 10);
-    const elemText200k = '<i>x'.repeat(200_000);
-    const elemText60k = '<i>x'.repeat(60_000); // ~21 MB V8 each
+      const pi2Mb = '<?>'.repeat(Math.floor((2 * 1024 * 1024) / 3) - 10);
+      const textCmt2Mb = 'x<!>'.repeat(Math.floor((2 * 1024 * 1024) / 4) - 10);
+      const elemText300k = '<i>x'.repeat(300_000); // 1.2 MB input, ~35.5 MB host model > 32 MB cap
+      const elemText180k = '<i>x'.repeat(180_000); // 720 KB input, ~21.3 MB host model each
 
-    for (const bad of [pi2Mb, textCmt2Mb, elemText200k]) {
-      const t = Date.now();
-      assert.throws(() => p.parseHtml(bad), DomLimitExceededError);
-      assert.ok(Date.now() - t < 1000);
-      assert.equal(p.docCount, 0);
+      for (const bad of [pi2Mb, textCmt2Mb, elemText300k]) {
+        const t = Date.now();
+        assert.throws(() => p.parseHtml(bad), DomLimitExceededError);
+        assert.ok(Date.now() - t < 1500);
+        assert.equal(p.docCount, 0);
+        assert.equal(p.currentVmMemoryBytes, 0);
+      }
+
+      // 2 x (<i>x * 180k) (~21.3 MB each = ~42.6 MB <= 48 MB) succeeds, then select('*') hits 48 MB VM budget
+      const d1 = p.parseHtml(elemText180k);
+      const d2 = p.parseHtml(elemText180k);
+      assert.throws(() => p.selectAllIds(d1, '*'), DomLimitExceededError);
+      p.closeDoc(d1);
+      p.closeDoc(d2);
       assert.equal(p.currentVmMemoryBytes, 0);
-    }
 
-    // 2 x (<i>x * 60k) (~21 MB each = ~42 MB <= 48 MB) succeeds, then select('*') hits 48 MB VM budget
-    const d1 = p.parseHtml(elemText60k);
-    const d2 = p.parseHtml(elemText60k);
-    assert.throws(() => p.selectAllIds(d1, '*'), DomLimitExceededError);
-    p.closeDoc(d1);
-    p.closeDoc(d2);
-    assert.equal(p.currentVmMemoryBytes, 0);
-
-    // 8 simultaneous live docs near the 48 MB VM cap + select('*') + outerHtml
-    const nearCapDocs = [
-      '<div>' + '<i>x</i>'.repeat(10_000) + '</div>',
-      '<div>' + '<i class="a b"></i>'.repeat(12_000) + '</div>',
-      '<div>' + '<!--c-->'.repeat(45_000) + '<p>ok</p></div>',
-      '<div>' + '<i></i>'.repeat(25_000) + '</div>',
-    ];
-    const roots = [];
-    for (let i = 0; i < 8; i++) roots.push(p.parseHtml(nearCapDocs[i % 4]));
-    assert.equal(p.docCount, 8);
-    assert.throws(() => p.parseHtml('<p>9th</p>'), DomLimitExceededError);
-    for (const r of roots) {
-      try { p.selectAllIds(r, '*'); } catch (e) { assert.ok(e instanceof DomLimitExceededError); }
-      assert.ok(p.outerHtml(r).length > 0);
+      // 8 simultaneous live docs near the 48 MB VM cap + select('*') + outerHtml
+      const nearCapDocs = [
+        '<div>' + '<i>x</i>'.repeat(30_000) + '</div>',
+        '<div>' + '<i class="a b"></i>'.repeat(35_000) + '</div>',
+        '<div>' + '<!--c-->'.repeat(60_000) + '<p>ok</p></div>',
+        '<div>' + '<i></i>'.repeat(50_000) + '</div>',
+      ];
+      const roots = [];
+      for (let i = 0; i < 8; i++) roots.push(p.parseHtml(nearCapDocs[i % 4]));
+      assert.equal(p.docCount, 8);
+      assert.throws(() => p.parseHtml('<p>9th</p>'), DomLimitExceededError);
+      for (const r of roots) {
+        try { p.selectAllIds(r, '*'); } catch (e) { assert.ok(e instanceof DomLimitExceededError); }
+        assert.ok(p.outerHtml(r).length > 0);
+      }
+      for (const r of roots) p.closeDoc(r);
+      assert.equal(p.currentVmMemoryBytes, 0);
+    } finally {
+      p.clear();
     }
-    for (const r of roots) p.closeDoc(r);
-    assert.equal(p.currentVmMemoryBytes, 0);
   }
 
   // 2. :empty caching + childNodes/attributes step accounting + entry deadline checks
@@ -1336,59 +1364,69 @@ test('Round 7: byte-budgeted DOM (2 MB/24 MB/48 MB), :empty caching & loop ticks
   }
 });
 
-test('Round 8: Node V8 calibration [0.60, 1.25] (HTML + XML + real pages), 64 MB process budget, 256-char name cap, escaped attrsJson cap', async () => {
-  const { execFileSync } = await import('node:child_process');
+test('Round 8 & 9: host-model parity (2 MB XML/HTML real pages + 150k simple elems + Item #3 shapes), 512 MB V8 safety net, 64 MB process budget, 256-char name cap, escaped attrsJson cap', async () => {
   const {
     PluginDomParser,
     DomLimitExceededError,
     MAX_PROCESS_MEMORY_BYTES,
+    MAX_V8_SAFETY_MEMORY_BYTES,
     currentProcessDomMemoryBytes,
+    currentV8SafetyMemoryBytes,
   } = await import('../src/dom.js');
+
+  assert.equal(MAX_V8_SAFETY_MEMORY_BYTES, 512 * 1024 * 1024);
 
   // 1. 256-char tag/attr name cap (HTML & XML)
   {
     const p = new PluginDomParser();
-    const okTag = 't'.repeat(256);
-    const okAttr = 'a'.repeat(256);
-    const rOk = p.parseHtml(`<${okTag} ${okAttr}="1"></${okTag}>`);
-    assert.equal(p.selectAllIds(rOk, okTag).length, 1);
-    p.clear();
+    try {
+      const okTag = 't'.repeat(256);
+      const okAttr = 'a'.repeat(256);
+      const rOk = p.parseHtml(`<${okTag} ${okAttr}="1"></${okTag}>`);
+      assert.equal(p.selectAllIds(rOk, okTag).length, 1);
+      p.clear();
 
-    assert.throws(() => p.parseHtml(`<${'t'.repeat(257)}></${'t'.repeat(257)}>`), DomLimitExceededError);
-    assert.throws(() => p.parseHtml(`<p ${'k'.repeat(257)}="1"></p>`), DomLimitExceededError);
-    assert.throws(() => p.parseHtml(`<${'t'.repeat(2_000_000)}>`), DomLimitExceededError);
-    assert.throws(() => p.parseXml(`<r><${'T'.repeat(257)}/></r>`), DomLimitExceededError);
-    assert.throws(() => p.parseXml(`<r><a ${'K'.repeat(257)}="1"/></r>`), DomLimitExceededError);
-    p.clear();
+      assert.throws(() => p.parseHtml(`<${'t'.repeat(257)}></${'t'.repeat(257)}>`), DomLimitExceededError);
+      assert.throws(() => p.parseHtml(`<p ${'k'.repeat(257)}="1"></p>`), DomLimitExceededError);
+      assert.throws(() => p.parseHtml(`<${'t'.repeat(2_000_000)}>`), DomLimitExceededError);
+      assert.throws(() => p.parseXml(`<r><${'T'.repeat(257)}/></r>`), DomLimitExceededError);
+      assert.throws(() => p.parseXml(`<r><a ${'K'.repeat(257)}="1"/></r>`), DomLimitExceededError);
+    } finally {
+      p.clear();
+    }
   }
 
   // 2. Escaped attrsJson 8 MB output cap (2 MB '\u0001' -> 12 MB JSON)
   {
     const p = new PluginDomParser();
-    const rCtrl = p.parseHtml("<p a='" + '\u0001'.repeat(2_000_000) + "'></p>");
-    const pId = p.selectFirstId(rCtrl, 'p');
-    const t = Date.now();
-    assert.throws(() => p.attrsJson(pId), DomLimitExceededError);
-    assert.ok(Date.now() - t < 1000);
-    const rSmall = p.parseHtml('<p a="x\n\t\u0001&quot;\\y"></p>');
-    const parsed = JSON.parse(p.attrsJson(p.selectFirstId(rSmall, 'p')));
-    assert.equal(parsed.a, 'x\n\t\u0001"\\y');
-    p.clear();
+    try {
+      const rCtrl = p.parseHtml("<p a='" + '\u0001'.repeat(2_000_000) + "'></p>");
+      const pId = p.selectFirstId(rCtrl, 'p');
+      const t = Date.now();
+      assert.throws(() => p.attrsJson(pId), DomLimitExceededError);
+      assert.ok(Date.now() - t < 1000);
+      const rSmall = p.parseHtml('<p a="x\n\t\u0001&quot;\\y"></p>');
+      const parsed = JSON.parse(p.attrsJson(p.selectFirstId(rSmall, 'p')));
+      assert.equal(parsed.a, 'x\n\t\u0001"\\y');
+    } finally {
+      p.clear();
+    }
   }
 
-  // 3. Process-wide 64 MB budget across two live PluginDomParser instances
+  // 3. Process-wide 64 MB budget across two live PluginDomParser instances (host model)
   {
     const baseProc = currentProcessDomMemoryBytes();
     const vm1 = new PluginDomParser();
     const vm2 = new PluginDomParser();
     try {
-      const chunk = '<div>' + '<p a="b">hi</p>'.repeat(32_000) + '</div>'; // ~17.7 MiB V8 each
+      // ~17.8 MiB host model per doc (95k <p a="b">hi</p>)
+      const chunk = '<div>' + '<p a="b">hi</p>'.repeat(95_000) + '</div>';
       const r1a = vm1.parseHtml(chunk);
-      const r1b = vm1.parseHtml(chunk); // vm1 ~35.4 MiB <= 48 MiB
-      const r2a = vm2.parseHtml(chunk); // proc ~53.1 MiB <= 64 MiB
+      const r1b = vm1.parseHtml(chunk); // vm1 ~35.6 MiB <= 48 MiB
+      const r2a = vm2.parseHtml(chunk); // proc ~53.4 MiB <= 64 MiB
       assert.ok(r1a > 0 && r1b > 0 && r2a > 0);
       assert.ok(currentProcessDomMemoryBytes() <= MAX_PROCESS_MEMORY_BYTES);
-      assert.throws(() => vm2.parseHtml(chunk), DomLimitExceededError); // ~70.8 MiB > 64 MiB process cap
+      assert.throws(() => vm2.parseHtml(chunk), DomLimitExceededError); // ~71.2 MiB > 64 MiB process cap
       vm1.clear();
       // After vm1 clears, vm2 can now allocate!
       const r2b = vm2.parseHtml(chunk);
@@ -1398,78 +1436,72 @@ test('Round 8: Node V8 calibration [0.60, 1.25] (HTML + XML + real pages), 64 MB
       vm2.clear();
     }
     assert.equal(currentProcessDomMemoryBytes(), baseProc);
+    assert.equal(currentV8SafetyMemoryBytes(), 0);
   }
 
-  // 4. Child Node `--expose-gc` subprocess calibrating realHeap / est in [0.60, 1.25]
-  //    across HTML shapes, XML shapes (incl. xelem, xuniqtag, xattr, xcdata), and realistic pages!
-  const domModuleUrl = new URL('../src/dom.js', import.meta.url).href;
-  const calibScript = `
-    const { PluginDomParser } = await import(${JSON.stringify(domModuleUrl)});
-    const gc = () => { for (let i = 0; i < 4; i++) global.gc(); return process.memoryUsage().heapUsed; };
-    const MAX = 2 * 1024 * 1024 - 64;
-    const fill = (pre, unit, post, f) => pre + unit.repeat(Math.floor(((MAX - pre.length - post.length) / unit.length) * f)) + post;
-    const uniq = (pre, mk, post, f) => { const parts=[pre]; let len=pre.length, i=0; while (len < MAX*f - 40) { const u = mk(i++); parts.push(u); len += u.length; } parts.push(post); return parts.join(''); };
-    const words = ['alpha','beta','gamma','delta','视频','电影','剧集','第一季','HD','1080p'];
-    const w = (i, k) => words[(i*7+k)%words.length];
-    function build(lim, head, row, tail) { const parts=[head]; let n=Buffer.byteLength(head)+Buffer.byteLength(tail), i=0; for(;;){ const r=row(i++); const b=Buffer.byteLength(r); if(n+b>lim) break; parts.push(r); n+=b; } parts.push(tail); return parts.join(''); }
-    const cases = [
-      ['pi', false, fill('', '<?>', '', 0.15)],
-      ['bogus', false, fill('', '<!>', '', 0.15)],
-      ['textcmt', false, fill('', 'x<!>', '', 0.15)],
-      ['elem', false, fill('<div>', '<p></p>', '</div>', 0.35)],
-      ['elemshort', false, fill('', '<i>', '', 0.15)],
-      ['elemtext', false, fill('<div>', '<p>x</p>', '</div>', 0.35)],
-      ['attr1', false, fill('<div>', '<p a=b></p>', '</div>', 0.35)],
-      ['manyattr', false, fill('<div>', '<p a b c d e f g h i j k l m n o q r s t u v w x y z></p>', '</div>', 0.35)],
-      ['manyattr3', false, (() => { const parts=['<div>']; let len=5,i=0; while (len < MAX*0.35-200) { let u='<p'; for (let j=0;j<40;j++) u+=' '+(i++).toString(36); u+='></p>'; parts.push(u); len+=u.length; } parts.push('</div>'); return parts.join(''); })()],
-      ['uniqtag', false, uniq('<div>', (i)=>{const t='t'+i.toString(36); return '<'+t+'></'+t+'>';}, '</div>', 0.35)],
-      ['uniqtagopen', false, uniq('<div>', (i)=>'<t'+i.toString(36)+'/>', '</div>', 0.35)],
-      ['deep', false, fill('', '<div>'.repeat(500)+'</div>'.repeat(500), '', 0.35)],
-      ['fostercmt', false, fill('<table><b>', '<!>', '', 0.15)],
-      ['xelem', true, fill('<r>', '<a/>', '</r>', 0.20)],
-      ['xcdata', true, fill('<r>', '<![CDATA[]]>', '</r>', 0.35)],
-      ['xuniqtag', true, uniq('<r>', (i)=>'<t'+i.toString(36)+'/>', '</r>', 0.25)],
-      ['xattr', true, fill('<r>', "<a b='c' d='e'/>", '</r>', 0.25)],
-      ['pages/article.html', false, build(2*1048576-256, '<html><body><article>', (i)=>'<p>'+(w(i,1)+' ').repeat(20)+'<a href="#n'+i+'">['+i+']</a> '+(w(i,2)+' ').repeat(10)+'</p>\\n', '</article></body></html>')],
-      ['pages/list.html', false, build(2*1048576-256, '<!DOCTYPE html><html><head><meta charset="utf-8"></head><body><ul class="items">\\n', (i)=>'<li class="item card" data-id="'+i+'"><a class="title" href="/v/'+i+'.html" title="'+w(i,3)+'"><img src="/p/'+i+'.jpg" alt="'+w(i,4)+'" loading="lazy"></a><span class="meta">'+w(i,5)+' · '+(i%60)+'分钟</span><span class="tag">'+w(i,6)+'</span></li>\\n', '</ul></body></html>')],
-      ['pages/table_pretty.html', false, build(1048576, '<!DOCTYPE html>\\n<html>\\n<body>\\n<table>\\n<tbody>\\n', (i)=>'  <tr>\\n    <td>'+i+'</td>\\n    <td><a href="/item/'+i+'">'+w(i,1)+' '+w(i,2)+'</a></td>\\n    <td class="size">'+((i*37)%9999)+' MB</td>\\n  </tr>\\n', '</tbody>\\n</table>\\n</body>\\n</html>\\n')],
-      ['pages/table_min.html', false, build(800000, '<html><body><table>', (i)=>'<tr><td>'+(i%100)+'</td><td>'+w(i,1)+'</td><td>'+(i%7)+'</td><td>x</td></tr>', '</table></body></html>')],
-      ['pages/mpd_timeline.xml', true, build(800000, '<?xml version="1.0"?>\\n<MPD><Period><AdaptationSet><SegmentTemplate><SegmentTimeline>\\n', (i)=>'          <S t="'+(i*180000)+'" d="180000"/>\\n', '</SegmentTimeline></SegmentTemplate></AdaptationSet></Period></MPD>\\n')],
-      ['pages/rss.xml', true, build(1048576, '<?xml version="1.0"?>\\n<rss><channel>\\n', (i)=>'  <item>\\n    <title>'+w(i,1)+' '+i+'</title>\\n    <link>https://example.com/p/'+i+'</link>\\n    <description><![CDATA[<p>'+w(i,2)+'</p>]]></description>\\n  </item>\\n', '</channel></rss>\\n')],
-      ['pages2/apache15.html', false, build(1572000, '<html><body><table>\\n', (i)=>'<tr><td valign="top"><img src="/icons/movie.gif" alt="[VID]"></td><td><a href="Show.S01E'+String(i).padStart(4,'0')+'.mkv">Show.S01E'+String(i).padStart(4,'0')+'.mkv</a></td><td>1.2G</td></tr>\\n', '</table></body></html>\\n')],
-      ['pages2/tracker2.html', false, build(1200000, '<html><body><table class="list">\\n', (i)=>'<tr class="'+(i%2?'odd':'even')+'">\\n  <td class="cat"><a href="/cat/5">TV</a></td>\\n  <td class="name"><a href="/t/'+i+'">Show S01E'+i+' 1080p</a></td>\\n  <td class="size">1.5 GB</td>\\n</tr>\\n', '</table></body></html>\\n')],
-    ];
-    // Warmup
-    { const w = new PluginDomParser(); const r = w.parseHtml('<p a="1">hi</p>'); w.outerHtml(r); w.text(r); w.selectAllIds(r, '*'); w.clear(); const rx = w.parseXml('<r><a b="1"/><![CDATA[x]]></r>'); w.outerHtml(rx); w.clear(); }
-
-    function checkOne(name, xml, inp) {
-      const p = new PluginDomParser({ maxDocMemoryBytes: 128<<20, maxVmMemoryBytes: 256<<20, maxProcessMemoryBytes: 256<<20 });
-      const h0 = gc();
-      const root = xml ? p.parseXml(inp) : p.parseHtml(inp);
-      const est = p.currentVmMemoryBytes;
-      const real = gc() - h0;
-      const ratio = real / est;
-      try { p.outerHtml(root); } catch {}
-      try { p.text(root); } catch {}
-      const realPost = gc() - h0;
-      const ratioPost = realPost / est;
-      console.log('NODE_R8CALIB ' + name.padEnd(25) + ' real=' + (real/1048576).toFixed(2) + 'MB est=' + (est/1048576).toFixed(2) + 'MB ratio=' + ratio.toFixed(3) + ' post=' + ratioPost.toFixed(3));
-      p.clear();
-      if (ratio < 0.60 || ratio > 1.25) {
-        throw new Error('Node shape ' + name + ' real/est=' + ratio.toFixed(3) + ' outside [0.60, 1.25]');
+  // 4. Round 9 Item #2: ALL normal 2 MB pages that host accepts MUST ALSO be accepted by kit under default 32 MB cap:
+  //    2 MB MPD timeline, 2 MB MPD list, 2 MB RSS, 2 MB XSPF, table_min, table_pretty, apache2, tracker2, >150k simple HTML elements
+  {
+    const lim2m = 2 * 1024 * 1024 - 256;
+    const words = ['alpha', 'beta', 'gamma', 'delta', '视频', '电影', '剧集', '第一季', 'HD', '1080p'];
+    const w = (i, k) => words[(i * 7 + k) % words.length];
+    function build(lim, head, row, tail) {
+      const parts = [head];
+      let n = Buffer.byteLength(head) + Buffer.byteLength(tail);
+      let i = 0;
+      for (;;) {
+        const r = row(i++);
+        const b = Buffer.byteLength(r);
+        if (n + b > lim) break;
+        parts.push(r);
+        n += b;
       }
-      if (ratioPost < 0.60 || ratioPost > 1.25) {
-        throw new Error('Node shape ' + name + ' post-ser real/est=' + ratioPost.toFixed(3) + ' outside [0.60, 1.25]');
+      parts.push(tail);
+      return parts.join('');
+    }
+    const normalPages = [
+      ['mpd_timeline_2mb.xml', true, build(lim2m, '<?xml version="1.0"?>\n<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic">\n<Period id="0"><AdaptationSet mimeType="video/mp4"><SegmentTemplate media="v-$Time$.m4s"><SegmentTimeline>\n', (i) => `          <S t="${i * 180000}" d="180000"/>\n`, '</SegmentTimeline></SegmentTemplate></AdaptationSet></Period></MPD>\n')],
+      ['mpd_list_2mb.xml', true, build(lim2m, '<?xml version="1.0"?>\n<MPD xmlns="urn:mpeg:dash:schema:mpd:2011">\n<Period><AdaptationSet><Representation id="1" bandwidth="1000"><SegmentList duration="2">\n', (i) => `<SegmentURL media="seg-${i}.m4s"/>\n`, '</SegmentList></Representation></AdaptationSet></Period></MPD>\n')],
+      ['rss_2mb.xml', true, build(lim2m, '<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">\n<channel><title>t</title>\n', (i) => `  <item><title>${w(i, 1)} ${i}</title><link>https://example.com/p/${i}</link><enclosure url="https://cdn.example.com/${i}.mp3" length="${i * 1000}" type="audio/mpeg"/><description><![CDATA[<p>${w(i, 2)}</p>]]></description></item>\n`, '</channel></rss>\n')],
+      ['playlist_2mb.xspf.xml', true, build(lim2m, '<?xml version="1.0" encoding="UTF-8"?><playlist version="1" xmlns="http://xspf.org/ns/0/"><trackList>\n', (i) => `<track><location>http://iptv.ex.com/live/${i}.m3u8</location><title>频道${i} ${w(i, 1)}</title><image>http://ex.com/logo/${i}.png</image><extension application="x"><group>${w(i, 2)}</group></extension></track>\n`, '</trackList></playlist>\n')],
+      ['table_pretty_2mb.html', false, build(lim2m, '<!DOCTYPE html>\n<html><body><table class="list"><tbody>\n', (i) => `  <tr>\n    <td>${i}</td>\n    <td><a href="/item/${i}">${w(i, 1)} ${w(i, 2)}</a></td>\n    <td class="size">${(i * 37) % 9999} MB</td>\n    <td>2024-0${(i % 9) + 1}-1${i % 9}</td>\n  </tr>\n`, '</tbody></table></body></html>\n')],
+      ['table_min_2mb.html', false, build(lim2m, '<html><body><table>', (i) => `<tr><td>${i % 100}</td><td>${w(i, 1)}</td><td>${i % 7}</td><td>x</td></tr>`, '</table></body></html>')],
+      ['apache2_2mb.html', false, build(lim2m, '<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">\n<html><head><title>Index</title></head><body><table>\n', (i) => { const s = String(i).padStart(4, '0'); return `<tr><td valign="top"><img src="/icons/movie.gif" alt="[VID]"></td><td><a href="Show.S01E${s}.1080p.WEB-DL.mkv">Show.S01E${s}.1080p.WEB-DL.mkv</a></td><td align="right">2024-01-${10 + (i % 18)} 10:${10 + (i % 50)}  </td><td align="right">1.${i % 9}G</td><td>&nbsp;</td></tr>\n`; }, '</table></body></html>\n')],
+      ['tracker2_2mb.html', false, build(lim2m, '<html><body><table class="list">\n', (i) => `<tr class="${i % 2 ? 'odd' : 'even'}">\n  <td class="cat"><a href="/cat/5"><img src="/i/tv.png" alt="TV"></a></td>\n  <td class="name"><a href="/t/${i}" title="Show S01E${i} 1080p">Show S01E${i} 1080p WEB-DL</a> <span class="tag new">NEW</span></td>\n  <td class="size">${(i % 90) / 10 + 1} GB</td>\n  <td class="seed">${i % 300}</td>\n</tr>\n`, '</table></body></html>\n')],
+      ['simple_160k_elems.html', false, '<div>' + '<p></p>'.repeat(160_000) + '</div>'],
+    ];
+    for (const [name, isXml, content] of normalPages) {
+      const p = new PluginDomParser();
+      try {
+        const root = isXml ? p.parseXml(content) : p.parseHtml(content);
+        assert.ok(root > 0, `Normal page '${name}' must be accepted under default 32 MB cap`);
+        assert.ok(p.currentEstimatedDomBytes <= 32 * 1024 * 1024);
+      } finally {
+        p.clear();
       }
     }
-    for (const [name, xml, inp] of cases) checkOne(name, xml, inp);
-    console.log('NODE_R8CALIB_PASSED');
-  `;
-  const out = execFileSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', calibScript], {
-    encoding: 'utf8',
-    maxBuffer: 16 * 1024 * 1024,
-  });
-  assert.ok(out.includes('NODE_R8CALIB_PASSED'), `Node Round 8 calibration failed:\n${out}`);
+    assert.equal(currentProcessDomMemoryBytes(), 0);
+    assert.equal(currentV8SafetyMemoryBytes(), 0);
+  }
+
+  // 5. Round 9 Item #2: loose V8 safety net rejects runaway V8 allocation even when host budget is lifted
+  {
+    const tightV8 = new PluginDomParser({
+      maxDocMemoryBytes: 64 * 1024 * 1024,
+      maxVmMemoryBytes: 128 * 1024 * 1024,
+      maxProcessMemoryBytes: 128 * 1024 * 1024,
+      maxV8SafetyMemoryBytes: 4 * 1024 * 1024,
+    });
+    try {
+      // 30k XML <a/> is only ~1.2 MB in host model, but ~12.9 MB in V8 linkedom -> hits 4 MB V8 safety net!
+      assert.throws(() => tightV8.parseXml('<r>' + '<a/>'.repeat(30_000) + '</r>'), DomLimitExceededError);
+      // 40k HTML <p></p> is only ~1.6 MB in host model, but ~6.4 MB in V8 parse5 -> hits 4 MB V8 safety net!
+      assert.throws(() => tightV8.parseHtml('<div>' + '<p></p>'.repeat(40_000) + '</div>'), DomLimitExceededError);
+    } finally {
+      tightV8.clear();
+    }
+    assert.equal(currentV8SafetyMemoryBytes(), 0);
+  }
 });
 
 test('Round 3: host memory caps, tool/host parity, redirect safe-headers, cookie warnings, unawaited Promise check, immutable globals', async () => {
@@ -1502,7 +1534,7 @@ test('Round 3: host memory caps, tool/host parity, redirect safe-headers, cookie
           return 'R'.repeat(9 * 1024 * 1024);
         }
         if (m === 'dom-node-flood') {
-          ctx.parse.html('<i>x</i>'.repeat(130000));
+          ctx.parse.html('<i>x'.repeat(300000));
           return { ok: true };
         }
         if (m === 'timer-flood') {
